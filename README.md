@@ -41,3 +41,7 @@ npm run build --prefix app               # Windows 客户端与安装包
 基于 [CloudCLI UI 1.37.3](https://github.com/siteboon/claudecodeui)，桌面壳使用 MyGo，文件同步使用 Mutagen。上游信息见 [`SOURCE.json`](SOURCE.json)。
 
 遵循 **AGPL-3.0-or-later**；上游及插件的许可与署名予以保留，见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
+
+## 致谢
+
+感谢 [Linux.do](https://linux.do) 社区。
