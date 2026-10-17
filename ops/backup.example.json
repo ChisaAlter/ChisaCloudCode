@@ -1,0 +1,13 @@
+{
+  "destination": "/var/backups/chisacloudcode/data",
+  "retainSnapshots": 3,
+  "sources": [
+    "/opt/chisacloudcode/workspaces",
+    "/opt/chisacloudcode/home",
+    "/opt/chisacloudcode/data"
+  ],
+  "sqliteDatabases": [
+    "/opt/chisacloudcode/data/auth.db"
+  ],
+  "excludeDirectoryNames": ["node_modules", ".venv", "__pycache__"]
+}

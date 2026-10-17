@@ -1,0 +1,279 @@
+openapi: 3.1.0
+info:
+  title: Global Job Dashboard RPC
+  version: 0.2.0
+  description: >
+    Local plugin RPC contract for the global dashboard that aggregates jobs across all known
+    workspace ledgers and allows a limited set of direct cross-workspace actions.
+
+paths:
+  /v1/global-dashboard:
+    get:
+      summary: Return the consolidated dashboard snapshot for all known workspaces
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [healthy, problem, paused, running, failed, missed, never_run]
+          required: false
+        - in: query
+          name: workspaceKey
+          schema:
+            type: string
+          required: false
+        - in: query
+          name: sortBy
+          schema:
+            type: string
+            enum: [urgency, next_run, workspace, name]
+          required: false
+      responses:
+        "200":
+          description: Global dashboard snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GlobalDashboardResponse"
+
+  /v1/global-jobs/{workspaceKey}/{taskId}/actions/run-now:
+    post:
+      summary: Trigger Run Now for a job from the global dashboard
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceKey"
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "202":
+          description: Run created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GlobalDashboardActionResponse"
+
+  /v1/global-jobs/{workspaceKey}/{taskId}/actions/pause:
+    post:
+      summary: Pause a job from the global dashboard
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceKey"
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: Updated task
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GlobalDashboardActionResponse"
+
+  /v1/global-jobs/{workspaceKey}/{taskId}/actions/resume:
+    post:
+      summary: Resume a job from the global dashboard
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceKey"
+        - $ref: "#/components/parameters/TaskId"
+      responses:
+        "200":
+          description: Updated task
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GlobalDashboardActionResponse"
+
+  /v1/global-jobs/{workspaceKey}/{taskId}/actions/retry:
+    post:
+      summary: Retry the latest actionable run for a job from the global dashboard
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceKey"
+        - $ref: "#/components/parameters/TaskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [runId]
+              properties:
+                runId:
+                  type: string
+      responses:
+        "202":
+          description: Retry run created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GlobalDashboardActionResponse"
+
+components:
+  parameters:
+    WorkspaceKey:
+      in: path
+      name: workspaceKey
+      required: true
+      schema:
+        type: string
+    TaskId:
+      in: path
+      name: taskId
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    GlobalDashboardResponse:
+      type: object
+      required: [generatedAt, summary, jobs, workspaces, partialData, warnings]
+      properties:
+        generatedAt:
+          type: string
+          format: date-time
+        summary:
+          $ref: "#/components/schemas/GlobalDashboardSummary"
+        jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/GlobalJobRecord"
+        workspaces:
+          type: array
+          items:
+            $ref: "#/components/schemas/WorkspaceAvailabilityState"
+        partialData:
+          type: boolean
+        warnings:
+          type: array
+          items:
+            type: string
+
+    GlobalDashboardSummary:
+      type: object
+      required:
+        [totalJobs, activeJobs, pausedJobs, problemJobs, workspacesTotal, workspacesDegraded]
+      properties:
+        totalJobs:
+          type: integer
+        activeJobs:
+          type: integer
+        pausedJobs:
+          type: integer
+        problemJobs:
+          type: integer
+        workspacesTotal:
+          type: integer
+        workspacesDegraded:
+          type: integer
+
+    GlobalJobRecord:
+      type: object
+      required:
+        [
+          taskId,
+          workspaceKey,
+          workspacePath,
+          workspaceLabel,
+          workspaceDrilldownAvailable,
+          name,
+          recurrenceSummary,
+          enabled,
+          nextRunAt,
+          lastRunStatus,
+          latestActionableRunId,
+          workspaceAvailability,
+          availableActions
+        ]
+      properties:
+        taskId:
+          type: string
+        workspaceKey:
+          type: string
+        workspacePath:
+          type: string
+        workspaceLabel:
+          type: string
+        workspaceDrilldownAvailable:
+          type: boolean
+        name:
+          type: string
+        recurrenceSummary:
+          type: string
+        enabled:
+          type: boolean
+        nextRunAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastRunStatus:
+          type: string
+          enum: [never_run, running, succeeded, failed, missed, paused]
+        lastRunFinishedAt:
+          type: string
+          format: date-time
+          nullable: true
+        latestActionableRunId:
+          type: string
+          nullable: true
+        workspaceAvailability:
+          type: string
+          enum: [available, partial, unavailable]
+        availableActions:
+          type: array
+          items:
+            type: string
+            enum: [run_now, pause, resume, retry]
+
+    WorkspaceAvailabilityState:
+      type: object
+      required: [workspaceKey, workspacePath, workspaceLabel, status, jobCount]
+      properties:
+        workspaceKey:
+          type: string
+        workspacePath:
+          type: string
+        workspaceLabel:
+          type: string
+        status:
+          type: string
+          enum: [available, partial, unavailable]
+        jobCount:
+          type: integer
+        warning:
+          type: string
+          nullable: true
+
+    GlobalDashboardActionResponse:
+      type: object
+      required: [task]
+      properties:
+        task:
+          $ref: "#/components/schemas/WorkspaceTask"
+        run:
+          $ref: "#/components/schemas/ScheduledRun"
+
+    WorkspaceTask:
+      type: object
+      required: [id, workspaceKey, workspacePath, name, enabled]
+      properties:
+        id:
+          type: string
+        workspaceKey:
+          type: string
+        workspacePath:
+          type: string
+        name:
+          type: string
+        enabled:
+          type: boolean
+
+    ScheduledRun:
+      type: object
+      required: [id, taskId, workspaceKey, status, scheduledFor]
+      properties:
+        id:
+          type: string
+        taskId:
+          type: string
+        workspaceKey:
+          type: string
+        status:
+          type: string
+          enum: [running, succeeded, failed, missed]
+        scheduledFor:
+          type: string
+          format: date-time

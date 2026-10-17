@@ -1,0 +1,998 @@
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { request as httpRequest } from 'node:http';
+import path from 'node:path';
+import { Readable } from 'node:stream';
+
+import { createSdkMcpServer, query as sdkQuery, tool } from '@anthropic-ai/claude-agent-sdk';
+import type { SpawnedProcess } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
+import type { RequestHandler } from 'express';
+
+import type { FileTreeFileSystem, WorkspaceGitFileSystem } from '@/shared/index.js';
+import { AppError, WORKSPACES_ROOT, getWorkspaceSyncNetwork, isWorkspaceSyncControlHost, isWorkspaceSyncRecoveryOnly } from '@/shared/index.js';
+
+type Binding = { root: string; host: string; port: number; token: string; bindingEpoch: string; readBatch: boolean; vps: boolean };
+type RpcStats = { size: number; mtime: number; mode: number; dir: boolean; symlink: boolean };
+type RpcResult = Partial<RpcStats> & { ok?: boolean; error?: string; code?: string; b64?: string; hash?: string; path?: string; entries?: Array<{ name: string; dir: boolean; stats?: RpcStats }>; results?: RpcResult[]; stdout?: string; stderr?: string; exitCode?: number; truncated?: boolean };
+type FileTreeReadRequest = { op: 'stat' | 'lstat' | 'list'; path: string; includeStats?: boolean };
+type PendingFileTreeRead = { request: FileTreeReadRequest; resolve(result: RpcResult): void; reject(error: unknown): void };
+type WorkspaceRequestScope = { signal: AbortSignal; deadline: number; id: string };
+
+const requestScopes = new AsyncLocalStorage<WorkspaceRequestScope>();
+const CONTROL_BUDGET_MS = 620_000;
+const REQUEST_BUDGET_MS = 2_000_000;
+
+/** Used by File Tree and Git routes to bind queued work to the requesting HTTP operation. */
+export const workspaceRequestScope: RequestHandler = (request, response, next) => {
+  const supplied = Number(request.headers['x-chisa-deadline-ms']);
+  const deadline = Math.min(Number.isFinite(supplied) && supplied > 0 ? supplied : Infinity, Date.now() + REQUEST_BUDGET_MS);
+  const cancellation = new AbortController();
+  const cancel = () => cancellation.abort(new AppError('Workspace request cancelled; check its result before repeating it', { code: 'WORKSPACE_REQUEST_CANCELLED', statusCode: 499 }));
+  const timer = setTimeout(cancel, Math.max(0, deadline - Date.now()));
+  timer.unref();
+  const finish = () => {
+    clearTimeout(timer);
+    request.off('aborted', cancel);
+    response.off('close', disconnected);
+  };
+  const disconnected = () => { if (!response.writableFinished) cancel(); finish(); };
+  request.once('aborted', cancel);
+  response.once('close', disconnected);
+  response.once('finish', finish);
+  if (request.aborted || deadline <= Date.now()) cancel();
+  requestScopes.run({ signal: cancellation.signal, deadline, id: randomUUID() }, next);
+};
+
+function operationSignal(signal?: AbortSignal): AbortSignal | undefined {
+  const scoped = requestScopes.getStore()?.signal;
+  return signal && scoped ? AbortSignal.any([signal, scoped]) : signal ?? scoped;
+}
+
+/** Git routes use the HTTP operation's cancellation for local Git and provider subprocesses. */
+export function workspaceRequestSignal(): AbortSignal | undefined {
+  const signal = requestScopes.getStore()?.signal;
+  signal?.throwIfAborted();
+  return signal;
+}
+
+function controlScope(signal?: AbortSignal, cleanup = false) {
+  const requestScope = cleanup ? undefined : requestScopes.getStore();
+  const deadline = Math.min(Date.now() + CONTROL_BUDGET_MS, requestScope?.deadline ?? Infinity);
+  // Reuse the HTTP deadline signal so a competing timer cannot change cancellation into a transport failure.
+  const timeout = requestScope && requestScope.deadline === deadline ? requestScope.signal : AbortSignal.timeout(Math.max(0, deadline - Date.now()));
+  const cancellation = cleanup ? undefined : operationSignal(signal);
+  return { deadline, signal: cancellation ? AbortSignal.any([timeout, cancellation]) : timeout };
+}
+
+function refreshedBinding(binding: Binding): Binding {
+  const current = resolveWorkspaceBinding(binding.root);
+  if (!current || current.root !== binding.root || current.host !== binding.host || current.token !== binding.token || current.bindingEpoch !== binding.bindingEpoch || current.vps !== binding.vps) {
+    throw new AppError('Workspace binding changed; synchronize the selected project before continuing', { code: 'STALE_BINDING', statusCode: 409 });
+  }
+  return current;
+}
+
+function combinedError(primary: unknown, cleanup: unknown): AppError {
+  const error = primary instanceof Error ? primary : new Error(String(primary));
+  const cleanupError = cleanup instanceof Error ? cleanup : new Error(String(cleanup));
+  return Object.assign(new AppError(`${error.message}. Workspace cleanup was not confirmed; synchronize before starting another task.`, {
+    code: primary instanceof AppError ? primary.code : 'code' in error && typeof error.code === 'string' ? error.code : 'WORKSPACE_OPERATION_FAILED',
+    statusCode: primary instanceof AppError ? primary.statusCode : 503,
+    details: { primaryName: error.name, primaryCode: 'code' in error ? error.code : undefined, cleanupName: cleanupError.name, cleanupCode: 'code' in cleanupError ? cleanupError.code : undefined },
+  }), { cause: error, cleanupError });
+}
+
+async function completeWithCleanup<T>(operation: () => Promise<T>, cleanup: () => Promise<void>, signal?: AbortSignal): Promise<T> {
+  const cancellation = operationSignal(signal);
+  let result: T | undefined;
+  let failure: unknown;
+  let failed = false;
+  try { result = await operation(); } catch (error) { failure = error; failed = true; }
+  try { await cleanup(); } catch (error) {
+    if (failed) throw combinedError(failure, error);
+    throw Object.assign(error instanceof Error ? error : new Error(String(error)), { workspaceCleanupError: true });
+  }
+  cancellation?.throwIfAborted();
+  if (failed) throw failure;
+  return result as T;
+}
+
+function fileStatsFromRpc(result: Partial<RpcStats>) {
+  return { size: result.size!, mtime: new Date(result.mtime! * 1000), mode: result.mode!, isDirectory: () => Boolean(result.dir), isSymbolicLink: () => Boolean(result.symlink) };
+}
+
+/** Used by workspace adapters; capability metadata is never passed to Claude. */
+function resolveWorkspaceBinding(candidate: string): Binding | null {
+  let root = path.resolve(candidate);
+  const boundary = path.resolve(WORKSPACES_ROOT);
+  if (root !== boundary && !root.startsWith(boundary + path.sep)) return null;
+  while (root !== boundary) {
+    const marker = path.join(root, '.chisa-bridge.json');
+    if (existsSync(marker)) {
+      const value = JSON.parse(readFileSync(marker, 'utf8')) as Record<string, unknown>;
+      if ((value.protocol !== 1 && value.protocol !== 2) || !Number.isInteger(value.port) || Number(value.port) < 1024 || Number(value.port) > 65535 || typeof value.token !== 'string' || typeof value.bindingEpoch !== 'string') throw new Error('Invalid workspace binding');
+      const host = value.controlHost === undefined ? '127.0.0.1' : value.controlHost;
+      if (typeof host !== 'string' || !isWorkspaceSyncControlHost(host)) throw new Error('Invalid workspace transport address');
+      return { root, host, port: Number(value.port), token: value.token, bindingEpoch: value.bindingEpoch, readBatch: value.readBatch === true, vps: value.protocol === 2 };
+    }
+    root = path.dirname(root);
+  }
+  return null;
+}
+
+/** Worktrees checks this before removing a directory: an independently bound root must be unbound first so its return-synchronization callback stays available. */
+export function isWorkspaceBindingRoot(candidate: string): boolean {
+  return resolveWorkspaceBinding(candidate)?.root === path.resolve(candidate);
+}
+
+function virtualPath(binding: Binding, candidate: string): string {
+  if (candidate === '/workspace' || candidate.startsWith('/workspace/')) return candidate;
+  const absolute = path.resolve(binding.root, candidate);
+  const relative = path.relative(binding.root, absolute);
+  if (relative.startsWith('..' + path.sep) || relative === '..' || path.isAbsolute(relative)) throw new Error('Path is outside the workspace');
+  return '/workspace' + (relative ? '/' + relative.split(path.sep).join('/') : '');
+}
+
+function checkRpcResult(result: RpcResult, statusCode?: number): RpcResult {
+  if (statusCode !== undefined || result.error) {
+    const code = result.code || 'WORKSPACE_OPERATION_FAILED';
+    // Filesystem existence errors remain errno errors for existing callers.
+    if (code === 'ENOENT') throw Object.assign(new Error(result.error), { code });
+    throw new AppError(result.error || 'Workspace operation failed', { code, statusCode: statusCode ?? (code === 'CONTENT_CONFLICT' ? 409 : code === 'WORKSPACE_UNAVAILABLE' ? 503 : 400) });
+  }
+  return result;
+}
+
+async function desktopControl(binding: Binding, request: Record<string, unknown>, cancellation?: AbortSignal, cleanup = false): Promise<RpcResult> {
+  binding = refreshedBinding(binding);
+  // The Go bridge expects the path's UTF-8 wire bytes in this header.
+  const workspaceHeader = Buffer.from(binding.root, 'utf8').toString('latin1');
+  const { signal, deadline } = controlScope(cancellation, cleanup);
+  signal.throwIfAborted();
+  const started = Date.now();
+  const operation = String(request.op);
+  // Built-in fetch has a separate 300-second headers timeout. Sync can legitimately
+  // take longer, so this loopback RPC uses one deadline for headers and body.
+  const response = await new Promise<{ result: RpcResult; statusCode: number }>((resolve, reject) => {
+    const payload = JSON.stringify(request);
+    const outgoing = httpRequest({
+      hostname: binding.host, port: binding.port, path: '/workspace/rpc', method: 'POST', signal,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'X-Bridge-Token': binding.token, 'X-Cwd': workspaceHeader, 'X-Binding-Epoch': binding.bindingEpoch, 'X-Chisa-Deadline-Ms': String(deadline) },
+    }, incoming => {
+      const chunks: Buffer[] = [];
+      incoming.on('data', (chunk: Buffer) => chunks.push(chunk));
+      incoming.on('error', reject);
+      incoming.on('end', () => {
+        try { resolve({ result: JSON.parse(Buffer.concat(chunks).toString('utf8')) as RpcResult, statusCode: incoming.statusCode ?? 502 }); }
+        catch (error) { reject(error); }
+      });
+    });
+    outgoing.on('error', reject);
+    // A Buffer keeps Node from re-encoding the Latin-1 header bytes with the JSON body.
+    outgoing.end(Buffer.from(payload, 'utf8'));
+  }).catch((error: unknown) => {
+    const failure = error as NodeJS.ErrnoException;
+    const timedOut = signal.aborted && signal.reason?.name === 'TimeoutError';
+    const details = { operation, timedOut, transportCode: failure?.code, errorName: failure?.name, elapsedMs: Date.now() - started };
+    // Never log the request, capability headers, project path or command payload.
+    console.error('[workspace-control]', details);
+    if (signal.aborted && !timedOut) throw signal.reason;
+    const message = operation === 'sync_end'
+      ? 'Workspace synchronization confirmation was not received. Do not resend completed work; use Sync now in the client to recover the workspace.'
+      : operation === 'sync_begin' ? 'Workspace connection unavailable before task start. Reconnect the desktop client and synchronize the project.'
+        : 'Workspace connection unavailable';
+    throw new AppError(message, { code: 'WORKSPACE_UNAVAILABLE', statusCode: 503, details });
+  });
+  const result = response.result;
+  if (binding.vps && String(request.op).startsWith('sync_') && result.error) {
+    result.error = 'Project synchronization is blocked. Check synchronization details in the client settings.';
+  }
+  return checkRpcResult(result, response.statusCode >= 200 && response.statusCode < 300 ? undefined : response.statusCode);
+}
+
+type WorkspaceLease = { owner: 'claude' | 'sync-needed' | 'pi' | 'sync'; id: string; epoch: string; pid?: number; processStartTime?: string; bootId?: string; mayWrite?: boolean; cleanupPending?: string[] };
+const activeWorkspaceLeases = new Map<string, WorkspaceLease>();
+
+function requireWorkspaceAdmission(binding: Binding): void {
+  if (isWorkspaceSyncRecoveryOnly(binding.root)) throw new AppError('Restore the pending workspace synchronization before starting new work', { code: 'WORKSPACE_RECOVERY_REQUIRED', statusCode: 409 });
+}
+
+/** The recovery service uses this exact in-process claim identity for legacy leases without a Linux birth identity. */
+export function isActiveWorkspaceLease(candidate: string, leaseId: string, epoch: string): boolean {
+  const active = activeWorkspaceLeases.get(path.resolve(candidate));
+  return active?.id === leaseId && active.epoch === epoch;
+}
+
+function leaseDirectory(binding: Binding): string { return binding.root + '.chisa-lease'; }
+function readLease(binding: Binding): WorkspaceLease | null {
+  const directory = leaseDirectory(binding);
+  if (!existsSync(directory)) return null;
+  return JSON.parse(readFileSync(path.join(directory, 'state.json'), 'utf8')) as WorkspaceLease;
+}
+function saveLease(binding: Binding, lease: WorkspaceLease): void {
+  const file = path.join(leaseDirectory(binding), 'state.json');
+  writeFileSync(file + '.tmp', JSON.stringify(lease), { mode: 0o600 });
+  renameSync(file + '.tmp', file);
+}
+function claimWorkspace(binding: Binding): WorkspaceLease {
+  requireWorkspaceAdmission(binding);
+  const processStat = process.platform === 'linux' ? readFileSync('/proc/self/stat', 'utf8') : '';
+  const identity = process.platform === 'linux' ? {
+    processStartTime: processStat.slice(processStat.lastIndexOf(')') + 2).trim().split(/\s+/)[19],
+    bootId: readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(),
+  } : {};
+  try { mkdirSync(leaseDirectory(binding), { mode: 0o700 }); }
+  catch { throw new AppError('Workspace is reserved or waiting for synchronization. Finish the current task or synchronize it in desktop settings.', { code: 'WORKSPACE_BUSY', statusCode: 409 }); }
+  const lease: WorkspaceLease = { owner: 'claude', id: randomUUID(), epoch: binding.bindingEpoch, pid: process.pid, ...identity, mayWrite: false };
+  saveLease(binding, lease);
+  activeWorkspaceLeases.set(binding.root, lease);
+  return lease;
+}
+async function releaseWorkspace(binding: Binding, lease: WorkspaceLease, prepared: boolean): Promise<void> {
+  // Retain the barrier after disconnection; desktop recovery checks that the run ended.
+  const latest = readLease(binding);
+  const mayWrite = !prepared || (latest?.id === lease.id ? latest.mayWrite !== false : true);
+  if (!latest || latest.id !== lease.id || latest.epoch !== lease.epoch) throw new AppError('Workspace reservation changed before cleanup', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+  saveLease(binding, { ...latest, mayWrite, owner: 'sync-needed' });
+  if (activeWorkspaceLeases.get(binding.root)?.id === lease.id) activeWorkspaceLeases.delete(binding.root);
+  if (latest.cleanupPending?.length) throw new AppError('Workspace container cleanup failed; use Sync now to stop it safely before continuing', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
+  const jobMarker = path.join(leaseDirectory(binding), 'sync-job.json');
+  if (existsSync(jobMarker)) throw new AppError('A remote synchronization command has not confirmed exit; use Sync now before continuing', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
+  // sync_end performs the final compare-and-release under the same persistent
+  // flock used by native sync-job admission. Node must not check then remove:
+  // a delayed SSH job could register between those two filesystem operations.
+  await desktopControl(binding, { op: 'sync_end', runId: lease.id, changed: mayWrite }, undefined, true);
+  // Ownership is already released; a missed UI notification must not fail completed work.
+  try { await desktopControl(binding, { op: 'sync_released', runId: lease.id }, undefined, true); }
+  catch (error) {
+    const failure = error as NodeJS.ErrnoException;
+    console.error('[workspace-release-notification]', { errorName: failure?.name, code: failure?.code });
+  }
+}
+
+function recordContainer(binding: Binding, name: string, pending: boolean, expected: WorkspaceLease | null): void {
+  if (!expected) return;
+  const lease = readLease(binding);
+  if (!lease || lease.id !== expected.id || lease.epoch !== expected.epoch || lease.owner !== expected.owner) {
+    throw new AppError('Workspace reservation changed during execution', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 409 });
+  }
+  const names = new Set(lease.cleanupPending ?? []);
+  if (pending) names.add(name); else names.delete(name);
+  saveLease(binding, { ...lease, cleanupPending: [...names] });
+}
+
+function checkWorkspaceRequest(): void {
+  requestScopes.getStore()?.signal.throwIfAborted();
+}
+
+async function removeWorkspaceContainer(name: string): Promise<void> {
+  const signal = AbortSignal.timeout(10_000);
+  const run = (args: string[]) => new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+    const child = spawn('docker', args, { stdio: ['ignore', 'pipe', 'ignore'], signal, killSignal: 'SIGKILL' });
+    let output = '';
+    let failure: Error | undefined;
+    child.stdout.on('data', (chunk: Buffer) => { output += chunk.toString(); });
+    child.on('error', error => { failure = error; });
+    child.on('close', code => { if (failure) reject(failure); else resolve({ code, output }); });
+  });
+  const removed = await run(['rm', '--force', name]);
+  if (removed.code === 0) return;
+  // --rm can remove an already-completed container first. A successful daemon
+  // query is required to distinguish that from a failed cleanup connection.
+  const remaining = await run(['ps', '--all', '--filter', `name=^/${name}$`, '--format', '{{.Names}}']);
+  if (remaining.code !== 0 || remaining.output.trim()) throw new AppError('Workspace container cleanup was not confirmed', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
+}
+
+const preparedWorkspaceWorkers = new Map<string, Promise<RpcResult>>();
+const preparedPreviewStartups = new Map<string, Set<Promise<void>>>();
+const preparedWorkspaceReservations = new Map<string, string>();
+
+async function waitPreparedPreviewStartups(root: string): Promise<void> {
+  const startups = preparedPreviewStartups.get(root);
+  if (startups) await Promise.all(startups);
+}
+
+function admittedWorkspaceLease(binding: Binding): WorkspaceLease | null {
+  requireWorkspaceAdmission(binding);
+  const current = readLease(binding);
+  if (current && (current.epoch !== binding.bindingEpoch || current.owner !== 'claude')) {
+    throw new AppError('Workspace is reserved or waiting for synchronization', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+  }
+  if (current?.cleanupPending?.length) {
+    throw new AppError('Workspace container cleanup is not confirmed', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
+  }
+  return current;
+}
+
+function workspaceRequestReadOnly(request: Record<string, unknown>): boolean {
+  return ['stat', 'lstat', 'list', 'batch', 'realpath', 'read', 'search', 'grep', 'preview_status'].includes(String(request.op))
+    || (request.op === 'exec' && request.readOnly === true);
+}
+
+function rejectBorrowedPreparedReservation(binding: Binding, lease: WorkspaceLease | null): void {
+  if (lease && preparedWorkspaceReservations.get(binding.root) === lease.id) {
+    throw new AppError('Workspace is reserved by another prepared operation', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+  }
+}
+
+function releasePreparedWorkerLease(binding: Binding, lease: WorkspaceLease): void {
+  binding = refreshedBinding(binding);
+  const current = readLease(binding);
+  if (!current || current.id !== lease.id || current.epoch !== lease.epoch || current.owner !== 'claude'
+    || current.cleanupPending?.length || existsSync(path.join(leaseDirectory(binding), 'sync-job.json'))) {
+    throw new AppError('Workspace cleanup was not confirmed after execution', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
+  }
+  rmSync(leaseDirectory(binding), { recursive: true });
+  if (activeWorkspaceLeases.get(binding.root)?.id === lease.id) activeWorkspaceLeases.delete(binding.root);
+}
+
+async function vpsWorker(binding: Binding, request: Record<string, unknown>, signal?: AbortSignal): Promise<RpcResult> {
+  signal = operationSignal(signal);
+  signal?.throwIfAborted();
+  // Queue only prepared execution: native callers already hold their Go lock,
+  // so waiting behind sync_begin's desktop callback would invert those locks.
+  const previous = preparedWorkspaceWorkers.get(binding.root) ?? Promise.resolve();
+  const operation = previous.catch(() => {}).then(async () => {
+    signal?.throwIfAborted();
+    binding = refreshedBinding(binding);
+    const current = admittedWorkspaceLease(binding);
+    rejectBorrowedPreparedReservation(binding, current);
+    const readOnly = workspaceRequestReadOnly(request);
+    // Idle snapshot reads do not transfer ownership. A prepared native write
+    // claims synchronously before Docker can yield to a new model run.
+    const lease = current ?? (readOnly ? null : claimWorkspace(binding));
+    if (lease && !readOnly && lease.mayWrite !== true) saveLease(binding, { ...lease, mayWrite: true });
+    if (!current && lease) preparedWorkspaceReservations.set(binding.root, lease.id);
+    try {
+      return await completeWithCleanup(() => runVPSWorker(binding, request, lease, signal), async () => {
+        // Native execution is already prepared; its later explicit sync handles
+        // handback. Calling sync_begin/sync_end here would recurse into its lock.
+        if (!current && lease) releasePreparedWorkerLease(binding, lease);
+      }, signal);
+    } finally {
+      if (!current && lease && preparedWorkspaceReservations.get(binding.root) === lease.id) preparedWorkspaceReservations.delete(binding.root);
+    }
+  });
+  preparedWorkspaceWorkers.set(binding.root, operation);
+  try { return await operation; }
+  finally { if (preparedWorkspaceWorkers.get(binding.root) === operation) preparedWorkspaceWorkers.delete(binding.root); }
+}
+
+async function runVPSWorker(binding: Binding, request: Record<string, unknown>, lease: WorkspaceLease | null, signal?: AbortSignal): Promise<RpcResult> {
+  // The kernel enforces read-only commands; command text is never used to guess writes.
+  const readOnly = request.op === 'exec' && request.readOnly === true;
+  const name = 'chisa-rpc-' + randomUUID();
+  recordContainer(binding, name, true, lease);
+  const args = ['run', '--rm', '--interactive', '--name', name,
+    '--network=' + (getWorkspaceSyncNetwork(binding.root) ?? 'bridge'),
+    '--label', 'chisa.workspace-root=' + createHash('sha256').update(binding.root).digest('hex'),
+    '--user=1000:1000', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+    '--pids-limit=256', '--memory=2g', '--hostname=workspace', '--workdir=/workspace', '--read-only',
+    '--tmpfs=/tmp:rw,size=512m', '--tmpfs=/home/chisa:rw,size=512m',
+    '--volume', binding.root + (readOnly ? ':/workspace:ro' : ':/workspace:rw'),
+    '--mount', `type=bind,src=${path.join(binding.root, '.chisa-bridge.json')},dst=/workspace/.chisa-bridge.json,readonly`,
+    '--env=HOME=/home/chisa', '--env=TZ=UTC',
+    'localhost/chisa-workspace:2', 'python3', '/opt/chisa/workspace.py'];
+  return completeWithCleanup(() => new Promise<RpcResult>((resolve, reject) => {
+      const timeout = AbortSignal.timeout(650_000);
+      const cancellation = operationSignal(signal);
+      const child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'], killSignal: 'SIGKILL', signal: cancellation ? AbortSignal.any([cancellation, timeout]) : timeout });
+      const chunks: Buffer[] = []; let length = 0; let diagnostic = '';
+      let processError: Error | undefined;
+      child.stdout.on('data', (chunk: Buffer) => {
+        length += chunk.length;
+        if (length > 24 * 1024 * 1024) { processError = new Error('Workspace response exceeds its limit'); child.kill('SIGKILL'); }
+        else chunks.push(chunk);
+      });
+      child.stderr.on('data', (chunk: Buffer) => { if (diagnostic.length < 4096) diagnostic += chunk.toString(); });
+      // Wait for the Docker client to exit before removing its container.
+      child.on('error', error => { processError = error; });
+      child.on('close', code => {
+        // The caller owns its cancellation reason; the independent worker
+        // budget describes transport failure, not an expired HTTP request.
+        if (cancellation?.aborted) { reject(cancellation.reason); return; }
+        if (timeout.aborted) { reject(new AppError('VPS workspace timed out', { code: 'WORKSPACE_UNAVAILABLE', statusCode: 503 })); return; }
+        if (processError) { reject(processError); return; }
+        if (code !== 0) { console.error('[workspace-vps]', diagnostic); reject(new AppError('VPS workspace could not start', { code: 'WORKSPACE_UNAVAILABLE', statusCode: 503 })); return; }
+        try { resolve(checkRpcResult(JSON.parse(Buffer.concat(chunks).toString()) as RpcResult)); }
+        catch (error) { reject(error); }
+      });
+      child.stdin.on('error', () => {});
+      child.stdin.end(JSON.stringify(request));
+    }), async () => {
+      try { await removeWorkspaceContainer(name); recordContainer(binding, name, false, lease); }
+      catch (error) {
+        let current = readLease(binding);
+        const absent = !current;
+        if (!current) current = claimWorkspace(binding);
+        if (absent || (lease && current.id === lease.id && current.epoch === lease.epoch && current.owner === lease.owner)) saveLease(binding, {
+          ...current, owner: 'sync-needed', cleanupPending: [...new Set([...(current.cleanupPending ?? []), name])],
+        });
+        throw new AppError('Workspace container cleanup failed; synchronize before starting another task', {
+          code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503,
+          details: { errorName: error instanceof Error ? error.name : 'Error', transportCode: error && typeof error === 'object' && 'code' in error ? error.code : undefined },
+        });
+      }
+    }, signal);
+}
+
+function syncTransportBinding(candidate: string, bindingEpoch: string): Binding {
+  const root = realpathSync(candidate);
+  const boundary = realpathSync(WORKSPACES_ROOT);
+  if (root === boundary || !root.startsWith(boundary + path.sep)) {
+    throw new AppError('工作目录不属于当前实例', { code: 'WORKSPACE_UNAVAILABLE', statusCode: 403 });
+  }
+  const marker = lstatSync(path.join(root, '.chisa-bridge.json'));
+  if (!marker.isFile() || marker.isSymbolicLink()) {
+    throw new AppError('工作区绑定已失效', { code: 'STALE_BINDING', statusCode: 409 });
+  }
+  const binding = resolveWorkspaceBinding(root);
+  if (!binding || !binding.vps || binding.root !== root || binding.bindingEpoch !== bindingEpoch) {
+    throw new AppError('工作区绑定已失效', { code: 'STALE_BINDING', statusCode: 409 });
+  }
+  return binding;
+}
+
+/** Managed preview startup synchronously reserves its current binding; its consumer confirms container cleanup before releasing only this temporary lease. */
+export function prepareSyncTransportPreview(candidate: string, bindingEpoch: string) {
+  const binding = syncTransportBinding(candidate, bindingEpoch);
+  const current = admittedWorkspaceLease(binding);
+  rejectBorrowedPreparedReservation(binding, current);
+  const lease = current ?? claimWorkspace(binding);
+  if (lease.mayWrite !== true) saveLease(binding, { ...lease, mayWrite: true });
+  let settled!: () => void;
+  const startup = new Promise<void>(resolve => { settled = resolve; });
+  const startups = preparedPreviewStartups.get(binding.root) ?? new Set<Promise<void>>();
+  startups.add(startup);
+  preparedPreviewStartups.set(binding.root, startups);
+  if (!current) preparedWorkspaceReservations.set(binding.root, lease.id);
+  const finishStartup = () => {
+    settled();
+    startups.delete(startup);
+    if (startups.size === 0) preparedPreviewStartups.delete(binding.root);
+    if (!current && preparedWorkspaceReservations.get(binding.root) === lease.id) preparedWorkspaceReservations.delete(binding.root);
+  };
+  return {
+    root: binding.root,
+    async finish(cleanupConfirmed: boolean, containerId?: string) {
+      if (!cleanupConfirmed) {
+        try {
+          const latest = readLease(binding);
+          if (containerId && latest?.id === lease.id && latest.epoch === lease.epoch && latest.owner === lease.owner) {
+            saveLease(binding, {
+              ...latest, owner: current ? latest.owner : 'sync-needed',
+              cleanupPending: [...new Set([...(latest.cleanupPending ?? []), containerId])],
+            });
+          }
+        } finally { finishStartup(); }
+        return;
+      }
+      await preparedWorkspaceWorkers.get(binding.root)?.catch(() => {});
+      if (!current) releasePreparedWorkerLease(binding, lease);
+      else {
+        const latest = admittedWorkspaceLease(refreshedBinding(binding));
+        if (latest?.id !== lease.id) throw new AppError('Workspace reservation changed during preview startup', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+      }
+      finishStartup();
+    },
+  };
+}
+
+/** Account sync transport uses the existing sandbox worker after the desktop has prepared its current binding. */
+export async function executeSyncTransportWorker(candidate: string, bindingEpoch: string, request: Record<string, unknown>, signal?: AbortSignal): Promise<RpcResult> {
+  signal?.throwIfAborted();
+  const binding = syncTransportBinding(candidate, bindingEpoch);
+  if (!['stat', 'lstat', 'list', 'batch', 'realpath', 'read', 'write', 'mkdir', 'rename', 'copy', 'remove', 'search', 'grep', 'exec'].includes(String(request.op))) {
+    throw new AppError('无效的工作区操作', { code: 'INVALID_REQUEST', statusCode: 400 });
+  }
+  return vpsWorker(binding, request, signal);
+}
+
+const workspaceOperations = new Map<string, Promise<unknown>>();
+async function enqueueWorkspaceOperation<T>(root: string, operation: () => Promise<T>): Promise<T> {
+  const previous = workspaceOperations.get(root) ?? Promise.resolve();
+  const queued = previous.catch(() => {}).then(operation);
+  workspaceOperations.set(root, queued);
+  try { return await queued; }
+  finally { if (workspaceOperations.get(root) === queued) workspaceOperations.delete(root); }
+}
+
+/** Worktrees protects every affected repository/worktree binding for one host Git transaction. Roots are deduplicated and acquired in fixed order; unbound paths retain their existing execution path. The operation must not re-enter workspace RPCs. */
+export async function withWorkspaceMutation<T>(candidate: string | string[], operation: () => Promise<T>): Promise<T> {
+  checkWorkspaceRequest();
+  const bindings = new Map<string, Binding>();
+  for (const path of typeof candidate === 'string' ? [candidate] : candidate) {
+    const binding = resolveWorkspaceBinding(path);
+    if (binding) bindings.set(binding.root, binding);
+  }
+  const orderedBindings = [...bindings.values()].sort((left, right) => left.root.localeCompare(right.root));
+  if (orderedBindings.length === 0) return operation();
+  if (orderedBindings.some(binding => !binding.vps)) throw new AppError('Worktree mutations require a server-backed workspace', { code: 'WORKSPACE_OPERATION_UNSUPPORTED', statusCode: 409 });
+  const signal = operationSignal();
+  const enqueueRoots = (index: number): Promise<T> => index < orderedBindings.length
+    ? enqueueWorkspaceOperation(orderedBindings[index].root, () => enqueueRoots(index + 1))
+    : execute();
+  const execute = () => {
+    const claims: Array<{ binding: Binding; lease: WorkspaceLease; prepared: boolean }> = [];
+    return completeWithCleanup(async () => {
+      signal?.throwIfAborted();
+      for (const initial of orderedBindings) {
+        const binding = refreshedBinding(initial);
+        claims.push({ binding, lease: claimWorkspace(binding), prepared: false });
+      }
+      for (const claim of claims) {
+        await desktopControl(claim.binding, { op: 'sync_begin', runId: claim.lease.id }, signal);
+        claim.prepared = true;
+        signal?.throwIfAborted();
+        claim.binding = refreshedBinding(claim.binding);
+        saveLease(claim.binding, { ...claim.lease, mayWrite: true });
+      }
+      return operation();
+    }, async () => {
+      const failures: unknown[] = [];
+      for (const claim of [...claims].reverse()) {
+        try {
+          await preparedWorkspaceWorkers.get(claim.binding.root)?.catch(() => {});
+          await waitPreparedPreviewStartups(claim.binding.root);
+          await releaseWorkspace(claim.binding, claim.lease, claim.prepared);
+        } catch (error) { failures.push(error); }
+      }
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) throw new AggregateError(failures, 'Workspace transaction cleanup was not confirmed');
+    });
+  };
+  return enqueueRoots(0);
+}
+
+async function rpc(binding: Binding, request: Record<string, unknown>, signal?: AbortSignal): Promise<RpcResult> {
+  signal = operationSignal(signal);
+  signal?.throwIfAborted();
+  binding = refreshedBinding(binding);
+  if (!binding.vps) return desktopControl(binding, request, signal);
+  // File Tree and Git requests share the same serialization as model tools.
+  return enqueueWorkspaceOperation(binding.root, async () => {
+    signal?.throwIfAborted();
+    binding = refreshedBinding(binding);
+    const current = admittedWorkspaceLease(binding);
+    rejectBorrowedPreparedReservation(binding, current);
+    // Browsing a server snapshot does not transfer execution ownership.
+    if (!current && ['stat', 'lstat', 'list', 'batch', 'realpath', 'read', 'search', 'grep'].includes(String(request.op))) {
+      return vpsWorker(binding, request, signal);
+    }
+    const lease = current ?? claimWorkspace(binding);
+    let prepared = Boolean(current);
+    return completeWithCleanup(async () => {
+      if (!current) {
+        await desktopControl(binding, { op: 'sync_begin', runId: lease.id }, signal);
+        prepared = true;
+      }
+      signal?.throwIfAborted();
+      binding = refreshedBinding(binding);
+      const readOnly = workspaceRequestReadOnly(request);
+      // Mark before execution so cancellation or a failed write still follows full recovery.
+      if (!readOnly && lease.mayWrite !== true) saveLease(binding, { ...readLease(binding)!, mayWrite: true });
+      return String(request.op).startsWith('preview_') ? await desktopControl(binding, request, signal) : await vpsWorker(binding, request, signal);
+    }, async () => {
+      if (!current) {
+        await preparedWorkspaceWorkers.get(binding.root)?.catch(() => {});
+        await waitPreparedPreviewStartups(binding.root);
+        await releaseWorkspace(binding, lease, prepared);
+      }
+    }, signal);
+  });
+}
+
+async function fileCall(candidate: string, op: string, extra: Record<string, unknown> = {}): Promise<RpcResult | null> {
+  checkWorkspaceRequest();
+  const binding = resolveWorkspaceBinding(candidate);
+  return binding ? rpc(binding, { op, path: virtualPath(binding, candidate), ...extra }) : null;
+}
+
+/** Used by the Git router; arguments execute inside the same project container. */
+export async function runWorkspaceCommand(cwd: string, command: string, args: string[]): Promise<RpcResult | null> {
+  checkWorkspaceRequest();
+  const binding = resolveWorkspaceBinding(cwd);
+  if (!binding) return null;
+  const workspaceArgs = args.map(arg => arg === binding.root || arg.startsWith(binding.root + path.sep) ? virtualPath(binding, arg) : arg);
+  const result = await rpc(binding, { op: 'exec', path: virtualPath(binding, cwd), argv: [command, ...workspaceArgs], timeoutSeconds: 60 });
+  // Git's repository-root response is a path consumed by server routing.
+  if (command === 'git' && args[0] === 'rev-parse' && args[1] === '--show-toplevel' && result.exitCode === 0) {
+    const root = result.stdout?.trim();
+    if (root === '/workspace' || root?.startsWith('/workspace/')) result.stdout = path.join(binding.root, path.relative('/workspace', root)) + '\n';
+  }
+  return result;
+}
+
+/** Used by File Tree composition; normal server projects keep their existing adapter. */
+export function bridgeFileSystem(base: FileTreeFileSystem): FileTreeFileSystem {
+  const pendingReads = new Map<string, PendingFileTreeRead[]>();
+
+  async function sendReadBatch(binding: Binding, pending: PendingFileTreeRead[]): Promise<void> {
+    try {
+      const results = pending.length === 1
+        ? [await rpc(binding, pending[0]!.request)]
+        : (await rpc(binding, { op: 'batch', requests: pending.map(item => item.request) })).results!;
+      for (let index = 0; index < pending.length; index += 1) {
+        const item = pending[index]!;
+        try { item.resolve(checkRpcResult(results[index]!)); }
+        catch (error) { item.reject(error); }
+      }
+    } catch (error) {
+      for (const item of pending) item.reject(error);
+    }
+  }
+
+  async function drainReadQueue(binding: Binding, key: string, pending: PendingFileTreeRead[]): Promise<void> {
+    try {
+      while (pending.length > 0) {
+        await sendReadBatch(binding, pending.splice(0, 64));
+      }
+    } finally {
+      pendingReads.delete(key);
+    }
+  }
+
+  async function readCall(candidate: string, op: FileTreeReadRequest['op'], includeStats = false): Promise<RpcResult | null> {
+    checkWorkspaceRequest();
+    const binding = resolveWorkspaceBinding(candidate);
+    if (!binding) return null;
+    const request: FileTreeReadRequest = { op, path: virtualPath(binding, candidate), ...(includeStats ? { includeStats: true } : {}) };
+    if (!binding.readBatch) return rpc(binding, request);
+    const key = JSON.stringify([binding.root, binding.bindingEpoch, binding.port, binding.token, requestScopes.getStore()?.id]);
+    return new Promise<RpcResult>((resolve, reject) => {
+      let pending = pendingReads.get(key);
+      if (!pending) {
+        pending = [];
+        pendingReads.set(key, pending);
+        const queued = pending;
+        // Keep one batch in flight so traversal reads arriving meanwhile accumulate together.
+        queueMicrotask(() => {
+          void drainReadQueue(binding, key, queued);
+        });
+      }
+      pending.push({ request, resolve, reject });
+    });
+  }
+
+  async function stats(candidate: string, op: 'stat' | 'lstat') {
+    const result = await readCall(candidate, op);
+    return result ? fileStatsFromRpc(result) : base[op](candidate);
+  }
+  return {
+    async readTextSnapshot(p) {
+      const r = await fileCall(p, 'read');
+      return r ? { content: new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(r.b64!, 'base64')), hash: r.hash } : { content: await base.readTextFile(p) };
+    },
+    async writeTextSnapshot(p, content, expectedHash) {
+      checkWorkspaceRequest();
+      const binding = resolveWorkspaceBinding(p);
+      if (!binding) { await base.writeTextFile(p, content); return {}; }
+      if (expectedHash === undefined) throw new AppError('Read the workspace file again before saving', { code: 'CONTENT_CONFLICT', statusCode: 409 });
+      const r = await rpc(binding, { op: 'write', path: virtualPath(binding, p), b64: Buffer.from(content).toString('base64'), expectedHash });
+      return { hash: r.hash };
+    },
+    async access(p) { if (!(await readCall(p, 'stat'))) await base.access(p); },
+    stat: p => stats(p, 'stat'), lstat: p => stats(p, 'lstat'),
+    async *openDirectory(p) {
+      const result = await readCall(p, 'list', true);
+      if (!result) { yield* base.openDirectory(p); return; }
+      for (const entry of result.entries!) yield { name: entry.name, isDirectory: () => entry.dir, stats: entry.stats ? fileStatsFromRpc(entry.stats) : undefined };
+    },
+    async realpath(p) {
+      checkWorkspaceRequest();
+      const binding = resolveWorkspaceBinding(p);
+      if (!binding) return base.realpath(p);
+      const result = await rpc(binding, { op: 'realpath', path: virtualPath(binding, p) });
+      return path.join(binding.root, path.relative('/workspace', result.path!));
+    },
+    async readTextFile(p) { const result = await fileCall(p, 'read'); return result ? Buffer.from(result.b64!, 'base64').toString('utf8') : base.readTextFile(p); },
+    async writeTextFile(p, content) {
+      checkWorkspaceRequest();
+      const binding = resolveWorkspaceBinding(p);
+      if (!binding) return base.writeTextFile(p, content);
+      // File Tree uses this method only to create files; an intervening local
+      // creation must conflict rather than becoming a new overwrite baseline.
+      await rpc(binding, { op: 'write', path: virtualPath(binding, p), expectedHash: null, b64: Buffer.from(content).toString('base64') });
+    },
+    async makeDirectory(p, recursive) { if (!(await fileCall(p, 'mkdir', { recursive }))) await base.makeDirectory(p, recursive); },
+    async rename(p, destination) {
+      checkWorkspaceRequest();
+      const binding = resolveWorkspaceBinding(p);
+      if (!binding) return base.rename(p, destination);
+      await rpc(binding, { op: 'rename', path: virtualPath(binding, p), destination: virtualPath(binding, destination) });
+    },
+    async removeDirectory(p) { if (!(await fileCall(p, 'remove'))) await base.removeDirectory(p); },
+    async unlink(p) { if (!(await fileCall(p, 'remove'))) await base.unlink(p); },
+    async copyFile(p, destination) {
+      checkWorkspaceRequest();
+      const binding = resolveWorkspaceBinding(p);
+      const target = resolveWorkspaceBinding(destination);
+      if (!binding && !target) return base.copyFile(p, destination);
+      if (!binding && target) {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        for await (const chunk of base.createReadStream(p)) {
+          const bytes = Buffer.from(chunk); size += bytes.length;
+          if (size > 8 * 1024 * 1024) throw new AppError('Workspace uploads are limited to 8 MiB', { statusCode: 413, code: 'FILE_TOO_LARGE' });
+          chunks.push(bytes);
+        }
+        await rpc(target, { op: 'write', path: virtualPath(target, destination), expectedHash: null, b64: Buffer.concat(chunks).toString('base64') });
+        return;
+      }
+      if (!binding || target?.root !== binding.root) throw new AppError('Copy must stay inside one workspace', { statusCode: 400, code: 'CROSS_WORKSPACE_COPY' });
+      await rpc(binding, { op: 'copy', path: virtualPath(binding, p), destination: virtualPath(binding, destination) });
+    },
+    createReadStream(p) {
+      const binding = resolveWorkspaceBinding(p);
+      if (!binding) return base.createReadStream(p);
+      return Readable.from((async function* () { const result = await rpc(binding, { op: 'read', path: virtualPath(binding, p) }); yield Buffer.from(result.b64!, 'base64'); })());
+    },
+  };
+}
+
+/** Used by Git composition for its file-content and untracked-file operations. */
+export function bridgeGitFileSystem(base: WorkspaceGitFileSystem): WorkspaceGitFileSystem {
+  return {
+    async access(p) { if (!(await fileCall(p, 'stat'))) await base.access(p); },
+    async stat(p) {
+      const r = await fileCall(p, 'stat');
+      return r ? { size: r.size!, mtime: new Date(r.mtime! * 1000), mode: r.mode!, isDirectory: () => Boolean(r.dir), isSymbolicLink: () => Boolean(r.symlink) } : base.stat(p);
+    },
+    async readFile(p, encoding) {
+      const r = await fileCall(p, 'read');
+      return r ? new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(r.b64!, 'base64')) : base.readFile(p, encoding);
+    },
+    async rm(p, options) { if (!(await fileCall(p, 'remove'))) await base.rm(p, options); },
+    async unlink(p) { if (!(await fileCall(p, 'remove'))) await base.unlink(p); },
+  };
+}
+
+function workspaceTools(binding: Binding, signal?: AbortSignal) {
+  async function result(request: Record<string, unknown>) {
+    try { return { content: [{ type: 'text' as const, text: JSON.stringify(await rpc(binding, request, signal)) }] }; }
+    catch (error) { return { isError: true, content: [{ type: 'text' as const, text: error instanceof Error ? error.message : 'Workspace operation failed' }] }; }
+  }
+  return createSdkMcpServer({ name: 'workspace', version: '1.0.0', tools: [
+    tool('list_files', 'List files in the project workspace.', { path: z.string().default('/workspace') }, a => result({ op: 'list', ...a })),
+    tool('read_file', 'Read a file and its SHA256 hash. Select base64 for binary files. Use this hash when writing.', { path: z.string(), encoding: z.enum(['utf8', 'base64']).default('utf8') }, async a => {
+      try {
+        const r = await rpc(binding, { op: 'read', ...a }, signal);
+        const content = a.encoding === 'base64' ? r.b64 : new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(r.b64!, 'base64'));
+        return { content: [{ type: 'text' as const, text: JSON.stringify({ content, encoding: a.encoding, hash: r.hash }) }] };
+      } catch (e) { return { isError: true, content: [{ type: 'text' as const, text: e instanceof Error ? e.message : 'Read failed' }] }; }
+    }),
+    tool('write_file', 'Write a UTF-8 file. Existing files require the hash from read_file; new files require null.', { path: z.string(), content: z.string(), expectedHash: z.string().nullable() }, a => result({ op: 'write', path: a.path, b64: Buffer.from(a.content).toString('base64'), expectedHash: a.expectedHash })),
+    tool('search_files', 'Search filenames or text in the project.', { path: z.string().default('/workspace'), query: z.string(), content: z.boolean().default(false) }, a => result({ op: a.content ? 'grep' : 'search', path: a.path, query: a.query })),
+    tool('run_command', 'Execute a Linux command. Set readOnly=true for code review, inspection and other commands that do not write project files; the workspace is mounted read-only. Use readOnly=false for builds, installs, edits and Git changes. Output and exit code are returned unchanged.', { command: z.string(), path: z.string().default('/workspace'), readOnly: z.boolean().default(false), timeoutSeconds: z.number().int().min(1).max(600).default(60) }, a => result({ op: 'exec', ...a })),
+    tool('start_preview', 'Start a persistent web preview. The service must bind 0.0.0.0 at the supplied port. Preview links are shown in the client.', { command: z.string(), path: z.string().default('/workspace'), port: z.number().int().min(1024).max(65535) }, a => result({ op: 'preview_start', ...a })),
+    tool('preview_status', 'Read preview process state, readiness and recent logs.', { previewId: z.string() }, a => result({ op: 'preview_status', ...a })),
+    tool('stop_preview', 'Stop a preview and release its container and port.', { previewId: z.string() }, a => result({ op: 'preview_stop', ...a })),
+  ] });
+}
+
+type LinuxProcessIdentity = { pid: number; parentPid: number; startTime: string; state: string };
+
+function readLinuxProcess(pid: number): LinuxProcessIdentity | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+    return { pid, parentPid: Number(fields[1]), startTime: fields[19], state: fields[0] };
+  } catch (error) {
+    if (['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) return;
+    throw error;
+  }
+}
+
+function ownClaudeDescendants(child: ChildProcess, owner: Buffer) {
+  const descendants = new Map<number, LinuxProcessIdentity>();
+  let root: LinuxProcessIdentity | undefined;
+  let failure: unknown;
+  let stopped = false;
+  try { root = child.pid ? readLinuxProcess(child.pid) : undefined; }
+  catch (error) { failure = error; }
+  const alive = (identity: LinuxProcessIdentity) => {
+    const current = readLinuxProcess(identity.pid);
+    return current?.startTime === identity.startTime && current.state !== 'Z';
+  };
+  return {
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      try {
+        // One stop snapshot includes both current ancestry and tools whose
+        // shell parent already exited. The private inherited marker belongs
+        // only to this locally spawned CLI; never signal a process group.
+        const byParent = new Map<number, LinuxProcessIdentity[]>();
+        for (const entry of readdirSync('/proc')) {
+          if (!/^\d+$/.test(entry)) continue;
+          const identity = readLinuxProcess(Number(entry));
+          if (!identity) continue;
+          const siblings = byParent.get(identity.parentPid) ?? [];
+          siblings.push(identity);
+          byParent.set(identity.parentPid, siblings);
+          try {
+            if (lstatSync(`/proc/${identity.pid}`).uid !== process.getuid!()) continue;
+            const environment = readFileSync(`/proc/${identity.pid}/environ`);
+            const offset = environment.indexOf(owner);
+            if (offset >= 0 && (offset === 0 || environment[offset - 1] === 0) && identity.pid !== root?.pid) descendants.set(identity.pid, identity);
+          } catch (error) {
+            if (!['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+          }
+        }
+        if (root && alive(root)) {
+          const parents = [root.pid];
+          for (const pid of parents) {
+            for (const identity of byParent.get(pid) ?? []) {
+              descendants.set(identity.pid, identity);
+              parents.push(identity.pid);
+            }
+          }
+          // Stop the owner before its tools: otherwise a failed Bash result
+          // can make the CLI launch a replacement during the SDK's grace.
+          if (alive(root)) {
+            try { process.kill(root.pid, 'SIGKILL'); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+          }
+        }
+        for (const identity of descendants.values()) {
+          if (!alive(identity)) continue;
+          try { process.kill(identity.pid, 'SIGKILL'); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+        }
+      } catch (error) { failure = error; }
+    },
+    async wait() {
+      const deadline = Date.now() + 2000;
+      while (!failure && ((root && alive(root)) || [...descendants.values()].some(alive))) {
+        if (Date.now() >= deadline) { failure = new Error('Claude descendants are still running'); break; }
+        await new Promise<void>(resolve => setTimeout(resolve, 20));
+      }
+      if (failure) throw Object.assign(new AppError('Claude subprocess cleanup could not be confirmed', { code: 'CLAUDE_PROCESS_CLEANUP_FAILED', statusCode: 503 }), { cause: failure });
+    },
+  };
+}
+
+/** Used by Claude runtime; bound workspaces expose only their project tools. */
+export function workspaceQuery(input: Parameters<typeof sdkQuery>[0], onProcessExit?: () => void): ReturnType<typeof sdkQuery> {
+  const binding = input.options?.cwd ? resolveWorkspaceBinding(input.options.cwd) : null;
+  const options = input.options ?? {};
+  const cancellation = new AbortController();
+  let stopOwnedDescendants = () => {};
+  let waitOwnedDescendants = async () => {};
+  const externalSignal = options.abortController?.signal;
+  const cancelFromCaller = () => { stopOwnedDescendants(); cancellation.abort(externalSignal?.reason); };
+  externalSignal?.addEventListener('abort', cancelFromCaller, { once: true });
+  if (externalSignal?.aborted) cancelFromCaller();
+  if (binding) {
+    options.tools = ['AskUserQuestion', 'ExitPlanMode', 'TodoWrite'];
+    options.mcpServers = { workspace: workspaceTools(binding, cancellation.signal) };
+    options.strictMcpConfig = true;
+    // Workspace permissions are resolved by the runtime's policy callback, including aliases for the native tools they replace.
+    options.allowedTools = (options.allowedTools ?? []).filter(entry => !entry.startsWith('mcp__workspace'));
+    options.settingSources = [];
+    options.env = { ...options.env, CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' };
+    const instruction = (binding.vps ? 'Claude Code and the project tools execute on this VPS. The tools run in an isolated Linux container on this server. Use run_command with readOnly=true for code review and inspection commands. This prohibits project writes and avoids unnecessary return synchronization. ' : '') + 'Project files and commands are available only through the workspace tools under /workspace. Read /workspace/CLAUDE.md if present for project instructions. Report actual command results; do not infer runtime success from a successful tool request.';
+    const previous = options.systemPrompt && typeof options.systemPrompt === 'object' && !Array.isArray(options.systemPrompt) && options.systemPrompt.type === 'preset' ? options.systemPrompt.append || '' : '';
+    options.systemPrompt = { type: 'preset', preset: 'claude_code', append: previous + '\n' + instruction };
+  }
+  const spawnProcess = options.spawnClaudeCodeProcess;
+  let processExit: Promise<void> | undefined;
+  let exitReported = false;
+  const reportProcessExit = () => { if (!exitReported) { exitReported = true; onProcessExit?.(); } };
+  options.spawnClaudeCodeProcess = spawnOptions => {
+    if (spawnProcess) {
+      // Custom transports own their process/container teardown. Their PID
+      // need not identify a host process, so never signal a host tree here.
+      const child: SpawnedProcess = spawnProcess(spawnOptions);
+      processExit = new Promise<void>((resolve, reject) => {
+        if (child.exitCode !== null) { reportProcessExit(); resolve(); return; }
+        child.once('exit', () => { reportProcessExit(); resolve(); });
+        child.once('error', reject);
+      });
+      void processExit.catch(() => {});
+      return child;
+    }
+    const captureStderr = Boolean(spawnOptions.env.DEBUG_CLAUDE_AGENT_SDK) || Boolean(options.stderr);
+    const processOwner = process.platform === 'linux' ? randomUUID() : undefined;
+    const child = spawn(spawnOptions.command, spawnOptions.args, {
+      cwd: spawnOptions.cwd, env: processOwner ? { ...spawnOptions.env, CHISA_CLAUDE_PROCESS_OWNER: processOwner } : spawnOptions.env, signal: spawnOptions.signal,
+      stdio: ['pipe', 'pipe', captureStderr ? 'pipe' : 'ignore'], windowsHide: true,
+    });
+    if (process.platform === 'linux') {
+      const descendants = ownClaudeDescendants(child, Buffer.from(`CHISA_CLAUDE_PROCESS_OWNER=${processOwner}\0`));
+      stopOwnedDescendants = () => descendants.stop();
+      waitOwnedDescendants = () => descendants.wait();
+    }
+    if (captureStderr) child.stderr?.on('data', (chunk: Buffer) => { options.stderr?.(chunk.toString()); });
+    // Query.close() ends its iterator before the CLI actually exits. The public
+    // SDK spawn hook lets the lease outlive that real process, without a sleep.
+    processExit = new Promise<void>(resolve => { child.once('close', () => { reportProcessExit(); resolve(); }); });
+    return child as unknown as SpawnedProcess;
+  };
+  let active: ReturnType<typeof sdkQuery> | undefined;
+  let cancelled = false;
+  let cleanup: Promise<void> | undefined;
+  const stream = (async function* () {
+    let lease: WorkspaceLease | undefined;
+    let prepared = false;
+    let primary: unknown;
+    let failed = false;
+    let cleanupFailure: unknown;
+    let cleanupFailed = false;
+    try {
+      cancellation.signal.throwIfAborted();
+      if (binding) requireWorkspaceAdmission(binding);
+      if (binding?.vps) {
+        lease = claimWorkspace(binding);
+        await desktopControl(binding, { op: 'sync_begin', runId: lease.id }, cancellation.signal);
+        prepared = true;
+      }
+      if (cancelled) return;
+      cancellation.signal.throwIfAborted();
+      active = sdkQuery({ ...input, options });
+      yield* active;
+    } catch (error) {
+      primary = error;
+      failed = true;
+    } finally {
+      cleanup = (async () => {
+        // Successful completion still waits for the CLI's normal exit; the
+        // owned-tree force stop is for cancellation or iterator failure.
+        if (cancelled || cancellation.signal.aborted || failed) stopOwnedDescendants();
+        active?.close();
+        await processExit;
+        await waitOwnedDescendants();
+        if (!lease || !binding) return;
+        // The lease must outlive any command still shutting down in Docker.
+        await workspaceOperations.get(binding.root)?.catch(() => {});
+        await preparedWorkspaceWorkers.get(binding.root)?.catch(() => {});
+        await waitPreparedPreviewStartups(binding.root);
+        await releaseWorkspace(binding, lease, prepared);
+      })().catch((error: unknown) => {
+        if (failed) throw combinedError(primary, error);
+        throw Object.assign(error instanceof Error ? error : new Error(String(error)), { workspaceCleanupError: true });
+      });
+      try { await cleanup; }
+      catch (error) { cleanupFailure = error; cleanupFailed = true; }
+      finally { externalSignal?.removeEventListener('abort', cancelFromCaller); }
+    }
+    if (cleanupFailed) throw cleanupFailure;
+    if (failed) throw primary;
+  })();
+  const wrapped: typeof stream = new Proxy(stream, {
+    get(target, property) {
+      if (property === Symbol.asyncIterator) return () => wrapped;
+      if (property === 'next' || property === 'return') return async () => {
+        const result = property === 'next' ? await target.next() : await target.return(undefined);
+        // An externally requested return skips code after finally. Every
+        // iterator consumer must still observe the same cleanup confirmation.
+        if (result.done) await cleanup;
+        return result;
+      };
+      if (property === 'interrupt') return async () => {
+        cancelled = true;
+        stopOwnedDescendants();
+        cancellation.abort();
+        active?.close();
+        // chat.abort may admit another turn only after sync_end removes the lease.
+        await target.return(undefined);
+        // A pending next() can receive the cleanup error before return() settles.
+        await cleanup;
+      };
+      if (property === 'close') return () => {
+        cancelled = true;
+        stopOwnedDescendants();
+        cancellation.abort();
+        active?.close();
+        void target.return(undefined).catch(() => {});
+      };
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  return wrapped as unknown as ReturnType<typeof sdkQuery>;
+}

@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      increment:
+        description: "Version bump: patch, minor, major, or explicit (e.g. 1.27.0)"
+        required: true
+        default: "patch"
+        type: string
+      release_name:
+        description: 'Custom release name (optional, defaults to "CloudCLI UI vX.Y.Z")'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# This workflow publishes releases with write credentials, so actions are pinned
+# to immutable commit SHAs. The trailing comments keep the original major tag
+# visible for maintenance context.
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: git config
+        run: |
+          git config user.name "${GITHUB_ACTOR}"
+          git config user.email "${GITHUB_ACTOR}@users.noreply.github.com"
+
+      # Trusted publishing (OIDC) requires npm >= 11.5.1; Node 22 ships npm 10.x.
+      - name: Use an npm that supports trusted publishing
+        run: npm install -g npm@^11.5.1
+
+      - run: npm ci
+
+      - name: Release
+        id: release
+        run: |
+          # Stream subprocess output so publishing errors are visible immediately.
+          ARGS=(--ci --verbose --verbose "--increment=$RELEASE_INCREMENT")
+          if [ -n "$RELEASE_NAME" ]; then
+            ARGS+=("--github.releaseName=$RELEASE_NAME")
+          fi
+          npx release-it "${ARGS[@]}"
+        env:
+          RELEASE_INCREMENT: ${{ inputs.increment }}
+          RELEASE_NAME: ${{ inputs.release_name }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
+          NPM_CONFIG_LOGS_DIR: ${{ runner.temp }}/release-npm-logs
+
+      - name: Show npm failure details
+        if: failure() && steps.release.outcome == 'failure'
+        env:
+          NPM_CONFIG_LOGS_DIR: ${{ runner.temp }}/release-npm-logs
+        run: |
+          # Read npm's on-disk errors even if release-it truncates its console output.
+          shopt -s nullglob
+          LOGS=("$NPM_CONFIG_LOGS_DIR"/*debug*.log)
+          if [ ${#LOGS[@]} -eq 0 ]; then
+            echo "No npm debug logs were created by the release step."
+          fi
+          for LOG in "${LOGS[@]}"; do
+            echo "npm diagnostics: $(basename "$LOG")"
+            grep -E '^[0-9]+ (error|verbose (stack|exit|code))([[:space:]]|$)' "$LOG" || true
+          done

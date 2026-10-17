@@ -1,0 +1,31 @@
+{
+  "name": "cloudcli-plugin-session-manager",
+  "version": "1.0.0",
+  "description": "View, manage, and kill active Claude Code sessions from the CloudCLI web UI.",
+  "author": "BillyCC",
+  "license": "MIT",
+  "keywords": [
+    "cloudcli",
+    "claude-code",
+    "plugin",
+    "session-manager",
+    "process-manager"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/strykereye2/cloudcli-plugin-session-manager.git"
+  },
+  "type": "module",
+  "main": "dist/server.js",
+  "files": [
+    "dist/",
+    "manifest.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "cp src/server.js dist/server.js && cp src/index.js dist/index.js",
+    "dev": "node dist/server.js"
+  }
+}

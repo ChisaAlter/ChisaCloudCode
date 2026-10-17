@@ -1,0 +1,30 @@
+# Example compose file for the ChisaCloudCode API container.
+# Copy next to your secrets, set CCC_TAG, and adjust paths.
+name: chisacloudcode
+services:
+  api:
+    image: local/chisacloudcode:${CCC_TAG}
+    container_name: chisacloudcode-api
+    restart: unless-stopped
+    network_mode: host
+    # JWT_SECRET, API_URL, model credentials ... (keep this file 0600)
+    env_file: /opt/chisacloudcode/secrets/api.env
+    environment:
+      HOME: /opt/chisacloudcode/home
+      DATABASE_PATH: /opt/chisacloudcode/data/auth.db
+      WORKSPACES_ROOT: /opt/chisacloudcode/workspaces
+      SERVER_PORT: "8791"
+      HOST: 0.0.0.0
+      # Runs as root inside its own container: let Claude Code accept
+      # --dangerously-skip-permissions / bypassPermissions. Also baked into the
+      # image; repeated here so an image built elsewhere still works.
+      IS_SANDBOX: "1"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/chisacloudcode/home:/opt/chisacloudcode/home
+      - /opt/chisacloudcode/data:/opt/chisacloudcode/data
+      - /opt/chisacloudcode/workspaces:/opt/chisacloudcode/workspaces
+    mem_limit: 4g
+    pids_limit: 1024
+    cpus: 3
+    logging: { driver: json-file, options: { max-size: 20m, max-file: "3" } }

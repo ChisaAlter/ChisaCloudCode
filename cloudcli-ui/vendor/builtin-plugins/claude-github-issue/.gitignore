@@ -1,0 +1,8 @@
+node_modules/
+*.local
+.env
+
+# Per-project config with secrets (token, anthropicKey) — never commit
+.GitHubBoard/
+# Throwaway screenshots dropped during dev
+temp-img/

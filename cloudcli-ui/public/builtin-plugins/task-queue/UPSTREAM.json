@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/TadMSTR/cloudcli-plugin-task-queue",
+  "commit": "56302b54eddd16d2a766e7fdbaee3e7c7b143a18",
+  "license": "See LICENSE",
+  "licenseFiles": [
+    "LICENSE"
+  ]
+}

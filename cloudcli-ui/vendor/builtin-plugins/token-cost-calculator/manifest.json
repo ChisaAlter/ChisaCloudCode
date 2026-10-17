@@ -1,0 +1,13 @@
+{
+  "name": "token-cost-calculator",
+  "displayName": "Token Cost Calculator",
+  "version": "1.0.0",
+  "description": "Calculate API costs by entering model prices and token usage (input, output, cached input). Supports preset model pricing.",
+  "author": "Claude Code User",
+  "icon": "icon.svg",
+  "type": "module",
+  "slot": "tab",
+  "entry": "dist/index.js",
+  "server": "dist/server.js",
+  "permissions": []
+}

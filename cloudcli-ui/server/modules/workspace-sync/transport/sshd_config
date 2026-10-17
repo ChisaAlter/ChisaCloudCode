@@ -1,0 +1,22 @@
+Port 2222
+ListenAddress 0.0.0.0
+HostKey /etc/chisa-sync/ssh_host_ed25519_key
+AuthorizedKeysFile /etc/chisa-sync/authorized_keys
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+UsePAM no
+AllowUsers root
+# The host API owns this read-only bind; its UID need not equal container root.
+StrictModes no
+AllowAgentForwarding no
+X11Forwarding no
+PermitUserRC no
+AllowTcpForwarding yes
+GatewayPorts clientspecified
+PermitListen 0.0.0.0:*
+PrintMotd no
+Subsystem sftp internal-sftp
+LogLevel VERBOSE

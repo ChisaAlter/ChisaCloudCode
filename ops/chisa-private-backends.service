@@ -1,0 +1,14 @@
+[Unit]
+Description=Restrict ChisaCloudCode HTTP backends to private access
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PUBLIC_INTERFACE=eth0
+ExecStart=/opt/chisacloudcode-ops/restrict-backends.sh apply ${PUBLIC_INTERFACE}
+ExecStop=/opt/chisacloudcode-ops/restrict-backends.sh rollback ${PUBLIC_INTERFACE}
+
+[Install]
+WantedBy=multi-user.target

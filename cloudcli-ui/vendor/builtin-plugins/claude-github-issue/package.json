@@ -1,0 +1,27 @@
+{
+  "name": "claude-github-issue",
+  "version": "1.10.0",
+  "description": "GitHub Issues Kanban board plugin for claudecodeui",
+  "author": "szmidtpiotr",
+  "license": "MIT",
+  "scripts": {
+    "build": "npm run build:backend && npm run build:frontend",
+    "build:frontend": "vite build",
+    "build:backend": "esbuild src/backend/server.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/backend.js --external:crypto --external:fs --external:path --external:http --external:os --external:url",
+    "dev": "concurrently \"npm run build:backend -- --watch\" \"vite build --watch\""
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "concurrently": "^8.2.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.5.2",
+    "vite": "^8.3.4"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "codex-usage",
+  "displayName": "Codex Usage",
+  "version": "1.0.1",
+  "description": "Live Codex plan limits and 30-day account token activity.",
+  "author": "dongwook-chan",
+  "icon": "icon.svg",
+  "type": "module",
+  "slot": "tab",
+  "entry": "dist/index.js",
+  "server": "dist/server.js",
+  "permissions": []
+}

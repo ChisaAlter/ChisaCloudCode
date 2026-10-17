@@ -1,0 +1,15 @@
+[Unit]
+Description=ChisaCloudCode private data backup
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/chisacloudcode-ops/backup.py backup --config /etc/chisacloudcode-backup.json
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=50%
+MemoryMax=512M
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/chisacloudcode/data
+PrivateTmp=true

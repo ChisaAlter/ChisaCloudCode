@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Scheduled Prompt">
+  <rect width="128" height="128" rx="28" fill="#102a43"/>
+  <rect x="20" y="24" width="88" height="80" rx="16" fill="#f0f4f8"/>
+  <rect x="20" y="24" width="88" height="20" rx="16" fill="#d9e2ec"/>
+  <circle cx="38" cy="34" r="5" fill="#486581"/>
+  <circle cx="54" cy="34" r="5" fill="#486581"/>
+  <circle cx="70" cy="34" r="5" fill="#486581"/>
+  <circle cx="64" cy="74" r="22" fill="#0ea5e9"/>
+  <path d="M64 58v18l12 8" fill="none" stroke="#f8fafc" stroke-linecap="round" stroke-linejoin="round" stroke-width="8"/>
+</svg>

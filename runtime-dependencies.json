@@ -1,0 +1,21 @@
+{
+  "version": "0.18.1",
+  "upstream": "https://github.com/mutagen-io/mutagen",
+  "archiveUrl": "https://github.com/mutagen-io/mutagen/releases/download/v0.18.1/mutagen_windows_amd64_v0.18.1.zip",
+  "requiredFiles": [
+    "mutagen.exe",
+    "mutagen-agents.tar.gz"
+  ],
+  "files": [
+    {
+      "path": "mutagen.exe",
+      "bytes": 13797376,
+      "sha256": "d9829413dfd47304ded128fb6696c92e9726c0dafd95c46f1909443ee17299ff"
+    },
+    {
+      "path": "mutagen-agents.tar.gz",
+      "bytes": 97228378,
+      "sha256": "390fef4f7e4ffd6041f59ec646176b8f4082e6d325a48c5c6d9654abe9a422ba"
+    }
+  ]
+}

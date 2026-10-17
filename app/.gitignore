@@ -1,0 +1,6 @@
+node_modules/
+/dist/
+/build/
+/.mygo/
+mygo_windows_*.syso
+/resources/windows-amd64/sync-ssh/

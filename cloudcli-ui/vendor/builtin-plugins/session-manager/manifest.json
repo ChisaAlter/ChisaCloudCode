@@ -1,0 +1,13 @@
+{
+  "name": "session-manager",
+  "displayName": "Sessions",
+  "version": "1.0.0",
+  "description": "View, manage, and kill active Claude Code sessions.",
+  "author": "BillyCC",
+  "icon": "icon.svg",
+  "type": "module",
+  "slot": "tab",
+  "entry": "dist/index.js",
+  "server": "dist/server.js",
+  "permissions": []
+}

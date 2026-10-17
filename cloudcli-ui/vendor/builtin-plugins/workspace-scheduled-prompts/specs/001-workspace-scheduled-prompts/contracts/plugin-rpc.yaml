@@ -1,0 +1,387 @@
+openapi: 3.1.0
+info:
+  title: Workspace Scheduled Prompts RPC
+  version: 0.1.0
+  description: >
+    RPC surface exposed by the plugin backend subprocess to the CloudCLI frontend module.
+servers:
+  - url: http://127.0.0.1/plugin
+paths:
+  /v1/workspace-state:
+    get:
+      summary: Load the task list, execution capability, and recent runs for the current workspace
+      parameters:
+        - in: query
+          name: workspacePath
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Workspace state loaded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkspaceStateResponse"
+  /v1/tasks:
+    post:
+      summary: Create a scheduled task in the current workspace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTaskRequest"
+      responses:
+        "201":
+          description: Task created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskResponse"
+  /v1/tasks/{taskId}:
+    patch:
+      summary: Update editable task fields
+      parameters:
+        - in: path
+          name: taskId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateTaskRequest"
+      responses:
+        "200":
+          description: Task updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskResponse"
+    delete:
+      summary: Delete a task from the current workspace
+      parameters:
+        - in: path
+          name: taskId
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: workspacePath
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Task deleted
+  /v1/tasks/{taskId}/actions/pause:
+    post:
+      summary: Pause an enabled task
+      parameters:
+        - in: path
+          name: taskId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkspaceScopedRequest"
+      responses:
+        "200":
+          description: Task paused
+  /v1/tasks/{taskId}/actions/resume:
+    post:
+      summary: Resume a paused task
+      parameters:
+        - in: path
+          name: taskId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkspaceScopedRequest"
+      responses:
+        "200":
+          description: Task resumed
+  /v1/tasks/{taskId}/actions/duplicate:
+    post:
+      summary: Duplicate an existing task in the same workspace
+      parameters:
+        - in: path
+          name: taskId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkspaceScopedRequest"
+      responses:
+        "201":
+          description: Task duplicated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskResponse"
+  /v1/tasks/{taskId}/actions/run-now:
+    post:
+      summary: Create an immediate manual run for a saved task
+      parameters:
+        - in: path
+          name: taskId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkspaceScopedRequest"
+      responses:
+        "202":
+          description: Manual run requested
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunResponse"
+  /v1/runs:
+    get:
+      summary: Load recent runs for the current workspace
+      parameters:
+        - in: query
+          name: workspacePath
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+      responses:
+        "200":
+          description: Runs loaded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Run"
+                required: [runs]
+  /v1/runs/{runId}/actions/retry:
+    post:
+      summary: Retry a failed or missed run as a new execution request
+      parameters:
+        - in: path
+          name: runId
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkspaceScopedRequest"
+      responses:
+        "202":
+          description: Retry requested
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunResponse"
+  /v1/execution-profile:
+    put:
+      summary: Save or update the execution settings for the current workspace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecutionProfileRequest"
+      responses:
+        "200":
+          description: Execution profile saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecutionProfileResponse"
+components:
+  schemas:
+    WorkspaceScopedRequest:
+      type: object
+      properties:
+        workspacePath:
+          type: string
+      required: [workspacePath]
+    Recurrence:
+      type: object
+      properties:
+        scheduleType:
+          type: string
+          enum: [one_time, daily, weekdays, weekly, monthly]
+        timezone:
+          type: string
+        localTime:
+          type: string
+        runAt:
+          type: string
+          format: date-time
+        weekdays:
+          type: array
+          items:
+            type: string
+        dayOfWeek:
+          type: string
+        dayOfMonth:
+          type: integer
+      required: [scheduleType, timezone]
+    CreateTaskRequest:
+      allOf:
+        - $ref: "#/components/schemas/WorkspaceScopedRequest"
+        - type: object
+          properties:
+            name:
+              type: string
+            prompt:
+              type: string
+            recurrence:
+              $ref: "#/components/schemas/Recurrence"
+          required: [name, prompt, recurrence]
+    UpdateTaskRequest:
+      allOf:
+        - $ref: "#/components/schemas/WorkspaceScopedRequest"
+        - type: object
+          properties:
+            name:
+              type: string
+            prompt:
+              type: string
+            recurrence:
+              $ref: "#/components/schemas/Recurrence"
+            enabled:
+              type: boolean
+    Task:
+      type: object
+      properties:
+        id:
+          type: string
+        workspacePath:
+          type: string
+        name:
+          type: string
+        prompt:
+          type: string
+        enabled:
+          type: boolean
+        nextRunAt:
+          type: string
+          format: date-time
+          nullable: true
+        recurrenceSummary:
+          type: string
+        lastRunStatus:
+          type: string
+          nullable: true
+      required: [id, workspacePath, name, prompt, enabled, recurrenceSummary]
+    TaskResponse:
+      type: object
+      properties:
+        task:
+          $ref: "#/components/schemas/Task"
+      required: [task]
+    Run:
+      type: object
+      properties:
+        id:
+          type: string
+        taskId:
+          type: string
+        scheduledFor:
+          type: string
+          format: date-time
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        finishedAt:
+          type: string
+          format: date-time
+          nullable: true
+        status:
+          type: string
+          enum: [scheduled, running, succeeded, failed, missed, canceled]
+        outcomeSummary:
+          type: string
+        failureReason:
+          type: string
+          nullable: true
+      required: [id, taskId, scheduledFor, status, outcomeSummary]
+    RunResponse:
+      type: object
+      properties:
+        run:
+          $ref: "#/components/schemas/Run"
+      required: [run]
+    ExecutionCapability:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ready, needs_config, invalid, unsupported]
+        message:
+          type: string
+      required: [status, message]
+    ExecutionProfileRequest:
+      allOf:
+        - $ref: "#/components/schemas/WorkspaceScopedRequest"
+        - type: object
+          properties:
+            command:
+              type: string
+            args:
+              type: array
+              items:
+                type: string
+            timeoutMs:
+              type: integer
+              minimum: 1000
+          required: [command, args]
+    ExecutionProfileResponse:
+      type: object
+      properties:
+        capability:
+          $ref: "#/components/schemas/ExecutionCapability"
+      required: [capability]
+    WorkspaceStateResponse:
+      type: object
+      properties:
+        capability:
+          $ref: "#/components/schemas/ExecutionCapability"
+        tasks:
+          type: array
+          items:
+            $ref: "#/components/schemas/Task"
+        runs:
+          type: array
+          items:
+            $ref: "#/components/schemas/Run"
+      required: [capability, tasks, runs]
