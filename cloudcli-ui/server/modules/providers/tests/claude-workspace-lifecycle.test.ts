@@ -117,6 +117,8 @@ for (const stopBeforeExit of [true, false]) {
       const synchronized = gate();
       const operations: string[] = [];
       let child: import('node:child_process').ChildProcess | undefined;
+      let stoppedAfterExit: boolean | undefined;
+      let childClosed: Promise<unknown> | undefined;
       const server = createServer((incoming, response) => {
         void (async () => {
           const chunks: Buffer[] = [];
@@ -145,21 +147,27 @@ for (const stopBeforeExit of [true, false]) {
       let run: Promise<void> | undefined;
       let stop: Promise<boolean> | undefined;
       try {
-        run = queryClaudeSDK('fixture', { cwd, sessionId: 'real-process-fixture' }, { send: (frame: NormalizedMessage) => frames.push(frame) }, context);
+        run = queryClaudeSDK('fixture', { cwd, sessionId: 'real-process-fixture' }, {
+          send: (frame: NormalizedMessage) => {
+            if (frame.text === 'model_stopped') stoppedAfterExit = Boolean(child && (child.exitCode !== null || child.signalCode !== null));
+            frames.push(frame);
+          },
+        }, context);
         await launched.promise;
+        // Linux cancellation kills the owned child immediately; observe close
+        // before cancelling, and never write to that child's closed stdin.
+        childClosed = once(child!, 'close');
         let stopConfirmed = false;
         if (stopBeforeExit) {
           stop = abortClaudeSDKSession('real-process-fixture').then(value => { stopConfirmed = value; return value; });
-          await new Promise<void>(resolve => setImmediate(resolve));
           assert.equal(stopConfirmed, false);
-          assert.equal(frames.some(frame => frame.text === 'model_stopped'), false);
         } else iteratorClosed.resolve();
-        const exited = once(child!, 'close');
-        child!.stdin!.write('exit\n');
-        await exited;
+        if (!stopBeforeExit || process.platform !== 'linux') child!.stdin!.write('exit\n');
+        await childClosed;
         await syncing.promise;
         if (!stopBeforeExit) stop = abortClaudeSDKSession('real-process-fixture').then(value => { stopConfirmed = value; return value; });
         assert.equal(frames.filter(frame => frame.text === 'model_stopped').length, 1);
+        assert.equal(stoppedAfterExit, true);
         assert.equal(frames.find(frame => frame.text === 'model_stopped')?.canInterrupt, false);
         assert.equal(stopConfirmed, false);
         assert.equal(frames.some(frame => frame.kind === 'complete'), false);
@@ -171,8 +179,8 @@ for (const stopBeforeExit of [true, false]) {
       } finally {
         synchronized.resolve();
         iteratorClosed.resolve();
-        if (child && child.exitCode === null) child.kill('SIGKILL');
-        await Promise.allSettled([run, stop]);
+        if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        await Promise.allSettled([childClosed, run, stop]);
         server.closeAllConnections();
         await new Promise<void>(resolve => server.close(() => resolve()));
         await rm(cwd + '.chisa-lease', { recursive: true, force: true });

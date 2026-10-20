@@ -11,3 +11,13 @@ Contributions by Siteboon AI B.V. prior to commit 004135ef were originally
 published under GPL-3.0 and are hereby relicensed to AGPL-3.0-or-later.
 Contributions by other authors prior to that commit remain under GPL-3.0
 and are incorporated into this work as permitted by GPL-3.0 Section 13.
+
+ChisaCloudCode synchronization runtime
+
+This distribution uses a customized Mutagen runtime based on v0.18.1.
+Copyright (c) 2016-present Docker, Inc. and other upstream contributors.
+The customized build does not enable SSPL enhancements. See
+ops/mutagen/LICENSE.upstream and ops/mutagen/NOTICE.runtime for the retained
+upstream and third-party license texts, and ops/mutagen/SOURCE.json for the
+pinned source and cumulative patch identity. The complete corresponding
+patched source is distributed with the runtime release assets.
