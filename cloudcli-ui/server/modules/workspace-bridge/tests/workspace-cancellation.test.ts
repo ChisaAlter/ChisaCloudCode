@@ -1066,7 +1066,8 @@ test('isolated startup reserves the source until worktree creation or shared lea
           probing.resolve();
           void finishProbe.promise.then(() => {
             if (createsWorktree) child.stdout.write(cwd + '\n');
-            child.emit('close', createsWorktree ? 0 : 1);
+            else child.stderr.write('fatal: not a git repository (or any of the parent directories): .git\n');
+            child.emit('close', createsWorktree ? 0 : 128);
           });
         } else {
           assert.deepEqual(args.slice(0, 3), ['worktree', 'add', '-b']);

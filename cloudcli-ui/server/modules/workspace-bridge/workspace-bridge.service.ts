@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chownSync, existsSync, lchownSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { cp } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
@@ -136,10 +136,35 @@ export function isWorkspaceBindingRoot(candidate: string): boolean {
 }
 
 type GitProcessResult = { code: number | null; stdout: string; stderr: string };
+type WorkspaceGitUser = { uid: number; gid: number };
+
+function workspaceGitUser(cwd: string): WorkspaceGitUser | undefined {
+  // Synced VPS replicas and their worker containers belong to this account,
+  // while the API needs root only to manage containers and synchronization.
+  return process.platform === 'linux' && process.getuid?.() === 0 && lstatSync(cwd).uid === 1000
+    ? { uid: 1000, gid: 1000 } : undefined;
+}
+
+function ownSessionWorktree(candidate: string, user: WorkspaceGitUser): void {
+  const stats = lstatSync(candidate);
+  // Never follow copied project symlinks when fixing this new snapshot's owner.
+  lchownSync(candidate, user.uid, user.gid);
+  if (stats.isDirectory()) {
+    for (const name of readdirSync(candidate)) ownSessionWorktree(path.join(candidate, name), user);
+  }
+}
 
 function runGit(args: string[], cwd: string, signal?: AbortSignal): Promise<GitProcessResult> {
+  const user = workspaceGitUser(cwd);
+  const env: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
+  Object.assign(env, {
+    ...(user ? { HOME: '/nonexistent', XDG_CONFIG_HOME: '/nonexistent' } : {}),
+    LC_ALL: 'C', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null',
+    GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null',
+    GIT_CONFIG_KEY_1: 'core.fsmonitor', GIT_CONFIG_VALUE_1: 'false',
+  });
   return new Promise((resolve, reject) => {
-    const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], signal, windowsHide: true });
+    const child = spawn('git', args, { cwd, env, ...user, stdio: ['ignore', 'pipe', 'pipe'], signal, windowsHide: true });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
@@ -194,13 +219,27 @@ async function createSessionWorktree(binding: Binding, sessionId: string, signal
   if (existsSync(worktreeRoot)) throw new AppError('Session worktree path already exists; recover it from Worktrees before starting again', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
 
   const repository = await runGit(['rev-parse', '--show-toplevel'], binding.root, signal);
-  if (repository.code !== 0 || !repository.stdout.trim()) return null;
+  if (repository.code !== 0 || !repository.stdout.trim()) {
+    // An absent repository may use shared execution; a broken or unreadable
+    // repository must never silently discard the session's isolation request.
+    if (repository.code !== 0 && /fatal: not a git repository(?: \(or any of the parent directories\))?:/i.test(repository.stderr)) return null;
+    throw new AppError('Could not inspect the Git repository for an isolated session', {
+      code: 'WORKSPACE_WORKTREE_CREATE_FAILED', statusCode: 503, details: repository.stderr.trim(),
+    });
+  }
   // A marker on a repository subdirectory would make the sibling worktree
   // path ambiguous. Keep that case on the shared-write path until a
   // repository-root-aware worktree mapping is available.
   if (path.resolve(repository.stdout.trim()) !== path.resolve(binding.root)) return null;
   const branch = `chisa/session/${sessionWorktreeName(sessionId)}`;
+  const user = workspaceGitUser(binding.root);
   mkdirSync(parent, { recursive: true, mode: 0o700 });
+  // This exact sibling may have been created by an earlier root API attempt.
+  // Reject redirection before changing only the parent's owner, never the source.
+  if (!lstatSync(parent).isDirectory() || realpathSync(parent) !== parent) {
+    throw new AppError('The session worktree directory is not a canonical directory', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
+  }
+  if (user) chownSync(parent, user.uid, user.gid);
   const created = await runGit(['worktree', 'add', '-b', branch, worktreeRoot, 'HEAD'], binding.root, signal);
   if (created.code !== 0) throw new AppError('Could not create the isolated session worktree', { code: 'WORKSPACE_WORKTREE_CREATE_FAILED', statusCode: 503, details: created.stderr.trim() });
   try {
@@ -223,6 +262,9 @@ async function createSessionWorktree(binding: Binding, sessionId: string, signal
     const marker = JSON.parse(readFileSync(path.join(binding.root, '.chisa-bridge.json'), 'utf8')) as Record<string, unknown>;
     writeFileSync(markerPath, JSON.stringify({ ...marker, execution: 'isolated-worktree', sessionId }), { mode: 0o600 });
     writeFileSync(metadataPath, JSON.stringify({ sessionId, bindingEpoch: binding.bindingEpoch, sourceRoot: binding.root, branch, createdAt: new Date().toISOString() }), { mode: 0o600 });
+    // Git created its metadata as the workspace user; Node's copied dirty files
+    // and private markers must remain readable and writable by that same worker.
+    if (user) ownSessionWorktree(worktreeRoot, user);
     const isolated = resolveWorkspaceBinding(worktreeRoot);
     if (!isolated) throw new AppError('Isolated session worktree was created without a valid workspace marker', { code: 'WORKSPACE_WORKTREE_CREATE_FAILED', statusCode: 503 });
     return isolated;
