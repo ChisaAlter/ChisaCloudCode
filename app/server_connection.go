@@ -99,6 +99,10 @@ func newServerConnection(loginURL, baseURL string) (*serverConnection, error) {
 	// failure. Select the protocol before sending, never replay an HTTP operation.
 	transport.Protocols = new(http.Protocols)
 	transport.Protocols.SetHTTP1(true)
+	// Clone initializes DefaultTransport's HTTP/2 support and copies its ALPN
+	// list. Start with a fresh verified TLS config even without a custom CA,
+	// otherwise H2 can still be negotiated by an HTTP/1-only transport.
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	defaults := distributionService()
 	if defaults.CACertificate != "" {
 		roots, err := x509.SystemCertPool()
@@ -108,7 +112,7 @@ func newServerConnection(loginURL, baseURL string) (*serverConnection, error) {
 		if !roots.AppendCertsFromPEM([]byte(defaults.CACertificate)) {
 			return nil, fmt.Errorf("服务证书配置无效")
 		}
-		transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+		transport.TLSClientConfig.RootCAs = roots
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	apiConnectionVersion++
