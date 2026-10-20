@@ -43,6 +43,7 @@ export interface SyncInfo {
   engineStatus?: string;
   emptySide?: string;
   taskOwner?: string;
+  gitRecoveryRequired?: boolean;
 }
 
 /** A switch applies only to the selected inactive projects displayed to the user. */
@@ -103,6 +104,13 @@ export const FrontendBridge = {
     return call("FrontendBridge.GetBuildIdentity");
   },
   /**
+   * GetProjectGitRecovery reads metadata and preflights both possible sources. It
+   * never starts a file synchronization or applies Git metadata to either endpoint.
+   */
+  getProjectGitRecovery(serverPath: string, bindingEpoch: string): Promise<Record<string, unknown>> {
+    return call("FrontendBridge.GetProjectGitRecovery", serverPath, bindingEpoch);
+  },
+  /**
    * GetProjectStorage measures one explicitly selected, account-bound project.
    * File IO never holds the connection lock or scans other registered projects.
    */
@@ -144,6 +152,18 @@ export const FrontendBridge = {
   },
   piSaveConfig(input: Record<string, unknown>): Promise<Record<string, unknown>> {
     return call("FrontendBridge.PiSaveConfig", input);
+  },
+  /**
+   * ProbeServerHTTPTransport compares the current pool with an independent HTTP/1
+   * pool using the same verified TLS/account configuration. It only reads running
+   * session metadata. Credentials and response contents never leave the connection.
+   * This explicit diagnostic does not replace the product client or replay work.
+   */
+  probeServerHTTPTransport(): Promise<Record<string, unknown>> {
+    return call("FrontendBridge.ProbeServerHTTPTransport");
+  },
+  recoverProjectGit(serverPath: string, bindingEpoch: string, token: string, source: string): Promise<Record<string, unknown>> {
+    return call("FrontendBridge.RecoverProjectGit", serverPath, bindingEpoch, token, source);
   },
   /**
    * Preview discovery is remote IO, not a prerequisite for login, Pi or settings

@@ -40,8 +40,9 @@ func prepareMutagenTransport(ctx context.Context, connection *serverConnection) 
 		return err
 	}
 	marker := filepath.Join(dataDir(), "mutagen-ssh-transport")
+	identity := workspaceSyncEngineVersion + "\n" + norm(sshPath)
 	previous, err := os.ReadFile(marker)
-	if err == nil && norm(strings.TrimSpace(string(previous))) == norm(sshPath) {
+	if err == nil && strings.TrimSpace(string(previous)) == identity {
 		return ctx.Err()
 	}
 	if err != nil && !os.IsNotExist(err) {
@@ -90,6 +91,15 @@ func prepareMutagenTransport(ctx context.Context, connection *serverConnection) 
 	binary := mutagenExe()
 	if binary == "" {
 		return fmt.Errorf("Mutagen 未随应用分发")
+	}
+	versionContext, cancelVersion := context.WithTimeout(ctx, 5*time.Second)
+	version, versionErr := runMutagenContext(versionContext, "version")
+	cancelVersion()
+	if versionErr != nil {
+		return fmt.Errorf("无法确认文件同步组件版本: %w", versionErr)
+	}
+	if strings.TrimSpace(version) != workspaceSyncEngineVersion {
+		return fmt.Errorf("文件同步组件版本不匹配，需要 %s", workspaceSyncEngineVersion)
 	}
 	daemonDirectory := filepath.Join(dataDir(), "mutagen", "daemon")
 	if err := os.MkdirAll(daemonDirectory, 0700); err != nil {
@@ -147,7 +157,7 @@ func prepareMutagenTransport(ctx context.Context, connection *serverConnection) 
 	if connection.ctx.Err() != nil {
 		return fmt.Errorf("文件同步账号或连接已改变")
 	}
-	if err := os.WriteFile(marker+".tmp", []byte(sshPath+"\n"), 0600); err != nil {
+	if err := os.WriteFile(marker+".tmp", []byte(identity+"\n"), 0600); err != nil {
 		return fmt.Errorf("无法保存文件同步组件升级状态: %w", err)
 	}
 	if err := os.Rename(marker+".tmp", marker); err != nil {

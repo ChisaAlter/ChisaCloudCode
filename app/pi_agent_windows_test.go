@@ -59,6 +59,16 @@ func isolatePi(t *testing.T) *Mapping {
 	store = &Store{Cfg: Config{ServerURL: "http://example.test:8791", WorkspaceServerURL: "http://example.test:8791"}, Mappings: []*Mapping{m}}
 	m.ServerID = serverIdentity(store.config())
 	t.Cleanup(func() {
+		// Released ownership is visible before the handback's final sync
+		// publication. Drain its workspace lock before restoring globals.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		unlock, err := lockWorkspace(ctx, m.ServerPath)
+		if err != nil {
+			t.Errorf("Pi handback still held the fixture workspace during cleanup: %v", err)
+		} else {
+			defer unlock()
+		}
 		piAgents.Lock()
 		piAgents.loaded, piAgents.loadErr, piAgents.sessions, piAgents.owners, piAgents.stopping = loaded, loadErr, sessions, owners, stopping
 		piAgents.Unlock()
@@ -150,6 +160,36 @@ func finishPi(s *piSession, text, reason, modelError string) {
 
 func TestPiClaimSerializesAndBlocksCloudMutations(t *testing.T) {
 	m := isolatePi(t)
+	handbackEntered := make(chan struct{})
+	allowHandback := make(chan struct{})
+	var handbackOnce sync.Once
+	unblockHandback := func() { handbackOnce.Do(func() { close(allowHandback) }) }
+	synchronizeProjectContext = func(ctx context.Context, _ *Mapping, pause bool) error {
+		if pause {
+			return nil
+		}
+		close(handbackEntered)
+		select {
+		case <-allowHandback:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	// Drain the handback before isolatePi restores the globals it still uses,
+	// including when an assertion below fails while synchronization is gated.
+	drainHandback := func() {
+		unblockHandback()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		unlock, err := lockWorkspace(ctx, m.ServerPath)
+		if err != nil {
+			t.Errorf("startup handback did not leave the workspace mutex: %v", err)
+			return
+		}
+		unlock()
+	}
+	t.Cleanup(drainHandback)
 	lock, _ := workspaceLocks.LoadOrStore(m.ServerPath, &sync.Mutex{})
 	mu := lock.(*sync.Mutex)
 	mu.Lock()
@@ -174,14 +214,41 @@ func TestPiClaimSerializesAndBlocksCloudMutations(t *testing.T) {
 	if accepted := <-result; accepted["accepted"] != true {
 		t.Fatalf("claim rejected: %v", accepted)
 	}
-	waitPi(t, func() bool { return (FrontendBridge{}).PiGetSession(m.ServerPath, "manual-A")["running"] == false })
-	// Missing private QA model config is a real startup failure, not success.
+	select {
+	case <-handbackEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("startup failure did not enter workspace handback")
+	}
+	// Running=false only means startup ended. Its reservation must remain until
+	// the unified handback finishes, even though no runtime was created.
 	state := (FrontendBridge{}).PiGetSession(m.ServerPath, "manual-A")
-	if state["lastResult"].(map[string]any)["status"] != "error" || state["owner"] != "claude" || piWorkspaceOwned(m.ServerPath) {
-		t.Fatal("startup failure was masked or retained a reservation without a runtime")
+	last, ok := state["lastResult"].(map[string]any)
+	if !ok || last["status"] != "error" || last["error"] == "" || last["workspaceStatus"] != "syncing" || state["running"] != false || state["runtimeActive"] != false || state["owner"] != "pi" || state["ownerSessionId"] != "manual-A" || !piWorkspaceOwned(m.ServerPath) {
+		t.Fatalf("startup failure lost its error or reservation during handback: %v", state)
+	}
+	mutations := []string{"write", "mkdir", "rename", "copy", "remove", "exec", "preview_start"}
+	for _, op := range mutations {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		response := workspaceRPCContext(ctx, m, map[string]any{"op": op})
+		cancel()
+		if response["ok"] != false || response["code"] != "WORKSPACE_UNAVAILABLE" {
+			t.Fatalf("%s bypassed the gated handback mutex: %v", op, response)
+		}
+	}
+	unblockHandback()
+	waitPi(t, func() bool {
+		view := (FrontendBridge{}).PiGetSession(m.ServerPath, "manual-A")
+		result, _ := view["lastResult"].(map[string]any)
+		return view["owner"] == "claude" && result["workspaceStatus"] == "released"
+	})
+	drainHandback()
+	// Missing private QA model config remains a startup error after handback.
+	state = (FrontendBridge{}).PiGetSession(m.ServerPath, "manual-A")
+	if state["lastResult"].(map[string]any)["status"] != "error" || state["running"] != false || state["runtimeActive"] != false || piWorkspaceOwned(m.ServerPath) {
+		t.Fatalf("startup failure was masked or retained its completed reservation: %v", state)
 	}
 	s, _ := seedPi(m, "manual-A")
-	for _, op := range []string{"write", "mkdir", "rename", "copy", "remove", "exec", "preview_start"} {
+	for _, op := range mutations {
 		response := workspaceRPC(m, map[string]any{"op": op})
 		if !reflect.DeepEqual(response, map[string]any{"ok": false, "error": "Workspace is busy", "code": "WORKSPACE_BUSY"}) {
 			t.Fatalf("%s was not blocked with a generic busy response: %v", op, response)

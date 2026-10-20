@@ -1,6 +1,7 @@
 import { LogIn } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
+import { HiRouteSettingsSection } from '@/modules/settings/tabs/agents-settings/sections/content/HiRouteSettingsSection';
 import { Badge, Button, LLMProviderLogo } from '@/shared/ui';
 import type { AgentProvider, ProviderAuthStatus } from '@/shared/types';
 
@@ -85,6 +86,10 @@ export default function AccountContent({ agent, authStatus, onLogin }: AccountCo
               <div className={`text-sm ${config.subtextClass}`}>
                 {authStatus.loading ? (
                   t('agents.authStatus.checkingAuth')
+                ) : authStatus.method === 'hiroute' ? (
+                  t('hiroute.configured')
+                ) : authStatus.method === 'model_connection' ? (
+                  t('models.configured')
                 ) : authStatus.authenticated ? (
                   t('agents.authStatus.loggedInAs', {
                     email: authStatus.email || t('agents.authStatus.authenticatedUser'),
@@ -101,7 +106,7 @@ export default function AccountContent({ agent, authStatus, onLogin }: AccountCo
                 </Badge>
               ) : authStatus.authenticated ? (
                 <Badge variant="secondary" className="bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">
-                  {t('agents.authStatus.connected')}
+                  {t(authStatus.method === 'hiroute' || authStatus.method === 'model_connection' ? 'hiroute.configuredBadge' : 'agents.authStatus.connected')}
                 </Badge>
               ) : (
                 <Badge variant="secondary" className="bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300">
@@ -111,7 +116,7 @@ export default function AccountContent({ agent, authStatus, onLogin }: AccountCo
             </div>
           </div>
 
-          {authStatus.method !== 'api_key' && (
+          {authStatus.method !== 'api_key' && authStatus.method !== 'hiroute' && authStatus.method !== 'model_connection' && (
             <div className="border-t border-border/50 pt-4">
               <div className="flex items-center justify-between">
                 <div>
@@ -145,6 +150,8 @@ export default function AccountContent({ agent, authStatus, onLogin }: AccountCo
           )}
         </div>
       </div>
+
+      {agent === 'claude' && <HiRouteSettingsSection />}
     </div>
   );
 }

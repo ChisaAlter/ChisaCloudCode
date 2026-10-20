@@ -114,6 +114,67 @@ func TestWorkspaceBridgeTotalDeadlineAndBodyCancel(t *testing.T) {
 	}
 }
 
+func TestWorkspaceFolderOpenImportBudget(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		mode         string
+		budget       time.Duration
+		callerLimit  time.Duration
+		cancelDuring bool
+	}{
+		{name: "retry-initial-import", budget: workspaceImportTimeout},
+		{name: "established-workspace", mode: "vps", budget: workspaceSyncTimeout},
+		{name: "earlier-caller-deadline", budget: 3 * time.Second, callerLimit: 3 * time.Second},
+		{name: "account-cancellation", budget: workspaceImportTimeout, cancelDuring: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := isolatePi(t)
+			isolateWorkspaceSyncTransport(t)
+			m.Mode = test.mode
+			connection := apiConnection
+			setup := &accountWorkspaceSetup{done: make(chan struct{})}
+			close(setup.done)
+			connection.workspaceSetup = setup
+			var cancelParent context.CancelFunc
+			if test.callerLimit > 0 {
+				connection.ctx, cancelParent = context.WithTimeout(connection.ctx, test.callerLimit)
+			} else {
+				connection.ctx, cancelParent = context.WithCancel(connection.ctx)
+			}
+			defer cancelParent()
+			previousPause := pauseProjectSync
+			t.Cleanup(func() {
+				pauseProjectSync = previousPause
+				syncStates.Delete(m.ServerPath)
+			})
+			stopped := errors.New("budget observed before remote writes")
+			observed := false
+			pauseProjectSync = func(ctx context.Context, _ *Mapping) error {
+				observed = true
+				deadline, ok := ctx.Deadline()
+				remaining := time.Until(deadline)
+				if !ok || remaining > test.budget || remaining < test.budget-time.Second {
+					t.Fatalf("folder-open synchronization budget = %s, want %s", remaining, test.budget)
+				}
+				if test.cancelDuring {
+					cancelParent()
+					select {
+					case <-ctx.Done():
+					case <-time.After(time.Second):
+						t.Fatal("initial import ignored account cancellation")
+					}
+					return ctx.Err()
+				}
+				return stopped
+			}
+			result := prepareLocalProject(m.LocalPath)
+			if !observed || result["ok"] != false {
+				t.Fatalf("folder open did not reach bounded synchronization: %v", result)
+			}
+		})
+	}
+}
+
 func TestWorkspaceManualReleaseAndExactRecovery(t *testing.T) {
 	m := isolatePi(t)
 	isolateWorkspaceSyncTransport(t)

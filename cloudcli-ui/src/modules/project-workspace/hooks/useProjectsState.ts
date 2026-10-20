@@ -82,6 +82,19 @@ const DEFAULT_PROVIDER: LLMProvider = 'claude';
 
 const serialize = (value: unknown) => JSON.stringify(value ?? null);
 
+const readProjectsResponse = async (response: Response): Promise<Project[]> => {
+  // Never let an HTTP error envelope enter React's deferred state updaters.
+  // Exceptions there occur during render, outside the request's try/catch.
+  if (!response.ok) {
+    throw new Error(`Failed to load projects (${response.status})`);
+  }
+  const payload: unknown = await response.json();
+  if (!Array.isArray(payload)) {
+    throw new Error('Invalid projects response: expected an array');
+  }
+  return payload as Project[];
+};
+
 const getSessionProvider = (session: ProjectSession): LLMProvider => {
   const provider = session.__provider ?? session.provider;
   return typeof provider === 'string' && provider.trim()
@@ -387,6 +400,8 @@ export function useProjectsState({
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isLoadingProjects, setIsLoadingProjects] = useState(true);
+  /** Keeps a failed list request visible and retryable without replacing usable workspace state. */
+  const [projectsLoadFailed, setProjectsLoadFailed] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState<LoadingProgress | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState('agents');
@@ -504,12 +519,13 @@ export function useProjectsState({
         setIsLoadingProjects(true);
       }
       const response = await api.projects();
-      const projectData = (await response.json()) as Project[];
+      const projectData = await readProjectsResponse(response);
 
       if (projectsRequestIdRef.current !== requestId) {
         return;
       }
 
+      setProjectsLoadFailed(false);
       setProjects((prevProjects) => {
         const projectsWithTaskMaster = mergeTaskMasterCache(projectData, prevProjects);
         const mergedProjects = mergeExpandedSessionPages(prevProjects, projectsWithTaskMaster);
@@ -543,6 +559,9 @@ export function useProjectsState({
           : previousProject;
       });
     } catch (error) {
+      if (projectsRequestIdRef.current === requestId) {
+        setProjectsLoadFailed(true);
+      }
       console.error('Error fetching projects:', error);
     } finally {
       // Only the newest request clears the flag, and it clears it whether or not
@@ -1022,9 +1041,11 @@ export function useProjectsState({
       clearSessionAttention(session.id);
       setSelectedSession(session);
 
-      if (activeTab === 'tasks' || activeTab === 'browser') {
-        setActiveTab('chat');
-      }
+      // Opening a conversation always shows that conversation. A persisted
+      // panel tab (git, files, shell, tasks, browser) used to survive the
+      // navigation, so the chat stayed hidden behind the last panel and the
+      // user had no obvious way back.
+      setActiveTab('chat');
 
       if (isMobile) {
         // Sessions are tagged with the owning project's DB `projectId` when
@@ -1041,7 +1062,7 @@ export function useProjectsState({
 
       navigate(`/session/${session.id}`);
     },
-    [activeTab, clearSessionAttention, isMobile, navigate, selectedProject?.projectId],
+    [clearSessionAttention, isMobile, navigate, selectedProject?.projectId],
   );
 
   const handleNewSession = useCallback(
@@ -1078,7 +1099,8 @@ export function useProjectsState({
   const handleSidebarRefresh = useCallback(async () => {
     try {
       const response = await api.projects();
-      const freshProjects = (await response.json()) as Project[];
+      const freshProjects = await readProjectsResponse(response);
+      setProjectsLoadFailed(false);
       const projectsWithTaskMaster = mergeTaskMasterCache(freshProjects, projects);
       const mergedProjects = mergeExpandedSessionPages(projects, projectsWithTaskMaster);
 
@@ -1121,6 +1143,7 @@ export function useProjectsState({
         }
       }
     } catch (error) {
+      setProjectsLoadFailed(true);
       console.error('Error refreshing sidebar:', error);
     }
   }, [projects, selectedProject, selectedSession]);
@@ -1230,6 +1253,7 @@ export function useProjectsState({
     activeTab,
     sidebarOpen,
     isLoadingProjects,
+    projectsLoadFailed,
     loadingProgress,
     showSettings,
     settingsInitialTab,

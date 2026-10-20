@@ -3,6 +3,8 @@ import { useEffect, useRef, useState } from 'react';
 
 import { FrontendBridge, getServerConnectionVersion, isDesktop, onWorkspaceSyncStateChanged } from '@/shared/chisa';
 import { getAuthSessionVersion } from '@/shared/authToken';
+import { usePaletteOps } from '@/modules/command-palette';
+import { GitSyncRecovery } from '@/modules/workspace-sync-recovery';
 import type { ChisaSyncInfo } from '@/shared/types';
 import { useConnectionIdentity } from '@/shared/hooks/useConnectionIdentity';
 import { useComponentVersions } from '@/shared/hooks/useComponentVersions';
@@ -32,6 +34,7 @@ export function WorkspaceSyncBar({ serverPath }: { serverPath: string }) {
 function WorkspaceSyncObservation({ serverPath }: { serverPath: string }) {
   // Copy feedback is scoped to the current project and binding, never a previous account.
   const [copyMessage, setCopyMessage] = useState('');
+  const { openSettings } = usePaletteOps();
   // The latest versioned engine observation determines state, including invalidation on disconnect.
   const [info, setInfo] = useState<ChisaSyncInfo | null>(null);
   const versions = useComponentVersions(`${serverPath}:${info?.bindingEpoch ?? ''}`);
@@ -152,6 +155,12 @@ function WorkspaceSyncObservation({ serverPath }: { serverPath: string }) {
     : status === 'ready' ? CheckCircle2 : taskBusy || status === 'paused' ? PauseCircle
       : synchronizing || status === 'syncing' ? Loader2 : Info;
   const errorDetail = connectionError || info?.detail;
+  // Native failures can include multiline Python/Git diagnostics; keep those in the scrollable details panel.
+  const summarizeError = (detail: string) => /Traceback|\n|fatal:|<[^>]+>|^\s*[{[]/.test(detail) || detail.length > 180
+    ? /unmerged|git-write-tree|合并冲突/.test(detail)
+      ? 'Git 合并冲突导致同步未完成，请查看详情。当前修改已保留。'
+      : '同步未完成，请查看详情后重试。'
+    : detail;
 
   const actionScope = () => {
     const generation = actionGeneration.current;
@@ -194,8 +203,8 @@ function WorkspaceSyncObservation({ serverPath }: { serverPath: string }) {
       }
     } finally {
       if (currentAction()) {
-        await refreshSnapshot.current();
-        if (currentAction()) setSynchronizing(false);
+        setSynchronizing(false);
+        void refreshSnapshot.current();
       }
     }
   };
@@ -230,14 +239,14 @@ function WorkspaceSyncObservation({ serverPath }: { serverPath: string }) {
       }
     } finally {
       if (currentAction()) {
-        await refreshSnapshot.current();
-        if (currentAction()) setSynchronizing(false);
+        setSynchronizing(false);
+        void refreshSnapshot.current();
       }
     }
   };
 
   return (
-    <section aria-label="本地与 VPS 文件同步" className="relative shrink-0 border-b border-border/50 px-4 py-1.5 text-xs sm:px-6">
+    <section aria-label="本地与 VPS 文件同步" data-sync-status={status} className="workspace-sync-bar relative shrink-0 border-b border-border/50 px-4 py-1.5 text-xs sm:px-6">
       <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5">
         <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
           <span className="shrink-0 font-medium text-foreground">本地 ↔ VPS</span>
@@ -247,28 +256,35 @@ function WorkspaceSyncObservation({ serverPath }: { serverPath: string }) {
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {status === 'unavailable' && <button type="button" onClick={() => void refreshSnapshot.current()} className="rounded px-1.5 py-1 text-muted-foreground outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring">刷新状态</button>}
-          <button
-            type="button"
-            onClick={() => void synchronize()}
-            disabled={disabled}
-            aria-busy={synchronizing}
-            title={taskBusy ? '等待当前任务结束后再同步' : status === 'unbound' ? '请先绑定本地目录' : localRootEmpty ? '本地目录已清空，确认后将清空 VPS 可同步文件并保留备份' : '立即完成本地与 VPS 文件同步；不会推送到 GitHub'}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-2.5 py-1 font-medium text-foreground outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            <RefreshCw aria-hidden="true" className={`h-3.5 w-3.5 ${synchronizing ? 'motion-safe:animate-spin' : ''}`} />
-            {synchronizing ? '同步中…' : localRootEmpty ? '确认同步清空' : '立即同步'}
-          </button>
+          {status === 'unavailable' && <button type="button" onClick={() => void refreshSnapshot.current()} className="rounded px-1.5 py-1 text-muted-foreground outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring">重新连接状态</button>}
+          <GitSyncRecovery info={info?.serverPath === serverPath ? info : null} unavailable={Boolean(connectionError) || synchronizing} onRecovered={() => void refreshSnapshot.current()} />
+          {status === 'unbound' ? (
+            <button type="button" onClick={() => openSettings('chisa')} className="rounded-md border border-border px-2.5 py-1 font-medium text-foreground outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring">查看同步设置</button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void synchronize()}
+              disabled={disabled}
+              aria-busy={synchronizing}
+              title={taskBusy ? '任务正在使用工作区，自动同步继续运行；任务结束后可手动同步' : localRootEmpty ? '本地目录已清空，确认后将清空 VPS 可同步文件并保留备份' : '立即完成本地与 VPS 文件同步；不会推送到 GitHub'}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-border px-2.5 py-1 font-medium text-foreground outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <RefreshCw aria-hidden="true" className={`h-3.5 w-3.5 ${synchronizing ? 'motion-safe:animate-spin' : ''}`} />
+              {synchronizing ? '同步中…' : localRootEmpty ? '确认同步清空' : '立即同步'}
+            </button>
+          )}
           <details ref={detailsRef} className="group">
             <summary className="cursor-pointer list-none rounded px-1.5 py-1 text-muted-foreground outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring">详情</summary>
-            <div className="absolute right-4 top-full z-40 mt-2 w-[calc(100%-2rem)] max-w-[22rem] space-y-2 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-md">
+            <div className="absolute right-4 top-full z-40 mt-2 w-[calc(100%-2rem)] max-h-80 max-w-[22rem] space-y-2 overflow-y-auto rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-md">
               <div><span className="text-muted-foreground">本地目录</span><div className="break-all">{info?.localPath || '未绑定或尚未确认'}</div></div>
               <div><span className="text-muted-foreground">VPS 目录</span><div className="break-all">{serverPath}</div></div>
               <p className="text-muted-foreground">“已同步”表示引擎已完成最近一轮文件同步，不保证刚保存的改动已被发现。发送任务前会再同步确认。</p>
               <p className="text-muted-foreground">仅同步源码和资源；依赖、构建产物及忽略文件不包含在内。</p>
-              {info?.detail && <p className="break-words">{info.detail}</p>}
-              {taskBusy && <p className="text-muted-foreground">任务开始前同步已完成；执行期间暂停自动同步，任务结束后再交还工作区。</p>}
-              {actionError && <p role="alert" className="break-words text-amber-700 dark:text-amber-400">上次手动同步失败：{actionError}</p>}
+              {connectionError && <p className="whitespace-pre-wrap break-words">{connectionError}</p>}
+              {info?.detail && <p className="whitespace-pre-wrap break-words">{info.detail}</p>}
+              {taskBusy && <p className="text-muted-foreground">任务正在使用工作区，自动同步继续运行；任务结束后可手动同步。</p>}
+              {status === 'unbound' && <p className="text-muted-foreground">可在侧栏打开本地目录，进入它对应的同步项目。此操作不会把本地目录绑定到当前 VPS 项目；同步设置用于查看和管理已有映射。</p>}
+              {actionError && <p className="whitespace-pre-wrap break-words text-amber-700 dark:text-amber-400">上次手动同步失败：{actionError}</p>}
               <div className="flex flex-wrap gap-2">
                 <button type="button" onClick={() => { void refreshSnapshot.current(); void versions.refresh(); }} className="rounded border border-border px-2 py-1 outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring">刷新状态与版本</button>
                 <button type="button" onClick={() => void copyDiagnostic()} className="rounded border border-border px-2 py-1 outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring">复制脱敏诊断</button>
@@ -279,6 +295,7 @@ function WorkspaceSyncObservation({ serverPath }: { serverPath: string }) {
           </details>
         </div>
       </div>
+      {status === 'unbound' && <p className="mt-1.5 text-muted-foreground">当前 VPS 项目尚未绑定本地目录。打开本地目录会进入其对应项目。</p>}
       {confirmingEmpty && (
         <div role="group" aria-label="确认同步清空 VPS" className="mt-2 space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
           <p className="font-medium text-foreground">本地目录已清空，是否将此变更同步到 VPS？</p>
@@ -291,8 +308,8 @@ function WorkspaceSyncObservation({ serverPath }: { serverPath: string }) {
         </div>
       )}
       {emptyBackup?.serverPath === serverPath && emptyBackup.bindingEpoch === info?.bindingEpoch && <div role="status" className="mt-1.5 break-all text-muted-foreground">{emptyBackup.complete ? 'VPS 可同步文件已移入备份：' : '已移动的部分文件可在此恢复：'}{emptyBackup.path}</div>}
-      {problem && errorDetail && <div role="alert" className="mt-1.5 break-words text-amber-700 dark:text-amber-400">{errorDetail}</div>}
-      {actionError && !problem && info?.status !== 'ready' && <div role="alert" className="mt-1.5 break-words text-amber-700 dark:text-amber-400">手动同步未完成：{actionError}</div>}
+      {problem && errorDetail && <div role="alert" className="mt-1.5 break-words text-amber-700 dark:text-amber-400">{summarizeError(errorDetail)}</div>}
+      {actionError && !problem && <div role="alert" className="mt-1.5 break-words text-amber-700 dark:text-amber-400">手动同步未完成：{summarizeError(actionError)}</div>}
     </section>
   );
 }

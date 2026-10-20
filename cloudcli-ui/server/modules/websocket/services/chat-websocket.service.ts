@@ -87,6 +87,8 @@ type ChatTurnResult = {
   started: boolean;
   error: string | null;
   reason?: 'busy' | 'unavailable';
+  code?: string;
+  retryable?: boolean;
 };
 
 // A cancelled runtime can settle before abort finishes releasing its workspace.
@@ -135,6 +137,37 @@ function finishStop(
   stoppingRuns.delete(run);
   runStops.delete(run);
   if (!success && settledRuns.has(run)) chatRunRegistry.completeRunIfCurrent(run, { exitCode: 1 });
+  finishSettledRun(run);
+}
+const notifiedRuns = new WeakSet<NonNullable<ReturnType<typeof chatRunRegistry.getRun>>>();
+const admissionRejectedRuns = new WeakSet<NonNullable<ReturnType<typeof chatRunRegistry.getRun>>>();
+const unsettledRuns = new Map<string, Set<NonNullable<ReturnType<typeof chatRunRegistry.getRun>>>>();
+const runSettledListeners = new Set<() => void>();
+
+/** Scheduled messages wait for runtime teardown and abort handback, even after a terminal frame. */
+export function isChatRunInFlight(sessionId: string): boolean {
+  return chatRunRegistry.isProcessing(sessionId) || unsettledRuns.has(sessionId);
+}
+
+/** Scheduled messages use this wakeup after an interactive or detached run has fully released its workspace. */
+export function onChatRunSettled(listener: () => void): () => void {
+  runSettledListeners.add(listener);
+  return () => { runSettledListeners.delete(listener); };
+}
+
+function finishSettledRun(run: NonNullable<ReturnType<typeof chatRunRegistry.getRun>>): void {
+  if (!settledRuns.has(run) || stoppingRuns.has(run) || notifiedRuns.has(run)) return;
+  notifiedRuns.add(run);
+  const pending = unsettledRuns.get(run.appSessionId);
+  pending?.delete(run);
+  if (pending?.size === 0) unsettledRuns.delete(run.appSessionId);
+  // A rejected admission did not release another task's workspace. Waking for
+  // it would repeatedly retry the same busy queue without waiting for progress.
+  if (admissionRejectedRuns.has(run)) return;
+  for (const listener of runSettledListeners) {
+    try { listener(); }
+    catch (error) { console.error('[Chat] Run-settled listener failed', error); }
+  }
 }
 
 /**
@@ -291,12 +324,16 @@ async function dispatchRun(
         sessionId
       );
     }
-    return { started: false, error: 'A run is already in progress for this session.', reason: 'busy' };
+    return { started: false, error: 'A run is already in progress for this session.', code: 'RUN_IN_PROGRESS', retryable: true, reason: 'busy' };
   }
+  const pending = unsettledRuns.get(sessionId) ?? new Set();
+  pending.add(run);
+  unsettledRuns.set(sessionId, pending);
   const cancellation = new AbortController();
   runCancellations.set(run, cancellation);
   let finishRun!: () => void;
   runSettlements.set(run, new Promise<void>(resolve => { finishRun = resolve; }));
+  chatRunRegistry.setPhase(run, 'queued');
 
   // Record what this turn runs with so reopening the session later restores the
   // same model and reasoning effort, and so the resume path has a
@@ -333,12 +370,18 @@ async function dispatchRun(
     images: uniqueAttachments.filter(isImageAttachmentDescriptor),
     files: uniqueAttachments.filter((descriptor) => !isImageAttachmentDescriptor(descriptor)),
     sessionId,
-    cwd: clientOptions.cwd ?? session.project_path ?? undefined,
-    projectPath: session.project_path ?? clientOptions.projectPath,
+    // The session row is the sole workspace identity for a run. A client may
+    // keep a stale cwd after switching projects, so accepting it here would
+    // split provider cwd, workspace tools, and synchronization ownership.
+    cwd: session.project_path ?? undefined,
+    projectPath: session.project_path ?? undefined,
+    workspaceMode: session.workspace_mode,
     abortSignal: cancellation.signal,
   };
 
   let failure: string | null = null;
+  let code: string | undefined;
+  let retryable = false;
   try {
     // Runs only now that the session is reserved, because an edit rewinds the
     // conversation here and a rewind for a run that was never admitted cannot
@@ -363,10 +406,17 @@ async function dispatchRun(
       }));
     }
     runtimeStartedRuns.add(run);
+    chatRunRegistry.setPhase(run, 'running');
     await dependencies.runtime.run(provider, command, runtimeOptions, run.writer);
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
-    console.error(`[Chat] Provider runtime "${provider}" failed`, { sessionId, error: failure });
+    const runtimeError = error as { code?: unknown; workspaceAdmissionRejected?: unknown; workspaceCleanupError?: unknown; cleanupError?: unknown } | null;
+    code = typeof runtimeError?.code === 'string' ? runtimeError.code : undefined;
+    retryable = !runtimeError?.workspaceCleanupError && !runtimeError?.cleanupError && (
+      code === 'RUN_IN_PROGRESS' || runtimeError?.workspaceAdmissionRejected === true
+    );
+    if (retryable) { admissionRejectedRuns.add(run); run.admissionRejected = true; }
+    console.error(`[Chat] Provider runtime "${provider}" failed`, { sessionId, error: failure, code });
   } finally {
     // Safety net: a runtime that crashed (or resolved) without emitting its
     // terminal `complete` would otherwise leave the session stuck in
@@ -377,6 +427,7 @@ async function dispatchRun(
     finishRun();
     if (!stoppingRuns.has(run)) chatRunRegistry.completeRunIfCurrent(run, { exitCode: 1 });
     runCancellations.delete(run);
+    finishSettledRun(run);
   }
 
   const completion = run.events.find((event) => event.kind === 'complete');
@@ -389,7 +440,7 @@ async function dispatchRun(
       ? 'The queued turn was stopped. Its input has been preserved.'
       : 'The provider did not complete the turn successfully.';
   }
-  return { started: true, error: failure };
+  return { started: !retryable, error: failure, ...(code ? { code } : {}), ...(retryable ? { retryable, reason: 'busy' as const } : {}) };
 }
 
 /**
@@ -594,11 +645,14 @@ function handleChatSubscribe(
       runId: run?.runId,
       isProcessing,
       modelStopped: run?.modelStopped ?? false,
+      runPhase: run?.phase ?? null,
       lastSeq: run?.lastSeq ?? 0,
       replayEpoch,
       pendingPermissions,
       timestamp: new Date().toISOString(),
     });
+    const lifecycle = chatRunRegistry.lifecycleSnapshot(sessionId);
+    if (lifecycle) sendJson(ws, lifecycle);
 
     // Replay only for RUNNING runs, strictly after the ack. Completed runs
     // are fully persisted to the provider transcript and served over REST —
@@ -683,10 +737,10 @@ export async function runDetachedChatTurn(
   }
 
   const activeRun = chatRunRegistry.getRun(input.sessionId);
+  if (!input.interruptActiveRun && isChatRunInFlight(input.sessionId)) {
+    return { started: false, error: 'A run was already in progress for this session.', code: 'RUN_IN_PROGRESS', retryable: true };
+  }
   if (activeRun && activeRun.status === 'running') {
-    if (!input.interruptActiveRun) {
-      return { started: false, error: 'A run was already in progress for this session.', reason: 'busy' };
-    }
     // Same shape as `chat.abort`: cancel the provider run and emit the
     // terminal `complete` on its behalf, so every watching client sees the
     // interrupted run end before this turn's stream begins. The interrupted

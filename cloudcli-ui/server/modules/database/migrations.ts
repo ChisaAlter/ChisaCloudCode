@@ -288,9 +288,22 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
     ? 'custom_name'
     : 'NULL';
 
+  const providerSessionIdExpression = columnNames.includes('provider_session_id')
+    ? 'provider_session_id'
+    : 'session_id';
+
   const jsonlPathExpression = columnNames.includes('jsonl_path')
     ? 'jsonl_path'
     : 'NULL';
+
+  const modelExpression = columnNames.includes('model') ? 'model' : 'NULL';
+  const effortExpression = columnNames.includes('effort') ? 'effort' : 'NULL';
+  const forkedFromSessionIdExpression = columnNames.includes('forked_from_session_id')
+    ? 'forked_from_session_id'
+    : 'NULL';
+  const workspaceModeExpression = columnNames.includes('workspace_mode')
+    ? "CASE WHEN workspace_mode = 'shared' THEN 'shared' ELSE 'isolated' END"
+    : "'isolated'";
 
   const isArchivedExpression = columnNames.includes('isArchived')
     ? 'COALESCE(isArchived, 0)'
@@ -312,9 +325,14 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
       CREATE TABLE sessions__new (
         session_id TEXT NOT NULL,
         provider TEXT NOT NULL DEFAULT 'claude',
+        provider_session_id TEXT,
         custom_name TEXT,
         project_path TEXT,
         jsonl_path TEXT,
+        model TEXT,
+        effort TEXT,
+        forked_from_session_id TEXT,
+        workspace_mode TEXT NOT NULL DEFAULT 'isolated',
         isArchived BOOLEAN DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -329,9 +347,14 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
         SELECT
           session_id,
           ${providerExpression} AS provider,
+          ${providerSessionIdExpression} AS provider_session_id,
           ${customNameExpression} AS custom_name,
           ${projectPathExpression} AS project_path,
           ${jsonlPathExpression} AS jsonl_path,
+          ${modelExpression} AS model,
+          ${effortExpression} AS effort,
+          ${forkedFromSessionIdExpression} AS forked_from_session_id,
+          ${workspaceModeExpression} AS workspace_mode,
           ${isArchivedExpression} AS isArchived,
           ${createdAtExpression} AS created_at,
           ${updatedAtExpression} AS updated_at,
@@ -343,9 +366,14 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
         SELECT
           session_id,
           provider,
+          provider_session_id,
           custom_name,
           project_path,
           jsonl_path,
+          model,
+          effort,
+          forked_from_session_id,
+          workspace_mode,
           isArchived,
           created_at,
           updated_at,
@@ -358,9 +386,14 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
       INSERT INTO sessions__new (
         session_id,
         provider,
+        provider_session_id,
         custom_name,
         project_path,
         jsonl_path,
+        model,
+        effort,
+        forked_from_session_id,
+        workspace_mode,
         isArchived,
         created_at,
         updated_at
@@ -368,9 +401,14 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
       SELECT
         session_id,
         provider,
+        provider_session_id,
         custom_name,
         project_path,
         jsonl_path,
+        model,
+        effort,
+        forked_from_session_id,
+        workspace_mode,
         isArchived,
         created_at,
         updated_at
@@ -463,6 +501,12 @@ const addSessionEffortColumn = (db: Database): void => {
   addColumnToTableIfNotExists(db, 'sessions', columnNames, 'effort', 'TEXT');
 };
 
+const addSessionWorkspaceModeColumn = (db: Database): void => {
+  const columnNames = getTableInfo(db, 'sessions').map((column) => column.name);
+  addColumnToTableIfNotExists(db, 'sessions', columnNames, 'workspace_mode', "TEXT NOT NULL DEFAULT 'isolated'");
+  db.exec("UPDATE sessions SET workspace_mode = 'isolated' WHERE workspace_mode IS NULL OR workspace_mode NOT IN ('isolated', 'shared')");
+};
+
 const ensureProjectsForSessionPaths = (db: Database): void => {
   if (!tableExists(db, 'sessions')) {
     return;
@@ -513,6 +557,9 @@ export const runMigrations = (db: Database) => {
       CREATE INDEX IF NOT EXISTS idx_provider_models_provider_order
       ON provider_models(provider, sort_order, id)
     `);
+    if (tableExists(db, 'claude_model_connections')) {
+      addColumnToTableIfNotExists(db, 'claude_model_connections', getTableInfo(db, 'claude_model_connections').map(column => column.name), 'auth_type', "TEXT NOT NULL DEFAULT 'api_key'");
+    }
     db.exec(USER_PREFERENCES_TABLE_SCHEMA_SQL);
     db.exec(SESSION_DRAFTS_TABLE_SCHEMA_SQL);
     db.exec(SUPERSEDED_PROVIDER_SESSIONS_TABLE_SCHEMA_SQL);
@@ -528,6 +575,7 @@ export const runMigrations = (db: Database) => {
     addSessionModelColumn(db);
     addSessionEffortColumn(db);
     addForkedFromSessionIdColumn(db);
+    addSessionWorkspaceModeColumn(db);
     ensureProjectsForSessionPaths(db);
     db.exec(SCHEDULED_MESSAGES_TABLE_SCHEMA_SQL);
 

@@ -54,8 +54,8 @@ function ComposerModelMenu({
   const close = useCallback(() => setIsOpen(false), []);
   const { triggerRef, menuRef, anchor, updateAnchor } = useComposerMenuAnchor(isOpen, close);
 
-  // The model list starts collapsed every time the menu opens, the way Codex
-  // shows reasoning first and keeps the longer model list one click away.
+  // When reasoning controls exist, start with them and keep the longer model
+  // list one click away. Models remain directly visible without reasoning.
   useEffect(() => {
     if (!isOpen) {
       setIsModelSectionOpen(false);
@@ -73,7 +73,7 @@ function ComposerModelMenu({
     () => modelOptions.find((option) => option.value === model) ?? null,
     [model, modelOptions],
   );
-  const modelLabel = selectedModelOption?.label || model;
+  const modelLabel = selectedModelOption?.label || (model === 'hiroute' ? 'HiRoute' : model);
   const resolvedLabel = resolvedModel
     ? modelOptions.find((option) => option.value === resolvedModel)?.label
       || resolvedModel.replace(/^claude-(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(\[1m\])?$/i,
@@ -147,20 +147,23 @@ function ComposerModelMenu({
           {hasModelSection && (
             <>
               {hasEffortSection && <ComposerMenuSeparator />}
-              <ComposerMenuItem
-                role="menuitem"
-                label={modelLabel}
-                isSelected={false}
-                onSelect={() => setIsModelSectionOpen((current) => !current)}
-                trailing={
-                  isModelSectionOpen
-                    ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
-                    : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
-                }
-                className="text-muted-foreground"
-              />
+              {hasEffortSection && (
+                <ComposerMenuItem
+                  role="menuitem"
+                  label={modelLabel}
+                  isSelected={false}
+                  onSelect={() => setIsModelSectionOpen((current) => !current)}
+                  trailing={
+                    isModelSectionOpen
+                      ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+                      : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+                  }
+                  className="text-muted-foreground"
+                />
+              )}
 
-              {isModelSectionOpen && (
+              {/* Without reasoning controls, model choices are the menu's primary content. */}
+              {(!hasEffortSection || isModelSectionOpen) && (
                 <>
                   <ComposerMenuHeading>
                     <span className="flex items-center justify-between gap-2">
@@ -194,7 +197,7 @@ function ComposerModelMenu({
                     <ComposerMenuItem
                       key={option.value}
                       label={option.label || option.value}
-                      description={option.value.startsWith('claude-') ? option.value : undefined}
+                      description={option.description || (option.value.startsWith('claude-') ? option.value : undefined)}
                       isSelected={option.value === model}
                       onSelect={() => {
                         if (modelsLoading) return;

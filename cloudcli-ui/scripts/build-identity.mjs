@@ -6,12 +6,18 @@ import { fileURLToPath } from 'node:url';
 export function captureBuildIdentity() {
   const root = fileURLToPath(new URL('../', import.meta.url));
   const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
-  let commit = null;
-  let dirty = null;
-  try {
-    commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', windowsHide: true }).trim();
-    dirty = execFileSync('git', ['status', '--porcelain', '--untracked-files=normal', '--', ':/', ':(top,exclude)cloudcli-ui/shared/build-identity.json'], { cwd: root, encoding: 'utf8', windowsHide: true }).trim().length > 0;
-  } catch { /* Source archives have no verifiable Git identity. */ }
+  const sourceCommit = process.env.CHISA_SOURCE_COMMIT;
+  if (sourceCommit && !/^[0-9a-f]{40}$/.test(sourceCommit)) {
+    throw new Error('CHISA_SOURCE_COMMIT must be a complete source commit hash.');
+  }
+  let commit = sourceCommit || null;
+  let dirty = sourceCommit ? false : null;
+  if (!sourceCommit) {
+    try {
+      commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', windowsHide: true }).trim();
+      dirty = execFileSync('git', ['status', '--porcelain', '--untracked-files=normal', '--', ':/', ':(top,exclude)cloudcli-ui/shared/build-identity.json'], { cwd: root, encoding: 'utf8', windowsHide: true }).trim().length > 0;
+    } catch { /* Source archives have no verifiable Git identity. */ }
+  }
   return { version, commit, dirty, builtAt: new Date().toISOString() };
 }
 

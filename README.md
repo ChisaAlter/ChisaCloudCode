@@ -16,21 +16,21 @@
 ## 使用
 
 1. 按[服务端部署说明](deploy/server/README.md)准备自己的 VPS 服务，并配置所需的模型服务或 CLI 登录。
-2. 构建 Windows 客户端，填写自己的 **HTTPS 服务地址、用户名和密码** 登录。
+2. 从 [Releases](https://github.com/ChisaAlter/ChisaCloudCode/releases) 下载 Windows 客户端，或按下文自行构建；填写自己的 **HTTPS 服务地址、用户名和密码** 登录。
 3. 选择项目、关联本地目录，等待同步就绪后开始对话。
 
-项目处于 Beta 阶段；Windows 安装包未签名。仓库不提供公共服务器、账号或模型凭据，公开源码不代表已发布新版安装包。
+项目处于 Beta 阶段；Windows 安装包未签名。仓库不提供公共服务器、账号或模型凭据。正式发布的安装包、源码与校验清单位于 Releases；客户端和服务端应使用同一发布版本。
 
 ## 构建
 
 需要 Windows、Node.js 24、Go 1.27.1，以及 [MyGo](https://github.com/egoist/mygo) 的 Windows 构建依赖。
 
-先按 [`runtime-dependencies.json`](runtime-dependencies.json) 下载并校验 Mutagen 0.18.1 Windows amd64，将 `mutagen.exe` 和 `mutagen-agents.tar.gz` 放到仓库根目录。
+先从 Releases 下载 [`runtime-dependencies.json`](runtime-dependencies.json) 对应的定制 Mutagen **0.18.1-chisa.2** 并核对校验值，将 `mutagen.exe` 和 `mutagen-agents.tar.gz` 放到仓库根目录；也可按[同步引擎构建说明](ops/mutagen/README.md)从公开补丁重建。该运行时提供应用需要的忽略规则更新能力，不能用上游原版替代。
 
 ```powershell
 npm ci --prefix cloudcli-ui
 npm ci --prefix app
-npm run build:server --prefix cloudcli-ui  # VPS 服务端
+npm run build --prefix cloudcli-ui       # Web 前端与服务端
 npm run build --prefix app               # Windows 客户端与安装包
 ```
 

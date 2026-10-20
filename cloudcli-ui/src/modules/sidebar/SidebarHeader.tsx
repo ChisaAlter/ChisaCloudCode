@@ -1,6 +1,8 @@
-import { Activity, Archive, Folder, FolderPlus, MessageSquare, PanelLeftClose, Plus, RefreshCw, Search, X } from 'lucide-react';
+import { useEffect } from 'react';
+import { Activity, Archive, Folder, FolderPlus, MessageSquare, PanelLeftClose, Plus, RefreshCw, Search, SquarePen, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
+import { isDesktop } from '@/shared/chisa';
 import { Input } from '@/shared/ui';
 import { cn } from '@/shared/utils';
 import type { SidebarSearchMode } from '@/shared/types';
@@ -33,7 +35,23 @@ export default function SidebarHeader({
   onSearchFilterChange, onClearSearchFilter, searchMode, onSearchModeChange,
   onRefresh, isRefreshing, onCreateProject, onNewSession, onCollapseSidebar, t,
 }: SidebarHeaderProps) {
-  const showSearchTools = (projectsCount > 0 || runningSessionsCount > 0 || archivedSessionsCount > 0 || isArchivedSessionsLoading) && !isLoading;
+  const desktop = isDesktop() && !isMobile;
+  const compose = onNewSession ?? onCreateProject;
+  const shortcut = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘⌥N' : 'Ctrl Alt N';
+  // Keep the displayed desktop shortcut attached to the same real action as the button.
+  useEffect(() => {
+    if (!desktop) return;
+    const handleComposeShortcut = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.altKey && !event.shiftKey && event.code === 'KeyN' && !event.repeat) {
+        if (document.querySelector('[role="dialog"], [aria-modal="true"]')) return;
+        event.preventDefault();
+        compose();
+      }
+    };
+    window.addEventListener('keydown', handleComposeShortcut);
+    return () => window.removeEventListener('keydown', handleComposeShortcut);
+  }, [desktop, compose]);
+  const showSearchTools = desktop || ((projectsCount > 0 || runningSessionsCount > 0 || archivedSessionsCount > 0 || isArchivedSessionsLoading) && !isLoading);
   const searchPlaceholder = searchMode === 'conversations'
     ? t('search.conversationsPlaceholder')
     : searchMode === 'archived'
@@ -51,10 +69,11 @@ export default function SidebarHeader({
         </button>
       </div>
 
-      <div className="space-y-1 px-3 pb-3">
-        <button type="button" onClick={onNewSession ?? onCreateProject} className="sidebar-new-chat flex h-10 w-full items-center gap-3 rounded-lg px-3 text-sm font-medium">
-          <Plus className="h-4 w-4" />
-          {onNewSession ? t('sessions.newSession') : t('tooltips.createProject')}
+      <div className="sidebar-primary-actions space-y-1 px-3 pb-3">
+        <button type="button" onClick={compose} aria-keyshortcuts={desktop ? 'Control+Alt+N Meta+Alt+N' : undefined} className="sidebar-new-chat flex h-10 w-full items-center gap-3 rounded-lg px-3 text-sm font-medium">
+          {desktop ? <SquarePen className="h-4 w-4 shrink-0" /> : <Plus className="h-4 w-4" />}
+          <span className="min-w-0 truncate">{onNewSession ? t('sessions.newSession') : t('tooltips.createProject')}</span>
+          {desktop && <kbd className="sidebar-compose-shortcut" aria-hidden="true">{shortcut}</kbd>}
         </button>
 
         {showSearchTools && (
@@ -80,7 +99,7 @@ export default function SidebarHeader({
         )}
       </div>
 
-      <div className="flex items-center gap-1 px-5 pb-2 pt-2">
+      <div className="sidebar-section-heading flex items-center gap-1 px-5 pb-2 pt-2">
         <span className="min-w-0 flex-1 truncate text-xs font-medium text-muted-foreground">
           {searchMode === 'conversations' ? t('recent.title', 'Recent conversations') : searchMode === 'archived' ? t('search.archiveOnlyTooltip', 'Archive') : searchMode === 'running' ? t('search.runningTooltip', 'Running sessions') : t('search.modeProjects')}
         </span>

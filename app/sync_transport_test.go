@@ -53,7 +53,7 @@ func TestMutagenTransportAlreadyCurrentDoesNotRestartActiveTask(t *testing.T) {
 		t.Fatal(err)
 	}
 	marker := filepath.Join(dataDir(), "mutagen-ssh-transport")
-	if err := os.WriteFile(marker, []byte(sshPath+"\n"), 0600); err != nil {
+	if err := os.WriteFile(marker, []byte(workspaceSyncEngineVersion+"\n"+norm(sshPath)+"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	oldTime := time.Unix(1_700_000_000, 0)
@@ -114,8 +114,8 @@ func TestMutagenTransportFreshAndStaleDaemonReady(t *testing.T) {
 				t.Fatal(err)
 			}
 			marker, err := os.ReadFile(filepath.Join(dataDir(), "mutagen-ssh-transport"))
-			if err != nil || strings.TrimSpace(string(marker)) != sshPath {
-				t.Fatal("ready daemon did not record its app-scoped SSH transport", err)
+			if err != nil || strings.TrimSpace(string(marker)) != workspaceSyncEngineVersion+"\n"+norm(sshPath) {
+				t.Fatal("ready daemon did not record its tagged engine and app-scoped SSH transport", err)
 			}
 			// A second CLI cannot hide premature readiness by auto-starting a daemon.
 			t.Setenv("MUTAGEN_DISABLE_AUTOSTART", "1")
@@ -123,6 +123,41 @@ func TestMutagenTransportFreshAndStaleDaemonReady(t *testing.T) {
 				t.Fatal("transport returned before the daemon served requests", err)
 			}
 		})
+	}
+}
+
+func TestMutagenTransportLegacyIdentityWaitsForActiveTask(t *testing.T) {
+	connection := accountWorkspaceFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("transport check used HTTP") })
+	sshPath, err := mutagenSSHPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dataDir(), "mutagen-ssh-transport")
+	if err := os.WriteFile(marker, []byte(sshPath+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cloudReservations.Store("legacy-engine-qa", "server-run")
+	t.Cleanup(func() { cloudReservations.Delete("legacy-engine-qa") })
+	if err := prepareMutagenTransport(context.Background(), connection); err == nil || !strings.Contains(err.Error(), "任务") {
+		t.Fatalf("a same-path legacy engine skipped the active-task upgrade gate: %v", err)
+	}
+	if value, err := os.ReadFile(marker); err != nil || strings.TrimSpace(string(value)) != sshPath {
+		t.Fatal("blocked engine upgrade rewrote its legacy identity", err)
+	}
+}
+
+func TestMutagenTransportRejectsUntaggedRuntime(t *testing.T) {
+	connection := accountWorkspaceFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("transport check used HTTP") })
+	calls := privateConnectionTool(t, "[]")
+	t.Setenv("CHISA_CONNECTION_TEST_VERSION", "0.18.1")
+	if err := prepareMutagenTransport(context.Background(), connection); err == nil || !strings.Contains(err.Error(), workspaceSyncEngineVersion) {
+		t.Fatalf("untagged runtime was activated as a patched engine: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir(), "mutagen-ssh-transport")); !os.IsNotExist(err) {
+		t.Fatal("untagged runtime recorded readiness", err)
+	}
+	if raw, err := os.ReadFile(calls); err != nil || strings.Contains(string(raw), `"daemon"`) || strings.Contains(string(raw), `"list"`) {
+		t.Fatal("wrong-version rejection started or stopped a daemon", err)
 	}
 }
 

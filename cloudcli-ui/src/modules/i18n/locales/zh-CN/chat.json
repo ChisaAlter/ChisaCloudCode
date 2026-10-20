@@ -1,4 +1,14 @@
 {
+  "starter": {
+    "label": "从这里开始",
+    "projectContext": "当前项目 · {{project}}",
+    "explore": "了解这个项目",
+    "explorePrompt": "请先了解这个项目，介绍它的代码结构、主要入口和运行方式。",
+    "build": "开发一个功能",
+    "buildPrompt": "我想为这个项目开发一个新功能。请先了解现有代码，再和我确认具体需求。",
+    "fix": "排查一个问题",
+    "fixPrompt": "帮我排查这个项目中的一个问题。请先询问实际表现和复现步骤，再着手修改。"
+  },
   "codeBlock": {
     "copy": "复制",
     "copied": "已复制",
@@ -156,7 +166,9 @@
     "manageModels": "管理模型",
     "noModelsFound": "未找到模型。",
     "loadingModels": "正在加载模型…",
-    "clickToChange": "点击切换模型"
+    "clickToChange": "点击切换模型",
+    "welcomeTitle": "今天想完成什么？",
+    "welcomeDescription": "描述你的任务，或选择模型后开始对话。"
   },
   "session": {
     "continue": {

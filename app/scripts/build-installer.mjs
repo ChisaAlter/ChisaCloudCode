@@ -48,9 +48,11 @@ function collect(directory, prefix = '') {
 collect(stage);
 files.sort();
 const preflight = path.join(work, 'preflight.nsh');
+const uninstallPreflight = path.join(work, 'uninstall-preflight.nsh');
 const payload = path.join(work, 'payload.nsh');
 const uninstall = path.join(work, 'uninstall.nsh');
 writeFileSync(preflight, files.map(file => `StrCpy $CheckedPath "$INSTDIR\\${escape(file)}"\nCall RequireWritableFile`).join('\n'));
+writeFileSync(uninstallPreflight, files.map(file => `StrCpy $CheckedPath "$INSTDIR\\${escape(file)}"\nCall un.RequireWritableFile`).join('\n'));
 writeFileSync(payload, files.map(file => {
   const directory = path.dirname(file);
   return `SetOutPath "$INSTDIR${directory === '.' ? '' : `\\${escape(directory)}`}"\nIfErrors install_failed\nFile ${quote(path.join(stage, file))}\nIfErrors install_failed`;
@@ -63,13 +65,14 @@ for (const file of files) {
 }
 const directoryRemoval = [...directories].sort((a, b) => b.split(path.sep).length - a.split(path.sep).length || a.localeCompare(b));
 writeFileSync(uninstall, [
-  ...files.map(file => `Delete "$INSTDIR\\${escape(file)}"`),
+  ...files.map(file => `IfFileExists "$INSTDIR\\${escape(file)}" 0 +3\nDelete "$INSTDIR\\${escape(file)}"\nIfErrors uninstall_failed`),
   ...directoryRemoval.map(directory => `RMDir "$INSTDIR\\${escape(directory)}"`),
 ].join('\n'));
 const result = spawnSync(compiler, [
   '/V2', '/INPUTCHARSET', 'UTF8', `/DPRODUCT_NAME=${name}`, `/DPRODUCT_ID=${identifier}`, `/DPRODUCT_VERSION=${version}`,
   `/DINSTALLER_OUTPUT=${temporaryOutput}`, `/DINSTALLER_ICON=${path.join(app, 'installer', 'icon.ico')}`,
-  `/DPREFLIGHT_INCLUDE=${preflight}`, `/DPAYLOAD_INCLUDE=${payload}`, `/DUNINSTALL_INCLUDE=${uninstall}`, path.join(app, 'installer', 'windows.nsi'),
+  `/DPREFLIGHT_INCLUDE=${preflight}`, `/DUNINSTALL_PREFLIGHT_INCLUDE=${uninstallPreflight}`,
+  `/DPAYLOAD_INCLUDE=${payload}`, `/DUNINSTALL_INCLUDE=${uninstall}`, path.join(app, 'installer', 'windows.nsi'),
 ], { stdio: 'inherit', windowsHide: true });
 if (result.error || result.status !== 0) throw result.error || new Error(`NSIS exited ${result.status}`);
 renameSync(temporaryOutput, output);

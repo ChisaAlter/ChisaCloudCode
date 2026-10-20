@@ -19,6 +19,7 @@ type ChangesViewProps = {
   onWrapTextChange: (wrapText: boolean) => void;
   onCreateInitialCommit: () => Promise<boolean>;
   onOpenFile: (filePath: string) => Promise<void>;
+  onLoadDiff: (filePath: string, signal?: AbortSignal) => Promise<void>;
   onDiscardFile: (filePath: string) => Promise<void>;
   onDeleteFile: (filePath: string) => Promise<void>;
   onStageFiles: (files: string[]) => Promise<boolean>;
@@ -40,6 +41,7 @@ export default function ChangesView({
   onWrapTextChange,
   onCreateInitialCommit,
   onOpenFile,
+  onLoadDiff,
   onDiscardFile,
   onDeleteFile,
   onStageFiles,
@@ -85,6 +87,12 @@ export default function ChangesView({
     // re-runs when the queue drains, syncing to the final refreshed status.
     setSelectedFiles(new Set(gitStatus.staged ?? []));
   }, [gitStatus, pendingStageOps]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    expandedFiles.forEach(filePath => { void onLoadDiff(filePath, controller.signal); });
+    return () => controller.abort();
+  }, [expandedFiles, gitStatus, onLoadDiff]);
 
   useEffect(() => {
     onExpandedFilesChange(hasExpandedFiles);

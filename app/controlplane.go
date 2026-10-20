@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"time"
@@ -19,6 +20,8 @@ func StartControlPlane(addr string) error {
 	if err != nil {
 		return err
 	}
+	controlPort = listener.Addr().(*net.TCPAddr).Port
+	log.Printf("[app-start] control_port=%d", controlPort)
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {

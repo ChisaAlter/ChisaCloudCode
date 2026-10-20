@@ -144,6 +144,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- normally. Informational only: a fork is a fully independent provider
     -- session, and deleting the source does not affect it.
     forked_from_session_id TEXT,
+    -- Durable execution intent. Existing and new sessions default to isolated
+    -- VPS worktrees; shared is an explicit opt-in for shared synchronization.
+    workspace_mode TEXT NOT NULL DEFAULT 'isolated',
     isArchived BOOLEAN DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -301,6 +304,29 @@ CREATE INDEX IF NOT EXISTS idx_provider_models_provider_order
 ON provider_models(provider, sort_order, id);
 
 ${USER_PREFERENCES_TABLE_SCHEMA_SQL}
+
+-- Server-private routing configuration is not exposed through preference/credential CRUD.
+CREATE TABLE IF NOT EXISTS hiroute_connections (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  connection_json TEXT NOT NULL
+);
+
+-- Custom Anthropic Messages endpoints and their active selection are isolated per user.
+CREATE TABLE IF NOT EXISTS claude_model_connections (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  model TEXT NOT NULL,
+  api_key TEXT NOT NULL,
+  auth_type TEXT NOT NULL DEFAULT 'api_key' CHECK (auth_type IN ('api_key', 'auth_token')),
+  PRIMARY KEY (user_id, id)
+);
+CREATE TABLE IF NOT EXISTS claude_active_connections (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  connection_id TEXT NOT NULL,
+  FOREIGN KEY (user_id, connection_id) REFERENCES claude_model_connections(user_id, id) ON DELETE CASCADE
+);
 
 ${SESSION_DRAFTS_TABLE_SCHEMA_SQL}
 

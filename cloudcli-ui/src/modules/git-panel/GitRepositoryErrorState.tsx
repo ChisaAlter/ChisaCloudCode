@@ -1,4 +1,4 @@
-import { GitBranch, Loader2 } from 'lucide-react';
+import { GitBranch, Loader2, RefreshCw } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 type GitRepositoryErrorStateProps = {
@@ -10,9 +10,14 @@ type GitRepositoryErrorStateProps = {
   /** Failure from the last `git init` attempt, shown below the action. */
   initError?: string | null;
   onInitRepository?: () => void;
+  /** Retries the failed repository or history read. */
+  onRetry?: () => void;
 };
 
-/** Rendered by GitPanel when the git status request fails, including the missing-repository case that offers `git init`. */
+/** Matches the server's WORKSPACE_UNAVAILABLE text and its connection-level variants. */
+const WORKSPACE_UNAVAILABLE = /workspace (?:connection|binding) unavailable|workspace_unavailable|ECONNREFUSED|工作区(?:未绑定|连接不可用)/i;
+
+/** Rendered by GitPanel and HistoryView for failed reads, with optional repository initialization. */
 export default function GitRepositoryErrorState({
   error,
   details,
@@ -20,9 +25,14 @@ export default function GitRepositoryErrorState({
   isInitializingRepository = false,
   initError,
   onInitRepository,
+  onRetry,
 }: GitRepositoryErrorStateProps) {
   const { t } = useTranslation();
   const showInitAction = canInitRepository && Boolean(onInitRepository);
+  // A workspace that is not connected to this desktop hides every repository
+  // operation behind a transport error; say what is wrong instead of echoing
+  // "Workspace connection unavailable" as the only thing on screen.
+  const workspaceUnavailable = !showInitAction && WORKSPACE_UNAVAILABLE.test(`${error} ${details ?? ''}`);
 
   return (
     <div className="flex flex-1 flex-col items-center justify-center px-6 py-12 text-muted-foreground">
@@ -58,11 +68,43 @@ export default function GitRepositoryErrorState({
             </p>
           )}
         </>
+      ) : workspaceUnavailable ? (
+        <>
+          <h3 className="mb-3 text-center text-lg font-medium text-foreground">工作区未连接到这台电脑</h3>
+          <p className="mb-6 max-w-md text-center text-sm leading-relaxed">
+            源代码管理要通过本机工作区通道读取仓库。请确认账号服务在线、该项目已绑定本地目录，然后重试。
+          </p>
+          {onRetry && (
+            <button
+              onClick={onRetry}
+              className="flex items-center gap-2 rounded-md border border-border px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent"
+            >
+              <RefreshCw className="h-4 w-4" />
+              重试
+            </button>
+          )}
+          <details className="mt-6 max-w-md text-center">
+            <summary className="cursor-pointer text-xs text-muted-foreground">技术详情</summary>
+            <p className="mt-2 break-words text-xs text-muted-foreground">
+              {error}
+              {details ? ` · ${details}` : ''}
+            </p>
+          </details>
+        </>
       ) : (
         <>
           <h3 className="mb-3 text-center text-lg font-medium text-foreground">{error}</h3>
           {details && (
             <p className="max-w-md text-center text-sm leading-relaxed">{details}</p>
+          )}
+          {onRetry && (
+            <button
+              onClick={onRetry}
+              className="mt-4 flex items-center gap-2 rounded-md border border-border px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent"
+            >
+              <RefreshCw className="h-4 w-4" />
+              {t('common:buttons.retry')}
+            </button>
           )}
         </>
       )}

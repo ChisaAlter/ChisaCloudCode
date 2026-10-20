@@ -1,4 +1,14 @@
 {
+  "starter": {
+    "label": "Ideas to get started",
+    "projectContext": "Working in {{project}}",
+    "explore": "Explore this project",
+    "explorePrompt": "Explore this project and explain its structure, main entry points, and how to run it.",
+    "build": "Build something",
+    "buildPrompt": "Help me implement a new feature in this project. First understand the existing code, then ask me what I want to build.",
+    "fix": "Find and fix a bug",
+    "fixPrompt": "Help me investigate a bug in this project. Ask me about the observed behavior and reproduction steps before making changes."
+  },
   "codeBlock": {
     "copy": "Copy",
     "copied": "Copied",
@@ -185,7 +195,9 @@
     "manageModels": "Manage models",
     "noModelsFound": "No models found.",
     "loadingModels": "Loading models…",
-    "clickToChange": "Click to change model"
+    "clickToChange": "Click to change model",
+    "welcomeTitle": "What would you like to build?",
+    "welcomeDescription": "Describe your task below, or choose a model to start a conversation."
   },
   "session": {
     "continue": {

@@ -85,6 +85,38 @@ func TestSyncMonitorVersionsAndOperations(t *testing.T) {
 	}
 }
 
+func TestSyncConnectionSnapshotsAdvanceObservationSequence(t *testing.T) {
+	m, session, _ := isolateSyncObserver(t)
+	syncMonitor.Lock()
+	syncMonitor.sessions = []syncSession{session}
+	syncMonitor.Unlock()
+	ready := observedProjectSync(m.ServerPath)
+	serverConnectionMu.Lock()
+	previousConnection := apiConnection
+	apiConnection = nil
+	serverConnectionMu.Unlock()
+	t.Cleanup(func() {
+		serverConnectionMu.Lock()
+		apiConnection = previousConnection
+		serverConnectionMu.Unlock()
+	})
+	disconnected := (FrontendBridge{}).GetProjectSync(m.ServerPath)
+	if disconnected.Sequence <= ready.Sequence || disconnected.Status != "disconnected" || disconnected.BindingEpoch != m.BindingEpoch {
+		t.Fatal("connection loss did not supersede the ready observation", disconnected)
+	}
+	repeated := observedProjectSync(m.ServerPath, SyncInfo{Status: "disconnected", Detail: disconnected.Detail})
+	if repeated.Sequence != disconnected.Sequence {
+		t.Fatal("unchanged disconnected snapshot changed version", repeated)
+	}
+	recovery := observedProjectSync(m.ServerPath, SyncInfo{Status: "blocked", Detail: "工作区正在恢复交还，请先完成恢复再同步"})
+	if recovery.Sequence <= disconnected.Sequence || recovery.Status != "blocked" {
+		t.Fatal("recovery snapshot did not supersede disconnection", recovery)
+	}
+	if restored := observedProjectSync(m.ServerPath); restored.Sequence <= recovery.Sequence || restored.Status != "ready" {
+		t.Fatal("restored observation did not supersede recovery", restored)
+	}
+}
+
 func TestSyncMonitorFrameAndFailure(t *testing.T) {
 	m, session, process := isolateSyncObserver(t)
 	padding := syncSession{Name: strings.Repeat("x", 80*1024)}

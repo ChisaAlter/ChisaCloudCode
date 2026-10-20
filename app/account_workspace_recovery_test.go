@@ -42,7 +42,7 @@ func TestAccountWorkspaceNormalSetupAttemptsDurableHandback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dataDir(), "mutagen-ssh-transport"), []byte(sshPath+"\n"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dataDir(), "mutagen-ssh-transport"), []byte(workspaceSyncEngineVersion+"\n"+norm(sshPath)+"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	previousTunnel := tunnel
@@ -68,6 +68,16 @@ func TestAccountWorkspaceNormalSetupAttemptsDurableHandback(t *testing.T) {
 		}
 		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
 	})
+	// The existing native readiness probe uses the default transport. Observe
+	// that probe here instead of depending on an installed app's fixed port.
+	previousDefaultTransport := http.DefaultTransport
+	http.DefaultTransport = reviewRoundTrip(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host != "127.0.0.1:18791" || request.URL.Path != "/api/auth/status" {
+			t.Fatal("unexpected native readiness request", request.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = previousDefaultTransport })
 	previousLease, previousPause, previousSync := remoteLeaseContext, pauseProjectSync, synchronizeProjectContext
 	t.Cleanup(func() {
 		remoteLeaseContext, pauseProjectSync, synchronizeProjectContext = previousLease, previousPause, previousSync

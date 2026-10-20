@@ -24,7 +24,8 @@
     "git": "Source Control",
     "tasks": "Tasks",
     "browser": "Browser",
-    "computer": "Computer"
+    "computer": "Computer",
+    "tools": "Tools"
   },
   "status": {
     "loading": "Loading...",
@@ -95,7 +96,9 @@
     "createProjectDesktop": "Create a new project by clicking the folder icon in the sidebar",
     "newSession": "New Session",
     "untitledSession": "Untitled Session",
-    "projectFiles": "Project Files"
+    "projectFiles": "Project Files",
+    "createProjectAction": "Add project",
+    "browseProjectsAction": "Browse conversations and projects"
   },
   "fileTree": {
     "loading": "Loading files...",
@@ -334,6 +337,7 @@
     "useThisFolder": "Use this folder"
   },
   "misc": {
+    "projectsLoadFailed": "Could not load projects and sessions. Check your connection and retry.",
     "appErrorTitle": "The interface could not continue",
     "appErrorDescription": "An interface error occurred. In the desktop app, diagnostic details are recorded in the local app.log. Reloading only restores the interface; it does not resend your message.",
     "reloadInterface": "Reload interface",

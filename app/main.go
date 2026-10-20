@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -35,12 +34,24 @@ func b64encode(s string) string {
 }
 
 func dataDir() string {
+	if dir := os.Getenv("CHISA_DATA_DIR"); dir != "" {
+		return filepath.Clean(dir)
+	}
 	base, err := os.UserConfigDir()
 	if err != nil {
 		wd, _ := os.Getwd()
 		return filepath.Join(wd, ".data")
 	}
-	return filepath.Join(base, "ChisaCloudCode")
+	name := "ChisaCloudCode"
+	if os.Getenv("MYGO_ENV") == "development" {
+		name += " Dev"
+		// One profile per launcher session also keeps overlapping Go hot reloads
+		// away from production data and unrelated development windows.
+		if session := os.Getenv("CHISA_DEV_SESSION"); session != "" {
+			return filepath.Join(base, name, "sessions", filepath.Base(session))
+		}
+	}
+	return filepath.Join(base, name)
 }
 
 func migrateBridgeKey(toDir string) string {
@@ -113,7 +124,9 @@ func prepareLocalProjectForConnection(connection *serverConnection, localPath st
 	if foreign {
 		return map[string]any{"ok": false, "error": errWorkspaceMappingsConflict.Error(), "action": "manage-mappings", "localPath": localPath}
 	}
-	if err := waitAccountWorkspace(connection, false); err != nil {
+	// A user opening a folder retries a completed enrollment failure, while
+	// concurrent opens share setup and successful setup remains reusable.
+	if err := waitAccountWorkspaceWithPolicy(connection, accountWorkspaceRetryFailure); err != nil {
 		result := map[string]any{"ok": false, "error": err.Error()}
 		serverConnectionMu.RLock()
 		if err == errWorkspaceMappingsConflict && len(inactiveWorkspaceMappingsLocked()) > 0 {
@@ -127,7 +140,7 @@ func prepareLocalProjectForConnection(connection *serverConnection, localPath st
 		return map[string]any{"ok": false, "error": err.Error()}
 	}
 	defer cancel()
-	ctx, timeout := context.WithTimeout(ctx, workspaceSyncTimeout)
+	ctx, timeout := context.WithTimeout(ctx, workspaceSynchronizationTimeout(store.findMappingByLocal(localPath)))
 	defer timeout()
 	snapshot := ctx.Value(workspaceSyncConnectionKey{}).(*workspaceSyncConnection)
 	fi, err := os.Stat(localPath)
@@ -150,10 +163,7 @@ func prepareLocalProjectForConnection(connection *serverConnection, localPath st
 	name := sanitizeName(base)
 	wsID := randHex(3)
 	cfg := snapshot.cfg
-	port := "8791"
-	if u, err := url.Parse(cfg.ServerURL); err == nil && u.Port() != "" {
-		port = u.Port()
-	}
+	port := workspaceAPIPort(cfg)
 	if number, err := strconv.Atoi(port); err != nil || number < 1 || number > 65535 {
 		return map[string]any{"ok": false, "error": "服务器端口无效"}
 	}
@@ -285,6 +295,14 @@ func configureAppLogging(dir string) error {
 	return debug.SetCrashOutput(f, debug.CrashOptions{})
 }
 
+func logShutdownStage(stage string, action func() error) error {
+	started := time.Now()
+	log.Printf("[app-shutdown] stage=%s event=begin", stage)
+	err := action()
+	log.Printf("[app-shutdown] stage=%s event=end elapsed=%s error_type=%T", stage, time.Since(started), err)
+	return err
+}
+
 func main() {
 	mygo.Bind(FrontendBridge{})
 	if os.Getenv("MYGO_GENERATE") != "" {
@@ -298,6 +316,16 @@ func main() {
 	}
 
 	dataD := dataDir()
+	if os.Getenv("MYGO_ENV") == "development" || os.Getenv("CHISA_DATA_DIR") != "" {
+		mygo.App.SetPath(mygo.PathUserData, dataD)
+		// MyGo's Windows backend builds its WebView2 directory from the app
+		// name instead of PathUserData. Override it before environment creation.
+		if os.Getenv("WEBVIEW2_USER_DATA_FOLDER") == "" {
+			if err := os.Setenv("WEBVIEW2_USER_DATA_FOLDER", filepath.Join(dataD, "WebView2")); err != nil {
+				log.Fatal(err)
+			}
+		}
+	}
 	keyPath := migrateBridgeKey(filepath.Join(dataD, "bridge-key"))
 	store = loadStore(dataDir())
 	cfg := store.config()
@@ -316,7 +344,7 @@ func main() {
 		log.Fatal("账号连接端口被占用: ", err)
 	}
 
-	if err := StartControlPlane(fmt.Sprintf("127.0.0.1:%d", controlPort)); err != nil {
+	if err := StartControlPlane("127.0.0.1:0"); err != nil {
 		log.Fatal("控制面端口被占用: ", err)
 	}
 
@@ -336,7 +364,10 @@ func main() {
 		})
 		win = w
 		w.OnClose(func(*mygo.CloseEvent) { log.Println("[window-close-requested]") })
-		w.OnClosed(func() { log.Println("[window-closed]") })
+		w.OnClosed(func() {
+			closeFrontendServerRequests()
+			log.Println("[window-closed]")
+		})
 		w.OnRenderProcessGone(func(reason string) {
 			log.Printf("[webview-renderer-error] reason=%q", errorLogField(reason, 64))
 		})
@@ -348,14 +379,23 @@ func main() {
 	err := mygo.App.Run()
 	log.Printf("[app-loop-return] error=%v", err)
 	if err != nil {
-		stopSyncMonitor(true)
+		_ = logShutdownStage("sync-monitor", func() error {
+			stopSyncMonitor(true)
+			return nil
+		})
 		log.Fatal(err)
 	}
-	stopSyncMonitor(true)
-	if err := stopAllPi(); err != nil {
+	_ = logShutdownStage("sync-monitor", func() error {
+		stopSyncMonitor(true)
+		return nil
+	})
+	if err := logShutdownStage("pi", stopAllPi); err != nil {
 		log.Println("[pi] cleanup:", err)
 	}
-	tunnel.stop()
-	_ = stopProjectPreviews("")
+	_ = logShutdownStage("tunnel", func() error {
+		tunnel.stop()
+		return nil
+	})
+	_ = logShutdownStage("previews", func() error { return stopProjectPreviews("") })
 	log.Println("[app-cleanup-complete]")
 }

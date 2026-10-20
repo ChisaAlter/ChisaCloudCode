@@ -303,7 +303,7 @@ func (FrontendBridge) OpenPreview(id string) map[string]any {
 		item = previews.items[id]
 		previews.Unlock()
 	}
-	status := previewRPC(m, map[string]any{"op": "preview_status", "previewId": id})
+	status := previewRPCContext(ctx, m, map[string]any{"op": "preview_status", "previewId": id})
 	if ready, _ := status["ready"].(bool); !ready {
 		return map[string]any{"ok": false, "error": "预览尚未监听端口，请检查启动日志"}
 	}

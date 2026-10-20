@@ -48,6 +48,29 @@ var store *Store
 
 func norm(p string) string { return strings.ReplaceAll(strings.ToLower(filepath.Clean(p)), "/", "\\") }
 
+// Bindings identify physical directories, including junction and short-name
+// aliases. Keep the lexical check for temporarily unavailable saved paths.
+func sameLocalDirectory(a, b string) bool {
+	if norm(a) == norm(b) {
+		return true
+	}
+	ai, ae := os.Stat(a)
+	bi, be := os.Stat(b)
+	return ae == nil && be == nil && ai.IsDir() && bi.IsDir() && os.SameFile(ai, bi)
+}
+
+// Managed workspaces reach the plain HTTP API through the container host;
+// ServerURL is their public HTTPS endpoint and can use a different port.
+// Manual connections retain their configured instance port.
+func workspaceAPIPort(cfg Config) string {
+	if cfg.WorkspaceAccount == "" {
+		if u, err := url.Parse(cfg.ServerURL); err == nil && u.Port() != "" {
+			return u.Port()
+		}
+	}
+	return "8791"
+}
+
 // A workspace belongs to one SSH account and CloudCLI instance, not just a path.
 func serverIdentity(cfg Config) string {
 	if cfg.WorkspaceAccount != "" {
@@ -56,11 +79,7 @@ func serverIdentity(cfg Config) string {
 		owner := strings.Join([]string{cfg.WorkspaceLoginURL, cfg.ServerURL, cfg.WorkspaceAccount, cfg.WorkspaceRoot}, "\n")
 		return fmt.Sprintf("account:%x", sha256.Sum256([]byte(owner)))
 	}
-	port := "8791"
-	if u, err := url.Parse(cfg.ServerURL); err == nil && u.Port() != "" {
-		port = u.Port()
-	}
-	identity := strings.ToLower(cfg.SSHHost) + ":" + port + "/" + cfg.SSHUser
+	identity := strings.ToLower(cfg.SSHHost) + ":" + workspaceAPIPort(cfg) + "/" + cfg.SSHUser
 	if cfg.SSHPort != 0 && cfg.SSHPort != 22 {
 		identity += fmt.Sprintf("/ssh:%d", cfg.SSHPort)
 	}
@@ -157,7 +176,7 @@ func (s *Store) flushLocked() error {
 }
 func (s *Store) findMappingByLocal(local string) *Mapping {
 	for _, m := range s.mappings() {
-		if norm(m.LocalPath) == norm(local) {
+		if sameLocalDirectory(m.LocalPath, local) {
 			return m
 		}
 	}
@@ -176,8 +195,11 @@ func (s *Store) addMapping(m *Mapping) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, existing := range s.Mappings {
-		if norm(existing.LocalPath) == norm(m.LocalPath) {
-			return nil
+		if sameLocalDirectory(existing.LocalPath, m.LocalPath) {
+			if *existing == *m {
+				return nil
+			}
+			return fmt.Errorf("本地目录已绑定另一项目，请使用现有绑定或先移除原绑定")
 		}
 		if existing.ServerPath == m.ServerPath {
 			return fmt.Errorf("服务器项目路径已被另一条本机映射使用")

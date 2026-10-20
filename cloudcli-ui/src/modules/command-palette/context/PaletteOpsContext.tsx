@@ -7,6 +7,8 @@ export type PaletteOps = {
   // (used by in-chat file links so they behave like the inline edit view).
   openFileInEditor: (path: string) => void;
   openSettings: (tab?: string) => void;
+  // Opens the sidebar-owned project creation flow from workspace welcome actions.
+  createProject: () => void;
   refreshProjects: () => Promise<void> | void;
 };
 
@@ -18,6 +20,7 @@ const defaultOps: PaletteOps = {
   openFile: () => undefined,
   openFileInEditor: () => undefined,
   openSettings: () => undefined,
+  createProject: () => undefined,
   refreshProjects: () => undefined,
 };
 
@@ -36,6 +39,7 @@ export function usePaletteOps(): PaletteOps {
         (ref?.current.openFileInEditor ?? defaultOps.openFileInEditor)(path),
       openSettings: (tab) => (ref?.current.openSettings ?? defaultOps.openSettings)(tab),
       refreshProjects: () => (ref?.current.refreshProjects ?? defaultOps.refreshProjects)(),
+      createProject: () => (ref?.current.createProject ?? defaultOps.createProject)(),
     }),
     [ref],
   );
@@ -43,7 +47,7 @@ export function usePaletteOps(): PaletteOps {
 
 export function usePaletteOpsRegister(partial: Partial<PaletteOps>) {
   const ref = useContext(PaletteOpsContext);
-  const { openFile, openFileInEditor, openSettings, refreshProjects } = partial;
+  const { openFile, openFileInEditor, openSettings, refreshProjects, createProject } = partial;
 
   useEffect(() => {
     if (!ref) return undefined;
@@ -56,11 +60,13 @@ export function usePaletteOpsRegister(partial: Partial<PaletteOps>) {
     if (openFileInEditor) registry.openFileInEditor = openFileInEditor;
     if (openSettings) registry.openSettings = openSettings;
     if (refreshProjects) registry.refreshProjects = refreshProjects;
+    if (createProject) registry.createProject = createProject;
     return () => {
       if (openFile && registry.openFile === openFile) registry.openFile = prev.openFile;
       if (openFileInEditor && registry.openFileInEditor === openFileInEditor) registry.openFileInEditor = prev.openFileInEditor;
       if (openSettings && registry.openSettings === openSettings) registry.openSettings = prev.openSettings;
       if (refreshProjects && registry.refreshProjects === refreshProjects) registry.refreshProjects = prev.refreshProjects;
+      if (createProject && registry.createProject === createProject) registry.createProject = prev.createProject;
     };
-  }, [ref, openFile, openFileInEditor, openSettings, refreshProjects]);
+  }, [ref, openFile, openFileInEditor, openSettings, refreshProjects, createProject]);
 }

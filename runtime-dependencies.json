@@ -1,21 +1,24 @@
 {
-  "version": "0.18.1",
+  "version": "0.18.1-chisa.2",
   "upstream": "https://github.com/mutagen-io/mutagen",
-  "archiveUrl": "https://github.com/mutagen-io/mutagen/releases/download/v0.18.1/mutagen_windows_amd64_v0.18.1.zip",
-  "requiredFiles": [
-    "mutagen.exe",
-    "mutagen-agents.tar.gz"
-  ],
+  "sourceModule": "github.com/mutagen-io/mutagen",
+  "sourceVersion": "v0.18.1",
+  "patchDirectory": "ops/mutagen",
+  "buildCommand": "ops/mutagen/build.ps1",
+  "releaseAsset": "mutagen-0.18.1-chisa.2-windows-amd64-linux-amd64.zip",
+  "clientPlatform": "windows_amd64",
+  "agentPlatforms": ["linux_amd64"],
+  "requiredFiles": ["mutagen.exe", "mutagen-agents.tar.gz"],
   "files": [
     {
       "path": "mutagen.exe",
-      "bytes": 13797376,
-      "sha256": "d9829413dfd47304ded128fb6696c92e9726c0dafd95c46f1909443ee17299ff"
+      "bytes": 21443584,
+      "sha256": "62c0a3d820a20cb40e014e55f26fd39d0e0f845a98d6f3e513d60dc7fc7ecf52"
     },
     {
       "path": "mutagen-agents.tar.gz",
-      "bytes": 97228378,
-      "sha256": "390fef4f7e4ffd6041f59ec646176b8f4082e6d325a48c5c6d9654abe9a422ba"
+      "bytes": 6496084,
+      "sha256": "d7225aecbe3b211f998ea23607edd5a0ecc2ab98acb73cdb88519e756e7fff39"
     }
   ]
 }

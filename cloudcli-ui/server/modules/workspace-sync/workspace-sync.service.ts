@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmod, mkdir, readFile, readdir, realpath, rename, stat, writeFile } from 'node:fs/promises';
+import { isIP } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -39,6 +40,23 @@ function publicKeyLine(input: string) {
     throw new AppError('同步设备公钥无效', { code: 'WORKSPACE_SYNC_KEY_INVALID', statusCode: 400 });
   }
   return 'ssh-ed25519 ' + match[1];
+}
+
+function workspaceSshHost(defaultHost: string) {
+  const configured = process.env.WORKSPACE_SYNC_SSH_HOST ?? defaultHost;
+  // URL.hostname brackets IPv6 literals; SSH consumes the bare address and adds
+  // its own brackets when constructing known_hosts entries and remote URLs.
+  const host = configured.startsWith('[') && configured.endsWith(']')
+    ? configured.slice(1, -1) : configured;
+  const ipVersion = isIP(host);
+  const hostname = host.endsWith('.') ? host.slice(0, -1) : host;
+  const validHostname = hostname.length <= 253 && !/^[\d.]+$/.test(hostname) && hostname.split('.').every((label) =>
+    /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/.test(label));
+  if (!host || /[\s\0/@\\]/.test(configured) ||
+    (configured !== host ? ipVersion !== 6 : !ipVersion && !validHostname)) {
+    throw new AppError('服务器文件同步 SSH 主机配置无效', { code: 'WORKSPACE_SYNC_UNAVAILABLE', statusCode: 503 });
+  }
+  return host;
 }
 
 async function inspectContainer(name: string): Promise<TransportContainer | null> {
@@ -205,13 +223,6 @@ export function createWorkspaceSyncService() {
     restore,
     async enroll(userId: string, publicKey: string, requestedServerUrl: string) {
       const key = publicKeyLine(publicKey);
-      try { await restore(userId); }
-      catch (error) {
-        // A busy legacy network still needs enrollment to recover; all ownership,
-        // Docker and isolation failures retain their original failure contract.
-        if (!(error instanceof AppError) || error.code !== 'WORKSPACE_BUSY') throw error;
-      }
-      const { root, owner, configDirectory } = await transportIdentity(userId);
       let serverUrl: URL;
       try { serverUrl = new URL(process.env.API_URL || requestedServerUrl); }
       catch {
@@ -221,6 +232,16 @@ export function createWorkspaceSyncService() {
         serverUrl.pathname !== '/' || serverUrl.search || serverUrl.hash) {
         throw new AppError('服务器工作区地址配置无效', { code: 'WORKSPACE_SYNC_UNAVAILABLE', statusCode: 503 });
       }
+      // Public HTTPS can be proxied independently of the directly reachable SSH endpoint.
+      // Reject invalid deployment settings before restoring or provisioning any transport.
+      const sshHost = workspaceSshHost(serverUrl.hostname);
+      try { await restore(userId); }
+      catch (error) {
+        // A busy legacy network still needs enrollment to recover; all ownership,
+        // Docker and isolation failures retain their original failure contract.
+        if (!(error instanceof AppError) || error.code !== 'WORKSPACE_BUSY') throw error;
+      }
+      const { root, owner, configDirectory } = await transportIdentity(userId);
       const previous = pending.get(owner) ?? Promise.resolve();
       const attempt = previous.catch(() => undefined).then(async () => {
         await mkdir(configDirectory, { recursive: true, mode: 0o700 });
@@ -279,7 +300,7 @@ export function createWorkspaceSyncService() {
         else registerWorkspaceSyncNetwork(root, network, controlHost);
         const hostKey = publicKeyLine((await readFile(hostKeyPath + '.pub', 'utf8')).trim());
         return {
-          sshHost: serverUrl.hostname,
+          sshHost,
           sshUser: 'root',
           sshPort: remotePort,
           workspaceServerUrl: serverUrl.origin,

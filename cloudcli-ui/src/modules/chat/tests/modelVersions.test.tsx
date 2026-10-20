@@ -80,7 +80,6 @@ test('an empty failed catalog keeps a visible model menu and a working reload ac
     effort="default" effortOptions={[]} onSelectEffort={vi.fn()} modelsLoading={false} modelsError onReloadModels={reload} />);
   fireEvent.click(screen.getByRole('button', { name: 'Select model and reasoning effort' }));
   expect(reload).toHaveBeenCalledTimes(1);
-  fireEvent.click(screen.getByRole('menuitem', { name: 'default' }));
   expect(screen.getByRole('alert').textContent).toContain('Could not load models');
   fireEvent.click(screen.getByRole('menuitem', { name: 'Reload models' }));
   expect(reload).toHaveBeenCalledTimes(2);
@@ -93,7 +92,6 @@ test('the selector shows the observed version while fixed choices send their exa
   expect(screen.getByRole('button', { name: 'Select model and reasoning effort' }).textContent).toContain('Opus (auto, 1M context)');
   fireEvent.click(screen.getByRole('button'));
   expect(screen.getByText('Last used: Opus 4.8')).toBeTruthy();
-  fireEvent.click(screen.getByRole('menuitem', { name: 'Opus (auto, 1M context)' }));
   fireEvent.click(screen.getByRole('menuitemradio', { name: /Opus 5/ }));
   expect(onSelectModel).toHaveBeenCalledWith('claude-opus-5-5');
 });

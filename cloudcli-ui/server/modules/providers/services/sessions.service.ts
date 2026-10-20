@@ -11,14 +11,16 @@ import type {
   FetchHistoryResult,
   LLMProvider,
   NormalizedMessage,
+  SessionWorkspaceMode,
 } from '@/shared/types.js';
-import { AppError, sliceTailPage } from '@/shared/utils.js';
+import { AppError, normalizeProjectPath, sliceTailPage } from '@/shared/utils.js';
 
 type CreateAppSessionResult = {
   sessionId: string;
   provider: LLMProvider;
   projectPath: string;
   sessionName: string;
+  workspaceMode: SessionWorkspaceMode;
 };
 
 type ArchivedSessionListItem = {
@@ -218,8 +220,10 @@ export const sessionsService = {
     provider: LLMProvider,
     projectPath: string,
     initialMessage: string,
+    workspaceMode: SessionWorkspaceMode = 'isolated',
   ): CreateAppSessionResult {
-    const normalizedProjectPath = projectPath.trim();
+    const normalizedWorkspaceMode: SessionWorkspaceMode = workspaceMode === 'shared' ? 'shared' : 'isolated';
+    const normalizedProjectPath = normalizeProjectPath(projectPath);
     if (!normalizedProjectPath) {
       throw new AppError('projectPath is required.', {
         code: 'PROJECT_PATH_REQUIRED',
@@ -229,13 +233,14 @@ export const sessionsService = {
 
     const sessionId = randomUUID();
     const sessionName = buildCloudCliSessionName(initialMessage);
-    sessionsDb.createAppSession(sessionId, provider, normalizedProjectPath, sessionName);
+    sessionsDb.createAppSession(sessionId, provider, normalizedProjectPath, sessionName, normalizedWorkspaceMode);
 
     return {
       sessionId,
       provider,
       projectPath: normalizedProjectPath,
       sessionName,
+      workspaceMode: normalizedWorkspaceMode,
     };
   },
 
@@ -300,6 +305,7 @@ export const sessionsService = {
       // differently from the conversation it was branched from.
       model: source.model,
       effort: source.effort,
+      workspaceMode: source.workspace_mode === 'shared' ? 'shared' : 'isolated',
     });
 
     await broadcastSessionUpserted(forkSessionId);
@@ -309,6 +315,7 @@ export const sessionsService = {
       provider,
       projectPath: source.project_path ?? '',
       sessionName,
+      workspaceMode: source.workspace_mode === 'shared' ? 'shared' : 'isolated',
     };
   },
 

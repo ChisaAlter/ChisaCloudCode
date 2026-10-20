@@ -50,17 +50,35 @@ func (FrontendBridge) ConnectAccountWorkspace() map[string]any {
 	return map[string]any{"ok": true, "tunnel": true}
 }
 
+type accountWorkspaceRetryPolicy int
+
+const (
+	accountWorkspaceReuseSetup accountWorkspaceRetryPolicy = iota
+	accountWorkspaceRetryFailure
+	accountWorkspaceRetrySetup
+)
+
 func waitAccountWorkspace(connection *serverConnection, retry bool) error {
+	policy := accountWorkspaceReuseSetup
+	if retry {
+		policy = accountWorkspaceRetrySetup
+	}
+	return waitAccountWorkspaceWithPolicy(connection, policy)
+}
+
+func waitAccountWorkspaceWithPolicy(connection *serverConnection, policy accountWorkspaceRetryPolicy) error {
 	serverConnectionMu.Lock()
 	if connection == nil || apiConnection != connection || !connection.authenticated {
 		serverConnectionMu.Unlock()
 		return fmt.Errorf("请先登录账号，再打开本机目录")
 	}
 	setup := connection.workspaceSetup
-	if setup != nil && retry {
+	if setup != nil && policy != accountWorkspaceReuseSetup {
 		select {
 		case <-setup.done:
-			setup = nil
+			if policy == accountWorkspaceRetrySetup || setup.err != nil {
+				setup = nil
+			}
 		default:
 		}
 	}

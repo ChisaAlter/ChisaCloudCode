@@ -159,7 +159,7 @@ func sameSyncView(a, b SyncInfo) bool {
 	return a == b
 }
 
-func observedProjectSync(serverPath string) SyncInfo {
+func observedProjectSync(serverPath string, override ...SyncInfo) SyncInfo {
 	syncMonitor.Lock()
 	defer syncMonitor.Unlock()
 	owner := syncWorkspaceOwner(serverPath)
@@ -175,6 +175,12 @@ func observedProjectSync(serverPath string) SyncInfo {
 	info := SyncInfo{Status: "unbound", Detail: "项目尚未绑定本地目录", ServerPath: serverPath}
 	if m != nil {
 		info = projectSyncInfo(m, store.Cfg, syncMonitor.sessions, syncMonitor.failure, syncMonitor.checkedAt, owner)
+	}
+	// Connection snapshots use the same sequence as engine observations, so a
+	// disconnect or recovery response can supersede an earlier ready event.
+	if len(override) > 0 && m != nil {
+		info.Status, info.Detail = override[0].Status, override[0].Detail
+		info.GitRecoveryRequired = false
 	}
 	previous, exists := syncMonitor.views[serverPath]
 	if !exists || !sameSyncView(previous, info) {

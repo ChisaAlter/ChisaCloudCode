@@ -3,10 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "mygo dev",
+    "dev": "node scripts/dev.mjs",
+    "dev:native": "mygo dev --skip-dev-command",
     "build": "mygo build && node scripts/build-installer.mjs",
     "generate": "mygo generate",
-    "dev:web": "vite",
+    "dev:web": "node scripts/dev-frontend.mjs",
     "build:web": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "build:installer": "node scripts/build-installer.mjs"

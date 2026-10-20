@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import { closeConnection, initializeDatabase, projectsDb, sessionsDb } from '@/modules/database/index.js';
 import { sessionsService } from '@/modules/providers/services/sessions.service.js';
+import { normalizeProjectPath } from '@/shared/utils.js';
 
 async function withIsolatedDatabase(runTest: () => void | Promise<void>): Promise<void> {
   const previousDatabasePath = process.env.DATABASE_PATH;
@@ -50,6 +51,28 @@ test('app session names use at most four whole words from the initial message', 
       sessionsDb.getSessionById(result.sessionId)?.custom_name,
       'supercalifragilisticexpialidocious second third fourth',
     );
+  });
+});
+
+test('app sessions persist one canonical project path for provider execution', { concurrency: false }, async () => {
+  await withIsolatedDatabase(() => {
+    const result = sessionsService.createAppSession('claude', '  /tmp/session-path-project/./  ', 'Initial message');
+    const session = sessionsDb.getSessionById(result.sessionId);
+
+    const expectedPath = normalizeProjectPath('  /tmp/session-path-project/./  ');
+    assert.equal(result.projectPath, expectedPath);
+    assert.equal(session?.project_path, expectedPath);
+    assert.equal(session?.workspace_mode, 'isolated');
+  });
+});
+
+test('app sessions preserve an explicit shared workspace intent', { concurrency: false }, async () => {
+  await withIsolatedDatabase(() => {
+    const result = sessionsService.createAppSession('claude', '/tmp/shared-workspace-project', 'Shared run', 'shared');
+    const session = sessionsDb.getSessionById(result.sessionId);
+
+    assert.equal(result.workspaceMode, 'shared');
+    assert.equal(session?.workspace_mode, 'shared');
   });
 });
 

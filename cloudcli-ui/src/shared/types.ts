@@ -1172,7 +1172,7 @@ export type AgentContext = {
 };
 
 /** Identifier of a top-level section in the settings dialog; use it whenever a tab is stored, compared or requested so deep links, the sidebar and the command palette all agree on the same set of names. */
-export type SettingsMainTab = 'agents' | 'appearance' | 'git' | 'api' | 'voice' | 'tasks' | 'browser' | 'notifications' | 'plugins' | 'about' | 'chisa';
+export type SettingsMainTab = 'agents' | 'models' | 'appearance' | 'git' | 'api' | 'voice' | 'tasks' | 'browser' | 'notifications' | 'plugins' | 'about' | 'chisa';
 
 /** The coding-agent CLI a settings screen is configuring, aliasing LLMProvider so agent-scoped settings read as being about an agent rather than a chat model. */
 export type AgentProvider = LLMProvider;
@@ -1681,7 +1681,41 @@ export type ChisaSyncInfo = {
   engineStatus?: string;
   /** Root-empty recovery is offered only for the side confirmed empty by the native engine. */
   emptySide?: 'local' | 'vps';
+  /** Only the native engine can admit a blocked binding to explicit Git state recovery. */
+  gitRecoveryRequired?: boolean;
   taskOwner?: 'claude' | 'pi';
+};
+
+/** Recovery review displays one side's observed branch, commit, staging and in-progress Git operation. */
+export type ChisaGitRecoverySide = {
+  branch: string;
+  head: string;
+  staged: boolean;
+  operation: string;
+};
+
+/** Recovery selects the authoritative Git state while project files continue safe bidirectional synchronization. */
+export type ChisaGitRecoverySource = 'local' | 'remote';
+
+/** The recovery dialog must confirm this observation's token against the same project and binding epoch. */
+export type ChisaGitRecovery = {
+  token: string;
+  serverPath: string;
+  bindingEpoch: string;
+  local: ChisaGitRecoverySide;
+  remote: ChisaGitRecoverySide;
+  localAllowed: boolean;
+  localReason: string;
+  remoteAllowed: boolean;
+  remoteReason: string;
+};
+
+/** The desktop bridge returns a recovery observation or a typed failure without starting file synchronization. */
+export type ChisaGitRecoveryResponse = {
+  ok: boolean;
+  error?: string;
+  code?: string;
+  recovery?: ChisaGitRecovery;
 };
 
 /** Native synchronization operations notify the project bar and background-operation indicator. */

@@ -7,6 +7,10 @@ import realPath from 'node:path';
 import { promisify } from 'node:util';
 import test, { mock } from 'node:test';
 
+const originalApiUrl = process.env.API_URL;
+const originalSshHost = process.env.WORKSPACE_SYNC_SSH_HOST;
+delete process.env.API_URL;
+delete process.env.WORKSPACE_SYNC_SSH_HOST;
 const root = '/srv/workspaces/account';
 const fixture = await realFiles.mkdtemp(realPath.join(realOs.tmpdir(), 'chisa-enrollment-'));
 const home = fixture.replaceAll('\\', '/');
@@ -30,6 +34,7 @@ let migrationPreview = false;
 let migrationWorker = false;
 let networkInspectionError: string | undefined;
 const commands: string[][] = [];
+const filesystemChanges: string[] = [];
 const newKey = () => {
   const publicBytes = generateKeyPairSync('ed25519').publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
   const wire = Buffer.alloc(51);
@@ -98,7 +103,8 @@ mock.module('node:path', { defaultExport: realPath.posix, namedExports: { ...rea
 mock.module('node:os', { defaultExport: { ...realOs, homedir: () => home }, namedExports: { ...realOs, homedir: () => home } });
 mock.module('node:fs/promises', { namedExports: {
   ...realFiles,
-  mkdir: async () => undefined, chmod: async () => undefined,
+  mkdir: async (filename: string) => { filesystemChanges.push('mkdir:' + filename); },
+  chmod: async (filename: string) => { filesystemChanges.push('chmod:' + filename); },
   readdir: async () => migrationLease ? [{ name: 'project.chisa-lease', isDirectory: () => true }] : [],
   realpath: async (filename: string) => filename,
   stat: async () => ({ isDirectory: () => true }),
@@ -115,6 +121,10 @@ const service = createWorkspaceSyncService();
 const platform = process.platform;
 test.before(() => Object.defineProperty(process, 'platform', { value: 'linux' }));
 test.after(async () => {
+  if (originalApiUrl === undefined) delete process.env.API_URL;
+  else process.env.API_URL = originalApiUrl;
+  if (originalSshHost === undefined) delete process.env.WORKSPACE_SYNC_SSH_HOST;
+  else process.env.WORKSPACE_SYNC_SSH_HOST = originalSshHost;
   Object.defineProperty(process, 'platform', { value: platform });
   await realFiles.rm(fixture, { recursive: true, force: true });
 });
@@ -212,6 +222,73 @@ test('an existing transport with foreign mounts, account label, or host networki
   container.HostConfig.NetworkMode = 'host';
   await assert.rejects(service.enroll('17', newKey(), 'http://server.example:8792'), { code: 'WORKSPACE_SYNC_TRANSPORT_MISMATCH' });
   container.HostConfig.NetworkMode = Object.keys(container.NetworkSettings.Networks)[0];
+});
+
+test('enrollment keeps the public HTTPS origin while advertising a direct SSH host', async () => {
+  process.env.API_URL = 'https://api.example.invalid:2096';
+  process.env.WORKSPACE_SYNC_SSH_HOST = '192.0.2.10';
+  try {
+    const enrolled = await service.enroll('17', primaryDevice, 'http://internal-api:8792');
+    assert.equal(enrolled.workspaceServerUrl, 'https://api.example.invalid:2096');
+    assert.equal(enrolled.sshHost, '192.0.2.10');
+    assert.equal(enrolled.sshPort, 32022);
+    assert.equal(enrolled.hostKey, hostKey);
+    delete process.env.WORKSPACE_SYNC_SSH_HOST;
+    const fallback = await service.enroll('17', primaryDevice, 'http://internal-api:8792');
+    assert.equal(fallback.sshHost, 'api.example.invalid');
+    assert.equal(fallback.workspaceServerUrl, enrolled.workspaceServerUrl);
+  } finally {
+    delete process.env.API_URL;
+    delete process.env.WORKSPACE_SYNC_SSH_HOST;
+  }
+});
+
+test('SSH host overrides accept DNS names and IPv6 without changing the API origin', async () => {
+  process.env.API_URL = 'https://api.example.invalid:2096';
+  try {
+    for (const [configured, expected] of [
+      ['ssh.example.com', 'ssh.example.com'],
+      ['2001:db8::1', '2001:db8::1'],
+      ['[2001:db8::1]', '2001:db8::1'],
+    ]) {
+      process.env.WORKSPACE_SYNC_SSH_HOST = configured;
+      const enrolled = await service.enroll('17', primaryDevice, 'http://internal-api:8792');
+      assert.equal(enrolled.sshHost, expected);
+      assert.equal(enrolled.workspaceServerUrl, 'https://api.example.invalid:2096');
+    }
+    delete process.env.WORKSPACE_SYNC_SSH_HOST;
+    process.env.API_URL = 'https://[2001:db8::2]:2096';
+    const fallback = await service.enroll('17', primaryDevice, 'http://internal-api:8792');
+    assert.equal(fallback.sshHost, '2001:db8::2');
+    assert.equal(fallback.workspaceServerUrl, 'https://[2001:db8::2]:2096');
+  } finally {
+    delete process.env.API_URL;
+    delete process.env.WORKSPACE_SYNC_SSH_HOST;
+  }
+});
+
+test('invalid SSH host overrides fail before filesystem or transport provisioning', async () => {
+  process.env.API_URL = 'https://api.example.invalid:2096';
+  const invalid = ['', ' ', ' 192.0.2.10', 'ssh.example.com\t', 'ssh\n.example', 'user@ssh.example.com',
+    'https://ssh.example.com', 'ssh.example.com/path', 'ssh.example.com:32768', 'ssh\\host', 'ssh\x7fhost',
+    '-ssh.example', 'ssh_.example', 'ssh..example', '999.0.2.10', '[192.0.2.10]', '[2001:db8::1',
+    '2001:db8::invalid', 'a'.repeat(64) + '.example', Array(5).fill('a'.repeat(63)).join('.')];
+  try {
+    for (const configured of invalid) {
+      process.env.WORKSPACE_SYNC_SSH_HOST = configured;
+      const beforeCommands = commands.length;
+      const beforeFilesystem = filesystemChanges.length;
+      const beforeFiles = [...files.entries()];
+      await assert.rejects(createWorkspaceSyncService().enroll('17', newKey(), 'http://internal-api:8792'),
+        { code: 'WORKSPACE_SYNC_UNAVAILABLE', statusCode: 503 }, JSON.stringify(configured));
+      assert.equal(commands.length, beforeCommands, 'invalid host must not restore or provision a transport');
+      assert.equal(filesystemChanges.length, beforeFilesystem, 'invalid host must not create directories or change permissions');
+      assert.deepEqual([...files.entries()], beforeFiles, 'invalid host must not provision keys');
+    }
+  } finally {
+    delete process.env.API_URL;
+    delete process.env.WORKSPACE_SYNC_SSH_HOST;
+  }
 });
 
 test('account identities receive different transports and private keys never enroll', async () => {

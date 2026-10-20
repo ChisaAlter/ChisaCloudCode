@@ -60,7 +60,7 @@ export default function NewBranchModal({
         aria-labelledby="new-branch-title"
       >
         <div className="p-6">
-          <h3 className="mb-4 text-lg font-semibold text-foreground">{t('git:newBranch.title')}</h3>
+          <h3 id="new-branch-title" className="mb-4 text-lg font-semibold text-foreground">{t('git:newBranch.title')}</h3>
 
           <div className="mb-4">
             <label htmlFor="git-new-branch-name" className="mb-2 block text-sm font-medium text-foreground/80">

@@ -13,6 +13,7 @@ type BranchesViewProps = {
   remoteBranches: string[];
   remoteStatus: GitRemoteStatus | null;
   isCreatingBranch: boolean;
+  isBranchBusy: boolean;
   onSwitchBranch: (branchName: string) => Promise<boolean>;
   onCreateBranch: (branchName: string) => Promise<boolean>;
   onDeleteBranch: (branchName: string, force?: boolean) => Promise<boolean>;
@@ -30,11 +31,12 @@ type BranchRowProps = {
   aheadCount: number;
   behindCount: number;
   isMobile: boolean;
+  isBusy: boolean;
   onSwitch: () => void;
   onDelete: () => void;
 };
 
-function BranchRow({ name, isCurrent, isRemote, aheadCount, behindCount, isMobile, onSwitch, onDelete }: BranchRowProps) {
+function BranchRow({ name, isCurrent, isRemote, aheadCount, behindCount, isMobile, isBusy, onSwitch, onDelete }: BranchRowProps) {
   const { t } = useTranslation();
   return (
     <div
@@ -84,13 +86,14 @@ function BranchRow({ name, isCurrent, isRemote, aheadCount, behindCount, isMobil
       </div>
 
       {/* Actions */}
-      <div className={`flex shrink-0 items-center gap-1 ${isCurrent ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'} transition-opacity`}>
+      <div className={`flex shrink-0 items-center gap-1 ${isCurrent || isMobile ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'} transition-opacity`}>
         {isCurrent ? (
           <Check className="h-4 w-4 text-primary" />
         ) : !isRemote ? (
           <>
             <button
               onClick={onSwitch}
+              disabled={isBusy}
               className="rounded-md px-2 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
               title={t('git:branches.switchTo', { name })}
             >
@@ -98,6 +101,7 @@ function BranchRow({ name, isCurrent, isRemote, aheadCount, behindCount, isMobil
             </button>
             <button
               onClick={onDelete}
+              disabled={isBusy}
               className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
               title={t('git:branches.deleteTo', { name })}
             >
@@ -136,6 +140,7 @@ export default function BranchesView({
   remoteBranches,
   remoteStatus,
   isCreatingBranch,
+  isBranchBusy,
   onSwitchBranch,
   onCreateBranch,
   onDeleteBranch,
@@ -162,7 +167,7 @@ export default function BranchesView({
     onRequestConfirmation({
       type: 'commit', // reuse neutral type for switch
       message: t('git:branches.confirmSwitch', { branch }),
-      onConfirm: () => void onSwitchBranch(branch),
+      onConfirm: async () => { await onSwitchBranch(branch); },
     });
   };
 
@@ -170,12 +175,12 @@ export default function BranchesView({
     onRequestConfirmation({
       type: 'deleteBranch',
       message: t('git:branches.confirmDelete', { branch }),
-      onConfirm: () => void onDeleteBranch(branch),
+      onConfirm: async () => { await onDeleteBranch(branch); },
       alternateConfirmation: {
         label: t('git:branches.forceDeleteLabel'),
         description: t('git:branches.forceDeleteDescription'),
         actionLabel: t('git:branches.forceDelete'),
-        onConfirm: () => void onDeleteBranch(branch, true),
+        onConfirm: async () => { await onDeleteBranch(branch, true); },
       },
     });
   };
@@ -199,6 +204,7 @@ export default function BranchesView({
         </span>
         <button
           onClick={() => setShowNewBranchModal(true)}
+          disabled={isBranchBusy}
           className="flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-sm font-medium text-primary transition-colors hover:bg-primary/20"
         >
           <Plus className="h-3.5 w-3.5" />
@@ -241,6 +247,7 @@ export default function BranchesView({
                 aheadCount={branch === currentBranch ? aheadCount : 0}
                 behindCount={branch === currentBranch ? behindCount : 0}
                 isMobile={isMobile}
+                isBusy={isBranchBusy}
                 onSwitch={() => requestSwitch(branch)}
                 onDelete={() => requestDelete(branch)}
               />
@@ -260,6 +267,7 @@ export default function BranchesView({
                 aheadCount={0}
                 behindCount={0}
                 isMobile={isMobile}
+                isBusy={isBranchBusy}
                 onSwitch={() => requestSwitch(branch)}
                 onDelete={() => requestDelete(branch)}
               />

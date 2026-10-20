@@ -448,14 +448,14 @@ export const api = {
       get(`/api/git/status${query({ project: projectId })}`, options),
     diff: (projectId: string, filePath: string, options: ApiRequestOptions = {}) =>
       get(`/api/git/diff${query({ project: projectId, file: filePath })}`, options),
-    commitDiff: (projectId: string, commit: string) =>
-      get(`/api/git/commit-diff${query({ project: projectId, commit })}`),
+    commitDiff: (projectId: string, commit: string, options: ApiRequestOptions = {}) =>
+      get(`/api/git/commit-diff${query({ project: projectId, commit })}`, options),
     fileWithDiff: (projectId: string, filePath: string) =>
       get(`/api/git/file-with-diff${query({ project: projectId, file: filePath })}`),
     branches: (projectId: string, options: ApiRequestOptions = {}) =>
       get(`/api/git/branches${query({ project: projectId })}`, options),
-    remoteStatus: (projectId: string) =>
-      get(`/api/git/remote-status${query({ project: projectId })}`),
+    remoteStatus: (projectId: string, options: ApiRequestOptions = {}) =>
+      get(`/api/git/remote-status${query({ project: projectId })}`, options),
     commits: (
       projectId: string,
       { limit }: { limit?: number } = {},
@@ -512,6 +512,18 @@ export const api = {
 
   // Provider (coding agent) endpoints — models, capabilities, sessions, MCP, skills.
   providers: {
+    connections: {
+      list: (options: ApiRequestOptions = {}) => get('/api/providers/claude/connections', options),
+      create: (input: unknown, options: ApiRequestOptions = {}) => post('/api/providers/claude/connections', input, options),
+      update: (id: string, input: unknown, options: ApiRequestOptions = {}) => put(`/api/providers/claude/connections/${encodeURIComponent(id)}`, input, options),
+      remove: (id: string, options: ApiRequestOptions = {}) => del(`/api/providers/claude/connections/${encodeURIComponent(id)}`, undefined, options),
+      activate: (id: string | null, options: ApiRequestOptions = {}) => put('/api/providers/claude/connections/active', { id }, options),
+    },
+    hiroute: {
+      settings: (options: ApiRequestOptions = {}) => get('/api/providers/claude/hiroute', options),
+      saveSettings: (settings: unknown, options: ApiRequestOptions = {}) =>
+        put('/api/providers/claude/hiroute', settings, options),
+    },
     capabilities: () => get('/api/providers/capabilities'),
     authStatus: (provider: string) =>
       get(`/api/providers/${encodeURIComponent(provider)}/auth/status`),

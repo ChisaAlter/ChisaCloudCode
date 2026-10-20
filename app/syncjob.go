@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	_ "embed"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"os/exec"
@@ -115,6 +117,13 @@ func syncRemoteJobCommand(ctx context.Context, m *Mapping, mode, command string)
 	if !ok {
 		return "", fmt.Errorf("同步操作缺少总截止时间")
 	}
+	if mode == "shell" {
+		var err error
+		command, err = compactSyncRemoteShellCommand(command)
+		if err != nil {
+			return "", err
+		}
+	}
 	args := []string{m.ServerPath, m.BindingEpoch, id, randHex(16), strconv.FormatFloat(float64(deadline.UnixMilli())/1000, 'f', 3, 64), mode}
 	if mode != "receive-pack" {
 		args = append(args, command)
@@ -124,6 +133,23 @@ func syncRemoteJobCommand(ctx context.Context, m *Mapping, mode, command string)
 		remote += " " + shellQuote(argument)
 	}
 	return remote, nil
+}
+
+// Compact only the command, leaving stdin available for JSON or Git streams.
+func compactSyncRemoteShellCommand(command string) (string, error) {
+	if len(command) <= 8192 {
+		return command, nil
+	}
+	var compressed bytes.Buffer
+	writer := zlib.NewWriter(&compressed)
+	if _, err := writer.Write([]byte(command)); err != nil {
+		return "", err
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+	bootstrap := "import base64,os,zlib;os.execlp('bash','bash','-c',zlib.decompress(base64.b64decode('" + base64.StdEncoding.EncodeToString(compressed.Bytes()) + "')).decode('utf-8'))"
+	return "python3 -c " + shellQuote(bootstrap), nil
 }
 
 func syncRemoteScript(ctx context.Context, m *Mapping, script string, input io.Reader) (string, error) {

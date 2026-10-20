@@ -56,6 +56,7 @@ export default function LoginForm({ embedded = false }: { embedded?: boolean } =
 
   const updateField = useCallback((field: keyof LoginFormState, value: string) => {
     setFormState((previous) => ({ ...previous, [field]: value }));
+    if (field === 'serverUrl') setErrorMessage('');
   }, []);
 
   const handleSubmit = useCallback(
@@ -128,7 +129,7 @@ export default function LoginForm({ embedded = false }: { embedded?: boolean } =
         <button
           type="submit"
           disabled={isSubmitting || isLoadingAddress}
-          className="flex w-full items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2.5 font-medium text-primary-foreground shadow-lg shadow-primary/25 transition-all duration-200 hover:shadow-primary/30 hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-primary/40 focus:ring-offset-2 focus:ring-offset-card active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60"
+          className="auth-submit flex w-full items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2.5 font-medium text-primary-foreground shadow-lg shadow-primary/25 transition-all duration-200 hover:shadow-primary/30 hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-primary/40 focus:ring-offset-2 focus:ring-offset-card active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60"
         >
           {isSubmitting || isLoadingAddress ? (
             <>

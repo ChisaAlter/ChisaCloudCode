@@ -3,6 +3,9 @@ export { closeConnection, getConnection, getDatabasePath } from '@/modules/datab
 export { apiKeysDb } from '@/modules/database/repositories/api-keys.js';
 export { appConfigDb } from '@/modules/database/repositories/app-config.js';
 export { credentialsDb } from '@/modules/database/repositories/credentials.js';
+// Providers persists private per-user Messages endpoints and HiRoute connections.
+export { claudeConnectionsDb } from '@/modules/database/repositories/claude-connections.db.js';
+export { hirouteDb } from '@/modules/database/repositories/hiroute.db.js';
 export { githubTokensDb } from '@/modules/database/repositories/github-tokens.js';
 export { notificationChannelEndpointsDb } from '@/modules/database/repositories/notification-channel-endpoints.js';
 export { notificationPreferencesDb } from '@/modules/database/repositories/notification-preferences.js';

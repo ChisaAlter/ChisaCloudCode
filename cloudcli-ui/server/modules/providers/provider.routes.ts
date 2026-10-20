@@ -18,8 +18,48 @@ import type {
   UpsertProviderMcpServerInput,
 } from '@/shared/types.js';
 import { AppError, asyncHandler, createApiSuccessResponse } from '@/shared/utils.js';
+import { hirouteService } from '@/modules/providers/services/hiroute.service.js';
+import { claudeConnectionsService } from '@/modules/providers/services/claude-connections.service.js';
 
 const router = express.Router();
+
+router.get('/claude/connections', asyncHandler(async (req: Request, res: Response) => {
+  res.json(createApiSuccessResponse(claudeConnectionsService.getSettings((req as Request & { user?: { id?: number | string } }).user?.id)));
+}));
+
+router.post('/claude/connections', asyncHandler(async (req: Request, res: Response) => {
+  const input = claudeConnectionsService.parseInput(req.body);
+  res.status(201).json(createApiSuccessResponse(claudeConnectionsService.create((req as Request & { user?: { id?: number | string } }).user?.id, input)));
+}));
+
+// Register the fixed active path before /:id.
+router.put('/claude/connections/active', asyncHandler(async (req: Request, res: Response) => {
+  const id = claudeConnectionsService.parseActiveInput(req.body);
+  res.json(createApiSuccessResponse(claudeConnectionsService.activate((req as Request & { user?: { id?: number | string } }).user?.id, id)));
+}));
+
+router.put('/claude/connections/:id', asyncHandler(async (req: Request, res: Response) => {
+  const id = claudeConnectionsService.parseId(req.params.id);
+  const input = claudeConnectionsService.parseInput(req.body);
+  res.json(createApiSuccessResponse(claudeConnectionsService.update((req as Request & { user?: { id?: number | string } }).user?.id, id, input)));
+}));
+
+router.delete('/claude/connections/:id', asyncHandler(async (req: Request, res: Response) => {
+  const id = claudeConnectionsService.parseId(req.params.id);
+  res.json(createApiSuccessResponse(claudeConnectionsService.delete((req as Request & { user?: { id?: number | string } }).user?.id, id)));
+}));
+
+// Authentication middleware supplies this identity; never read a user id from request data.
+router.get('/claude/hiroute', asyncHandler(async (req: Request, res: Response) => {
+  const userId = (req as Request & { user?: { id?: number | string } }).user?.id;
+  res.json(createApiSuccessResponse(hirouteService.getSettings(userId)));
+}));
+
+router.put('/claude/hiroute', asyncHandler(async (req: Request, res: Response) => {
+  const input = hirouteService.parseInput(req.body);
+  const userId = (req as Request & { user?: { id?: number | string } }).user?.id;
+  res.json(createApiSuccessResponse(hirouteService.saveSettings(userId, input)));
+}));
 
 const readPathParam = (value: unknown, name: string): string => {
   if (typeof value === 'string') {
@@ -508,7 +548,8 @@ router.get(
   '/:provider/auth/status',
   asyncHandler(async (req: Request, res: Response) => {
     const provider = parseProvider(req.params.provider);
-    const status = await providerAuthService.getProviderAuthStatus(provider);
+    const userId = (req as Request & { user?: { id?: number | string } }).user?.id;
+    const status = await providerAuthService.getProviderAuthStatus(provider, userId);
     res.json(createApiSuccessResponse(status));
   }),
 );
@@ -731,7 +772,8 @@ router.post(
     const provider = parseProvider(body.provider);
     const projectPath = typeof body.projectPath === 'string' ? body.projectPath : '';
     const initialMessage = typeof body.initialMessage === 'string' ? body.initialMessage : '';
-    const result = sessionsService.createAppSession(provider, projectPath, initialMessage);
+    const workspaceMode = body.workspaceMode === 'shared' ? 'shared' : 'isolated';
+    const result = sessionsService.createAppSession(provider, projectPath, initialMessage, workspaceMode);
     res.status(201).json(createApiSuccessResponse(result));
   }),
 );

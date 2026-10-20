@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,7 +17,7 @@ func TestSyncIgnoreRuntimeKeepsTrackedSources(t *testing.T) {
 	for _, scenario := range []struct {
 		directory string
 		tracked   bool
-	}{{".dev", false}, {".dev", true}, {".nodetmp", false}, {".nodetmp", true}} {
+	}{{".dev", false}, {".dev", true}, {".nodetmp", false}, {".nodetmp", true}, {".local-node", false}, {".local-node", true}, {"arbitrary runtime [1]", false}, {"arbitrary runtime [1]", true}} {
 		directory, tracked := scenario.directory, scenario.tracked
 		name := directory + "/temporary runtime"
 		if tracked {
@@ -26,7 +27,7 @@ func TestSyncIgnoreRuntimeKeepsTrackedSources(t *testing.T) {
 			m := isolatePi(t)
 			for name, content := range map[string]string{
 				"README.md":                         "project source",
-				".gitignore":                        directory + "/\n",
+				".gitignore":                        strings.NewReplacer("[", "\\[", "]", "\\]").Replace(directory) + "/\n",
 				directory + "/assets/source.txt":    "tracked asset",
 				directory + "/assets/generated.bin": "temporary output",
 				directory + "/pw/browser.exe":       "temporary browser",
@@ -39,11 +40,13 @@ func TestSyncIgnoreRuntimeKeepsTrackedSources(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			commands := [][]string{{"init", "-b", "main"}}
 			if tracked {
-				for _, args := range [][]string{{"init", "-b", "main"}, {"add", "-f", directory + "/assets/source.txt"}} {
-					if _, err := gitOutputContext(context.Background(), m.LocalPath, args...); err != nil {
-						t.Fatal(err)
-					}
+				commands = append(commands, []string{"add", "-f", directory + "/assets/source.txt"})
+			}
+			for _, args := range commands {
+				if _, err := gitOutputContext(context.Background(), m.LocalPath, args...); err != nil {
+					t.Fatal(err)
 				}
 			}
 			configuration, err := syncIgnoreConfigurationContext(context.Background(), m)
@@ -95,5 +98,53 @@ func TestSyncIgnoreRuntimeKeepsTrackedSources(t *testing.T) {
 				t.Fatalf("synchronized entries = %v, want %v", names, want)
 			}
 		})
+	}
+}
+
+// A vendored repository can report thousands of ignored directories and tens of
+// thousands of tracked files. Enumerating a re-include exception per tracked
+// descendant is what made a cold scan take minutes, so the generated rule set has
+// to stay bounded no matter how large the repository is.
+func TestSyncIgnoreRuleCountStaysBounded(t *testing.T) {
+	m := isolatePi(t)
+	var ignored []string
+	for i := 0; i < 400; i++ {
+		ignored = append(ignored, fmt.Sprintf("pkg%d/dist/", i))
+	}
+	var tracked []string
+	for i := 0; i < 4000; i++ {
+		tracked = append(tracked, fmt.Sprintf("pkg%d/src/file%d.ts", i%400, i))
+	}
+	// A handful of tracked files that really do live inside an ignored directory.
+	for i := 0; i < 200; i++ {
+		tracked = append(tracked, fmt.Sprintf("pkg%d/dist/keep%d.ts", i%400, i))
+	}
+	configuration, err := writeSyncIgnoreConfiguration(m, syncGitInventory{Tracked: tracked, Ignored: ignored})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patterns, exceptions := 0, 0
+	for _, line := range strings.Split(string(contents), "\n") {
+		item, found := strings.CutPrefix(strings.TrimSpace(line), "- ")
+		if !found {
+			continue
+		}
+		patterns++
+		if strings.Contains(item, `"!`) {
+			exceptions++
+		}
+	}
+	if patterns > 2000 {
+		t.Fatalf("rule set grew with the repository: %d patterns (%d exceptions)", patterns, exceptions)
+	}
+	// Exceptions may grow linearly with the tracked files that genuinely live
+	// inside an ignored directory (a few rules per path level), but they must not
+	// grow with the repository's overall size.
+	if exceptions > 4*200 {
+		t.Fatalf("re-include exceptions are unbounded: %d for 200 tracked inputs", exceptions)
 	}
 }

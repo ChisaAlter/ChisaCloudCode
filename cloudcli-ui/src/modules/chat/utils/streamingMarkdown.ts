@@ -12,9 +12,9 @@
  * Correctness rests on markdown blocks being independent across a blank line:
  * rendering `settled` and `pending` as two documents must equal rendering their
  * concatenation. That does NOT hold inside a fenced code block, a display-math
- * block, a list, a blockquote, a table, an indented code block, or across a
- * link-reference/footnote definition and its usage — the boundary search skips
- * all of them.
+ * block, a list, a blockquote, a table, an indented code block, an HTML block,
+ * or across a link-reference/footnote definition and its usage — the boundary
+ * search skips them, falling back to one document for HTML.
  */
 
 /** An opening or closing code fence, per CommonMark: up to 3 spaces of indent. */
@@ -22,6 +22,9 @@ const FENCE_PATTERN = /^ {0,3}(`{3,}|~{3,})/;
 
 /** A `$$` display-math delimiter. remark-math is configured for block math only. */
 const MATH_DELIMITER_PATTERN = /^ {0,3}\$\$/;
+
+/** HTML can span blank lines; keep even incomplete tags in one markdown document. */
+const HTML_BLOCK_CANDIDATE_PATTERN = /^ {0,3}<(?:[A-Za-z!/?]|$)/;
 
 /**
  * Block starters whose meaning depends on the surrounding lines, checked on both
@@ -97,6 +100,13 @@ export function splitStreamingMarkdown(content: string): StreamingMarkdownSplit 
         insideMath = !insideMath;
       }
       continue;
+    }
+
+    // CommonMark HTML blocks have several different closing rules. Reusing one
+    // document preserves the real parser's context instead of reparsing a CSS,
+    // script, or comment tail as ordinary markdown at an interior blank line.
+    if (!openFence && !insideMath && HTML_BLOCK_CANDIDATE_PATTERN.test(line)) {
+      return { settled: '', pending: content };
     }
 
     if (openFence || insideMath || line.trim() !== '') {

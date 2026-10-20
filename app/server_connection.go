@@ -22,7 +22,8 @@ import (
 //go:embed resources/service.json
 var serviceConfiguration []byte
 
-const apiProxyPort = 18792
+// Assigned by the loopback listener at startup so dev/reload instances coexist.
+var apiProxyPort int
 
 type serviceDefaults struct {
 	LoginURL      string `json:"loginUrl"`
@@ -92,6 +93,12 @@ func newServerConnection(loginURL, baseURL string) (*serverConnection, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// Retire idle sockets before the gateway's advertised five-second boundary.
 	transport.IdleConnTimeout = 4 * time.Second
+	// The deployed gateway intermittently stalls during H2 negotiation or on
+	// shared H2 streams. Keep verified TLS and H1 keep-alive; independent H1
+	// connections allow polls and task streams to progress without sharing that
+	// failure. Select the protocol before sending, never replay an HTTP operation.
+	transport.Protocols = new(http.Protocols)
+	transport.Protocols.SetHTTP1(true)
 	defaults := distributionService()
 	if defaults.CACertificate != "" {
 		roots, err := x509.SystemCertPool()
@@ -105,8 +112,15 @@ func newServerConnection(loginURL, baseURL string) (*serverConnection, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	apiConnectionVersion++
-	return &serverConnection{baseURL: baseURL, loginURL: loginURL, ctx: ctx, cancel: cancel, version: apiConnectionVersion,
-		client: &http.Client{Transport: transport, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	version := apiConnectionVersion
+	// Explicit diagnostic H2 clients retain PING/ACK liveness. This setting
+	// does not enable H2 for product traffic and adds no request deadline.
+	transport.HTTP2 = &http.HTTP2Config{
+		SendPingTimeout: 15 * time.Second,
+		PingTimeout:     15 * time.Second,
+	}
+	return &serverConnection{baseURL: baseURL, loginURL: loginURL, ctx: ctx, cancel: cancel, version: version,
+		client: &http.Client{Transport: &serverTLSRecoveryTransport{transport: transport, account: ctx}, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 
 func replaceServerConnection(next *serverConnection) {
@@ -166,10 +180,12 @@ func (FrontendBridge) EndServerSession(version uint64) {
 
 // Only the current service connection can proxy chat, shell and plugin upgrades.
 func StartAPIProxy() error {
-	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", apiProxyPort))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
 	}
+	apiProxyPort = listener.Addr().(*net.TCPAddr).Port
+	log.Printf("[app-start] api_proxy_port=%d", apiProxyPort)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		prefix := "/channel/" + apiProxyKey
 		if !strings.HasPrefix(request.URL.Path, prefix+"/") {

@@ -10,7 +10,7 @@ import express from 'express';
 import { closeConnection, initializeDatabase, scheduledMessagesDb, sessionDraftsDb, sessionsDb, userDb } from '@/modules/database/index.js';
 import { closeScheduledMessageDispatcher, dispatchDueScheduledMessages, dispatchQueuedMessages, initializeScheduledMessageDispatcher } from '@/modules/scheduled-messages/services/scheduled-message-dispatcher.service.js';
 import { scheduledMessagesService } from '@/modules/scheduled-messages/services/scheduled-messages.service.js';
-import { chatRunRegistry, runDetachedChatTurn } from '@/modules/websocket/index.js';
+import { chatRunRegistry, isChatRunInFlight, onChatRunSettled, runDetachedChatTurn } from '@/modules/websocket/index.js';
 import type { ProviderRuntimeGateway } from '@/modules/websocket/index.js';
 import type { ProviderRuntimeWriter } from '@/shared/index.js';
 import { createCompleteMessage } from '@/shared/utils.js';
@@ -587,3 +587,144 @@ test('an old run terminal cannot suspend a newer run queue', async () => {
     assert.deepEqual(sessionDraftsDb.getDrafts(userId)[0].queuedMessage, queued);
   });
 });
+
+
+
+test('due runs block only their own session and queued turns wake after handback', { timeout: 5000 }, async () => {
+  await withIsolatedDatabase(async userId => {
+    const otherSession = 'other-scheduled-session';
+    sessionsDb.createAppSession(otherSession, 'claude', '/workspace/other');
+    scheduledMessagesService.schedule({ userId, sessionId: SESSION_ID, content: 'long scheduled run', scheduledFor: new Date(Date.now() - 1000).toISOString() });
+    sessionDraftsDb.saveDraft(userId, SESSION_ID, { text: '', queuedMessage: { content: 'same session next' } });
+    sessionDraftsDb.saveDraft(userId, otherSession, { text: '', queuedMessage: { content: 'unrelated queue' } });
+    const entered = gate();
+    const handback = gate();
+    const calls: string[] = [];
+    const runtime = {
+      ...createRuntime([]),
+      run: async (_provider: string, command: string, _options: unknown, writer: Parameters<ProviderRuntimeGateway['run']>[3]) => {
+        calls.push(command);
+        if (command === 'long scheduled run') {
+          // A provider terminal frame can precede actual workspace cleanup.
+          writer.send({ kind: 'complete', provider: 'claude', sessionId: SESSION_ID, exitCode: 0 });
+          entered.resolve();
+          await handback.promise;
+        } else writer.send(createCompleteMessage({ provider: 'claude', exitCode: 0 }));
+      },
+    } as ProviderRuntimeGateway;
+    initializeScheduledMessageDispatcher(runtime);
+    try {
+      await entered.promise;
+      await flushDispatcher();
+      assert.equal(isChatRunInFlight(SESSION_ID), true);
+      assert.deepEqual(calls, ['long scheduled run', 'unrelated queue']);
+      assert.equal(await dispatchQueuedMessages(runtime, false), 0);
+      assert.equal((sessionDraftsDb.getDrafts(userId)[0].queuedMessage as { content: string }).content, 'same session next');
+      handback.resolve();
+      await flushDispatcher();
+      assert.deepEqual(calls, ['long scheduled run', 'unrelated queue', 'same session next']);
+      assert.equal(sessionDraftsDb.getDrafts(userId).length, 0);
+    } finally {
+      handback.resolve();
+      await flushDispatcher();
+    }
+  });
+});
+
+
+test('workspace admission busy preserves the exact draft without self-waking and can retry once', { timeout: 5000 }, async () => {
+  await withIsolatedDatabase(async userId => {
+    const queuedMessage = { content: 'retry after workspace handback', options: { workspaceMode: 'isolated', model: 'claude-opus-5' }, attachments: [] };
+    sessionDraftsDb.saveDraft(userId, SESSION_ID, { text: 'new draft text', queuedMessage });
+    let calls = 0;
+    let busy = true;
+    let settled = 0;
+    const remove = onChatRunSettled(() => { settled++; });
+    const runtime = {
+      ...createRuntime([]),
+      run: async (_provider, _command, _options, writer) => {
+        calls++;
+        if (busy) {
+          writer.send({ ...createCompleteMessage({ provider: 'claude', exitCode: 1 }), workspaceAdmissionRejected: true });
+          throw Object.assign(new Error('Workspace reserved by synchronization'), { code: 'WORKSPACE_BUSY', workspaceAdmissionRejected: true });
+        }
+        writer.send(createCompleteMessage({ provider: 'claude', exitCode: 0 }));
+      },
+    } as ProviderRuntimeGateway;
+    initializeScheduledMessageDispatcher(runtime);
+    try {
+      await flushDispatcher();
+      assert.equal(calls, 1);
+      assert.equal(settled, 0);
+      assert.deepEqual(sessionDraftsDb.getDrafts(userId)[0].queuedMessage, queuedMessage);
+      assert.equal(sessionDraftsDb.getDrafts(userId)[0].text, 'new draft text');
+      busy = false;
+      const results = await Promise.all([dispatchQueuedMessages(runtime), dispatchQueuedMessages(runtime)]);
+      assert.deepEqual(results, [1, 0]);
+      assert.equal(calls, 2);
+      assert.equal(settled, 1);
+      assert.equal(sessionDraftsDb.getDrafts(userId)[0].queuedMessage, null);
+    } finally { remove(); }
+  });
+});
+
+
+test('a newer queued draft wins over a rejected admission restore', async () => {
+  await withIsolatedDatabase(async userId => {
+    sessionDraftsDb.saveDraft(userId, SESSION_ID, { text: '', queuedMessage: { content: 'old queue' } });
+    const runtime = {
+      ...createRuntime([]),
+      run: async () => {
+        sessionDraftsDb.saveDraft(userId, SESSION_ID, { text: 'new text', queuedMessage: { content: 'new queue' } });
+        throw Object.assign(new Error('Workspace busy'), { code: 'WORKSPACE_BUSY', workspaceAdmissionRejected: true });
+      },
+    } as ProviderRuntimeGateway;
+    assert.equal(await dispatchQueuedMessages(runtime), 1);
+    assert.deepEqual(sessionDraftsDb.getDrafts(userId)[0].queuedMessage, { content: 'new queue' });
+    assert.equal(sessionDraftsDb.getDrafts(userId)[0].text, 'new text');
+  });
+});
+
+
+test('interactive completion wakes a queued turn only after runtime teardown', { timeout: 5000 }, async () => {
+  await withIsolatedDatabase(async userId => {
+    const entered = gate();
+    const teardown = gate();
+    const calls: string[] = [];
+    const runtime = {
+      ...createRuntime([]),
+      run: async (_provider: string, command: string, _options: unknown, writer: Parameters<ProviderRuntimeGateway['run']>[3]) => {
+        calls.push(command);
+        if (command === 'interactive original') {
+          writer.send({ kind: 'complete', provider: 'claude', sessionId: SESSION_ID, exitCode: 0 });
+          entered.resolve();
+          await teardown.promise;
+        } else writer.send(createCompleteMessage({ provider: 'claude', exitCode: 0 }));
+      },
+    } as ProviderRuntimeGateway;
+    const original = runDetachedChatTurn({ sessionId: SESSION_ID, userId, content: 'interactive original' }, { runtime });
+    await entered.promise;
+    sessionDraftsDb.saveDraft(userId, SESSION_ID, { text: '', queuedMessage: { content: 'queued continuation' } });
+    initializeScheduledMessageDispatcher(runtime);
+    try {
+      await flushDispatcher();
+      assert.deepEqual(calls, ['interactive original']);
+      teardown.resolve();
+      await original;
+      await flushDispatcher();
+      assert.deepEqual(calls, ['interactive original', 'queued continuation']);
+      assert.equal(sessionDraftsDb.getDrafts(userId).length, 0);
+    } finally { teardown.resolve(); await original; }
+  });
+});
+
+function gate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function flushDispatcher(): Promise<void> {
+  await new Promise<void>(resolve => { setImmediate(resolve); });
+  await new Promise<void>(resolve => { setImmediate(resolve); });
+}

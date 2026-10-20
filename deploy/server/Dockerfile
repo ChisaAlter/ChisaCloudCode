@@ -1,7 +1,7 @@
 # ChisaCloudCode server (cloudcli-ui) container image.
 #
 # Build from the repository root:
-#   docker build --build-arg COMMIT=$(git rev-parse --short HEAD) \
+#   docker build --build-arg COMMIT=$(git rev-parse HEAD) \
 #     -f deploy/server/Dockerfile -t local/chisacloudcode:<tag> .
 #
 # The API container runs as root (it drives the host docker socket to manage
@@ -9,15 +9,15 @@
 # sandbox boundary, which is why IS_SANDBOX=1 is set below: without it Claude
 # Code refuses --dangerously-skip-permissions / bypassPermissions as root.
 FROM node:24-bookworm AS build
-ARG COMMIT=unknown
+ARG COMMIT
 ENV HUSKY=0
+ENV CHISA_SOURCE_COMMIT=${COMMIT}
 WORKDIR /src/cloudcli-ui
 COPY cloudcli-ui/package.json cloudcli-ui/package-lock.json ./
 COPY cloudcli-ui/scripts ./scripts
 RUN npm ci --no-audit --no-fund
 COPY cloudcli-ui/ ./
 RUN NODE_OPTIONS=--max-old-space-size=4096 npm run build
-RUN C="$COMMIT" node -e "const fs=require('fs'); for (const f of ['shared/build-identity.json','dist-server/shared/build-identity.json']) { if (!fs.existsSync(f)) { console.log('skip', f); continue; } const j=JSON.parse(fs.readFileSync(f,'utf8')); j.commit=process.env.C; j.dirty=false; fs.writeFileSync(f, JSON.stringify(j)); console.log('identity', f, JSON.stringify(j)); }"
 RUN npm prune --omit=dev --no-audit --no-fund
 
 FROM docker:29-cli AS dockercli
@@ -56,6 +56,9 @@ RUN set -eu; \
     ln -sf "$bin" /usr/local/bin/claude; \
     claude --version
 
+ARG COMMIT
+LABEL org.opencontainers.image.source="https://github.com/ChisaAlter/ChisaCloudCode" \
+      org.opencontainers.image.revision=${COMMIT}
 ENV NODE_ENV=production
 ENTRYPOINT ["/usr/bin/tini","--"]
 CMD ["npm","run","server"]

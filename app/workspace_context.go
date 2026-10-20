@@ -10,6 +10,23 @@ import (
 )
 
 const workspaceSyncTimeout = 620 * time.Second
+
+// Initial imports carry the complete worktree and Git history. Failed imports
+// retain their mapping without Mode=vps, so retries need the same larger budget.
+const workspaceImportTimeout = 30 * time.Minute
+
+func workspaceSynchronizationTimeout(m *Mapping) time.Duration {
+	if m == nil || m.Mode != "vps" {
+		return workspaceImportTimeout
+	}
+	return workspaceSyncTimeout
+}
+
+// A pause must never consume the transfer budget. Steady-state synchronization
+// keeps the engine watching, so this bound only applies to rule migrations and
+// explicit stops.
+const workspaceSyncPauseTimeout = 10 * time.Second
+const workspaceSyncEngineVersion = "0.18.1-chisa.2"
 const serverRequestTimeout = 2000 * time.Second
 const workspaceDeadlineHeader = "X-Chisa-Deadline-Ms"
 

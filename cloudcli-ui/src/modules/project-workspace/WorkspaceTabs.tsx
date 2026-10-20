@@ -1,17 +1,21 @@
-import { MessageSquare, Terminal, Folder, GitBranch, ClipboardCheck, MonitorPlay, type LucideIcon } from 'lucide-react';
+import { MessageSquare, Terminal, Folder, GitBranch, ClipboardCheck, MonitorPlay, PanelsTopLeft, type LucideIcon } from 'lucide-react';
 import { Fragment } from 'react';
 import type { Dispatch, KeyboardEvent, SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { Tooltip, PillBar, Pill } from '@/shared/ui';
+import { ActionMenu, Tooltip, PillBar, Pill } from '@/shared/ui';
 import type { AppTab } from '@/shared/types';
 import { usePlugins,PluginIcon } from '@/modules/plugins';
+import { GitWorkspaceButton } from '@/modules/git-panel';
 
 type WorkspaceTabsProps = {
   activeTab: AppTab;
   setActiveTab: Dispatch<SetStateAction<AppTab>>;
   shouldShowTasksTab: boolean;
   shouldShowBrowserTab: boolean;
+  compact?: boolean;
+  projectId?: string;
+  serverPath?: string;
 };
 
 type BuiltInTab = {
@@ -58,6 +62,9 @@ export default function WorkspaceTabs({
   setActiveTab,
   shouldShowTasksTab,
   shouldShowBrowserTab,
+  compact = false,
+  projectId,
+  serverPath,
 }: WorkspaceTabsProps) {
   const { t } = useTranslation();
   const { plugins } = usePlugins();
@@ -98,6 +105,43 @@ export default function WorkspaceTabs({
     tabButtons[nextIndex]?.focus();
     tabButtons[nextIndex]?.click();
   };
+
+  if (compact) {
+    const toolTabs = tabs.filter((tab) => tab.id !== 'chat' && tab.id !== 'git');
+    const activeTool = toolTabs.find((tab) => tab.id === activeTab);
+    const labelFor = (tab: TabDefinition) => tab.kind === 'builtin' ? t(tab.labelKey) : tab.label;
+
+    return (
+      <div className="workspace-tools flex shrink-0 items-center gap-1">
+        <button
+          type="button"
+          aria-pressed={activeTab === 'chat'}
+          onClick={() => setActiveTab('chat')}
+          className="workspace-view-button"
+        >
+          <MessageSquare className="h-3.5 w-3.5" />
+          <span>{t('tabs.chat')}</span>
+        </button>
+        <GitWorkspaceButton projectId={projectId} serverPath={serverPath} active={activeTab === 'git'} onClick={() => setActiveTab('git')} />
+        <ActionMenu
+          label={activeTool ? labelFor(activeTool) : t('tabs.tools', { defaultValue: 'Tools' })}
+          icon={activeTool?.kind === 'builtin' ? activeTool.icon : PanelsTopLeft}
+          variant="ghost"
+          portal
+          triggerClassName={`workspace-view-button ${activeTool ? 'is-active' : ''}`}
+          items={toolTabs.map((tab) => ({
+            key: tab.id,
+            label: labelFor(tab),
+            icon: tab.kind === 'builtin' ? tab.icon : undefined,
+            leading: tab.kind === 'plugin' ? (
+              <PluginIcon pluginName={tab.pluginName} iconFile={tab.iconFile} className="h-4 w-4" />
+            ) : undefined,
+            onSelect: () => setActiveTab(tab.id),
+          }))}
+        />
+      </div>
+    );
+  }
 
   return (
     <PillBar

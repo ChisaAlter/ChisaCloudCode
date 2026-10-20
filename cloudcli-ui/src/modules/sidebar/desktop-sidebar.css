@@ -1,0 +1,150 @@
+/* Native sidebar only: browser/mobile retain the existing sidebar presentation. */
+.sidebar-surface.desktop-sidebar {
+  --sidebar-compose: 18 52% 43%;
+  width: 260px;
+  min-width: 260px;
+  background: hsl(var(--sidebar-background));
+  border-right: 1px solid hsl(var(--border) / 0.48);
+}
+.dark .sidebar-surface.desktop-sidebar { --sidebar-compose: 20 59% 64%; }
+
+.desktop-sidebar .sidebar-brand {
+  height: 60px;
+  min-height: 60px;
+  padding-right: 15px;
+  padding-left: max(20px, var(--mygo-titlebar-inset-left, 0px));
+  border: 0;
+}
+.desktop-sidebar .sidebar-brand h1 {
+  font-size: 13px;
+  font-weight: 550;
+  letter-spacing: -0.025em;
+  color: hsl(var(--foreground) / 0.88);
+}
+.desktop-sidebar .sidebar-brand .sidebar-icon { opacity: 0.55; }
+.desktop-sidebar .sidebar-brand .sidebar-icon:hover { opacity: 1; }
+.desktop-sidebar .sidebar-primary-actions { padding: 6px 14px 12px; }
+.desktop-sidebar .sidebar-new-chat {
+  height: 40px;
+  gap: 9px;
+  padding: 0 10px;
+  margin-bottom: 13px;
+  border: 1px solid hsl(var(--sidebar-compose) / 0.16);
+  border-radius: 8px;
+  background: hsl(var(--sidebar-compose) / 0.105);
+  color: hsl(var(--sidebar-compose));
+  font-size: 12px;
+  font-weight: 550;
+  box-shadow: none;
+}
+.desktop-sidebar .sidebar-new-chat:hover {
+  background: hsl(var(--sidebar-compose) / 0.17);
+  border-color: hsl(var(--sidebar-compose) / 0.3);
+}
+.desktop-sidebar .sidebar-compose-shortcut {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-family: inherit;
+  font-size: 9px;
+  font-weight: 400;
+  letter-spacing: -0.025em;
+  opacity: 0.66;
+}
+.desktop-sidebar .sidebar-search {
+  height: 34px;
+  padding-left: 34px;
+  border-color: hsl(var(--border) / 0.6);
+  border-radius: 7px;
+  background: hsl(var(--background) / 0.4);
+  font-size: 12px;
+}
+.desktop-sidebar .sidebar-primary-actions nav { margin-top: 8px; }
+.desktop-sidebar .sidebar-nav-item {
+  min-height: 34px;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: hsl(var(--muted-foreground));
+}
+.desktop-sidebar .sidebar-nav-item svg { width: 15px; height: 15px; stroke-width: 1.6; }
+.desktop-sidebar .sidebar-nav-item.is-active {
+  background: hsl(var(--foreground) / 0.065);
+  color: hsl(var(--foreground));
+  font-weight: 500;
+}
+.desktop-sidebar .sidebar-section-heading {
+  min-height: 35px;
+  padding: 4px 16px 3px 22px;
+}
+.desktop-sidebar .sidebar-section-heading > span {
+  font-size: 10px;
+  font-weight: 500;
+  color: hsl(var(--muted-foreground) / 0.78);
+}
+.desktop-sidebar .sidebar-section-heading .sidebar-icon { min-width: 23px; height: 25px; opacity: 0.65; }
+.desktop-sidebar .sidebar-section-heading .sidebar-icon:hover,
+.desktop-sidebar .sidebar-section-heading .sidebar-icon.is-active { opacity: 1; }
+.desktop-sidebar .sidebar-recents { padding: 0 5px; }
+/* The header owns the desktop Recents heading and tools. */
+.desktop-sidebar .sidebar-recents-summary { display: none; }
+.desktop-sidebar .sidebar-recent-link {
+  min-height: 48px;
+  padding: 8px 34px 8px 11px;
+  border-radius: 6px;
+  background: transparent;
+}
+.desktop-sidebar .sidebar-recent-link:hover,
+.desktop-sidebar .sidebar-recent-item:focus-within .sidebar-recent-link { background: hsl(var(--foreground) / 0.045); }
+.desktop-sidebar .sidebar-recent-link[aria-current="page"] { background: hsl(var(--foreground) / 0.075); }
+.desktop-sidebar .sidebar-recent-provider { display: none; }
+.desktop-sidebar .sidebar-recent-title { font-size: 12px; line-height: 17px; color: hsl(var(--foreground) / 0.9); }
+.desktop-sidebar .sidebar-recent-link[aria-current="page"] .sidebar-recent-title { font-weight: 500; color: hsl(var(--foreground)); }
+.desktop-sidebar .sidebar-recent-metadata { margin-top: 2px; font-size: 10px; color: hsl(var(--muted-foreground) / 0.75); }
+.desktop-sidebar .sidebar-recent-more {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  z-index: 1;
+  width: 25px;
+  min-width: 25px;
+  height: 25px;
+  transform: translateY(-50%);
+  opacity: 0;
+}
+.desktop-sidebar .sidebar-recent-item:hover .sidebar-recent-more,
+.desktop-sidebar .sidebar-recent-item:focus-within .sidebar-recent-more { opacity: 1; }
+.desktop-sidebar .sidebar-recent-item:hover .sidebar-recent-link,
+.desktop-sidebar .sidebar-recent-item:focus-within .sidebar-recent-link { padding-right: 78px; }
+.desktop-sidebar .sidebar-recent-item[data-pinned] .sidebar-recent-link { padding-right: 60px; }
+.desktop-sidebar .sidebar-recent-options { right: 33px; }
+.desktop-sidebar .sidebar-recent-options > div { gap: 0; }
+.desktop-sidebar .sidebar-recent-options .sidebar-icon { width: 24px; min-width: 24px; }
+.desktop-sidebar .sidebar-recent-item[data-renaming] .sidebar-recent-options {
+  right: 5px;
+  left: 5px;
+  padding: 5px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 7px;
+  background: hsl(var(--background));
+  z-index: 2;
+}
+.desktop-sidebar .sidebar-recent-item[data-renaming] .sidebar-recent-options input { width: 0; min-width: 0; flex: 1; }
+.desktop-sidebar .sidebar-account-footer { margin-top: auto; padding: 6px; }
+.desktop-sidebar .sidebar-account-footer .nav-divider { margin: 0 8px; background: hsl(var(--border) / 0.5); }
+.desktop-sidebar .sidebar-version { padding-top: 6px; font-size: 10px; }
+.desktop-sidebar .sidebar-account-menu { padding: 6px 0 0; }
+.desktop-sidebar .sidebar-account-menu > div > button {
+  min-height: 56px;
+  gap: 10px;
+  padding: 9px 11px;
+  border-radius: 7px;
+}
+.desktop-sidebar .sidebar-account-menu button .text-sm { font-size: 12px; }
+.desktop-sidebar .sidebar-account-menu button .text-xs { font-size: 10px; opacity: 0.8; }
+.desktop-sidebar .sidebar-new-chat:focus-visible,
+.desktop-sidebar .sidebar-recent-more:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: 2px; }
+
+/* A native narrow viewport uses the mobile presentation, including its row controls. */
+.sidebar-recent-more { display: none; }
+.desktop-sidebar .sidebar-recent-more { display: inline-flex; }

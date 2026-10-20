@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useGitPanelController } from '@/modules/git-panel/hooks/useGitPanelController';
@@ -37,20 +37,40 @@ export default function GitPanel({
   const [wrapText, setWrapText] = useState(true);
   const [hasExpandedFiles, setHasExpandedFiles] = useState(false);
   const [confirmAction, setConfirmAction] = useState<ConfirmationRequest | null>(null);
+  // Confirmations stay visible and cannot be submitted twice while their action runs.
+  const [isConfirming, setIsConfirming] = useState(false);
+  const confirmationRequestRef = useRef<symbol | null>(null);
+  // A project transition clears repository-owned UI before the new project's first commit.
+  const [uiProjectId, setUiProjectId] = useState(selectedProject?.projectId ?? null);
+  if (uiProjectId !== (selectedProject?.projectId ?? null)) {
+    setUiProjectId(selectedProject?.projectId ?? null);
+    setConfirmAction(null);
+    setIsConfirming(false);
+    setHasExpandedFiles(false);
+  }
+
+  useEffect(() => {
+    confirmationRequestRef.current = null;
+    return () => { confirmationRequestRef.current = null; };
+  }, [selectedProject?.projectId]);
 
   const {
     gitStatus,
     gitDiff,
     isLoading,
     isLoadingCommits,
+    commitsError,
+    retryCommits,
     currentBranch,
     branches,
     localBranches,
     remoteBranches,
     recentCommits,
     commitDiffs,
+    commitDiffErrors,
     remoteStatus,
     isCreatingBranch,
+    isBranchBusy,
     isFetching,
     isPulling,
     isPushing,
@@ -59,6 +79,7 @@ export default function GitPanel({
     isInitializingRepository,
     operationError,
     clearOperationError,
+    reportOperationError,
     refreshAll,
     switchBranch,
     createBranch,
@@ -72,6 +93,7 @@ export default function GitPanel({
     stageFiles,
     unstageFiles,
     fetchCommitDiff,
+    fetchFileDiff,
     commitChanges,
     createInitialCommit,
     initRepository,
@@ -87,21 +109,30 @@ export default function GitPanel({
     // as the `project` body param.
     projectId: selectedProject?.projectId ?? null,
     onSuccess: refreshAll,
+    onError: reportOperationError,
   });
 
   const executeConfirmedAction = useCallback(async (useAlternateConfirmation = false) => {
-    if (!confirmAction) return;
+    if (!confirmAction || confirmationRequestRef.current) return;
     const actionToExecute = confirmAction;
-    setConfirmAction(null);
+    const request = Symbol('confirmation');
+    confirmationRequestRef.current = request;
+    setIsConfirming(true);
     try {
       const confirmationHandler = useAlternateConfirmation
         ? actionToExecute.alternateConfirmation?.onConfirm ?? actionToExecute.onConfirm
         : actionToExecute.onConfirm;
       await confirmationHandler();
+      if (confirmationRequestRef.current === request) setConfirmAction(null);
     } catch (error) {
-      console.error('Error executing confirmation action:', error);
+      if (confirmationRequestRef.current === request) reportOperationError(error);
+    } finally {
+      if (confirmationRequestRef.current === request) {
+        confirmationRequestRef.current = null;
+        setIsConfirming(false);
+      }
     }
-  }, [confirmAction]);
+  }, [confirmAction, reportOperationError]);
 
   const changeCount = getChangedFileCount(gitStatus);
   // Without a repository the branch/fetch/refresh header controls are all
@@ -126,6 +157,7 @@ export default function GitPanel({
           remoteStatus={remoteStatus}
           isLoading={isLoading}
           isCreatingBranch={isCreatingBranch}
+          isBranchBusy={isBranchBusy}
           isFetching={isFetching}
           isPulling={isPulling}
           isPushing={isPushing}
@@ -152,6 +184,7 @@ export default function GitPanel({
           canInitRepository={isMissingRepository}
           isInitializingRepository={isInitializingRepository}
           initError={isMissingRepository ? operationError : null}
+          onRetry={refreshAll}
           onInitRepository={() => {
             clearOperationError();
             void initRepository();
@@ -168,7 +201,7 @@ export default function GitPanel({
 
           {activeView === 'changes' && (
             <ChangesView
-              key={selectedProject.fullPath}
+              key={selectedProject.projectId}
               isMobile={isMobile}
               projectPath={selectedProject.fullPath}
               gitStatus={gitStatus}
@@ -179,6 +212,7 @@ export default function GitPanel({
               onWrapTextChange={setWrapText}
               onCreateInitialCommit={createInitialCommit}
               onOpenFile={openFile}
+              onLoadDiff={fetchFileDiff}
               onDiscardFile={discardChanges}
               onDeleteFile={deleteUntrackedFile}
               onStageFiles={stageFiles}
@@ -191,13 +225,17 @@ export default function GitPanel({
 
           {activeView === 'history' && (
             <HistoryView
+              key={selectedProject.projectId}
               isMobile={isMobile}
               // Treat an in-flight commits request as loading only while the
               // list is empty, so "No commits found" never flashes before the
               // first response and refetches don't blank an existing list.
               isLoading={isLoading || (recentCommits.length === 0 && isLoadingCommits)}
+              error={commitsError}
+              onRetry={retryCommits}
               recentCommits={recentCommits}
               commitDiffs={commitDiffs}
+              commitDiffErrors={commitDiffErrors}
               wrapText={wrapText}
               onFetchCommitDiff={fetchCommitDiff}
             />
@@ -223,6 +261,7 @@ export default function GitPanel({
               remoteBranches={remoteBranches}
               remoteStatus={remoteStatus}
               isCreatingBranch={isCreatingBranch}
+              isBranchBusy={isBranchBusy}
               onSwitchBranch={switchBranch}
               onCreateBranch={createBranch}
               onDeleteBranch={deleteBranch}
@@ -234,7 +273,11 @@ export default function GitPanel({
 
       <ConfirmActionModal
         action={confirmAction}
-        onCancel={() => setConfirmAction(null)}
+        isPending={isConfirming}
+        error={confirmAction?.type === 'revertLocalCommit' ? operationError : null}
+        onCancel={() => {
+          if (!confirmationRequestRef.current) setConfirmAction(null);
+        }}
         onConfirm={(useAlternateConfirmation) => {
           void executeConfirmedAction(useAlternateConfirmation);
         }}

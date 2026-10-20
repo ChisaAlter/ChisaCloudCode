@@ -12,6 +12,7 @@ type GitPanelHeaderProps = {
   remoteStatus: GitRemoteStatus | null;
   isLoading: boolean;
   isCreatingBranch: boolean;
+  isBranchBusy: boolean;
   isFetching: boolean;
   isPulling: boolean;
   isPushing: boolean;
@@ -38,6 +39,7 @@ export default function GitPanelHeader({
   remoteStatus,
   isLoading,
   isCreatingBranch,
+  isBranchBusy,
   isFetching,
   isPulling,
   isPushing,
@@ -93,7 +95,7 @@ export default function GitPanelHeader({
   const aheadCount = remoteStatus?.ahead ?? 0;
   const behindCount = remoteStatus?.behind ?? 0;
   const remoteName = remoteStatus?.remoteName ?? 'remote';
-  const anyPending = isFetching || isPulling || isPushing || isPublishing;
+  const anyPending = isFetching || isPulling || isPushing || isPublishing || isBranchBusy || isRevertingLocalCommit;
 
   const requestPullConfirmation = () => {
     onRequestConfirmation({
@@ -144,6 +146,8 @@ export default function GitPanelHeader({
         <div className="relative" ref={dropdownRef}>
           <button
             onClick={() => setShowBranchDropdown((prev) => !prev)}
+            disabled={anyPending}
+            aria-busy={isBranchBusy}
             className={`flex items-center rounded-lg transition-colors hover:bg-accent ${isMobile ? 'space-x-1 px-2 py-1' : 'space-x-2 px-3 py-1.5'}`}
           >
             <GitBranch className={`text-muted-foreground ${isMobile ? 'h-3 w-3' : 'h-4 w-4'}`} />
@@ -200,6 +204,7 @@ export default function GitPanelHeader({
                     <button
                       key={branch}
                       onClick={() => void handleSwitchBranch(branch)}
+                      disabled={anyPending}
                       className={`w-full px-4 py-2 text-left text-sm transition-colors hover:bg-accent ${
                         branch === currentBranch ? 'bg-accent/50 text-foreground' : 'text-muted-foreground'
                       }`}
@@ -214,6 +219,7 @@ export default function GitPanelHeader({
               </div>
               <div className="border-t border-border py-1">
                 <button
+                  disabled={anyPending}
                   onClick={() => {
                     setShowNewBranchModal(true);
                     setShowBranchDropdown(false);
@@ -285,7 +291,7 @@ export default function GitPanelHeader({
 
           <button
             onClick={requestRevertLocalCommitConfirmation}
-            disabled={isRevertingLocalCommit}
+            disabled={anyPending}
             className={`rounded-lg transition-colors hover:bg-accent disabled:opacity-50 ${isMobile ? 'p-1' : 'p-1.5'}`}
             title={t('git:header.revertTitle')}
           >
@@ -307,7 +313,7 @@ export default function GitPanelHeader({
 
       {/* Inline error banner */}
       {operationError && (
-        <div className="flex items-start gap-2 border-b border-destructive/20 bg-destructive/10 px-4 py-2.5 text-sm text-destructive">
+        <div role="alert" className="flex items-start gap-2 border-b border-destructive/20 bg-destructive/10 px-4 py-2.5 text-sm text-destructive">
           <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
           <span className="flex-1 leading-snug">{operationError}</span>
           <button

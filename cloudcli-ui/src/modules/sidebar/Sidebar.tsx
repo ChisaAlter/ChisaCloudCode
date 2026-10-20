@@ -1,14 +1,15 @@
-import { memo, useCallback, useEffect } from 'react';
+import { memo, useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useDeviceSettings } from '@/shared/hooks/useDeviceSettings';
 import { useUiPreferences, useSetUiPreference } from '@/shared/context/UiPreferencesContext';
 import { useSidebarController } from '@/modules/sidebar/hooks/useSidebarController';
 import { useTaskMaster, useTasksSettings } from '@/modules/task-master';
-import { usePaletteOps } from '@/modules/command-palette';
+import { usePaletteOps, usePaletteOpsRegister } from '@/modules/command-palette';
 import { isDesktop } from '@/shared/chisa';
 import { api } from '@/shared/api';
 import { beginBlockingOperation } from '@/shared/utils';
+import { Dialog, DialogContent, DialogTitle } from '@/shared/ui/Dialog';
 import { useBusySessionIdSet } from '@/shared/context/SessionProtectionContext';
 import type { LLMProvider, LoadingProgress, MCPServerStatus, Project, ProjectSession, SidebarProjectListProps } from '@/shared/types';
 import SidebarCollapsed from '@/modules/sidebar/SidebarCollapsed';
@@ -72,6 +73,8 @@ function Sidebar({
   const { setCurrentProject, mcpServerStatus } = useTaskMaster() as TaskMasterSidebarContext;
   const { tasksEnabled } = useTasksSettings();
   const paletteOps = usePaletteOps();
+  // Retain the folder-open failure until dismissed without blocking WebView rendering.
+  const [directoryOpenError, setDirectoryOpenError] = useState<string | null>(null);
   // Only membership is rendered here, so subscribing to the full activity map
   // would re-render the whole tree on every provider status frame.
   const activeSessions = useBusySessionIdSet();
@@ -176,6 +179,54 @@ function Sidebar({
     await paletteOps.refreshProjects();
   };
 
+  const createProject = () => {
+    if (!isDesktop()) {
+      setShowNewProject(true);
+      return;
+    }
+    setDirectoryOpenError(null);
+    // All desktop entry points use the native picker and the same sync/create flow.
+    void (async () => {
+      const finish = beginBlockingOperation('正在打开工作目录', '正在准备工作区并载入项目，请稍候…');
+      try {
+        const { FrontendBridge, recordLocalSelection } = await import('@/shared/chisa');
+        const result = await FrontendBridge.selectLocalFolder();
+        if (result.canceled) return;
+        if (result.action === 'manage-mappings') {
+          finish();
+          paletteOps.openSettings('chisa');
+          return;
+        }
+        if (!result.ok || !result.serverPath) {
+          setDirectoryOpenError(String(result.error || '打开本地目录失败'));
+          return;
+        }
+        recordLocalSelection({ localPath: String(result.localPath || ''), serverPath: String(result.serverPath) });
+        const serverPath = String(result.serverPath);
+        const base = serverPath.split('/').filter(Boolean).pop() || 'local-project';
+        const cleanName = base.replace(/-[a-f0-9]{6}$/, '');
+        const existingProject = projects.find((project) => (project.fullPath || project.path) === serverPath);
+        if (existingProject) {
+          await handleProjectCreated(existingProject);
+          return;
+        }
+        const response = await api.createProject({ name: base, path: serverPath, customName: cleanName });
+        const data = await response.json();
+        if (!response.ok) {
+          const message = data.error?.message || (typeof data.error === 'string' ? data.error : '创建项目失败');
+          const details = data.error?.details ?? data.details;
+          throw new Error(details && details !== message ? `${message}\n${typeof details === 'string' ? details : JSON.stringify(details)}` : message);
+        }
+        await handleProjectCreated(data.project);
+      } catch (e) {
+        setDirectoryOpenError(e instanceof Error ? e.message : String(e));
+      } finally {
+        finish();
+      }
+    })();
+  };
+  usePaletteOpsRegister({ createProject });
+
   // Stable so memo() on the row components can bail out; an inline arrow here
   // would give every row a new callback on each sidebar render.
   const handleSaveProjectName = useCallback((projectId: string, nextName: string) => {
@@ -231,6 +282,15 @@ function Sidebar({
 
   return (
     <>
+      <Dialog open={directoryOpenError !== null} onOpenChange={(open) => { if (!open) setDirectoryOpenError(null); }}>
+        <DialogContent aria-labelledby="directory-open-error-title" aria-describedby="directory-open-error-detail" className="max-w-md p-6">
+          <DialogTitle id="directory-open-error-title" className="not-sr-only text-base font-semibold">打开本地目录失败</DialogTitle>
+          <p id="directory-open-error-detail" className="mt-3 whitespace-pre-wrap break-words text-sm text-muted-foreground">{directoryOpenError}</p>
+          <div className="mt-5 flex justify-end">
+            <button type="button" onClick={() => setDirectoryOpenError(null)} className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">确定</button>
+          </div>
+        </DialogContent>
+      </Dialog>
         <SidebarModals
           projects={projects}
         showSettings={showSettings}
@@ -324,54 +384,7 @@ function Sidebar({
               void refreshProjects();
             }}
             isRefreshing={isRefreshing}
-            onCreateProject={() => {
-              if (isDesktop()) {
-                // 桌面模式：选择本机文件夹 → 自动同步 + 建项目，不出服务器路径表单
-                void (async () => {
-                  const finish = beginBlockingOperation('正在打开工作目录', '正在准备工作区并载入项目，请稍候…');
-                  try {
-                    const { FrontendBridge, recordLocalSelection } = await import('@/shared/chisa');
-                    const result = await FrontendBridge.selectLocalFolder();
-                    if (result.canceled) return;
-                    if (result.action === 'manage-mappings') {
-                      finish();
-                      paletteOps.openSettings('chisa');
-                      return;
-                    }
-                    if (!result.ok || !result.serverPath) {
-                      window.alert(String(result.error || '打开本地目录失败'));
-                      return;
-                    }
-                    recordLocalSelection({
-                      localPath: String(result.localPath || ''),
-                      serverPath: String(result.serverPath),
-                    });
-                    const serverPath = String(result.serverPath);
-                    const base = serverPath.split('/').filter(Boolean).pop() || 'local-project';
-                    const cleanName = base.replace(/-[a-f0-9]{6}$/, '');
-                    const existingProject = projects.find((project) =>
-                      (project.fullPath || project.path) === serverPath,
-                    );
-                    if (existingProject) {
-                      await handleProjectCreated(existingProject);
-                      return;
-                    }
-                    const response = await api.createProject({ name: base, path: serverPath, customName: cleanName });
-                    const data = await response.json();
-                    if (!response.ok) {
-                      throw new Error(data.error?.details || data.details || data.error?.message || data.error || '创建项目失败');
-                    }
-                    await handleProjectCreated(data.project);
-                  } catch (e) {
-                    window.alert('打开本地目录失败：' + (e instanceof Error ? e.message : String(e)));
-                  } finally {
-                    finish();
-                  }
-                })();
-                return;
-              }
-              setShowNewProject(true);
-            }}
+            onCreateProject={createProject}
             onCollapseSidebar={handleCollapseSidebar}
             onShowSettings={onShowSettings}
             projectListProps={projectListProps}

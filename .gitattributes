@@ -1,0 +1,3 @@
+# Keep cumulative upstream patches byte-stable. Their context lines intentionally
+# contain diff prefixes followed by tabs or blank content.
+ops/mutagen/*.patch text eol=lf -whitespace

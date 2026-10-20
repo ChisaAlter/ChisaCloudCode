@@ -68,6 +68,35 @@ export type AuthenticatedWebSocketRequest = IncomingMessage & {
  */
 export type LLMProvider = 'claude' | 'codex' | 'cursor' | 'opencode';
 
+//----------------- HIROUTE CONNECTION SETTINGS ------------
+/** Per-user gateway configuration safe to return to settings; never includes the grant. */
+export type HiRouteSettings = { enabled: boolean; baseUrl: string; routeModel: string; hasAuthToken: boolean };
+/** Validated settings update; omitted or blank tokens retain the grant, while null removes it. */
+export type HiRouteSettingsInput = { enabled: boolean; baseUrl: string; routeModel: string; authToken?: string | null };
+/** Server-only stored gateway connection. Keep authToken out of API responses and logs. */
+export type HiRouteConnection = Omit<HiRouteSettings, 'hasAuthToken'> & { authToken: string };
+
+// ---------------------------
+//----------------- CLAUDE CUSTOM MODEL CONNECTIONS ------------
+/** Public metadata for the authenticated user's settings. API keys are never returned. */
+export type ClaudeModelConnection = { id: string; name: string; baseUrl: string; model: string; hasApiKey: boolean; authType: 'api_key' | 'auth_token' };
+/** Mutation snapshot; a null activeId selects the ordinary Claude connection. */
+export type ClaudeModelConnections = { activeId: string | null; connections: ClaudeModelConnection[] };
+/** Server-only runtime connection. Never serialize apiKey to HTTP clients or logs. */
+export type ClaudeModelConnectionSecret = Omit<ClaudeModelConnection, 'hasApiKey'> & { apiKey: string };
+/** Create or edit payload. Omitted or blank keys retain existing secrets; null is rejected. */
+export type ClaudeModelConnectionInput = { name: string; baseUrl: string; model: string; apiKey?: string; authType?: 'api_key' | 'auth_token' };
+/** Messages endpoint override distinguishing bearer grants from x-api-key authentication. */
+export type ClaudeEndpointOptions = { baseUrl: string; model: string; auth: { type: 'api_key' | 'auth_token'; value: string } };
+
+// ---------------------------
+//----------------- SESSION WORKSPACE EXECUTION ------------
+/** Durable session intent: isolated selects VPS worktrees; shared opts into synchronization leases. Native protocol-1 bindings still serialize writes. */
+export type SessionWorkspaceMode = 'isolated' | 'shared';
+
+// ---------------------------
+//----------------- PROVIDER MODEL CATALOG ------------
+
 /**
  * One selectable model row in a provider model catalog.
  */
@@ -207,6 +236,7 @@ export type MessageKind =
  */
 export type GatewayEventKind =
   | 'chat_subscribed'
+  | 'chat_run_status'
   | 'session_upserted'
   | 'loading_progress'
   | 'protocol_error';

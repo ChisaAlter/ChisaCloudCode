@@ -1,6 +1,6 @@
 {
   "name": "chisacloudcode",
-  "version": "0.1.6",
+  "version": "0.1.10",
   "productName": "ChisaCloudCode",
   "description": "ChisaCloudCode desktop and server workspace",
   "type": "module",
@@ -10,7 +10,6 @@
     "cloudcli": "dist-server/server/modules/cli/cli.js"
   },
   "files": [
-    "electron/",
     "server/",
     "shared/",
     "public/api-docs.html",
@@ -28,21 +27,16 @@
     "server:dev": "tsx --tsconfig server/tsconfig.json server/index.ts",
     "server:dev-watch": "tsx watch --tsconfig server/tsconfig.json server/index.ts",
     "client": "vite",
-    "desktop": "electron electron/main.js",
-    "desktop:dev": "cross-env ELECTRON_DEV_URL=http://127.0.0.1:5173 electron electron/main.js",
-    "desktop:stage": "node scripts/release/prepare-desktop-app.js",
-    "desktop:pack": "npm run build && npm run desktop:stage && electron-builder --projectDir .desktop-build/desktop-app --dir",
-    "desktop:dist:mac": "npm run build && npm run desktop:stage && electron-builder --projectDir .desktop-build/desktop-app --mac dmg",
-    "desktop:dist:win": "npm run build && npm run desktop:stage && electron-builder --projectDir .desktop-build/desktop-app --win nsis",
     "server:bundle": "npm run build && node scripts/release/build-server-bundle.js",
-    "desktop:icon:mac": "node electron/scripts/generate-macos-icon.js",
     "build": "npm run build:client && npm run build:server",
     "build:client": "vite build",
     "prebuild:server": "node -e \"require('node:fs').rmSync('dist-server.next', { recursive: true, force: true })\"",
     "build:server": "node scripts/build-identity.mjs --server && tsc -p server/tsconfig.json && tsc-alias -p server/tsconfig.json",
     "postbuild:server": "node scripts/promote-dist-server.mjs",
     "preview": "vite preview",
+    "pretypecheck": "node scripts/build-identity.mjs --server",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p server/tsconfig.json",
+    "pretest": "node scripts/build-identity.mjs --server",
     "test": "tsx --tsconfig server/tsconfig.json --experimental-test-module-mocks --test \"server/**/*.test.ts\" \"server/**/*.test.js\"",
     "test:client": "vitest run",
     "lint": "oxlint src/ server/",
@@ -60,66 +54,6 @@
     "prebuild:client": "node scripts/build-builtin-plugins.mjs",
     "plugins:build": "node scripts/build-builtin-plugins.mjs",
     "prebuild:web": "node scripts/build-builtin-plugins.mjs"
-  },
-  "build": {
-    "appId": "ai.cloudcli.desktop",
-    "productName": "ChisaCloudCode",
-    "asar": false,
-    "artifactName": "chisacloudcode-desktop-${version}-${os}-${arch}.${ext}",
-    "directories": {
-      "output": "release/desktop"
-    },
-    "extraMetadata": {
-      "main": "electron/main.js"
-    },
-    "files": [
-      "electron/",
-      "public/",
-      "dist/",
-      "dist-server/",
-      "shared/",
-      "server/",
-      "package.json",
-      "!**/node_modules/@anthropic-ai/claude-agent-sdk-{darwin,linux,win32}-*/**"
-    ],
-    "protocols": [
-      {
-        "name": "ChisaCloudCode",
-        "schemes": [
-          "cloudcli"
-        ]
-      }
-    ],
-    "mac": {
-      "category": "public.app-category.developer-tools",
-      "icon": "electron/assets/logo-macos.icns",
-      "notarize": true,
-      "target": [
-        "dmg"
-      ],
-      "extendInfo": {
-        "CFBundleName": "ChisaCloudCode",
-        "CFBundleDisplayName": "ChisaCloudCode",
-        "CFBundleURLTypes": [
-          {
-            "CFBundleURLName": "ChisaCloudCode",
-            "CFBundleURLSchemes": [
-              "cloudcli"
-            ]
-          }
-        ]
-      }
-    },
-    "win": {
-      "icon": "electron/assets/logo-windows.ico",
-      "target": [
-        "nsis"
-      ]
-    },
-    "nsis": {
-      "installerIcon": "electron/assets/logo-windows.ico",
-      "uninstallerIcon": "electron/assets/logo-windows.ico"
-    }
   },
   "keywords": [
     "claude code",
@@ -140,7 +74,7 @@
   "author": "CloudCLI UI Contributors",
   "license": "AGPL-3.0-or-later",
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.280",
+    "@anthropic-ai/claude-agent-sdk": "0.3.303",
     "@codemirror/lang-css": "^6.3.1",
     "@codemirror/lang-html": "^6.4.9",
     "@codemirror/lang-javascript": "^6.2.4",
@@ -202,7 +136,8 @@
     "remark-math": "^6.0.0",
     "tailwind-merge": "^3.3.1",
     "web-push": "^3.6.7",
-    "ws": "^8.22.0"
+    "ws": "^8.22.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@commitlint/cli": "^20.5.0",
@@ -222,20 +157,22 @@
     "@types/react-syntax-highlighter": "^15.5.13",
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^4.6.0",
+    "@xterm/addon-search": "^0.15.0",
+    "@xterm/addon-unicode11": "^0.8.0",
     "auto-changelog": "^2.5.0",
     "autoprefixer": "^10.4.16",
     "concurrently": "^8.2.2",
-    "cross-env": "^10.1.0",
-    "electron": "^41.10.6",
-    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.2",
     "eslint": "^9.39.3",
     "eslint-import-resolver-typescript": "^4.4.4",
     "eslint-plugin-boundaries": "^6.0.2",
     "eslint-plugin-import-x": "^4.16.1",
     "eslint-plugin-tailwindcss": "^3.18.2",
     "husky": "^9.1.7",
+    "js-yaml": "^4.3.0",
     "jsdom": "^26.1.0",
     "lint-staged": "^16.3.2",
+    "luxon": "^3.7.2",
     "node-gyp": "^13.1.0",
     "oxlint": "^1.79.0",
     "oxlint-tsgolint": "^7.0.2001",
@@ -247,19 +184,13 @@
     "tsx": "^4.23.15",
     "typescript": "^5.9.3",
     "vite": "^7.3.7",
-    "vitest": "^5.0.4",
-    "@xterm/addon-search": "^0.15.0",
-    "@xterm/addon-unicode11": "^0.8.0",
-    "luxon": "^3.7.2",
-    "esbuild": "^0.28.2",
-    "js-yaml": "^4.3.0"
+    "vitest": "^5.0.4"
   },
   "lint-staged": {
     "src/**/*.{ts,tsx,js,jsx}": "oxlint",
     "server/**/*.{js,ts}": "oxlint"
   },
   "optionalDependencies": {
-    "@nut-tree-fork/nut-js": "^4.2.6",
-    "screenshot-desktop": "^1.15.4"
+    "@nut-tree-fork/nut-js": "^4.2.6"
   }
 }

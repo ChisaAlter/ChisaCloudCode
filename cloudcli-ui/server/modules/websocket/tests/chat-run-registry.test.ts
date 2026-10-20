@@ -17,7 +17,8 @@ class FakeConnection {
   frames: Array<Record<string, unknown>> = [];
 
   send(data: string): void {
-    this.frames.push(JSON.parse(data) as Record<string, unknown>);
+    const frame = JSON.parse(data) as Record<string, unknown>;
+    if (frame.kind !== 'chat_run_status') this.frames.push(frame);
   }
 }
 
@@ -577,5 +578,23 @@ test('completed-run late session ids cannot overwrite the next run provider mapp
     await new Promise((resolve) => { setTimeout(resolve, 0); });
     assert.equal(chatRunRegistry.getRun('late-mapping-channel'), next);
     assert.equal(next.providerSessionId, 'native-current');
+  });
+});
+
+test('run phases have a stable run id without consuming the channel replay sequence', async () => {
+  await withIsolatedDatabase(() => {
+    sessionsDb.createAppSession('run-phase', 'claude', '/workspace/demo');
+    const frames: Array<Record<string, unknown>> = [];
+    const connection = { readyState: 1, send: (payload: string) => { frames.push(JSON.parse(payload)); } };
+    const run = chatRunRegistry.startRun({ appSessionId: 'run-phase', provider: 'claude', providerSessionId: null, connection, userId: null });
+    assert.ok(run);
+    chatRunRegistry.setPhase(run, 'queued');
+    chatRunRegistry.setPhase(run, 'running');
+    run.writer.send({ kind: 'text', provider: 'claude', content: 'answer' });
+    run.writer.sendComplete({ exitCode: 0 });
+    const status = frames.filter(frame => frame.kind === 'chat_run_status');
+    assert.deepEqual(status.map(frame => frame.phase), ['accepted', 'queued', 'running', 'completed']);
+    assert.ok(status.every(frame => frame.runId === run.runId && frame.sessionId === 'run-phase'));
+    assert.deepEqual(chatRunRegistry.replayEvents('run-phase', 0).map(frame => frame.seq), [1, 2]);
   });
 });

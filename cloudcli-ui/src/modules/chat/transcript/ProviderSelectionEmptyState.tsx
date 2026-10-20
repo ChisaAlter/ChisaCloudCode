@@ -1,5 +1,5 @@
 import React, { useCallback, useMemo, useState } from "react";
-import { ChevronDown, Plus } from "lucide-react";
+import { ChevronDown, Plus, Sparkles } from "lucide-react";
 import { Trans, useTranslation } from "react-i18next";
 
 import type {
@@ -167,21 +167,22 @@ export default function ProviderSelectionEmptyState({
 
   if (!selectedSession && !currentSessionId) {
     return (
-      <div className="flex h-full items-center justify-center px-4">
+      <div className="chat-welcome flex h-full items-center justify-center px-4">
         <div className="w-full max-w-[34.25rem]">
-          <div className="mb-8 text-center">
-            <h2 className="text-lg font-semibold tracking-tight text-foreground sm:text-xl">
-              {t("providerSelection.title")}
+          <div className="chat-welcome-heading mb-8 text-center">
+            <Sparkles className="chat-welcome-mark mx-auto mb-5 h-9 w-9 text-primary" strokeWidth={1.2} aria-hidden="true" />
+            <h2 className="text-3xl font-medium tracking-tight text-foreground sm:text-4xl">
+              {t("providerSelection.welcomeTitle", { defaultValue: "What would you like to build?" })}
             </h2>
             <p className="mt-1 text-[13px] text-muted-foreground">
-              {t("providerSelection.description")}
+              {t("providerSelection.welcomeDescription", { defaultValue: "Describe your task below, or choose a model to start a conversation." })}
             </p>
           </div>
 
           <Dialog open={dialogOpen} onOpenChange={setPickerOpen}>
             <DialogTrigger asChild>
               <Card
-                className="group mx-auto max-w-xs cursor-pointer border-border/60 transition-all duration-150 hover:border-border hover:shadow-md active:scale-[0.99]"
+                className="chat-welcome-model group mx-auto max-w-xs cursor-pointer border-border/60 transition-all duration-150 hover:border-border hover:shadow-md active:scale-[0.99]"
                 role="button"
                 tabIndex={0}
               >
@@ -292,7 +293,7 @@ export default function ProviderSelectionEmptyState({
             </DialogContent>
           </Dialog>
 
-          <p className="mt-4 text-center text-sm text-muted-foreground/70">
+          <p className="chat-welcome-ready mt-4 text-center text-sm text-muted-foreground/70">
             {
               {
                 claude: t("providerSelection.readyPrompt.claude", {
@@ -312,7 +313,7 @@ export default function ProviderSelectionEmptyState({
             }
           </p>
 
-          <p className="mt-3 flex items-center justify-center gap-1.5 text-center text-xs text-muted-foreground/60">
+          <p className="chat-welcome-shortcut mt-3 flex items-center justify-center gap-1.5 text-center text-xs text-muted-foreground/60">
             <Trans
               ns="chat"
               i18nKey="providerSelection.pressToSearch"

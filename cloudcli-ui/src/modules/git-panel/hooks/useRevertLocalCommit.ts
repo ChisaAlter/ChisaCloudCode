@@ -1,47 +1,74 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { api } from '@/shared/api';
-import type { GitOperationResponse } from '@/shared/types';
 
 type UseRevertLocalCommitOptions = {
   // DB primary key for the project; forwarded to the git API via the
   // `project` body param.
   projectId: string | null;
-  onSuccess?: () => void;
+  onSuccess?: () => void | Promise<void>;
+  onError?: (error: unknown) => void;
 };
 
-async function readJson<T>(response: Response): Promise<T> {
-  return (await response.json()) as T;
-}
+export function useRevertLocalCommit({ projectId, onSuccess, onError }: UseRevertLocalCommitOptions) {
+  // Project-scoped ownership keeps pending feedback visible through the write and its refresh.
+  const [pendingOperation, setPendingOperation] = useState<{ projectId: string | null; operation: symbol | null }>({ projectId, operation: null });
+  const projectEpochRef = useRef(0);
+  const pendingRef = useRef<symbol | null>(null);
+  if (pendingOperation.projectId !== projectId) {
+    setPendingOperation({ projectId, operation: null });
+  }
+  const isRevertingLocalCommit = pendingOperation.projectId === projectId && pendingOperation.operation !== null;
 
-export function useRevertLocalCommit({ projectId, onSuccess }: UseRevertLocalCommitOptions) {
-  const [isRevertingLocalCommit, setIsRevertingLocalCommit] = useState(false);
+  useEffect(() => {
+    const epoch = ++projectEpochRef.current;
+    pendingRef.current = null;
+    return () => {
+      projectEpochRef.current = epoch + 1;
+      pendingRef.current = null;
+    };
+  }, [projectId]);
 
   const revertLatestLocalCommit = useCallback(async () => {
-    if (!projectId) {
-      return;
-    }
-
-    setIsRevertingLocalCommit(true);
+    if (!projectId || pendingRef.current) return;
+    const epoch = projectEpochRef.current;
+    const operation = Symbol('revert');
+    pendingRef.current = operation;
+    const isCurrent = () => epoch === projectEpochRef.current && pendingRef.current === operation;
+    setPendingOperation({ projectId, operation });
+    onError?.(null);
     try {
       const response = await api.git.revertLocalCommit(projectId);
-      const data = await readJson<GitOperationResponse>(response);
-
-      if (!data.success) {
-        console.error('Revert local commit failed:', data.error || data.details || 'Unknown error');
-        return;
+      let raw: unknown;
+      try {
+        raw = await response.json();
+      } catch {
+        throw new Error(response.ok
+          ? 'Git returned an invalid response. Please try again.'
+          : `Revert local commit failed (HTTP ${response.status})`);
       }
-
-      onSuccess?.();
+      if (!isCurrent()) return;
+      const data = raw && typeof raw === 'object' && !Array.isArray(raw)
+        ? raw as Record<string, unknown> : null;
+      if (!response.ok || data?.success !== true || data.error) {
+        // The controller normalizes unknown backend payloads before rendering them.
+        throw data?.error ?? new Error(response.ok
+          ? 'Revert local commit failed'
+          : `Revert local commit failed (HTTP ${response.status})`);
+      }
+      await onSuccess?.();
     } catch (error) {
-      console.error('Error reverting local commit:', error);
+      if (!isCurrent()) return;
+      onError?.(error);
+      // Keep the confirmation open so the user can retry the failed operation.
+      throw error;
     } finally {
-      setIsRevertingLocalCommit(false);
+      if (isCurrent()) {
+        pendingRef.current = null;
+        setPendingOperation({ projectId, operation: null });
+      }
     }
-  }, [onSuccess, projectId]);
+  }, [onError, onSuccess, projectId]);
 
-  return {
-    isRevertingLocalCommit,
-    revertLatestLocalCommit,
-  };
+  return { isRevertingLocalCommit, revertLatestLocalCommit };
 }

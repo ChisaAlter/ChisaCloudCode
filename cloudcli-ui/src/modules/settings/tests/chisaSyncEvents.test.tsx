@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 import ChisaSettingsTab from '@/modules/settings/tabs/chisa-settings/ChisaSettingsTab';
-import type { ChisaState, ChisaSyncInfo, ChisaWorkspaceSwitchResult } from '@/shared/types';
+import type { ChisaGitRecoveryResponse, ChisaState, ChisaSyncInfo, ChisaWorkspaceSwitchResult } from '@/shared/types';
 
 const native = vi.hoisted(() => ({
   authVersion: 0,
@@ -19,10 +19,14 @@ const native = vi.hoisted(() => ({
   refreshProjects: vi.fn(),
   recordLocalSelection: vi.fn(),
   revoke: vi.fn(),
+  getProjectGitRecovery: vi.fn<() => Promise<ChisaGitRecoveryResponse>>(),
+  recoverProjectGit: vi.fn<() => Promise<Record<string, unknown>>>(),
   listeners: new Set<(info: ChisaSyncInfo) => void>(),
   connectionListeners: new Set<() => void>(),
 }));
 
+// Isolate account connection controls so this suite exercises the real native
+// synchronization snapshots and live events without an unrelated auth provider.
 vi.mock('@/modules/local-agent', () => ({ PiAgentSettings: () => null }));
 vi.mock('@/modules/auth', () => ({ AccountServerConnection: () => null }));
 vi.mock('@/modules/command-palette', () => ({ usePaletteOps: () => ({ refreshProjects: native.refreshProjects }) }));
@@ -33,7 +37,7 @@ vi.mock('@/shared/chisa', () => ({
   getServerConnectionVersion: () => native.connectionVersion,
   isDesktop: () => true,
   recordLocalSelection: native.recordLocalSelection,
-  FrontendBridge: { getState: native.getState, refreshPreviews: native.refreshPreviews, stopPreview: native.stopPreview, getProjectStorage: native.getProjectStorage, syncProject: native.syncProject, forgetMapping: native.forgetMapping, switchAccountWorkspace: native.switchAccountWorkspace, connectAccountWorkspace: native.connectAccountWorkspace, revoke: native.revoke },
+  FrontendBridge: { getState: native.getState, refreshPreviews: native.refreshPreviews, stopPreview: native.stopPreview, getProjectStorage: native.getProjectStorage, syncProject: native.syncProject, forgetMapping: native.forgetMapping, switchAccountWorkspace: native.switchAccountWorkspace, connectAccountWorkspace: native.connectAccountWorkspace, revoke: native.revoke, getProjectGitRecovery: native.getProjectGitRecovery, recoverProjectGit: native.recoverProjectGit },
   onWorkspaceSyncStateChanged: (listener: (info: ChisaSyncInfo) => void) => {
     native.listeners.add(listener);
     return () => native.listeners.delete(listener);
@@ -391,4 +395,91 @@ test('preview discovery failure leaves connection and project controls usable', 
   expect(screen.getByRole('alert').textContent).toBe('无法连接预览服务');
   expect(screen.getByText('C:\\work\\project-0')).toBeDefined();
   expect(screen.getByRole<HTMLButtonElement>('button', { name: '刷新状态' }).disabled).toBe(false);
+});
+
+function blockedState(overrides: Partial<ChisaSyncInfo> = {}, tunnel = true): ChisaState {
+  return {
+    tunnel, serverUrl: 'https://example.invalid',
+    mappings: [{ serverPath: PROJECT, localPath: 'C:\\work\\project', mode: 'vps' }],
+    sync: { [PROJECT]: { status: 'blocked', sequence: 10, bindingEpoch: 'binding-a', checkedAt: '', serverPath: PROJECT, gitRecoveryRequired: true, ...overrides } },
+  };
+}
+
+test('settings can review and recover Git state from the mapping without opening a project', async () => {
+  native.getState.mockResolvedValueOnce(blockedState())
+    .mockResolvedValueOnce(blockedState({ status: 'ready', sequence: 11, gitRecoveryRequired: false }));
+  native.getProjectGitRecovery.mockResolvedValueOnce({ ok: true, recovery: {
+    token: 'settings-review', serverPath: PROJECT, bindingEpoch: 'binding-a',
+    local: { branch: 'feature', head: 'local-head', staged: true, operation: '' },
+    remote: { branch: 'main', head: 'remote-head', staged: false, operation: '' },
+    localAllowed: true, localReason: '', remoteAllowed: true, remoteReason: '',
+  } });
+  native.recoverProjectGit.mockResolvedValueOnce({ ok: true });
+  render(<ChisaSettingsTab />);
+  await act(async () => {});
+  expect(native.getProjectGitRecovery).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: '恢复 Git 状态' }));
+  await act(async () => {});
+  expect(native.getProjectGitRecovery).toHaveBeenCalledExactlyOnceWith(PROJECT, 'binding-a');
+  fireEvent.click(screen.getByRole('radio', { name: '以VPS Git 状态为准' }));
+  fireEvent.click(screen.getByRole('button', { name: '确认恢复 Git 状态' }));
+  await act(async () => {});
+  expect(native.recoverProjectGit).toHaveBeenCalledExactlyOnceWith(PROJECT, 'binding-a', 'settings-review', 'remote');
+  expect(native.getState).toHaveBeenCalledTimes(2);
+  expect(screen.getByRole('status').textContent).toBe('已同步');
+  expect(screen.queryByRole('dialog')).toBeNull();
+  expect(native.getProjectStorage).not.toHaveBeenCalled();
+  expect(native.syncProject).not.toHaveBeenCalled();
+});
+
+test.each([
+  ['task owner', { taskOwner: 'pi' }, true],
+  ['disconnected tunnel', {}, false],
+  ['unavailable engine', { status: 'unavailable' }, true],
+  ['unadmitted binding', { gitRecoveryRequired: false }, true],
+] as const)('settings suppresses Git recovery for %s', async (_reason, info, tunnel) => {
+  native.getState.mockResolvedValueOnce(blockedState(info, tunnel));
+  render(<ChisaSettingsTab />);
+  await act(async () => {});
+  expect(screen.queryByRole('button', { name: '恢复 Git 状态' })).toBeNull();
+  expect(native.getProjectGitRecovery).not.toHaveBeenCalled();
+});
+
+test('a paused mapping opened during startup becomes reviewable when the workspace handshake completes', async () => {
+  const paused = { status: 'paused', gitRecoveryRequired: false };
+  native.getState.mockResolvedValueOnce({ ...blockedState(paused, false), workspaceConnecting: true })
+    .mockResolvedValue({ ...blockedState(paused), workspaceConnecting: false });
+  render(<ChisaSettingsTab />);
+  await act(async () => {});
+  expect(screen.queryByRole('button', { name: '恢复 Git 状态' })).toBeNull();
+  await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+  expect(screen.getByRole('button', { name: '恢复 Git 状态' })).toBeDefined();
+  await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+  expect(native.getState).toHaveBeenCalledTimes(2);
+  expect(native.getProjectStorage).not.toHaveBeenCalled();
+  expect(native.getProjectGitRecovery).not.toHaveBeenCalled();
+  expect(native.syncProject).not.toHaveBeenCalled();
+});
+
+test('a failed startup handshake refresh removes recovery admission and stops checking', async () => {
+  native.getState.mockResolvedValueOnce({ ...blockedState({}, false), workspaceConnecting: true })
+    .mockRejectedValue(new Error('native disconnected'));
+  render(<ChisaSettingsTab />);
+  await act(async () => {});
+  await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+  expect(screen.queryByRole('button', { name: '恢复 Git 状态' })).toBeNull();
+  await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+  expect(native.getState).toHaveBeenCalledTimes(2);
+  expect(native.getProjectGitRecovery).not.toHaveBeenCalled();
+});
+
+test('a failed settings snapshot removes recovery actions backed by a cached blocked state', async () => {
+  native.getState.mockResolvedValueOnce(blockedState()).mockRejectedValueOnce(new Error('native disconnected'));
+  render(<ChisaSettingsTab />);
+  await act(async () => {});
+  expect(screen.getByRole('button', { name: '恢复 Git 状态' })).toBeDefined();
+  fireEvent.click(screen.getByRole('button', { name: '刷新状态' }));
+  await act(async () => {});
+  expect(screen.queryByRole('button', { name: '恢复 Git 状态' })).toBeNull();
+  expect(native.getProjectGitRecovery).not.toHaveBeenCalled();
 });

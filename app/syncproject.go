@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,14 @@ func executeRemoteLeaseContext(parent context.Context, m *Mapping, op, owner, id
 		return nil, err
 	}
 	request := map[string]any{"root": m.ServerPath, "op": op, "owner": owner, "id": id, "epoch": m.BindingEpoch}
+	if consent, _ := ctx.Value(syncGitRecoveryKey{}).(*syncGitRecoveryConsent); op == "recover" && consent != nil {
+		// The preview lease, including its absence, is compared again under the
+		// remote ownership guard. A later server check cannot replace this proof.
+		if !json.Valid([]byte(consent.lease)) {
+			return nil, errSyncGitRecoveryStale
+		}
+		request["recoveryLease"] = json.RawMessage(consent.lease)
+	}
 	if transport.Cfg.WorkspaceAccount != "" && op == "recover" {
 		checked, err := accountWorkspaceRPC(ctx, "/api/workspace-sync/lease-recovery", map[string]any{"serverPath": m.ServerPath, "bindingEpoch": m.BindingEpoch})
 		if err != nil {
@@ -73,6 +82,9 @@ func executeRemoteLeaseContext(parent context.Context, m *Mapping, op, owner, id
 		return nil, err
 	}
 	if result["ok"] != true {
+		if result["code"] == "GIT_RECOVERY_STALE" {
+			return result, errSyncGitRecoveryStale
+		}
 		return result, fmt.Errorf("%v", result["error"])
 	}
 	return result, nil
@@ -123,6 +135,43 @@ func localGitRepository(ctx context.Context, local string) (bool, error) {
 	return false, err
 }
 
+type gitSeedSource struct {
+	Head, Branch, Refs, Origin, ObjectFormat, Shallow string
+}
+
+func captureGitSeedSource(ctx context.Context, local string) (gitSeedSource, error) {
+	var source gitSeedSource
+	for _, query := range []struct {
+		value   *string
+		args    []string
+		missing int
+	}{
+		{&source.Head, []string{"rev-parse", "--verify", "HEAD^{commit}"}, -1},
+		{&source.Branch, []string{"symbolic-ref", "--quiet", "HEAD"}, 1},
+		{&source.Refs, []string{"for-each-ref", "--format=%(objectname) %(refname)"}, -1},
+		{&source.Origin, []string{"remote", "get-url", "origin"}, 2},
+		{&source.ObjectFormat, []string{"rev-parse", "--show-object-format"}, -1},
+	} {
+		value, err := gitOutputContext(ctx, local, query.args...)
+		if err != nil && (query.missing < 0 || gitExitCode(err) != query.missing) {
+			return source, err
+		}
+		if err == nil {
+			*query.value = value
+		}
+	}
+	shallowPath, err := gitOutputContext(ctx, local, "rev-parse", "--path-format=absolute", "--git-path", "shallow")
+	if err != nil {
+		return source, err
+	}
+	shallow, err := os.ReadFile(shallowPath)
+	if err != nil && !os.IsNotExist(err) {
+		return source, err
+	}
+	source.Shallow = string(shallow)
+	return source, nil
+}
+
 func syncGitContext(ctx context.Context, m *Mapping) (err error) {
 	repository, err := localGitRepository(ctx, m.LocalPath)
 	if err != nil {
@@ -142,14 +191,14 @@ func syncGitContext(ctx context.Context, m *Mapping) (err error) {
 		}
 		return err
 	}
-	defer func() {
+	// Git's index retains executable bits that a Windows checkout cannot expose.
+	fixup := func() {
 		if err != nil {
 			return
 		}
-		// Git's index retains executable bits that a Windows checkout cannot expose.
 		worker := "import os,pathlib,subprocess,sys\nroot=pathlib.Path(sys.argv[1]).resolve();excluded=[]\nfor entry in sys.stdin.buffer.read().split(b'\\0'):\n if not entry:continue\n meta,name=entry.split(b'\\t',1);parts=os.fsdecode(name).split('/')\n if any(x in ('node_modules','.venv','venv','__pycache__') for x in parts) or ((parts[-1]=='.env' or parts[-1].startswith('.env.')) and parts[-1] not in ('.env.example','.env.sample')):excluded.append(name);continue\n if meta.split()[0]!=b'100755':continue\n p=root/os.fsdecode(name)\n if p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(root):p.chmod(p.stat().st_mode|0o111)\nif excluded:subprocess.run(['git','-C',str(root),'update-index','--skip-worktree','-z','--stdin'],input=b'\\0'.join(excluded)+b'\\0',check=True)"
 		_, err = syncRemoteScript(ctx, m, "set -o pipefail\n"+serverGit(m, "ls-files", "--stage", "-z")+" | setpriv --reuid=1000 --regid=1000 --clear-groups env HOME=/nonexistent python3 -c "+shellQuote(worker)+" "+shellQuote(m.ServerPath), nil)
-	}()
+	}
 	transport, err := workspaceSyncTunnel(ctx, m)
 	if err != nil {
 		return err
@@ -159,39 +208,85 @@ func syncGitContext(ctx context.Context, m *Mapping) (err error) {
 		return err
 	}
 	if remoteHead == "" || remoteHead == "CHISA_GIT_SEED_PENDING" {
+		defer fixup()
 		bundle := filepath.Join(dataDir(), "sync-config", m.BindingEpoch+".bundle")
 		if err := os.MkdirAll(filepath.Dir(bundle), 0700); err != nil {
 			return err
 		}
-		if _, err = gitOutputContext(ctx, m.LocalPath, "bundle", "create", bundle, "--all"); err != nil {
+		source, sourceErr := captureGitSeedSource(ctx, m.LocalPath)
+		if sourceErr != nil {
+			return sourceErr
+		}
+		bundleArgs := []string{"bundle", "create", bundle, "--all"}
+		for _, boundary := range strings.Fields(source.Shallow) {
+			// Stale boundaries can still own objects outside refs/*; preserve any
+			// that exist without requiring source repositories to retain all of them.
+			if _, boundaryErr := gitOutputContext(ctx, m.LocalPath, "cat-file", "-e", boundary+"^{commit}"); boundaryErr == nil {
+				bundleArgs = append(bundleArgs, boundary)
+			} else if ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
+		if _, err = gitOutputContext(ctx, m.LocalPath, bundleArgs...); err != nil {
 			return err
 		}
 		defer os.Remove(bundle)
+		confirmedSource, sourceErr := captureGitSeedSource(ctx, m.LocalPath)
+		if sourceErr != nil {
+			return sourceErr
+		}
+		if source != confirmedSource || source.Head != localHead {
+			return fmt.Errorf("Git 初始化期间本地引用已改变，请重试同步")
+		}
+		advertised, manifestErr := gitOutputContext(ctx, m.LocalPath, "bundle", "list-heads", bundle)
+		if manifestErr != nil {
+			return manifestErr
+		}
+		var bundleRefs []string
+		for _, line := range strings.Split(advertised, "\n") {
+			parts := strings.Fields(line)
+			if len(parts) != 2 {
+				return fmt.Errorf("Git 初始化包引用格式不正确")
+			}
+			if strings.HasPrefix(parts[1], "refs/") {
+				bundleRefs = append(bundleRefs, parts[0]+" "+parts[1])
+			} else if parts[1] == "HEAD" && parts[0] != source.Head {
+				return fmt.Errorf("Git 初始化包 HEAD 已改变，请重试同步")
+			}
+		}
+		sort.Strings(bundleRefs)
+		sourceRefs := strings.Split(source.Refs, "\n")
+		if source.Refs == "" {
+			sourceRefs = nil
+		}
+		sort.Strings(sourceRefs)
+		if strings.Join(bundleRefs, "\n") != strings.Join(sourceRefs, "\n") {
+			return fmt.Errorf("Git 初始化包引用已改变，请重试同步")
+		}
 		target := m.ServerPath + ".bundle"
 		input, err := os.Open(bundle)
 		if err != nil {
 			return err
 		}
-		_, uploadErr := syncRemoteScript(ctx, m, "umask 077; cat > "+shellQuote(target), input)
+		deadline, _ := ctx.Deadline()
+		uploadStarted := time.Now()
+		log.Printf("[sync-git-import] upload=begin remaining=%s", time.Until(deadline))
+		// Keep the previous resumable payload intact if this upload is canceled.
+		staging := target + ".upload"
+		_, uploadErr := syncRemoteScript(ctx, m, "set -e\numask 077\ncat > "+shellQuote(staging)+"\nmv -f -- "+shellQuote(staging)+" "+shellQuote(target), input)
+		log.Printf("[sync-git-import] upload=end elapsed=%s error_type=%T", time.Since(uploadStarted), uploadErr)
 		_ = input.Close()
 		if uploadErr != nil {
 			return fmt.Errorf("Git 初次上传失败: %w", uploadErr)
 		}
-		branch, branchErr := gitOutputContext(ctx, m.LocalPath, "symbolic-ref", "--quiet", "HEAD")
-		if branchErr != nil && gitExitCode(branchErr) != 1 {
-			return branchErr
-		}
-		origin, originErr := gitOutputContext(ctx, m.LocalPath, "remote", "get-url", "origin")
-		if originErr != nil && gitExitCode(originErr) != 2 {
-			return originErr
-		}
-		request, _ := json.Marshal(map[string]any{"root": m.ServerPath, "epoch": m.BindingEpoch, "head": localHead, "branch": branch, "origin": origin})
+		request, _ := json.Marshal(map[string]any{"root": m.ServerPath, "epoch": m.BindingEpoch, "head": source.Head, "branch": source.Branch, "origin": source.Origin, "shallow": source.Shallow, "objectFormat": source.ObjectFormat})
 		_, err = syncRemoteScript(ctx, m, "python3 -c "+shellQuote(syncGitSeedWorker), bytes.NewReader(request))
 		if err != nil {
 			return err
 		}
 		return syncGitStateContext(ctx, m)
 	}
+	defer fixup()
 	if _, err = syncRemoteScript(ctx, m, serverGitConfigurationContext(ctx, m), nil); err != nil {
 		return err
 	}
@@ -215,7 +310,7 @@ func serverGitConfiguration(m *Mapping) string {
 func serverGitConfigurationContext(ctx context.Context, m *Mapping) string {
 	worker := "import pathlib,sys\np=pathlib.Path(sys.argv[1])/'.git/info/exclude';p.parent.mkdir(parents=True,exist_ok=True)\ns=p.read_text() if p.exists() else ''\nif '.chisa-bridge.json' not in s.splitlines():p.write_text(s+'\\n.chisa-bridge.json\\n')"
 	// Replace only the temporary bundle remote created during initial replication.
-	remoteCommand := serverGit(m, "remote", "remove", "origin")
+	remoteCommand := serverGit(m, "config", "--remove-section", "remote.origin")
 	if origin, err := gitOutputContext(ctx, m.LocalPath, "remote", "get-url", "origin"); err == nil {
 		remoteCommand = serverGit(m, "remote", "set-url", "origin", origin)
 	}
@@ -236,6 +331,14 @@ func (e *syncPauseError) Unwrap() error { return e.error }
 type unconfirmedSyncStop struct{ epoch, name string }
 
 var syncStopUnconfirmed sync.Map
+
+func pauseSyncSessionContext(ctx context.Context, m *Mapping, session string) error {
+	if _, err := runMutagenContext(ctx, "sync", "pause", session); err != nil {
+		syncStopUnconfirmed.Store(m.ServerPath, unconfirmedSyncStop{m.BindingEpoch, m.SyncName})
+		return &syncPauseError{fmt.Errorf("同步暂停尚未确认: %w", err)}
+	}
+	return nil
+}
 
 func confirmProjectSyncStop(ctx context.Context, m *Mapping) error {
 	if value, ok := syncStopUnconfirmed.Load(m.ServerPath); ok {
@@ -262,11 +365,13 @@ func pauseProjectSyncContext(ctx context.Context, m *Mapping) error {
 	if len(sessions) == 0 {
 		return nil
 	}
-	if len(sessions) != 1 || !syncSessionMatchesMapping(sessions[0], m, workspaceSyncConfig(ctx)) {
-		return fmt.Errorf("暂停同步前发现项目会话绑定不一致")
+	if len(sessions) != 1 {
+		return fmt.Errorf("暂停同步前无法确认唯一的项目会话")
 	}
-	_, err = runMutagenContext(ctx, "sync", "pause", m.SyncName)
-	return err
+	if err := pinProjectSyncSessionContext(ctx, m, sessions[0]); err != nil {
+		return err
+	}
+	return pauseSyncSessionContext(ctx, m, sessions[0].Identifier)
 }
 
 func syncProjectContents(m *Mapping, pause bool) error {
@@ -276,21 +381,37 @@ func syncProjectContents(m *Mapping, pause bool) error {
 }
 
 func syncProjectContentsContext(ctx context.Context, m *Mapping, pause bool) (failure error) {
+	if pinned, _ := ctx.Value(syncSessionIdentityKey{}).(*syncSessionIdentity); pinned == nil {
+		ctx = context.WithValue(ctx, syncSessionIdentityKey{}, &syncSessionIdentity{})
+	}
 	finish := beginSyncOperation(m, "syncing")
 	defer finish()
 	defer func() {
 		if failure != nil && m.SyncName != "" {
-			// Canceling the CLI does not cancel a daemon synchronization cycle.
-			cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			if snapshot, _ := ctx.Value(workspaceSyncConnectionKey{}).(*workspaceSyncConnection); snapshot != nil {
-				cleanup = context.WithValue(cleanup, workspaceSyncConnectionKey{}, snapshot)
-			}
-			if err := pauseProjectSync(cleanup, m); err != nil {
+			var pauseError *syncPauseError
+			if errors.As(failure, &pauseError) {
+				// The daemon may still be handling the first pause after its CLI
+				// was canceled. Another pause would wait behind the same request.
 				syncStopUnconfirmed.Store(m.ServerPath, unconfirmedSyncStop{m.BindingEpoch, m.SyncName})
-				failure = errors.Join(failure, &syncPauseError{fmt.Errorf("同步暂停尚未确认: %w", err)})
+			} else {
+				// Canceling the CLI does not cancel a daemon synchronization cycle.
+				cleanup, cancel := context.WithTimeout(context.Background(), workspaceSyncPauseTimeout)
+				defer cancel()
+				if snapshot, _ := ctx.Value(workspaceSyncConnectionKey{}).(*workspaceSyncConnection); snapshot != nil {
+					cleanup = context.WithValue(cleanup, workspaceSyncConnectionKey{}, snapshot)
+				}
+				if pinned, _ := ctx.Value(syncSessionIdentityKey{}).(*syncSessionIdentity); pinned != nil {
+					cleanup = context.WithValue(cleanup, syncSessionIdentityKey{}, pinned)
+				}
+				if err := pauseProjectSync(cleanup, m); err != nil {
+					syncStopUnconfirmed.Store(m.ServerPath, unconfirmedSyncStop{m.BindingEpoch, m.SyncName})
+					if !errors.As(err, &pauseError) {
+						err = &syncPauseError{fmt.Errorf("同步暂停尚未确认: %w", err)}
+					}
+					failure = errors.Join(failure, err)
+				}
 			}
-			setSyncInfo(m, "blocked", "同步确认已中断，保留两端修改并重新同步恢复: "+failure.Error())
+			setSyncFailure(m, fmt.Errorf("同步确认已中断，保留两端修改并重新同步恢复: %w", failure))
 		}
 	}()
 	if err := confirmProjectSyncStop(ctx, m); err != nil {
@@ -309,44 +430,77 @@ func syncProjectContentsContext(ctx context.Context, m *Mapping, pause bool) (fa
 		return err
 	}
 	lease, _ := confirmed["lease"].(map[string]any)
-	source := ""
-	if lease["owner"] == "sync-needed" || lease["gitSource"] == "remote" {
-		source = "remote"
+	// Explicit branch/recovery actions have already chosen their source. Lease
+	// defaults may only fill an absent choice, never reverse that action.
+	if source, _ := ctx.Value(syncGitSourceKey{}).(string); source == "" {
+		source = ""
+		if lease["owner"] == "sync-needed" || lease["gitSource"] == "remote" {
+			source = "remote"
+		}
+		if lease["owner"] == "claude" {
+			source = "local"
+		}
+		ctx = context.WithValue(ctx, syncGitSourceKey{}, source)
 	}
-	if lease["owner"] == "claude" {
-		source = "local"
-	}
-	ctx = context.WithValue(ctx, syncGitSourceKey{}, source)
 	started := time.Now()
-	if err := flushSyncContext(ctx, m, true); err != nil {
+	// Resolve conflicts and freeze the Git direction before this explicit file
+	// flush. An active watcher can run independently; it never authorizes us to
+	// replace a concurrently changed Git state with this earlier plan.
+	if err := ensureSyncNameContext(ctx, m); err != nil {
+		setSyncFailure(m, err)
+		return err
+	}
+	plan, err := prepareGitSyncContext(ctx, m)
+	if err != nil {
+		setSyncFailure(m, err)
+		return err
+	}
+	preflightDone := time.Now()
+	if _, err := refreshSyncIgnoreContext(ctx, m); err != nil {
+		setSyncFailure(m, err)
+		return err
+	}
+	if err := plan.persistRecoveryIntent(ctx, m); err != nil {
+		setSyncFailure(m, err)
+		return err
+	}
+	if err := flushSyncContext(ctx, m, false); err != nil {
 		setSyncFailure(m, err)
 		return err
 	}
 	filesDone := time.Now()
-	if err := ctx.Err(); err != nil {
+	if err := plan.apply(ctx, m); err != nil {
 		setSyncFailure(m, err)
 		return err
 	}
-	setSyncInfo(m, "syncing", "")
-	if err := syncGitContext(ctx, m); err != nil {
+	// Recompute after any index/ignore-path changes, including a cached first
+	// policy pass. Newly tracked files must be included before task admission.
+	if changed, err := refreshSyncIgnoreContext(ctx, m); err != nil {
 		setSyncFailure(m, err)
 		return err
-	}
-	if err := refreshSyncIgnoreContext(ctx, m); err != nil {
-		setSyncFailure(m, err)
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		setSyncFailure(m, err)
-		return err
-	}
-	if !pause {
-		if _, err := runMutagenContext(ctx, "sync", "resume", m.SyncName); err != nil {
+	} else if changed {
+		if err := flushSyncContext(ctx, m, false); err != nil {
 			setSyncFailure(m, err)
 			return err
 		}
 	}
-	log.Printf("[sync] files=%s git=%s pause=%t", filesDone.Sub(started), time.Since(filesDone), pause)
+	if err := plan.finish(ctx, m); err != nil {
+		setSyncFailure(m, err)
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		setSyncFailure(m, err)
+		return err
+	}
+	// Handing the workspace to Claude or back to the user must not stop the
+	// synchronization engine: a stopped session rescans both endpoints from
+	// scratch on its next use, which costs minutes on a large project. The
+	// lease still serializes task execution.
+	if err := ensureSyncWatchingContext(ctx, m); err != nil {
+		setSyncFailure(m, err)
+		return err
+	}
+	log.Printf("[sync] preflight=%s files=%s finalize=%s reserve=%t", preflightDone.Sub(started), filesDone.Sub(preflightDone), time.Since(filesDone), pause)
 	if pause {
 		setSyncInfo(m, "reserved", "")
 	} else {
@@ -438,12 +592,19 @@ func syncProjectWithEmptyConfirmationContext(parent context.Context, serverPath,
 		return map[string]any{"ok": false, "error": err.Error()}
 	}
 	defer cancel()
-	ctx, timeout := context.WithTimeout(ctx, workspaceSyncTimeout)
-	defer timeout()
+	// Keep the same daemon identity across admission, pause and the inner file
+	// pipeline. A recreated name must never become a new first observation.
+	if pinned, _ := ctx.Value(syncSessionIdentityKey{}).(*syncSessionIdentity); pinned == nil {
+		ctx = context.WithValue(ctx, syncSessionIdentityKey{}, &syncSessionIdentity{})
+	}
+	// An explicit synchronization is the user's way to force a full policy refresh.
+	ctx = context.WithValue(ctx, syncIgnoreForceKey{}, true)
 	m := store.findMappingByServer(serverPath)
 	if m == nil {
 		return map[string]any{"ok": false, "error": "工作区未绑定"}
 	}
+	ctx, timeout := context.WithTimeout(ctx, workspaceSynchronizationTimeout(m))
+	defer timeout()
 	unlock, err := lockWorkspace(ctx, serverPath)
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error()}
@@ -457,6 +618,14 @@ func syncProjectWithEmptyConfirmationContext(parent context.Context, serverPath,
 	}
 	if piWorkspaceOwned(serverPath) {
 		return map[string]any{"ok": false, "error": "Pi 正在使用项目，请先结束任务"}
+	}
+	if consent, _ := ctx.Value(syncGitRecoveryKey{}).(*syncGitRecoveryConsent); consent != nil {
+		if err := mappingTaskBusy(m, false); err != nil {
+			return syncGitRecoveryFailure(err)
+		}
+		if err := validateSyncGitRecovery(ctx, m, consent); err != nil {
+			return syncGitRecoveryFailure(err)
+		}
 	}
 	var emptySession *syncSession
 	if emptyEpoch != "" {
@@ -521,7 +690,7 @@ func syncProjectWithEmptyConfirmationContext(parent context.Context, serverPath,
 	id := randHex(16)
 	if emptySession != nil {
 		pendingEmptyConfirmations.Store(m.ServerPath, pendingEmptyConfirmation{epoch: m.BindingEpoch, session: *emptySession})
-		_, err = runMutagenContext(ctx, "sync", "pause", emptySession.Identifier)
+		err = pauseSyncSessionContext(ctx, m, emptySession.Identifier)
 	} else {
 		err = pauseProjectSync(ctx, m)
 	}
@@ -535,6 +704,9 @@ func syncProjectWithEmptyConfirmationContext(parent context.Context, serverPath,
 	}
 	if _, err := remoteLeaseContext(ctx, m, "recover", "sync", id); err != nil {
 		setSyncFailure(m, err)
+		if errors.Is(err, errSyncGitRecoveryStale) {
+			return syncGitRecoveryFailure(err)
+		}
 		return map[string]any{"ok": false, "error": err.Error()}
 	}
 	ctx = syncLeaseContext(ctx, id)
@@ -583,6 +755,9 @@ func syncProjectWithEmptyConfirmationContext(parent context.Context, serverPath,
 		var pauseError *syncPauseError
 		releaseBlocked = errors.As(err, &pauseError)
 		setSyncFailure(m, err)
+		if errors.Is(err, errSyncGitRecoveryStale) {
+			return syncGitRecoveryFailure(err)
+		}
 		return map[string]any{"ok": false, "error": err.Error(), "backupPath": clearResult.BackupPath}
 	}
 	cloudReservations.Delete(serverPath)
@@ -667,6 +842,9 @@ func synchronizationRPCContext(ctx context.Context, m *Mapping, q map[string]any
 	if m.Mode != "vps" || id == "" {
 		return map[string]any{"error": "项目尚未完成 VPS 迁移", "code": "WORKSPACE_UNAVAILABLE"}
 	}
+	if op == "sync_begin" {
+		readOnlySyncPreparations.Delete(m.ServerPath)
+	}
 	state, err := remoteLeaseContext(ctx, m, "read", "", "")
 	if err != nil {
 		return map[string]any{"error": err.Error(), "code": "WORKSPACE_UNAVAILABLE"}
@@ -680,6 +858,9 @@ func synchronizationRPCContext(ctx context.Context, m *Mapping, q map[string]any
 		}
 		cloudReservations.CompareAndDelete(m.ServerPath, id)
 		cloudSyncRecovery.CompareAndDelete(m.ServerPath, id)
+		if value, ok := readOnlySyncPreparations.Load(m.ServerPath); ok && value.(readOnlySyncPreparation).leaseID == id {
+			readOnlySyncPreparations.CompareAndDelete(m.ServerPath, value)
+		}
 		publishProjectSync(m)
 		if err := workspaceSyncCurrent(ctx); err != nil {
 			return map[string]any{"error": err.Error(), "code": "WORKSPACE_UNAVAILABLE"}
@@ -721,11 +902,30 @@ func synchronizationRPCContext(ctx context.Context, m *Mapping, q map[string]any
 		return map[string]any{"error": "Pi 正在使用工作区", "code": "WORKSPACE_BUSY"}
 	}
 
-	if err := synchronizeProjectContext(ctx, m, op == "sync_begin"); err != nil {
-		return map[string]any{"error": err.Error(), "code": "SYNC_BLOCKED"}
+	// The same incremental handoff covers read-only work as well: an active
+	// flush observes new local edits without taking a whole-tree snapshot.
+	err = synchronizeProjectContext(ctx, m, op == "sync_begin")
+	if err != nil {
+		code := "SYNC_BLOCKED"
+		var pauseError *syncPauseError
+		if errors.As(err, &pauseError) {
+			code = "SYNC_PAUSE_UNCONFIRMED"
+		}
+		return map[string]any{"error": err.Error(), "code": code}
+	}
+	result = map[string]any{"ok": true}
+	if op == "sync_begin" && q["readOnly"] == true {
+		upstream, observationError := readLocalGitRemoteStatus(ctx, m)
+		if observationError != nil {
+			return map[string]any{"error": observationError.Error(), "code": "WORKSPACE_GIT_CHANGED"}
+		}
+		result["gitRemoteStatus"] = upstream
 	}
 	publishProjectSync(m)
 	if err := workspaceSyncCurrent(ctx); err != nil {
+		if op == "sync_begin" {
+			readOnlySyncPreparations.Delete(m.ServerPath)
+		}
 		return map[string]any{"error": err.Error(), "code": "WORKSPACE_UNAVAILABLE"}
 	}
 	if op == "sync_end" {
@@ -737,7 +937,7 @@ func synchronizationRPCContext(ctx context.Context, m *Mapping, q map[string]any
 			return map[string]any{"error": err.Error(), "code": "WORKSPACE_CLEANUP_FAILED"}
 		}
 	}
-	return map[string]any{"ok": true}
+	return result
 }
 
 // Every account transport reconnect checks durable handback. Normal transports

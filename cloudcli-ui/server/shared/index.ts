@@ -1,3 +1,3 @@
 export { appendFilesInputTag, appendImagesInputTag, buildCodexInputItems, normalizeImageDescriptors, normalizeAttachmentDescriptors } from './image-attachments.js';
 export { AppError, extractClaudeResolvedModel, WORKSPACES_ROOT, createCompleteMessage, createNormalizedMessage, registerWorkspaceSyncControlHost, isWorkspaceSyncControlHost, registerWorkspaceSyncNetwork, getWorkspaceSyncNetwork, registerWorkspaceSyncRecoveryTransport, isWorkspaceSyncRecoveryOnly, terminateProviderProcess, flattenPromptForWindowsShell, getOpenCodeDatabasePath } from './utils.js';
-export type { AnyRecord, FileTreeFileSystem, WorkspaceGitFileSystem, ProviderRuntimeContext, ProviderRuntimeWriter, ProviderModelsDefinition, NormalizedMessage } from './types.js';
+export type { AnyRecord, FileTreeFileSystem, WorkspaceGitFileSystem, ProviderRuntimeContext, ProviderRuntimeWriter, ProviderModelsDefinition, NormalizedMessage, SessionWorkspaceMode } from './types.js';

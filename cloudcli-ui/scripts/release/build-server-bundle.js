@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import crypto from 'node:crypto';
-import { createReadStream, readFileSync } from 'node:fs';
+import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -11,22 +11,6 @@ const rootDir = path.resolve(__dirname, '..', '..');
 const packageJson = JSON.parse(
   await fs.readFile(path.join(rootDir, 'package.json'), 'utf8'),
 );
-
-function getElectronVersion() {
-  try {
-    return JSON.parse(
-      readFileSync(path.join(rootDir, 'node_modules', 'electron', 'package.json'), 'utf8'),
-    ).version;
-  } catch {
-    try {
-      return JSON.parse(
-        readFileSync(path.join(rootDir, 'package-lock.json'), 'utf8'),
-      ).packages['node_modules/electron'].version;
-    } catch {
-      throw new Error('Could not resolve an exact Electron version for server native rebuild.');
-    }
-  }
-}
 
 function mapArch(arch = process.arch) {
   return arch === 'arm64' ? 'arm64' : 'x64';
@@ -85,10 +69,12 @@ async function writeServerPackageJson(stageDir) {
   };
   // The bundle stage is not a git checkout with dev dependencies, so lifecycle
   // scripts such as Husky prepare must not run there. Dependency install scripts
-  // still run; native modules need them before the Electron ABI rebuild below.
+  // still run so native modules target the Node.js runtime used by this server.
   delete stagedPackageJson.scripts.postinstall;
   delete stagedPackageJson.scripts.prepare;
   delete stagedPackageJson.scripts.prepublishOnly;
+  delete stagedPackageJson.scripts.pretypecheck;
+  delete stagedPackageJson.scripts.pretest;
   await fs.writeFile(
     path.join(stageDir, 'package.json'),
     `${JSON.stringify(stagedPackageJson, null, 2)}\n`,
@@ -108,6 +94,9 @@ function sha256(filePath) {
 
 const platform = mapPlatform(process.env.CLOUDCLI_BUNDLE_PLATFORM || process.platform);
 const arch = mapArch(process.env.CLOUDCLI_BUNDLE_ARCH || process.arch);
+if (platform !== mapPlatform(process.platform) || arch !== mapArch(process.arch)) {
+  throw new Error('Build server bundles on their target platform and architecture so native dependencies match.');
+}
 const version = packageJson.version;
 const bundleName = `chisacloudcode-local-server-${version}-${platform}-${arch}.tar.gz`;
 const bundleRoot = path.join(rootDir, 'release', 'local-server');
@@ -126,25 +115,12 @@ await copyRequired(stageDir, 'server/modules/workspace-sync/transport');
 await copyRequired(stageDir, 'scripts/install-workspace-sync.sh');
 await copyRequired(stageDir, 'package-lock.json');
 await copyIfExists(stageDir, 'scripts/fix-node-pty.js');
+await copyRequired(stageDir, 'scripts/promote-dist-server.mjs');
 await writeServerPackageJson(stageDir);
 
 console.log('Installing production server dependencies into bundle stage...');
 await run('npm', ['ci', '--omit=dev'], {
   cwd: stageDir,
-  env: {
-    ...process.env,
-    npm_config_audit: 'false',
-    npm_config_fund: 'false',
-  },
-});
-
-const electronVersion = getElectronVersion();
-const electronRebuild = process.platform === 'win32'
-  ? path.join(rootDir, 'node_modules', '.bin', 'electron-rebuild.cmd')
-  : path.join(rootDir, 'node_modules', '.bin', 'electron-rebuild');
-console.log(`Rebuilding native server dependencies for Electron ${electronVersion} (${arch})...`);
-await run(electronRebuild, ['--version', electronVersion, '--module-dir', stageDir, '--arch', arch, '--force'], {
-  cwd: rootDir,
   env: {
     ...process.env,
     npm_config_audit: 'false',

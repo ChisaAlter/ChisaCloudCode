@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,6 +48,7 @@ type piSession struct {
 	Context           string         `json:"handoffContext,omitempty"`
 	ContextFile       string         `json:"claudeReferenceFile,omitempty"`
 	LeaseID           string         `json:"workspaceLease,omitempty"`
+	HandoffPhase      string         `json:"handoffPhase,omitempty"`
 	Events            []piEvent      `json:"-"`
 	process           *piProcess
 	secrets           []string
@@ -90,6 +92,8 @@ var piAgents = struct {
 
 var piSessionIDPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$`)
 var piShellExitPattern = regexp.MustCompile(`(?:^|\n)Command exited with code (-?[0-9]+)\s*$`)
+
+const piHandoffReleasePending = "release-pending"
 
 func piSessionDirectory(sessionID string) string {
 	return filepath.Join(dataDir(), "pi", "sessions", sessionID)
@@ -276,7 +280,9 @@ func piSnapshotLocked(s *piSession, after int64) map[string]any {
 	}
 	view := map[string]any{"ok": true, "sessionId": s.SessionID, "serverPath": s.ServerPath, "owner": owner, "ownerSessionId": ownerID, "running": running, "runtimeActive": s.process != nil, "cursor": s.Cursor, "messages": messages, "messagesReset": reset, "events": events}
 	if reset || len(events) > 0 {
-		view["lastResult"] = s.LastResult
+		// Handoff updates this map after the bridge method returns. Its nested
+		// tool evidence is immutable, but the result fields need their own map.
+		view["lastResult"] = maps.Clone(s.LastResult)
 	}
 	return view
 }
@@ -395,8 +401,8 @@ func piStartLockedContext(ctx context.Context, m *Mapping, sessionID, message, h
 	defer func() {
 		if !claimed {
 			if prepared {
-				// Preparation paused a real sync. Every later rejection must use
-				// the same handback as a finished turn, not just drop its lease.
+				// Preparation synchronized the active watcher. Every later rejection
+				// must use the same handback as a finished turn before release.
 				message, _ := result["error"].(string)
 				code, _ := result["code"].(string)
 				piAgents.Lock()
@@ -454,9 +460,12 @@ func piStartLockedContext(ctx context.Context, m *Mapping, sessionID, message, h
 		return piFailure(err.Error(), "SYNC_BLOCKED")
 	}
 	prepared = true
-	// Observation failure must retain the full handback path. In particular,
-	// shell commands can modify files without emitting edit/write events.
-	baseline, _ = capturePiWorkspace(ctx, m)
+	// Keep the prepared binding identity without observing the tree. The active
+	// watcher and unified handback also cover writes outside Pi's tool events.
+	baseline = &piWorkspaceSnapshot{
+		localPath: m.LocalPath, serverPath: m.ServerPath, serverID: m.ServerID,
+		epoch: m.BindingEpoch, syncName: m.SyncName,
+	}
 	attachments, err := piStoreAttachments(sessionID, inputs)
 	if err != nil {
 		return piFailure(err.Error(), "PI_ATTACHMENT_FAILED")
@@ -477,6 +486,7 @@ func piStartLockedContext(ctx context.Context, m *Mapping, sessionID, message, h
 	previousProjectOwner := piAgents.owners[m.ServerPath]
 	s.Owner, s.Running = "pi", true
 	s.LeaseID = leaseID
+	s.HandoffPhase = ""
 	s.Context, s.ContextFile, s.LastResult, s.aborting = "", referencePath, nil, false
 	s.runID++
 	piResetTurnLocked(s)
@@ -1131,7 +1141,7 @@ func piReleaseWorkspaceContext(ctx context.Context, s *piSession, runID uint64) 
 		return errors.New("Pi 当前任务尚未结束")
 	}
 	owner := piAgents.owners[s.ServerPath]
-	leaseID, baseline := s.LeaseID, s.workspaceBaseline
+	leaseID, baseline, phase := s.LeaseID, s.workspaceBaseline, s.HandoffPhase
 	// An idle runtime can outlive its reservation. Stopping it, or receiving a
 	// duplicate settle, must not rewrite a result or touch another turn's owner.
 	if leaseID == "" && owner != s.SessionID {
@@ -1144,11 +1154,9 @@ func piReleaseWorkspaceContext(ctx context.Context, s *piSession, runID uint64) 
 	}
 	piAgents.Unlock()
 	defer func() {
-		status := "released"
 		if failure != nil {
-			status = "failed"
+			piHandoffStatus(s, runID, "failed", failure)
 		}
-		piHandoffStatus(s, runID, status, failure)
 	}()
 	piHandoffStatus(s, runID, "releasing", nil)
 	if leaseID != "" {
@@ -1156,19 +1164,27 @@ func piReleaseWorkspaceContext(ctx context.Context, s *piSession, runID uint64) 
 		if m == nil || m.BindingEpoch != s.BindingEpoch || m.ServerID != serverIdentity(store.config()) {
 			return errors.New("项目绑定已失效，尚未交还同步")
 		}
-		if baseline != nil && (baseline.localPath != m.LocalPath || baseline.serverID != m.ServerID || baseline.syncName != m.SyncName) {
+		if baseline != nil && (baseline.localPath != m.LocalPath || baseline.serverPath != m.ServerPath || baseline.serverID != m.ServerID || baseline.epoch != m.BindingEpoch || baseline.syncName != m.SyncName) {
 			return errors.New("Pi 任务的工作区绑定已失效，保留原工作区")
 		}
-		changed, observationErr := baseline.changed(ctx, m)
-		if observationErr == nil && !changed {
-			if err := resumePiWorkspace(ctx, m, leaseID); err != nil {
-				return err
-			}
-		} else {
+		if phase != piHandoffReleasePending {
 			piHandoffStatus(s, runID, "syncing", nil)
 			if err := synchronizeProjectContext(syncLeaseContext(ctx, leaseID), m, false); err != nil {
 				return err
 			}
+			// Once synchronized, recovery only needs the exact idempotent
+			// release. Save this before the remote lease can disappear.
+			piAgents.Lock()
+			s.HandoffPhase = piHandoffReleasePending
+			err := piSaveLocked(s)
+			if err != nil {
+				s.HandoffPhase = phase
+			}
+			piAgents.Unlock()
+			if err != nil {
+				return err
+			}
+			phase = piHandoffReleasePending
 		}
 		if _, err := remoteLeaseContext(ctx, m, "release", "pi", leaseID); err != nil {
 			setSyncInfo(m, "blocked", err.Error())
@@ -1183,23 +1199,32 @@ func piReleaseWorkspaceContext(ctx context.Context, s *piSession, runID uint64) 
 			publishProjectSync(m)
 		}
 	}()
+	previousResult := maps.Clone(s.LastResult)
 	s.LeaseID = ""
+	s.HandoffPhase = ""
 	s.Owner = "claude"
 	s.workspaceBaseline = nil
 	reserved := piAgents.owners[s.ServerPath] == s.SessionID
 	if reserved {
 		delete(piAgents.owners, s.ServerPath)
 	}
-	piEventLocked(s, "workspace_released", map[string]any{"type": "workspace_released"})
+	// Persist the visible completion together with ownership, so a restart
+	// cannot restore an already released turn as still releasing.
+	s.LastResult["workspaceStatus"] = "released"
+	delete(s.LastResult, "workspaceError")
 	if err := piSaveLocked(s); err != nil {
 		s.Owner = "pi"
 		s.LeaseID = leaseID
+		s.HandoffPhase = phase
 		s.workspaceBaseline = baseline
+		s.LastResult = previousResult
 		if reserved {
 			piAgents.owners[s.ServerPath] = s.SessionID
 		}
 		return err
 	}
+	piEventLocked(s, "workspace_released", map[string]any{"type": "workspace_released"})
+	piEventLocked(s, "workspace_handoff", map[string]any{"type": "workspace_handoff", "status": "released"})
 	return nil
 }
 
@@ -1246,7 +1271,7 @@ func (FrontendBridge) PiRecoverSession(serverPath, sessionID string) map[string]
 
 // Closing stdin is Pi's documented orderly shutdown. The Job Object provides
 // bounded cancellation and kills only this Pi process and its descendants.
-func piCloseSession(s *piSession, projectLocked bool) error {
+func piStopSession(s *piSession) (uint64, error) {
 	piAgents.Lock()
 	p := s.process
 	wasRunning := s.Running
@@ -1264,12 +1289,12 @@ func piCloseSession(s *piSession, projectLocked bool) error {
 		case <-p.done:
 		case <-time.After(5 * time.Second):
 			if err := p.guard.close(); err != nil {
-				return errors.New("Pi 子进程无法停止；项目仍由 Pi 拥有")
+				return 0, errors.New("Pi 子进程无法停止；项目仍由 Pi 拥有")
 			}
 			select {
 			case <-p.done:
 			case <-time.After(5 * time.Second):
-				return errors.New("Pi 退出尚未确认；项目仍由 Pi 拥有")
+				return 0, errors.New("Pi 退出尚未确认；项目仍由 Pi 拥有")
 			}
 		}
 	}
@@ -1288,11 +1313,19 @@ func piCloseSession(s *piSession, projectLocked bool) error {
 		piEventLocked(s, "run_error", map[string]any{"type": "run_error", "error": "Pi 任务已停止"})
 		if err := piSaveLocked(s); err != nil {
 			piAgents.Unlock()
-			return err
+			return 0, err
 		}
 	}
 	runID := s.runID
 	piAgents.Unlock()
+	return runID, nil
+}
+
+func piCloseSession(s *piSession, projectLocked bool) error {
+	runID, err := piStopSession(s)
+	if err != nil {
+		return err
+	}
 	if !projectLocked {
 		return piReleaseWorkspace(s, runID)
 	}
@@ -1380,11 +1413,34 @@ func stopProjectPi(serverPath string) error {
 		if p != nil {
 			_ = p.guard.close()
 		}
-		if err := piCloseSession(s, serverPath != ""); err != nil {
-			return err
+	}
+	// Confirm and save every process stop before any slow workspace handback.
+	stopped := make(map[*piSession]uint64, len(items))
+	var failures []error
+	for _, s := range items {
+		runID, err := piStopSession(s)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("停止 Pi 会话 %s: %w", s.SessionID, err))
+			continue
+		}
+		stopped[s] = runID
+	}
+	for _, s := range items {
+		runID, ok := stopped[s]
+		if !ok {
+			continue
+		}
+		var err error
+		if serverPath == "" {
+			err = piReleaseWorkspace(s, runID)
+		} else {
+			err = piReleaseWorkspaceLocked(s, runID)
+		}
+		if err != nil {
+			failures = append(failures, fmt.Errorf("交还 Pi 会话 %s: %w", s.SessionID, err))
 		}
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 func stopAllPi() error { return stopProjectPi("") }

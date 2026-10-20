@@ -3,6 +3,8 @@ import { Activity, Archive, Folder, MessageSquare, RotateCcw, Search, Trash2 } f
 import type { TFunction } from 'i18next';
 
 import { LLMProviderLogo, ScrollArea } from '@/shared/ui';
+import { isDesktop } from '@/shared/chisa';
+import '@/modules/sidebar/desktop-sidebar.css';
 import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationSearchResults, Project, RecentConversationListItem, SearchProgress, SidebarProjectListProps, SidebarSearchMode } from '@/shared/types';
 import { formatCompactAge, getAllSessions } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 import SidebarFooter from '@/modules/sidebar/SidebarFooter';
@@ -174,8 +176,7 @@ export default function SidebarContent({
 
   return (
     <div
-      className="sidebar-surface flex h-full flex-col md:w-72 md:select-none"
-      style={{}}
+      className={`sidebar-surface flex h-full flex-col md:w-72 md:select-none${isDesktop() && !isMobile ? ' desktop-sidebar' : ''}`}
     >
       <SidebarHeader
         isPWA={isPWA}

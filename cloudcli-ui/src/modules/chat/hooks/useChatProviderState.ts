@@ -335,6 +335,11 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
       return option.effort?.values ?? [];
     }
 
+    // HiRoute chooses its execution model; Claude effort is valid only if its catalog advertises it.
+    if (targetProvider === 'claude' && model === 'hiroute') {
+      return [];
+    }
+
     return toProviderEffortOptions(FALLBACK_PROVIDER_EFFORT_VALUES[targetProvider] ?? []);
   }, [getModelOption, getSupportsEffortForProvider]);
 
@@ -621,10 +626,10 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
   /**
    * Applies a model choice.
    *
-   * The pick always becomes the per-provider default so the next new chat
-   * inherits it, and — when a session is open — is also recorded against that
-   * session so reopening it later restores this model.
-   * Queue-control restores supply an optional validity predicate; ordinary picks use the original entry point.
+   * Normal model picks also become the default for new chats. HiRoute picks
+   * in an existing session stay scoped to that session; reopening it restores
+   * the backend's saved choice without changing other chats.
+   * Queue-control restores provide a validity predicate so stale restores cannot change newer selections.
    */
   const selectProviderModel = useCallback(async (
     targetProvider: LLMProvider,
@@ -641,7 +646,9 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
       || sessionSelection.sessionId !== normalizedSessionId || sessionSelection.status !== 'ready')) {
       throw new Error('Wait for this session’s model and reasoning effort to load before changing them.');
     }
-    setStoredProviderModel(targetProvider, model);
+    if (!normalizedSessionId || targetProvider !== 'claude' || model !== 'hiroute') {
+      setStoredProviderModel(targetProvider, model);
+    }
     if (!normalizedSessionId) {
       return { scope: 'default' as const, model };
     }

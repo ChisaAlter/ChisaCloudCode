@@ -24,7 +24,8 @@
     "git": "源代码管理",
     "tasks": "任务",
     "browser": "浏览器",
-    "computer": "计算机"
+    "computer": "计算机",
+    "tools": "工具"
   },
   "status": {
     "loading": "加载中...",
@@ -95,7 +96,9 @@
     "createProjectDesktop": "点击侧边栏中的文件夹图标以创建新项目",
     "newSession": "新会话",
     "untitledSession": "未命名会话",
-    "projectFiles": "项目文件"
+    "projectFiles": "项目文件",
+    "createProjectAction": "添加项目",
+    "browseProjectsAction": "浏览对话和项目"
   },
   "fileTree": {
     "loading": "正在加载文件...",
@@ -334,6 +337,7 @@
     "useThisFolder": "使用此文件夹"
   },
   "misc": {
+    "projectsLoadFailed": "项目和会话加载失败，请检查连接后重试。",
     "appErrorTitle": "界面遇到错误",
     "appErrorDescription": "界面发生异常。桌面端会将诊断信息记录在本机 app.log 中。重新加载只恢复界面，不会自动重发消息。",
     "reloadInterface": "重新加载界面",

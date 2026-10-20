@@ -59,6 +59,14 @@ test('a closed code fence can be settled', () => {
   assert.equal(pending, 'After the block');
 });
 
+test('HTML inside a fenced example keeps the settled-prefix optimization', () => {
+  const example = '```html\n<script>\nconst first = 1;\n\nconst second = 2;\n</script>\n```\n\n';
+  const { settled, pending } = splitStreamingMarkdown(`${example}After the example`);
+
+  assert.equal(settled, example);
+  assert.equal(pending, 'After the example');
+});
+
 test('a blank line inside a loose list is not a boundary', () => {
   // Splitting here would restart the numbering at 1 in the second half.
   const content = '1. first\n\n2. second\n\n3. third partial';

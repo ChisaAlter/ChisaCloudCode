@@ -17,7 +17,7 @@ import (
 //go:embed resources/workspace.py
 var workspaceWorker string
 
-const workspaceImage = "localhost/chisa-workspace:2"
+const workspaceImage = "localhost/chisa-workspace:3"
 
 var workspaceLocks sync.Map
 
@@ -65,7 +65,7 @@ func workspaceRPCContext(ctx context.Context, m *Mapping, request map[string]any
 	op, _ := request["op"].(string)
 	traceOp := op
 	switch op {
-	case "stat", "lstat", "list", "batch", "realpath", "read", "write", "mkdir", "rename", "copy", "remove", "search", "grep", "exec", "preview_start", "preview_status", "preview_stop", "sync_begin", "sync_end", "sync_released":
+	case "stat", "lstat", "list", "batch", "realpath", "read", "write", "mkdir", "rename", "copy", "remove", "search", "grep", "exec", "git_read", "git_branch", "preview_start", "preview_status", "preview_stop", "sync_begin", "sync_end", "sync_released":
 	default:
 		traceOp = "unknown"
 	}
@@ -86,17 +86,31 @@ func workspaceRPCContext(ctx context.Context, m *Mapping, request map[string]any
 	unlock, err := lockWorkspace(ctx, m.ServerPath)
 	waiting = time.Since(waitStarted)
 	if err != nil {
-		return map[string]any{"error": "工作区请求已取消或超时", "code": "WORKSPACE_UNAVAILABLE"}
+		return map[string]any{"ok": false, "error": "工作区请求已取消或超时", "code": "WORKSPACE_UNAVAILABLE"}
 	}
 	defer unlock()
 	if current := store.findMappingByServer(m.ServerPath); current == nil || current.BindingEpoch != m.BindingEpoch {
-		return map[string]any{"error": "工作区绑定已失效", "code": "STALE_BINDING"}
+		return map[string]any{"ok": false, "error": "工作区绑定已失效", "code": "STALE_BINDING"}
 	}
 	serverConnectionMu.RLock()
 	owned := workspaceMappingActiveLocked(m)
 	serverConnectionMu.RUnlock()
 	if !owned {
 		return map[string]any{"ok": false, "error": "此项目未连接当前账号", "code": "WORKSPACE_UNAVAILABLE"}
+	}
+	if op == "git_read" {
+		runStarted := time.Now()
+		response := localGitReadRPC(ctx, m, request)
+		running = time.Since(runStarted)
+		succeeded = response["ok"] == true
+		return response
+	}
+	if op == "git_branch" {
+		runStarted := time.Now()
+		response := localGitBranchRPC(ctx, m, request)
+		running = time.Since(runStarted)
+		succeeded = response["ok"] == true
+		return response
 	}
 	if op == "sync_begin" || op == "sync_end" || op == "sync_released" {
 		response := synchronizationRPCContext(ctx, m, request)

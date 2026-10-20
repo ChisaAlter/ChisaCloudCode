@@ -10,6 +10,7 @@ import type {
 } from '@/shared/types.js';
 
 type ChatRunStatus = 'running' | 'completed';
+type ChatRunPhase = 'accepted' | 'queued' | 'running' | 'completed';
 
 /** The audience and replay cursor belong to the session, not one provider run. */
 type SessionChannel = {
@@ -33,17 +34,20 @@ type SessionChannel = {
  *   can replay exactly the events it missed via `chat.subscribe`.
  */
 type ChatRun = {
-  runId: string;
   appSessionId: string;
   provider: LLMProvider;
   providerSessionId: string | null;
+  runId: string;
   status: ChatRunStatus;
+  phase: ChatRunPhase;
   lastSeq: number;
   events: NormalizedMessage[];
+  lifecycleEvents: Array<Record<string, unknown>>;
   writer: ChatSessionWriter;
   startedAt: number;
   completedAt: number | null;
   modelStopped: boolean;
+  admissionRejected?: boolean;
 };
 
 /**
@@ -105,6 +109,29 @@ function evictRunLater(completedRun: ChatRun): void {
  * 3. Buffer the event for `chat.subscribe` replay.
  * 4. Flip the run to `completed` when the terminal `complete` event passes by.
  */
+function createLifecycleEvent(run: ChatRun): Record<string, unknown> {
+  return {
+    kind: 'chat_run_status',
+    sessionId: run.appSessionId,
+    runId: run.runId,
+    status: run.status,
+    phase: run.phase,
+    lastSeq: run.lastSeq,
+    startedAt: run.startedAt,
+    completedAt: run.completedAt,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function emitLifecycle(run: ChatRun): void {
+  const event = createLifecycleEvent(run);
+  run.lifecycleEvents.push(event);
+  if (run.lifecycleEvents.length > 16) {
+    run.lifecycleEvents.splice(0, run.lifecycleEvents.length - 16);
+  }
+  run.writer.sendGatewayEvent(event);
+}
+
 function decorateAndRecordEvent(run: ChatRun, channel: SessionChannel, message: NormalizedMessage): NormalizedMessage | null {
   // Exactly-one-complete contract: when a run is aborted the chat handler
   // emits the terminal `complete` immediately, but the killed runtime may
@@ -127,20 +154,25 @@ function decorateAndRecordEvent(run: ChatRun, channel: SessionChannel, message: 
   if (message.kind === 'status' && message.text === 'model_stopped') run.modelStopped = true;
 
   if (message.kind === 'complete') {
+    if (message.workspaceAdmissionRejected === true) run.admissionRejected = true;
+    // Internal retry evidence is not part of the client replay protocol.
+    delete outbound.workspaceAdmissionRejected;
     // Persist before clients see the terminal: a restart must not auto-send
     // the unsent queue after this owner failed or was stopped.
     const failed = message.aborted === true || message.success === false
       || (typeof message.exitCode === 'number' && message.exitCode !== 0);
     const userId = Number(run.writer.userId);
-    if (failed && runs.get(run.appSessionId) === run && Number.isSafeInteger(userId) && userId > 0) {
+    if (failed && !run.admissionRejected && runs.get(run.appSessionId) === run && Number.isSafeInteger(userId) && userId > 0) {
       sessionDraftsDb.pauseQueuedMessage(userId, run.appSessionId);
     }
     // The provider may report its own id here; the frontend only ever knows
     // the app id, so the "actual" id is by definition the app id as well.
     outbound.actualSessionId = run.appSessionId;
     run.status = 'completed';
+    run.phase = 'completed';
     run.completedAt = Date.now();
     evictRunLater(run);
+    emitLifecycle(run);
   }
 
   run.events.push(outbound);
@@ -234,8 +266,10 @@ export const chatRunRegistry = {
       provider: input.provider,
       providerSessionId: input.providerSessionId,
       status: 'running',
+      phase: 'accepted',
       lastSeq: channel.lastSeq,
       events: [],
+      lifecycleEvents: [],
       writer: null as unknown as ChatSessionWriter,
       startedAt: Date.now(),
       completedAt: null,
@@ -254,7 +288,16 @@ export const chatRunRegistry = {
     });
 
     runs.set(input.appSessionId, run);
+    emitLifecycle(run);
     return run;
+  },
+
+  setPhase(run: ChatRun, phase: Exclude<ChatRunPhase, 'completed'>): void {
+    if (runs.get(run.appSessionId) !== run || run.status !== 'running' || run.phase === phase) {
+      return;
+    }
+    run.phase = phase;
+    emitLifecycle(run);
   },
 
   getRun(appSessionId: string): ChatRun | undefined {
@@ -326,6 +369,11 @@ export const chatRunRegistry = {
     // A server restart can put an older client's cursor ahead of the new log.
     const cursor = afterSeq > run.lastSeq ? 0 : afterSeq;
     return run.events.filter((event) => typeof event.seq === 'number' && event.seq > cursor);
+  },
+
+  lifecycleSnapshot(appSessionId: string): Record<string, unknown> | null {
+    const run = runs.get(appSessionId);
+    return run ? createLifecycleEvent(run) : null;
   },
 
   /**

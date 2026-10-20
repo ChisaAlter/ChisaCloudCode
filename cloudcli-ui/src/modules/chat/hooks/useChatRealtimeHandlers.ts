@@ -82,6 +82,8 @@ export function useChatRealtimeHandlers({
   // listener so back-to-back permission events can dedupe and re-arm the
   // notification sound before React finishes a rerender.
   const pendingPermissionRequestsRef = useRef(pendingPermissionRequests);
+  // A live run announced after a subscribe must survive an older idle acknowledgement.
+  const runStartedAtRef = useRef(new Map<string, number>());
 
   useEffect(() => {
     pendingPermissionRequestsRef.current = pendingPermissionRequests;
@@ -102,6 +104,11 @@ export function useChatRealtimeHandlers({
 
       const activeViewSessionId = activeViewSessionIdRef.current;
       const sid = (typeof msg.sessionId === 'string' && msg.sessionId) || activeViewSessionId;
+      const subscribedAt = sid ? statusCheckSentAtRef.current.get(sid) : undefined;
+      const liveRunStartedAt = sid ? runStartedAtRef.current.get(sid) : undefined;
+      if (msg.kind === 'chat_subscribed' && msg.isProcessing === false
+        && (!msg.replayEpoch || msg.replayEpoch === replayCursorsRef.current.get(sid ?? '')?.replayEpoch)
+        && liveRunStartedAt !== undefined && subscribedAt !== undefined && liveRunStartedAt >= subscribedAt) return;
 
       if (sid && typeof msg.replayEpoch === 'string'
         && replayCursorsRef.current.get(sid)?.replayEpoch !== msg.replayEpoch) {
@@ -120,6 +127,8 @@ export function useChatRealtimeHandlers({
         if (cursor?.runId || (streamBuffersRef.current.get(sid)?.runId
           && streamBuffersRef.current.get(sid)?.runId !== msg.runId)) finishStream(sid);
         replayCursorsRef.current.set(sid, { ...cursor, runId: msg.runId, seq: cursor?.seq ?? 0 });
+        if (msg.kind === 'chat_subscribed') runStartedAtRef.current.delete(sid);
+        else runStartedAtRef.current.set(sid, Date.now());
       }
       if (sid && typeof msg.seq === 'number') {
         const cursor = replayCursorsRef.current.get(sid);
@@ -162,6 +171,7 @@ export function useChatRealtimeHandlers({
               ifStartedBefore: statusCheckSentAtRef.current.get(sid),
             });
             finishStream(sid);
+            runStartedAtRef.current.delete(sid);
             if (sid === activeViewSessionId && replayCursorsRef.current.has(sid)) {
               void requestLatestMessages(sid, isActiveRef.current);
             }
@@ -182,6 +192,10 @@ export function useChatRealtimeHandlers({
           }
           return;
         }
+
+        case 'chat_run_status':
+          // Lifecycle metadata owns activity and replay identity, never a transcript row.
+          return;
 
         case 'protocol_error': {
           console.error('[Chat] Protocol error:', msg.code, msg.error);
@@ -225,6 +239,7 @@ export function useChatRealtimeHandlers({
           const current = sessionStore.getMessages(sid).find(row => row.id === `__streaming_${sid}`);
           buffer = { runId: msg.runId, provider: (msg.provider as LLMProvider) || provider, text: current?.content ?? '', timer: null };
           streamBuffersRef.current.set(sid, buffer);
+          if (!runStartedAtRef.current.has(sid)) runStartedAtRef.current.set(sid, Date.now());
         }
         buffer.text += text;
         if (buffer.timer === null) {

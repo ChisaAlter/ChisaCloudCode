@@ -1,22 +1,30 @@
-import { useState } from 'react';
-import { LogIn } from 'lucide-react';
+import { Terminal } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import { AccountMenu } from '@/modules/auth/AccountMenu';
-import { AccountPopup } from '@/modules/auth/AccountPopup';
+import LoginForm from '@/modules/auth/LoginForm';
+import '@/modules/auth/desktop-login.css';
 
-/** ProtectedRoute renders this desktop shell without loading authenticated projects until login succeeds. */
+/** ProtectedRoute uses this focused entry screen before opening the desktop workspace. */
 export function SignedOutDesktop() {
   const { t } = useTranslation('auth');
-  // The central welcome action opens login directly; the bottom entry first opens the account menu.
-  const [showAccount, setShowAccount] = useState(false);
-  return <div className="flex h-screen bg-background pt-8">
-    <aside className="flex w-64 shrink-0 flex-col border-r border-border bg-card p-3">
-      <span className="px-2 py-3 text-lg font-semibold">ChisaCloudCode</span>
-      <p className="mt-5 px-2 text-sm text-muted-foreground">{t('accountMenu.workspaceHint')}</p>
-      <div className="mt-auto"><AccountMenu /></div>
-    </aside>
-    <main className="flex min-w-0 flex-1 flex-col items-center justify-center gap-4 p-6 text-center"><LogIn className="h-8 w-8 text-muted-foreground" /><h1 className="text-xl font-medium">{t('accountMenu.welcome')}</h1><p className="text-sm text-muted-foreground">{t('accountMenu.continueHint')}</p><button type="button" className="rounded-lg bg-primary px-4 py-2 text-sm text-primary-foreground" onClick={() => setShowAccount(true)}>{t('login.submit')}</button></main>
-    <AccountPopup isOpen={showAccount} onClose={() => setShowAccount(false)} />
-  </div>;
+  return (
+    <div className="desktop-signed-out desktop-login">
+      <main className="desktop-login-main">
+        <div className="desktop-login-content">
+          <div className="desktop-login-brand">
+            <span className="desktop-login-mark" aria-hidden="true"><Terminal size={21} strokeWidth={1.7} /></span>
+            <span>ChisaCloudCode</span>
+          </div>
+          <section className="desktop-login-card" aria-labelledby="desktop-login-title">
+            <header className="desktop-login-heading">
+              <h1 id="desktop-login-title">{t('desktop.title')}</h1>
+              <p>{t('desktop.description')}</p>
+            </header>
+            <LoginForm embedded />
+          </section>
+          <p className="desktop-login-footer">{t('desktop.footer')}</p>
+        </div>
+      </main>
+    </div>
+  );
 }

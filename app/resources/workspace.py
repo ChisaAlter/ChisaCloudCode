@@ -15,6 +15,7 @@ def resolve(value='.', follow=True):
     p = Path(value)
     if p.is_absolute(): p = p.relative_to(ROOT)
     candidate = ROOT / p
+    if not follow and candidate.name == '..': raise PermissionError('Path must name a workspace entry')
     target = candidate.resolve() if follow else candidate.parent.resolve() / candidate.name
     if target != ROOT and ROOT not in target.parents: raise PermissionError('Path is outside the workspace')
     if '.chisa-bridge.json' in target.parts: raise PermissionError('Reserved workspace metadata')
@@ -41,7 +42,7 @@ def main(q):
             if not isinstance(request, dict) or request.get('op') not in ('stat', 'lstat', 'list') or not isinstance(request.get('path', '.'), str):
                 raise ValueError('Batch requests must use stat, lstat or list with a string path')
         return {'results': [request_result(request) for request in requests]}
-    p = resolve(q.get('path', '.'), op not in ('lstat', 'remove'))
+    p = resolve(q.get('path', '.'), op not in ('lstat', 'remove', 'rename'))
     if op == 'list':
         if q.get('includeStats') is not True:
             return {'entries': [{'name': e.name, 'dir': e.is_dir()} for e in sorted(p.iterdir()) if e.name != '.chisa-bridge.json']}
@@ -78,7 +79,7 @@ def main(q):
         return {'hash': hashlib.sha256(data).hexdigest(), 'bytes': len(data)}
     if op == 'mkdir': p.mkdir(parents=q.get('recursive', True), exist_ok=True); return {}
     if op in ('rename', 'copy'):
-        dst = resolve(q['destination'])
+        dst = resolve(q['destination'], op != 'rename')
         if op == 'rename': p.rename(dst)
         else: shutil.copyfile(p, dst)
         return {}
@@ -106,15 +107,25 @@ def main(q):
     if op == 'exec':
         command = q.get('command', '')
         if not command.strip() and not q.get('argv'): raise ValueError('Command is empty')
-        timeout = min(max(int(q.get('timeoutSeconds', 60)), 1), 600)
+        timeout = q.get('timeoutSeconds', 60)
+        if type(timeout) not in (int, float) or not 1 <= timeout <= 2_147_000:
+            raise ValueError('Command timeout must be a finite number between 1 and 2147000 seconds')
         argv = q.get('argv') or ['bash', '-c', command]
+        environment = q.get('env')
+        if environment is not None and (not isinstance(environment, dict) or any(not isinstance(value, str) for value in environment.values())):
+            raise ValueError('Command environment must map names to strings')
+        stdin = q.get('stdin')
+        if stdin is not None and not isinstance(stdin, str): raise ValueError('Command stdin must be a string')
+        child_environment = os.environ.copy()
+        if environment is not None: child_environment.update(environment)
         with open('/tmp/stdout', 'w+b') as out, open('/tmp/stderr', 'w+b') as err:
-            process = subprocess.Popen(argv, cwd=p, stdout=out, stderr=err, start_new_session=True)
+            process = subprocess.Popen(argv, cwd=p, env=child_environment, stdin=subprocess.PIPE if stdin is not None else None,
+                                       stdout=out, stderr=err, start_new_session=True)
             timed_out = False
-            try: process.wait(timeout=timeout)
+            try: process.communicate(input=stdin.encode('utf-8') if stdin is not None else None, timeout=timeout)
             except subprocess.TimeoutExpired:
                 import signal
-                timed_out = True; os.killpg(process.pid, signal.SIGKILL); process.wait()
+                timed_out = True; os.killpg(process.pid, signal.SIGKILL); process.communicate()
             out.seek(0); err.seek(0)
             stdout = out.read(MAX_FILE + 1); stderr = err.read(MAX_FILE + 1)
             return {'stdout': stdout[:MAX_FILE].decode(errors='replace'), 'stderr': stderr[:MAX_FILE].decode(errors='replace'), 'exitCode': process.returncode, 'timedOut': timed_out, 'truncated': len(stdout) > MAX_FILE or len(stderr) > MAX_FILE}

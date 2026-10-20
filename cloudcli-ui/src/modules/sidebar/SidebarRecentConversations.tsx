@@ -1,9 +1,10 @@
-import { Loader2, MessageSquare } from 'lucide-react';
+import { Loader2, MessageSquare, MoreHorizontal } from 'lucide-react';
 import type { MouseEvent } from 'react';
 import type { TFunction } from 'i18next';
 
 import { Button, LLMProviderLogo, Tooltip } from '@/shared/ui';
 import { cn } from '@/shared/utils';
+import { isDesktop } from '@/shared/chisa';
 import type { ProjectSession, RecentConversationListItem, SessionRowActions } from '@/shared/types';
 import { formatCompactAge } from '@/modules/sidebar/utils/sidebarProjectFormatting';
 import { usePinnedSessions } from '@/modules/sidebar/hooks/usePinnedSessions';
@@ -66,6 +67,7 @@ export default function SidebarRecentConversations({
   t,
 }: SidebarRecentConversationsProps) {
   const { pinnedSessionIds } = usePinnedSessions();
+  const desktop = isDesktop();
   if (isLoading && conversations.length === 0) {
     return <RecentConversationSkeleton />;
   }
@@ -99,8 +101,8 @@ export default function SidebarRecentConversations({
   }
 
   return (
-    <div className="px-1" data-testid="recent-conversations-list">
-      <div className="flex items-center justify-between px-2 pb-1.5 pt-0.5">
+    <div className="sidebar-recents px-1" data-testid="recent-conversations-list">
+      <div className="sidebar-recents-summary flex items-center justify-between px-2 pb-1.5 pt-0.5">
         <span className="text-[11px] font-medium text-muted-foreground">
           {t('recent.title', 'Recent conversations')}
         </span>
@@ -132,7 +134,7 @@ export default function SidebarRecentConversations({
           };
 
           return (
-            <div key={conversation.sessionId} className="group relative" data-session-row>
+            <div key={conversation.sessionId} className="sidebar-recent-item group relative" data-session-row data-renaming={sessionRename ? true : undefined} data-pinned={pinnedSessionIds.has(conversation.sessionId) ? true : undefined}>
               {/*
                 * Only the amber "needs attention" dot, and the spinner below. The
                 * Projects row also has a green dot for a session touched recently,
@@ -159,24 +161,24 @@ export default function SidebarRecentConversations({
                 data-testid="recent-conversation-row"
                 aria-current={isSelected ? 'page' : undefined}
                 className={cn(
-                  'flex min-w-0 items-center gap-2 rounded-lg px-2 py-2 pr-16 text-left transition-colors',
+                  'sidebar-recent-link flex min-w-0 items-center gap-2 rounded-lg px-2 py-2 pr-16 text-left transition-colors',
                   isSelected
                     ? 'bg-accent text-foreground'
                     : 'text-foreground hover:bg-accent/60',
                 )}
               >
                 <span className={cn(
-                  'flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md',
+                  'sidebar-recent-provider flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md',
                   'bg-transparent',
                 )}>
                   <LLMProviderLogo provider={conversation.provider} className="h-3.5 w-3.5" />
                 </span>
 
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[13px] font-normal leading-4">
+                  <span className="sidebar-recent-title block truncate text-[13px] font-normal leading-4" title={conversation.sessionTitle}>
                     {conversation.sessionTitle}
                   </span>
-                  <span className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[10px] leading-3 text-muted-foreground">
+                  <span className="sidebar-recent-metadata mt-0.5 flex min-w-0 items-center gap-1.5 text-[10px] leading-3 text-muted-foreground">
                     <span className="truncate">{conversation.projectDisplayName}</span>
                     {isProcessing ? (
                       <>
@@ -197,8 +199,23 @@ export default function SidebarRecentConversations({
                 </span>
               </a>
 
+              {desktop && !sessionRename && <button
+                type="button"
+                className="sidebar-recent-more sidebar-icon"
+                aria-label={t('sessionMenu.optionsFor', { name: conversation.sessionTitle, defaultValue: 'Options for {{name}}' })}
+                aria-haspopup="menu"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  // Reuse SessionOptions' context menu so capability checks and callbacks stay shared.
+                  const button = event.currentTarget;
+                  const bounds = button.getBoundingClientRect();
+                  button.closest('[data-session-row]')?.dispatchEvent(new window.MouseEvent('contextmenu', {
+                    bubbles: true, cancelable: true, clientX: bounds.right, clientY: bounds.bottom,
+                  }));
+                }}
+              ><MoreHorizontal className="h-4 w-4" /></button>}
               <SessionOptions
-                className="absolute right-2 top-1/2 -translate-y-1/2 transform"
+                className="sidebar-recent-options absolute right-2 top-1/2 -translate-y-1/2 transform"
                 sessionId={conversation.sessionId}
                 sessionName={conversation.sessionTitle}
                 provider={conversation.provider}

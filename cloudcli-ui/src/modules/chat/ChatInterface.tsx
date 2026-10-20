@@ -34,6 +34,7 @@ import {
 import ChatMessagesPane from '@/modules/chat/transcript/ChatMessagesPane';
 import ChatComposer from '@/modules/chat/composer/ChatComposer';
 import CommandResultModal from '@/modules/chat/modals/CommandResultModal';
+import ChatStarterPrompts from '@/modules/chat/transcript/ChatStarterPrompts';
 
 type ChatInterfaceProps = {
   isActive: boolean;
@@ -267,6 +268,7 @@ function ChatInterface({
     openAttachmentPicker,
     handleSubmit,
     canSubmitWithoutModelOptions,
+    isPreparingSend,
     workspacePendingDraft,
     workspacePendingNotice,
     isWaitingForWorkspace,
@@ -332,6 +334,7 @@ function ChatInterface({
   const handleWebSocketReconnect = useCallback(async () => {
     if (!selectedProject || !selectedSession) return;
     await requestLatestMessages(selectedSession.id, isActive);
+    statusCheckSentAtRef.current.set(selectedSession.id, Date.now());
     try {
       sendMessage({
         type: 'chat.subscribe',
@@ -342,7 +345,6 @@ function ChatInterface({
           runId: replayCursorsRef.current.get(selectedSession.id)?.runId,
         }],
       });
-      statusCheckSentAtRef.current.set(selectedSession.id, Date.now());
     } catch (error) {
       console.warn('Chat subscription awaits the next connection:', error);
     }
@@ -549,10 +551,12 @@ function ChatInterface({
   }
 
 
+  const isNewConversation = !selectedSession && !currentSessionId && chatMessages.length === 0 && !isLoadingSessionMessages && !isProcessing;
+
   return (
     <PermissionContext.Provider value={permissionContextValue}>
       <div ref={splitPaneRef} className="flex h-full min-h-0 min-w-0">
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <div className={`chat-conversation flex min-h-0 min-w-0 flex-1 flex-col ${isNewConversation ? 'chat-conversation--new' : ''}`}>
         {(piSessionId || tokenBudget) && <div className="chat-session-tools flex shrink-0 items-center justify-end gap-1 px-5 py-1">
           {piAvailable && <button type="button" aria-expanded={piOpen} className="flex items-center gap-2 rounded-lg px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground" onClick={() => setPiOpen((value) => !value)}><PanelRightOpenIcon className="h-3.5 w-3.5" />{piOpen ? '收起 Pi 工作区' : 'Pi 工作区'}</button>}
           <ActionMenu label={t('misc.sessionOptions', { defaultValue: 'Session options' })} ariaLabel={t('misc.sessionOptions', { defaultValue: 'Session options' })} icon={MoreHorizontalIcon} iconOnly variant="ghost" portal triggerClassName="h-7 w-7 rounded-lg p-0 text-muted-foreground" items={[{ key: 'usage', label: t('misc.showTokenUsage'), icon: ActivityIcon, onSelect: showCostModal }]} />
@@ -610,7 +614,7 @@ function ChatInterface({
           onLoadFullTranscript={loadFullTranscript}
         />
 
-        <div className="relative flex-shrink-0">
+        <div className="chat-composer-dock relative flex-shrink-0">
           {isUserScrolledUp && chatMessages.length > 0 && (
             <div className="pointer-events-none absolute -top-11 left-0 right-0 z-20 flex justify-center">
               <button
@@ -664,6 +668,7 @@ function ChatInterface({
           hasInput={Boolean(input.trim())}
           onClearInput={handleClearInput}
           onSubmit={handleSubmit}
+          isPreparingSend={isPreparingSend}
           isDragActive={isDragActive}
           queuedDraft={queuedDraft}
           workspacePendingDraft={workspacePendingDraft}
@@ -707,6 +712,7 @@ function ChatInterface({
           sendByCtrlEnter={sendByCtrlEnter}
         />
         </div>
+        {isNewConversation && <ChatStarterPrompts projectName={selectedProject.displayName || selectedProject.projectId} onSelect={(prompt) => { setInput(prompt); textareaRef.current?.focus(); }} />}
       </div>
       {isDesktop() && provider === 'claude' && piSessionId && (
         <>

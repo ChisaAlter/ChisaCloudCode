@@ -4,7 +4,7 @@ import { call, on } from "mygo-runtime";
 
 import { beginBackgroundOperation, withBackgroundOperation, withBlockingOperation } from '@/shared/utils';
 import { getAuthSessionVersion, getStoredAuthToken } from '@/shared/authToken';
-import type { ComponentBuildIdentity, BridgeResponse, ChisaClearResult, ChisaApiConnection, ChisaProjectStorage, ChisaState, ChisaSyncInfo, ChisaWorkspaceBindingSelection, ChisaWorkspaceSwitchResult, ChisaWorkspaceSyncEvent, FrontendErrorReport, LocalSelection, PiAttachmentInput, PiBridgeResult, PiConfigInput, PiConfigView, PiSessionView } from "@/shared/types";
+import type { ComponentBuildIdentity, BridgeResponse, ChisaClearResult, ChisaApiConnection, ChisaGitRecoveryResponse, ChisaGitRecoverySource, ChisaProjectStorage, ChisaState, ChisaSyncInfo, ChisaWorkspaceBindingSelection, ChisaWorkspaceSwitchResult, ChisaWorkspaceSyncEvent, FrontendErrorReport, LocalSelection, PiAttachmentInput, PiBridgeResult, PiConfigInput, PiConfigView, PiSessionView } from "@/shared/types";
 
 export function isDesktop(): boolean {
   try {
@@ -39,6 +39,8 @@ export function onPiConfigChanged(listener: (config: PiConfigView) => void): () 
   piConfigListeners.add(listener);
   return () => { piConfigListeners.delete(listener); };
 }
+// Workspace reconnects invalidate sync snapshots independently of account requests.
+let workspaceConnectionVersion = 0;
 
 /** Shared API URL builders use the native loopback proxy, whose remote side verifies HTTPS. */
 export function desktopWebSocketUrl(path: string, token: string | null): string {
@@ -144,16 +146,29 @@ export const FrontendBridge = {
   },
   connectAccountWorkspace(): Promise<Record<string, unknown>> {
     return withBackgroundOperation('正在连接文件同步', '正在使用当前账号连接本地文件同步。', () => call<Record<string, unknown>>('FrontendBridge.ConnectAccountWorkspace'))
-      .finally(() => workspaceConnectionListeners.forEach(listener => listener()));
+      .finally(() => { workspaceConnectionVersion++; workspaceConnectionListeners.forEach(listener => listener()); });
   },
-  connectWorkspace(serverUrl: string, sshHost: string, sshUser: string, keyPath: string): Promise<Record<string, unknown>> {
-    return withBackgroundOperation('正在连接文件同步', '正在建立独立的文件同步连接。', () => call('FrontendBridge.ConnectWorkspace', serverUrl, sshHost, sshUser, keyPath));
+  async connectWorkspace(serverUrl: string, sshHost: string, sshUser: string, keyPath: string): Promise<Record<string, unknown>> {
+    const version = ++workspaceConnectionVersion;
+    const result = await withBackgroundOperation<Record<string, unknown>>('正在连接文件同步', '正在建立独立的文件同步连接。', () => call('FrontendBridge.ConnectWorkspace', serverUrl, sshHost, sshUser, keyPath));
+    if (result.ok !== false && version === workspaceConnectionVersion) {
+      // Reads started during the handshake may still describe the former workspace connection.
+      workspaceConnectionVersion++;
+      workspaceConnectionListeners.forEach(listener => listener());
+    }
+    return result;
   },
   selectWorkspaceKey(): Promise<Record<string, unknown>> {
     return call('FrontendBridge.SelectWorkspaceKey');
   },
   getProjectSync(serverPath: string): Promise<ChisaSyncInfo> {
     return call("FrontendBridge.GetProjectSync", serverPath);
+  },
+  getProjectGitRecovery(serverPath: string, bindingEpoch: string): Promise<ChisaGitRecoveryResponse> {
+    return call('FrontendBridge.GetProjectGitRecovery', serverPath, bindingEpoch);
+  },
+  recoverProjectGit(serverPath: string, bindingEpoch: string, token: string, source: ChisaGitRecoverySource): Promise<Record<string, unknown>> {
+    return call('FrontendBridge.RecoverProjectGit', serverPath, bindingEpoch, token, source);
   },
   reportFrontendError(report: FrontendErrorReport): Promise<void> {
     return call("FrontendBridge.ReportFrontendError", report);
@@ -226,7 +241,7 @@ export function onWorkspaceSyncChanged(listener: (event: ChisaWorkspaceSyncEvent
   return on<ChisaWorkspaceSyncEvent>('chisa:workspace-sync', listener);
 }
 
-/** The project bar and desktop settings receive authoritative engine state only when its meaning changes. */
+/** The project bar, settings and background notices share versioned state only when its meaning changes. */
 export function onWorkspaceSyncStateChanged(listener: (info: ChisaSyncInfo) => void): () => void {
   return on<ChisaSyncInfo>('chisa:workspace-sync-state', listener);
 }
@@ -269,30 +284,122 @@ export function installFrontendErrorReporting(): () => void {
   };
 }
 
-/** App shows nonblocking status for automatic handoffs and startup synchronization. */
+/** App keeps explicit synchronization notices aligned with versioned state and recovery snapshots. */
 export function subscribeWorkspaceSynchronization(): () => void {
   if (!isDesktop()) return () => {};
+  // Each project owns its notice, so finishing one handoff never dismisses another.
   const pending = new Map<string, () => void>();
-  const seen = new Set<string>();
-  const update = (serverPath: string, status: string) => {
-    const busy = status === 'syncing' || status === 'migrating';
+  // Keep legacy activity for recovery reads even when cleanup outlives an authoritative terminal state.
+  const active = new Set<string>();
+  // A terminal observation consumes this operation's notice; later watcher scans cannot revive it.
+  const eligible = new Set<string>();
+  // Retain the newest observation even after completion to reject late events and old bindings.
+  const observations = new Map<string, ChisaSyncInfo>();
+  // Live legacy activity outranks the unversioned startup operation snapshot.
+  const seenOperations = new Set<string>();
+  // Failed reads suppress stale busy state until a fresh snapshot or newer event recovers it.
+  const unavailable = new Set<string>();
+  // Per-project requests coalesce focus, visibility and reconnect bursts into one follow-up.
+  const queries = new Map<string, { queued: boolean }>();
+  // Native calls cannot be cancelled; cleanup makes their late results inert.
+  let disposed = false;
+  const isBusy = (status: string) => status === 'syncing' || status === 'migrating';
+  const update = (serverPath: string) => {
+    const info = observations.get(serverPath);
+    const busy = eligible.has(serverPath) && !unavailable.has(serverPath) && (!info || isBusy(info.status));
     if (busy && !pending.has(serverPath)) pending.set(serverPath, beginBackgroundOperation('正在同步工作区', '后台同步中，可继续浏览和编辑消息。'));
     else if (!busy) { pending.get(serverPath)?.(); pending.delete(serverPath); }
   };
-  let disposed = false;
-  const unsubscribe = onWorkspaceSyncChanged(event => {
-    seen.add(event.serverPath);
-    update(event.serverPath, event.status);
+  const accept = (info: ChisaSyncInfo) => {
+    if (disposed || !info.serverPath || !Number.isFinite(info.sequence)) return;
+    const previous = observations.get(info.serverPath);
+    if (previous && info.sequence <= previous.sequence) return;
+    observations.set(info.serverPath, info);
+    if (!isBusy(info.status)) eligible.delete(info.serverPath);
+    unavailable.delete(info.serverPath);
+    update(info.serverPath);
+  };
+  const refreshProject = async (serverPath: string): Promise<void> => {
+    if (disposed || document.visibilityState === 'hidden') return;
+    const current = queries.get(serverPath);
+    if (current) {
+      current.queued = true;
+      return;
+    }
+    const query = { queued: false };
+    queries.set(serverPath, query);
+    const requestSequence = observations.get(serverPath)?.sequence;
+    const requestServerVersion = serverConnectionVersion;
+    const requestWorkspaceVersion = workspaceConnectionVersion;
+    const connectionCurrent = () => requestServerVersion === serverConnectionVersion && requestWorkspaceVersion === workspaceConnectionVersion;
+    try {
+      const next = await FrontendBridge.getProjectSync(serverPath);
+      if (!disposed && connectionCurrent() && next.serverPath === serverPath) {
+        accept(next);
+        // A successful read may confirm the same sequence after a transport failure.
+        if (Number.isFinite(next.sequence) && next.sequence === observations.get(serverPath)?.sequence) {
+          unavailable.delete(serverPath);
+          update(serverPath);
+        }
+      }
+    } catch {
+      if (!disposed && connectionCurrent() && requestSequence === observations.get(serverPath)?.sequence) {
+        unavailable.add(serverPath);
+        update(serverPath);
+      }
+    } finally {
+      queries.delete(serverPath);
+      if (!disposed && query.queued && active.has(serverPath)) void refreshProject(serverPath);
+    }
+  };
+  const refreshActive = () => {
+    if (!disposed && document.visibilityState !== 'hidden') active.forEach(serverPath => { void refreshProject(serverPath); });
+  };
+  // Subscribe before requesting the startup snapshot, preserving newer native observations.
+  const unsubscribeState = onWorkspaceSyncStateChanged(accept);
+  const unsubscribeOperation = onWorkspaceSyncChanged(event => {
+    if (disposed || !event.serverPath) return;
+    seenOperations.add(event.serverPath);
+    if (isBusy(event.status)) {
+      if (!active.has(event.serverPath)) eligible.add(event.serverPath);
+      active.add(event.serverPath);
+    } else {
+      active.delete(event.serverPath);
+      eligible.delete(event.serverPath);
+    }
+    // Repeated cleanup activity cannot revive a notice after ready, blocked or unavailable.
+    update(event.serverPath);
   });
+  const startupServerVersion = serverConnectionVersion;
+  const startupWorkspaceVersion = workspaceConnectionVersion;
   void FrontendBridge.getState().then(state => {
-    if (!disposed) for (const [serverPath, info] of Object.entries(state.syncOperations ?? {})) {
-      // Live events received since the request began take precedence over its snapshot.
-      if (!seen.has(serverPath)) update(serverPath, info.status);
+    if (disposed || startupServerVersion !== serverConnectionVersion || startupWorkspaceVersion !== workspaceConnectionVersion) return;
+    for (const [serverPath, info] of Object.entries(state.sync ?? {})) {
+      if (info.serverPath === serverPath) accept(info);
+    }
+    for (const [serverPath, operation] of Object.entries(state.syncOperations ?? {})) {
+      if (!seenOperations.has(serverPath) && isBusy(operation.status)) {
+        active.add(serverPath);
+        const info = observations.get(serverPath);
+        // Startup activity cannot qualify a newer watcher observation after its original operation ended.
+        if (!info || (isBusy(info.status) && info.sequence === state.sync?.[serverPath]?.sequence)) eligible.add(serverPath);
+        update(serverPath);
+      }
     }
   }).catch(() => {});
+  window.addEventListener('focus', refreshActive);
+  window.addEventListener('online', refreshActive);
+  document.addEventListener('visibilitychange', refreshActive);
+  workspaceConnectionListeners.add(refreshActive);
   return () => {
     disposed = true;
-    unsubscribe();
+    unsubscribeState();
+    unsubscribeOperation();
+    window.removeEventListener('focus', refreshActive);
+    window.removeEventListener('online', refreshActive);
+    document.removeEventListener('visibilitychange', refreshActive);
+    workspaceConnectionListeners.delete(refreshActive);
     pending.forEach(finish => finish());
+    pending.clear();
   };
 }

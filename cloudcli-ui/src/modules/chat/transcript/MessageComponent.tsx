@@ -113,12 +113,12 @@ const MessageComponent = memo(({ message, accountUser = null, prevMessage, creat
               <ChatMessageFiles files={message.files} />
             )}
             {userCopyContent.trim().length > 0 || (!message.images?.length && !message.files?.length) ? (
-              <div className="group max-w-full rounded-2xl rounded-br-md border border-border/60 bg-muted/60 px-3 py-2 text-foreground shadow-sm dark:bg-gray-800/60 sm:px-4">
-                <div dir="auto" className="break-words font-serif text-sm">
+              <div className="group max-w-full rounded-2xl rounded-br-md border border-border/45 bg-muted/65 px-3 py-2 text-foreground shadow-none dark:bg-gray-800/60 sm:px-4">
+                <div dir="auto" className="break-words font-sans text-sm">
                   <Markdown
                     breaks
                     projectId={selectedProject?.projectId}
-                    className="prose prose-sm max-w-none font-serif dark:prose-invert"
+                    className="prose prose-sm max-w-none font-sans dark:prose-invert"
                   >
                     {message.content}
                   </Markdown>
@@ -225,7 +225,7 @@ const MessageComponent = memo(({ message, accountUser = null, prevMessage, creat
               <>
                 <div className="flex flex-col">
                   <div className="flex flex-col">
-                    <Markdown projectId={selectedProject?.projectId} className="prose prose-sm max-w-none font-serif dark:prose-invert">
+                    <Markdown projectId={selectedProject?.projectId} className="prose prose-sm max-w-none font-sans dark:prose-invert">
                       {String(message.displayText || '')}
                     </Markdown>
                   </div>
@@ -280,7 +280,7 @@ const MessageComponent = memo(({ message, accountUser = null, prevMessage, creat
               <Reasoning defaultOpen={isExporting}>
                 <ReasoningTrigger />
                 <ReasoningContent>
-                  <Markdown projectId={selectedProject?.projectId} className="prose prose-sm prose-gray max-w-none font-serif dark:prose-invert">
+                  <Markdown projectId={selectedProject?.projectId} className="prose prose-sm prose-gray max-w-none font-sans dark:prose-invert">
                     {message.content}
                   </Markdown>
                   {!isExporting && (
@@ -345,7 +345,7 @@ const MessageComponent = memo(({ message, accountUser = null, prevMessage, creat
                       content={content}
                       projectId={selectedProject?.projectId}
                       isStreaming={Boolean(message.isStreaming)}
-                      className="prose prose-sm prose-gray max-w-none font-serif dark:prose-invert"
+                      className="prose prose-sm prose-gray max-w-none font-sans dark:prose-invert"
                     />
                   ) : (
                     <div className="whitespace-pre-wrap">

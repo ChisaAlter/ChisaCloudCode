@@ -307,6 +307,8 @@ export function useChatComposerState({
   // The active submission token prevents double Enter while upload/session
   // allocation is pending; a different scope can still start its own send.
   const pendingSubmitRef = useRef<{ scopeRevision: number } | null>(null);
+  // Async send preparation belongs to its conversation and must not clear another conversation's indicator.
+  const [preparingScopeRevision, setPreparingScopeRevision] = useState<number | null>(null);
   // Explicit queue editors retain their browser files when temporarily visiting another chat.
   const manualQueueEditorsRef = useRef(new Set<string>());
   // Explicit option picks also supersede an editor whose pause acknowledgement is still pending.
@@ -925,6 +927,7 @@ export function useChatComposerState({
       if (pendingSubmitRef.current?.scopeRevision === scopeRevision) return false;
       const submission = { scopeRevision };
       pendingSubmitRef.current = submission;
+      setPreparingScopeRevision(scopeRevision);
       const authVersion = getAuthSessionVersion();
       const connectionVersion = getServerConnectionVersion();
       const bindingEpoch = waitForWorkspace ? workspaceObservationRef.current.info?.bindingEpoch || null : null;
@@ -1211,7 +1214,10 @@ export function useChatComposerState({
         }
         return false;
       } finally {
-        if (pendingSubmitRef.current === submission) pendingSubmitRef.current = null;
+        if (pendingSubmitRef.current === submission) {
+          pendingSubmitRef.current = null;
+          if (mountedRef.current) setPreparingScopeRevision(null);
+        }
       }
     },
     [
@@ -1729,6 +1735,7 @@ export function useChatComposerState({
     openAttachmentPicker: open,
     handleSubmit,
     canSubmitWithoutModelOptions,
+    isPreparingSend: preparingScopeRevision === submissionScopeRef.current.revision,
     workspacePendingDraft: workspacePendingSend?.scopeRevision === submissionScopeRef.current.revision
       ? workspacePendingSend.submission : null,
     workspacePendingNotice: workspacePendingSend?.notice,

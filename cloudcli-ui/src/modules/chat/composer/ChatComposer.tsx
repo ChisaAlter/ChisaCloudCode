@@ -50,6 +50,8 @@ type ChatComposerProps = {
   handleGrantToolPermission: (suggestion: { entry: string; toolName: string }) => { success: boolean };
   activity: SessionActivity | null;
   isLoading: boolean;
+  /** Uploading attachments or allocating a session before socket dispatch. */
+  isPreparingSend?: boolean;
   onAbortSession: () => void;
   permissionMode: PermissionMode;
   availablePermissionModes: PermissionMode[];
@@ -135,6 +137,7 @@ export default function ChatComposer({
   handleGrantToolPermission,
   activity,
   isLoading,
+  isPreparingSend = false,
   onAbortSession,
   permissionMode,
   availablePermissionModes,
@@ -276,6 +279,8 @@ export default function ChatComposer({
   const canQueueDraft = isLoading && Boolean(input.trim() || draftAttachments.length > 0 || hasManualDraft);
   const submitAriaLabel = !submitOptionsReady && (!isLoading || canQueueDraft)
     ? modelsErrorMessage || t('composer.restoringSessionOptions', { defaultValue: '正在恢复会话模型设置' })
+    : isPreparingSend
+    ? t('input.preparing', { defaultValue: '正在准备发送…' })
     : isWaitingForWorkspace
     ? '待发送：同步完成后自动发送'
     : canQueueDraft
@@ -490,6 +495,7 @@ export default function ChatComposer({
           </PromptInputTools>
 
           <div className="ml-auto flex min-w-0 items-center gap-1">
+            {isPreparingSend && <span role="status" className="text-xs text-muted-foreground">{t('input.preparing', { defaultValue: '正在准备发送…' })}</span>}
             {hasInput && <ScheduleMessagePopover
               disabled={!input.trim() || !sendOptionsReady}
               onSchedule={onScheduleMessage}
@@ -530,7 +536,7 @@ export default function ChatComposer({
                       : undefined
               }
               disabled={
-                !submitOptionsReady && (!isLoading || canQueueDraft) ? true
+                isPreparingSend ? true : !submitOptionsReady && (!isLoading || canQueueDraft) ? true
                   : isWaitingForWorkspace
                   ? true
                   : isLoading
@@ -543,10 +549,10 @@ export default function ChatComposer({
               }
               aria-label={submitAriaLabel}
               title={submitAriaLabel}
-              className="h-7 w-7 rounded-full bg-[#ef73b0] text-white hover:bg-[#e85fa4] disabled:opacity-50"
+              className="h-7 w-7 rounded-full bg-primary text-primary-foreground shadow-sm hover:bg-primary/90 disabled:opacity-50"
               aria-description={sendByCtrlEnter ? t('input.hintText.ctrlEnter') : t('input.hintText.enter')}
             >
-              {isWaitingForWorkspace || isTranscribing || (!submitOptionsReady && !modelsErrorMessage && (!isLoading || canQueueDraft)) ? (
+              {isPreparingSend || isWaitingForWorkspace || isTranscribing || (!submitOptionsReady && !modelsErrorMessage && (!isLoading || canQueueDraft)) ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
               ) : canQueueDraft ? (
                 <ArrowUpIcon className="h-4 w-4" />

@@ -35,7 +35,7 @@ mock.module('node:child_process', { namedExports: {
     return child as unknown as ReturnType<typeof realSpawn>;
   },
 } });
-const { executeSyncTransportWorker, prepareSyncTransportPreview, workspaceQuery } = await import('@/modules/workspace-bridge/index.js');
+const { executeSyncTransportWorker, prepareSyncTransportPreview, workspaceQuery, isActiveWorkspaceLease } = await import('@/modules/workspace-bridge/index.js');
 const { registerWorkspaceSyncNetwork } = await import('@/shared/index.js');
 const network = 'chisa-workspace-network-' + 'a'.repeat(24);
 registerWorkspaceSyncNetwork(fixture, network, '172.18.0.2');
@@ -95,7 +95,7 @@ test('snapshot reads and read-only exec remain lease-free and use the account ne
     assert.equal(existsSync(leasePath(root)), false);
     const runs = commands.filter(args => args[0] === 'run');
     assert.ok(runs.every(args => args.includes('--network=' + network)));
-    assert.ok(runs[1].includes(root + ':/workspace:ro'));
+    assert.ok(runs.every(args => args.includes(root + ':/workspace:ro')));
   });
 });
 
@@ -121,12 +121,16 @@ for (const op of ['write', 'exec']) {
       const lease = readLease(root);
       assert.equal(lease.owner, 'claude');
       assert.equal(lease.epoch, epoch);
+      assert.equal(isActiveWorkspaceLease(root, lease.id, epoch), true);
+      assert.equal(isActiveWorkspaceLease(root, lease.id, 'old-epoch'), false);
+      assert.equal(isActiveWorkspaceLease(root, 'other-id', epoch), false);
       assert.equal(lease.mayWrite, true);
       assert.equal(lease.cleanupPending?.length, 1);
       await assert.rejects(workspaceQuery({ prompt: 'must not overlap', options: { cwd: root } }).next(), { code: 'WORKSPACE_BUSY' });
       finish(child, 0, JSON.stringify({ ok: true, exitCode: 0 }));
       await execution;
       assert.equal(existsSync(leasePath(root)), false);
+      assert.equal(isActiveWorkspaceLease(root, lease.id, epoch), false);
       assert.equal(commands.filter(args => args[0] === 'rm').length, 1);
     });
   });

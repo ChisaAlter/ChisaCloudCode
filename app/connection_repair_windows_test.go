@@ -14,10 +14,11 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
-// The copied test executable impersonates only Mutagen's list/terminate CLI.
+// The copied test executable impersonates only the requested Mutagen CLI calls.
 // It never starts a daemon, opens SSH or reads the user's profile.
 func init() {
 	if os.Getenv("CHISA_CONNECTION_TEST_TOOL") != "mutagen" {
@@ -31,6 +32,14 @@ func init() {
 	}
 	_, _ = fmt.Fprintln(file, string(encoded))
 	_ = file.Close()
+	if len(args) == 1 && args[0] == "version" {
+		version := os.Getenv("CHISA_CONNECTION_TEST_VERSION")
+		if version == "" {
+			version = workspaceSyncEngineVersion
+		}
+		fmt.Println(version)
+		os.Exit(0)
+	}
 	if len(args) >= 2 && args[0] == "sync" && args[1] == "list" {
 		fmt.Println("CHISA_SYNC_JSON:" + os.Getenv("CHISA_CONNECTION_TEST_SESSIONS"))
 		os.Exit(0)
@@ -38,6 +47,23 @@ func init() {
 	if len(args) == 3 && args[0] == "sync" && args[1] == "terminate" {
 		fmt.Fprintln(os.Stderr, "controlled termination failure")
 		os.Exit(42)
+	}
+	if mode := os.Getenv("CHISA_CONNECTION_TEST_SYNC_MODE"); mode != "" && len(args) == 3 && args[0] == "sync" {
+		switch args[1] {
+		case "pause":
+			if mode == "pause-hang" {
+				fmt.Fprintln(os.Stderr, "Pausing session private-test-session...")
+				time.Sleep(time.Minute)
+			}
+			os.Exit(0)
+		case "flush":
+			if mode == "flush-slow" {
+				time.Sleep(11 * time.Second)
+			}
+			os.Exit(0)
+		case "resume":
+			os.Exit(0)
+		}
 	}
 	os.Exit(92)
 }

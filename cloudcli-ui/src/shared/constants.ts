@@ -202,6 +202,13 @@ export const CODE_EDITOR_DEFAULTS = {
 
 // ---------------------------
 
+//----------------- GIT OBSERVATION ------------
+
+/** The Git panel publishes accepted status reads so the workspace entry can update its branch without another request. */
+export const GIT_STATUS_OBSERVED_EVENT = 'chisa:git-status-observed';
+
+// ---------------------------
+
 //----------------- PROVIDER TOOL SETTINGS STORAGE ------------
 
 /**

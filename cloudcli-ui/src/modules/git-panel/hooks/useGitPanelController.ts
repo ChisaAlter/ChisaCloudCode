@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { api } from '@/shared/api';
+import { isDesktop, onWorkspaceSyncStateChanged } from '@/shared/chisa';
 import type { FileOpenHandler, GitApiErrorResponse, GitCommitSummary, GitDiffMap, GitOperationResponse, GitPanelView, GitRemoteStatus, GitStatusResponse, Project } from '@/shared/types';
-import { getAllChangedFiles } from '@/modules/git-panel/utils/gitPanelUtils';
+import { GIT_STATUS_OBSERVED_EVENT } from '@/shared/constants';
 import { useSelectedProvider } from '@/modules/git-panel/hooks/useSelectedProvider';
 
 const DEFAULT_BRANCH = 'main';
@@ -20,14 +21,18 @@ type GitPanelController = {
   gitDiff: GitDiffMap;
   isLoading: boolean;
   isLoadingCommits: boolean;
+  commitsError: string | null;
+  retryCommits: () => Promise<void>;
   currentBranch: string;
   branches: string[];
   localBranches: string[];
   remoteBranches: string[];
   recentCommits: GitCommitSummary[];
   commitDiffs: GitDiffMap;
+  commitDiffErrors: Record<string, string>;
   remoteStatus: GitRemoteStatus | null;
   isCreatingBranch: boolean;
+  isBranchBusy: boolean;
   isFetching: boolean;
   isPulling: boolean;
   isPushing: boolean;
@@ -36,7 +41,8 @@ type GitPanelController = {
   isInitializingRepository: boolean;
   operationError: string | null;
   clearOperationError: () => void;
-  refreshAll: () => void;
+  reportOperationError: (error: unknown) => void;
+  refreshAll: () => Promise<void>;
   switchBranch: (branchName: string) => Promise<boolean>;
   createBranch: (branchName: string) => Promise<boolean>;
   deleteBranch: (branchName: string, force?: boolean) => Promise<boolean>;
@@ -48,7 +54,8 @@ type GitPanelController = {
   deleteUntrackedFile: (filePath: string) => Promise<void>;
   stageFiles: (files: string[]) => Promise<boolean>;
   unstageFiles: (files: string[]) => Promise<boolean>;
-  fetchCommitDiff: (commitHash: string) => Promise<void>;
+  fetchCommitDiff: (commitHash: string, signal?: AbortSignal) => Promise<void>;
+  fetchFileDiff: (filePath: string, signal?: AbortSignal) => Promise<void>;
   generateCommitMessage: (files: string[]) => Promise<string | null>;
   commitChanges: (message: string, files: string[]) => Promise<boolean>;
   createInitialCommit: () => Promise<boolean>;
@@ -85,18 +92,71 @@ function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError';
 }
 
+async function readWithAbort<T>(read: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  // Release the UI's request ownership immediately even if a transport ignores cancellation.
+  let cancel!: () => void;
+  const aborted = new Promise<never>((_, reject) => {
+    cancel = () => reject(new DOMException('Request aborted', 'AbortError'));
+    signal.addEventListener('abort', cancel, { once: true });
+    if (signal.aborted) cancel();
+  });
+  try {
+    return await Promise.race([read(), aborted]);
+  } finally {
+    signal.removeEventListener('abort', cancel);
+  }
+}
+
+function readErrorText(value: unknown): string | undefined {
+  const message = value && typeof value === 'object' && 'message' in value ? value.message : value;
+  if (typeof message !== 'string') return undefined;
+  const normalized = message.trim().replace(/\s+/g, ' ');
+  // Keep the actionable prefix while hiding embedded native/SSH stack traces.
+  const text = normalized.split(/Traceback \(most recent call last\):|\bexit status \d+:|\b(?:RuntimeError|TypeError|SyntaxError|ReferenceError):|<!doctype|<html\b/i, 1)[0].trim().replace(/[:：]\s*$/, '');
+  // Transport diagnostics, serialized JSON and proxy HTML are not user-facing text.
+  if (!text || /^(?:\{|\[|<)/.test(text)) return undefined;
+  return text.length > 240 ? `${text.slice(0, 239)}…` : text;
+}
+
 async function readJson<T>(response: Response, signal?: AbortSignal): Promise<T> {
   if (signal?.aborted) {
     throw new DOMException('Request aborted', 'AbortError');
   }
 
-  const data = (await response.json()) as T;
+  const invalidResponse = response.ok
+    ? 'Git returned an invalid response. Please try again.'
+    : `Git request failed (HTTP ${response.status})`;
+  let raw: unknown;
+  try {
+    raw = await response.json();
+  } catch (error) {
+    if (signal?.aborted) throw new DOMException('Request aborted', 'AbortError');
+    if (isAbortError(error)) throw error;
+    throw new Error(invalidResponse);
+  }
 
   if (signal?.aborted) {
     throw new DOMException('Request aborted', 'AbortError');
   }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error(invalidResponse);
+  }
 
-  return data;
+  const data = raw as Record<string, unknown>;
+  const envelopeError = data.error && typeof data.error === 'object'
+    ? data.error as Record<string, unknown>
+    : undefined;
+  const failed = !response.ok || data.success === false || Boolean(data.error);
+  // Keep the controller's renderable state string-only even when the backend
+  // sends a structured AppError or a native transport diagnostics object.
+  return {
+    ...data,
+    error: failed
+      ? readErrorText(data.error) ?? readErrorText(data.message) ?? (response.ok ? 'Git operation failed' : invalidResponse)
+      : undefined,
+    details: readErrorText(data.details) ?? readErrorText(envelopeError?.details),
+    ...(failed ? { success: false } : {}),
+  } as T;
 }
 
 export function useGitPanelController({
@@ -114,11 +174,18 @@ export function useGitPanelController({
   // found" while the commits request is still in flight.
   const [isLoadingCommits, setIsLoadingCommits] = useState(false);
   const [hasLoadedCommits, setHasLoadedCommits] = useState(false);
+  // A failed history read must remain distinguishable from a successful empty list.
+  const [commitsError, setCommitsError] = useState<string | null>(null);
   const [commitDiffs, setCommitDiffs] = useState<GitDiffMap>({});
+  // Expanded commits surface their own read failures without replacing the history list.
+  const [commitDiffErrors, setCommitDiffErrors] = useState<Record<string, string>>({});
   const [remoteStatus, setRemoteStatus] = useState<GitRemoteStatus | null>(null);
   const [localBranches, setLocalBranches] = useState<string[]>([]);
   const [remoteBranches, setRemoteBranches] = useState<string[]>([]);
   const [isCreatingBranch, setIsCreatingBranch] = useState(false);
+  // The branch list and header share one pending indicator until the native handback finishes.
+  const [isBranchBusy, setIsBranchBusy] = useState(false);
+  const branchOperationRef = useRef(false);
   const [isFetching, setIsFetching] = useState(false);
   const [isPulling, setIsPulling] = useState(false);
   const [isPushing, setIsPushing] = useState(false);
@@ -135,6 +202,33 @@ export function useGitPanelController({
   useEffect(() => {
     selectedProjectIdRef.current = selectedProject?.projectId ?? null;
   }, [selectedProject]);
+
+  // Later refreshes take precedence over older requests for the same project.
+  const statusRequestRef = useRef(0);
+  const branchesRequestRef = useRef(0);
+  const remoteRequestRef = useRef(0);
+  const commitsRequestRef = useRef(0);
+  const commitsControllerRef = useRef<AbortController | null>(null);
+  // Per-hash ownership allows different expanded commits to load concurrently.
+  const commitDiffControllersRef = useRef(new Map<string, AbortController>());
+  // Each repository refresh owns a signal so recovery can supersede reads from before synchronization.
+  const refreshControllerRef = useRef<AbortController | null>(null);
+  const activeViewRef = useRef(activeView);
+  useEffect(() => { activeViewRef.current = activeView; }, [activeView]);
+
+  const invalidateHistoryRequests = useCallback(() => {
+    ++commitsRequestRef.current;
+    commitsControllerRef.current?.abort();
+    commitsControllerRef.current = null;
+    commitDiffControllersRef.current.forEach(controller => controller.abort());
+    commitDiffControllersRef.current.clear();
+  }, []);
+
+  const reportOperationError = useCallback((error: unknown) => {
+    if (selectedProjectIdRef.current === selectedProject?.projectId) {
+      setOperationError(error === null ? null : readErrorText(error) ?? 'Git operation failed');
+    }
+  }, [selectedProject?.projectId]);
 
   const provider = useSelectedProvider();
 
@@ -158,7 +252,7 @@ export function useGitPanelController({
           return;
         }
 
-        if (!data.error && data.diff) {
+        if (!data.error && typeof data.diff === 'string') {
           setGitDiff((previous) => ({
             ...previous,
             [filePath]: data.diff as string,
@@ -176,25 +270,22 @@ export function useGitPanelController({
   );
 
   const fetchGitStatus = useCallback(async (signal?: AbortSignal) => {
-    if (!selectedProject) {
-      return;
-    }
+    if (!selectedProject || selectedProjectIdRef.current !== selectedProject.projectId) return;
 
     // `project` query param carries the DB projectId everywhere now.
     const projectId = selectedProject.projectId;
 
+    const request = ++statusRequestRef.current;
     setIsLoading(true);
     try {
       const response = await api.git.status(projectId, { signal });
       const data = await readJson<GitStatusResponse>(response, signal);
 
-      if (
-        signal?.aborted ||
-        selectedProjectIdRef.current !== projectId
-      ) {
-        return;
-      }
+      if (signal?.aborted || selectedProjectIdRef.current !== projectId || request !== statusRequestRef.current) return;
 
+      window.dispatchEvent(new CustomEvent(GIT_STATUS_OBSERVED_EVENT, { detail: { projectId, status: data } }));
+      // Expanded files refetch against this observation; closed files never request a diff.
+      setGitDiff({});
       if (data.error) {
         // A missing repository is an expected state, not an error.
         if (!data.notGitRepository) {
@@ -212,37 +303,29 @@ export function useGitPanelController({
       setGitStatus(data);
       setCurrentBranch(data.branch || DEFAULT_BRANCH);
 
-      const changedFiles = getAllChangedFiles(data);
-      changedFiles.forEach((filePath) => {
-        void fetchFileDiff(filePath, signal);
-      });
     } catch (error) {
       if (signal?.aborted || isAbortError(error)) {
         return;
       }
 
-      if (
-        selectedProjectIdRef.current !== projectId
-      ) {
-        return;
-      }
+      if (selectedProjectIdRef.current !== projectId || request !== statusRequestRef.current) return;
 
       console.error('Error fetching git status:', error);
-      setGitStatus({ error: 'Git operation failed', details: String(error) });
+      setGitStatus({ error: 'Git operation failed', details: readErrorText(error) });
       setCurrentBranch('');
     } finally {
-      setIsLoading(false);
+      if (!signal?.aborted && selectedProjectIdRef.current === projectId && request === statusRequestRef.current) setIsLoading(false);
     }
-  }, [fetchFileDiff, selectedProject]);
+  }, [selectedProject]);
 
-  const fetchBranches = useCallback(async () => {
-    if (!selectedProject) {
-      return;
-    }
-
+  const fetchBranches = useCallback(async (signal?: AbortSignal) => {
+    if (!selectedProject || selectedProjectIdRef.current !== selectedProject.projectId) return;
+    const projectId = selectedProject.projectId;
+    const request = ++branchesRequestRef.current;
     try {
-      const response = await api.git.branches(selectedProject.projectId);
-      const data = await readJson<GitBranchesResponse>(response);
+      const response = await api.git.branches(projectId, { signal });
+      const data = await readJson<GitBranchesResponse>(response, signal);
+      if (signal?.aborted || selectedProjectIdRef.current !== projectId || request !== branchesRequestRef.current) return;
 
       if (!data.error && data.branches) {
         setBranches(data.branches);
@@ -255,6 +338,7 @@ export function useGitPanelController({
       setLocalBranches([]);
       setRemoteBranches([]);
     } catch (error) {
+      if (signal?.aborted || isAbortError(error) || selectedProjectIdRef.current !== projectId || request !== branchesRequestRef.current) return;
       console.error('Error fetching branches:', error);
       setBranches([]);
       setLocalBranches([]);
@@ -262,14 +346,14 @@ export function useGitPanelController({
     }
   }, [selectedProject]);
 
-  const fetchRemoteStatus = useCallback(async () => {
-    if (!selectedProject) {
-      return;
-    }
-
+  const fetchRemoteStatus = useCallback(async (signal?: AbortSignal) => {
+    if (!selectedProject || selectedProjectIdRef.current !== selectedProject.projectId) return;
+    const projectId = selectedProject.projectId;
+    const request = ++remoteRequestRef.current;
     try {
-      const response = await api.git.remoteStatus(selectedProject.projectId);
-      const data = await readJson<GitRemoteStatus | GitApiErrorResponse>(response);
+      const response = await api.git.remoteStatus(projectId, { signal });
+      const data = await readJson<GitRemoteStatus | GitApiErrorResponse>(response, signal);
+      if (signal?.aborted || selectedProjectIdRef.current !== projectId || request !== remoteRequestRef.current) return;
 
       if (!data.error) {
         setRemoteStatus(data as GitRemoteStatus);
@@ -278,90 +362,154 @@ export function useGitPanelController({
 
       setRemoteStatus(null);
     } catch (error) {
+      if (signal?.aborted || isAbortError(error) || selectedProjectIdRef.current !== projectId || request !== remoteRequestRef.current) return;
       console.error('Error fetching remote status:', error);
       setRemoteStatus(null);
     }
   }, [selectedProject]);
 
-  const switchBranch = useCallback(
-    async (branchName: string) => {
-      if (!selectedProject) {
+  const fetchRecentCommits = useCallback(async () => {
+    if (!selectedProject || selectedProjectIdRef.current !== selectedProject.projectId) return;
+    const projectId = selectedProject.projectId;
+    const request = ++commitsRequestRef.current;
+    commitsControllerRef.current?.abort();
+    const controller = new AbortController();
+    commitsControllerRef.current = controller;
+    const isCurrent = () => !controller.signal.aborted && request === commitsRequestRef.current
+      && selectedProjectIdRef.current === projectId;
+
+    setIsLoadingCommits(true);
+    setCommitsError(null);
+    try {
+      const data = await readWithAbort(async () => {
+        const response = await api.git.commits(projectId, { limit: RECENT_COMMITS_LIMIT }, { signal: controller.signal });
+        return readJson<GitCommitsResponse>(response, controller.signal);
+      }, controller.signal);
+      if (!isCurrent()) return;
+      if (data.error || !Array.isArray(data.commits)) {
+        throw new Error(data.error ?? 'Git returned an invalid commit history. Please try again.');
+      }
+      setRecentCommits(data.commits);
+      setHasLoadedCommits(true);
+    } catch (error) {
+      if (!isCurrent() || isAbortError(error)) return;
+      setCommitsError(readErrorText(error) ?? 'Failed to load commit history. Please try again.');
+    } finally {
+      // Superseded reads must not clear the newer request's loading state.
+      if (isCurrent()) {
+        commitsControllerRef.current = null;
+        setIsLoadingCommits(false);
+      }
+    }
+  }, [selectedProject]);
+
+  const fetchCommitDiff = useCallback(async (commitHash: string, signal?: AbortSignal) => {
+    if (!selectedProject || signal?.aborted || selectedProjectIdRef.current !== selectedProject.projectId) return;
+    const projectId = selectedProject.projectId;
+    const requests = commitDiffControllersRef.current;
+    requests.get(commitHash)?.abort();
+    const controller = new AbortController();
+    requests.set(commitHash, controller);
+    const cancel = () => controller.abort();
+    signal?.addEventListener('abort', cancel, { once: true });
+    const isCurrent = () => !controller.signal.aborted && requests.get(commitHash) === controller
+      && selectedProjectIdRef.current === projectId;
+    setCommitDiffErrors(previous => {
+      const next = { ...previous };
+      delete next[commitHash];
+      return next;
+    });
+
+    try {
+      const data = await readWithAbort(async () => {
+        const response = await api.git.commitDiff(projectId, commitHash, { signal: controller.signal });
+        return readJson<GitDiffResponse>(response, controller.signal);
+      }, controller.signal);
+      if (!isCurrent()) return;
+      if (data.error || typeof data.diff !== 'string') {
+        throw new Error(data.error ?? 'Git returned an invalid commit diff. Please try again.');
+      }
+      setCommitDiffs(previous => ({ ...previous, [commitHash]: data.diff as string }));
+    } catch (error) {
+      if (!isCurrent() || isAbortError(error)) return;
+      setCommitDiffErrors(previous => ({
+        ...previous,
+        [commitHash]: readErrorText(error) ?? 'Failed to load commit diff. Please try again.',
+      }));
+    } finally {
+      signal?.removeEventListener('abort', cancel);
+      if (requests.get(commitHash) === controller) requests.delete(commitHash);
+    }
+  }, [selectedProject]);
+
+  const refreshAll = useCallback(async () => {
+    if (!selectedProject || selectedProjectIdRef.current !== selectedProject.projectId) return;
+    refreshControllerRef.current?.abort();
+    const controller = new AbortController();
+    refreshControllerRef.current = controller;
+    invalidateHistoryRequests();
+    setIsLoadingCommits(false);
+    setHasLoadedCommits(false);
+    setCommitsError(null);
+    setCommitDiffs({});
+    setCommitDiffErrors({});
+    // The changes view stays cheap; returning to History obtains a fresh list.
+    const historyRead = activeViewRef.current === 'history' ? fetchRecentCommits() : undefined;
+    await Promise.all([
+      fetchGitStatus(controller.signal),
+      fetchBranches(controller.signal),
+      fetchRemoteStatus(controller.signal),
+      historyRead,
+    ]);
+  }, [fetchBranches, fetchGitStatus, fetchRecentCommits, fetchRemoteStatus, invalidateHistoryRequests, selectedProject]);
+
+  const runBranchOperation = useCallback(async (
+    operation: (projectId: string) => Promise<Response>,
+    fallbackError: string,
+    creating = false,
+  ): Promise<boolean> => {
+    if (!selectedProject || branchOperationRef.current) return false;
+    const projectId = selectedProject.projectId;
+    branchOperationRef.current = true;
+    setIsBranchBusy(true);
+    setIsCreatingBranch(creating);
+    setOperationError(null);
+    try {
+      // The response includes native synchronization and the workspace handback.
+      const response = await operation(projectId);
+      const data = await readJson<GitOperationResponse>(response);
+      if (selectedProjectIdRef.current !== projectId) return false;
+      if (!response.ok || !data.success) {
+        setOperationError(data.error || fallbackError);
         return false;
       }
-
-      try {
-        const response = await api.git.checkout(selectedProject.projectId, branchName);
-
-        const data = await readJson<GitOperationResponse>(response);
-        if (!data.success) {
-          console.error('Failed to switch branch:', data.error);
-          return false;
-        }
-
-        setCurrentBranch(branchName);
-        void fetchGitStatus();
-        return true;
-      } catch (error) {
-        console.error('Error switching branch:', error);
-        return false;
+      await refreshAll();
+      return selectedProjectIdRef.current === projectId;
+    } catch (error) {
+      if (selectedProjectIdRef.current === projectId) {
+        setOperationError(error instanceof Error ? error.message : fallbackError);
       }
-    },
-    [fetchGitStatus, selectedProject],
-  );
+      return false;
+    } finally {
+      branchOperationRef.current = false;
+      setIsBranchBusy(false);
+      setIsCreatingBranch(false);
+    }
+  }, [refreshAll, selectedProject]);
 
-  const createBranch = useCallback(
-    async (branchName: string) => {
-      const trimmedBranchName = branchName.trim();
-      if (!selectedProject || !trimmedBranchName) {
-        return false;
-      }
+  const switchBranch = useCallback((branchName: string) => runBranchOperation(
+    projectId => api.git.checkout(projectId, branchName), 'Switch branch failed',
+  ), [runBranchOperation]);
 
-      setIsCreatingBranch(true);
-      try {
-        const response = await api.git.createBranch(selectedProject.projectId, trimmedBranchName);
+  const createBranch = useCallback((branchName: string) => {
+    const trimmed = branchName.trim();
+    if (!trimmed) return Promise.resolve(false);
+    return runBranchOperation(projectId => api.git.createBranch(projectId, trimmed), 'Create branch failed', true);
+  }, [runBranchOperation]);
 
-        const data = await readJson<GitOperationResponse>(response);
-        if (!data.success) {
-          console.error('Failed to create branch:', data.error);
-          return false;
-        }
-
-        setCurrentBranch(trimmedBranchName);
-        void fetchBranches();
-        void fetchGitStatus();
-        return true;
-      } catch (error) {
-        console.error('Error creating branch:', error);
-        return false;
-      } finally {
-        setIsCreatingBranch(false);
-      }
-    },
-    [fetchBranches, fetchGitStatus, selectedProject],
-  );
-
-  const deleteBranch = useCallback(
-    async (branchName: string, force = false) => {
-      if (!selectedProject) return false;
-
-      try {
-        const response = await api.git.deleteBranch(selectedProject.projectId, branchName, force);
-
-        const data = await readJson<GitOperationResponse>(response);
-        if (!data.success) {
-          setOperationError(data.error ?? 'Delete branch failed');
-          return false;
-        }
-
-        void fetchBranches();
-        return true;
-      } catch (error) {
-        setOperationError(error instanceof Error ? error.message : 'Delete branch failed');
-        return false;
-      }
-    },
-    [fetchBranches, selectedProject],
-  );
+  const deleteBranch = useCallback((branchName: string, force = false) => runBranchOperation(
+    projectId => api.git.deleteBranch(projectId, branchName, force), 'Delete branch failed',
+  ), [runBranchOperation]);
 
   const handleFetch = useCallback(async () => {
     if (!selectedProject) {
@@ -374,19 +522,17 @@ export function useGitPanelController({
 
       const data = await readJson<GitOperationResponse>(response);
       if (data.success) {
-        void fetchGitStatus();
-        void fetchRemoteStatus();
-        void fetchBranches();
+        void refreshAll();
         return;
       }
 
-      setOperationError(data.error ?? 'Fetch failed');
+      reportOperationError(data.error ?? 'Fetch failed');
     } catch (error) {
-      setOperationError(error instanceof Error ? error.message : 'Fetch failed');
+      reportOperationError(error instanceof Error ? error.message : 'Fetch failed');
     } finally {
       setIsFetching(false);
     }
-  }, [fetchBranches, fetchGitStatus, fetchRemoteStatus, selectedProject]);
+  }, [refreshAll, reportOperationError, selectedProject]);
 
   const handlePull = useCallback(async () => {
     if (!selectedProject) {
@@ -399,18 +545,17 @@ export function useGitPanelController({
 
       const data = await readJson<GitOperationResponse>(response);
       if (data.success) {
-        void fetchGitStatus();
-        void fetchRemoteStatus();
+        void refreshAll();
         return;
       }
 
-      setOperationError(data.error ?? 'Pull failed');
+      reportOperationError(data.error ?? 'Pull failed');
     } catch (error) {
-      setOperationError(error instanceof Error ? error.message : 'Pull failed');
+      reportOperationError(error instanceof Error ? error.message : 'Pull failed');
     } finally {
       setIsPulling(false);
     }
-  }, [fetchGitStatus, fetchRemoteStatus, selectedProject]);
+  }, [refreshAll, reportOperationError, selectedProject]);
 
   const handlePush = useCallback(async () => {
     if (!selectedProject) {
@@ -423,18 +568,17 @@ export function useGitPanelController({
 
       const data = await readJson<GitOperationResponse>(response);
       if (data.success) {
-        void fetchGitStatus();
-        void fetchRemoteStatus();
+        void refreshAll();
         return;
       }
 
-      setOperationError(data.error ?? 'Push failed');
+      reportOperationError(data.error ?? 'Push failed');
     } catch (error) {
-      setOperationError(error instanceof Error ? error.message : 'Push failed');
+      reportOperationError(error instanceof Error ? error.message : 'Push failed');
     } finally {
       setIsPushing(false);
     }
-  }, [fetchGitStatus, fetchRemoteStatus, selectedProject]);
+  }, [refreshAll, reportOperationError, selectedProject]);
 
   const handlePublish = useCallback(async () => {
     if (!selectedProject) {
@@ -447,18 +591,17 @@ export function useGitPanelController({
 
       const data = await readJson<GitOperationResponse>(response);
       if (data.success) {
-        void fetchGitStatus();
-        void fetchRemoteStatus();
+        void refreshAll();
         return;
       }
 
-      console.error('Publish failed:', data.error);
+      reportOperationError(data.error || 'Publish failed');
     } catch (error) {
-      console.error('Error publishing branch:', error);
+      reportOperationError(error instanceof Error ? error.message : 'Publish failed');
     } finally {
       setIsPublishing(false);
     }
-  }, [currentBranch, fetchGitStatus, fetchRemoteStatus, selectedProject]);
+  }, [currentBranch, refreshAll, reportOperationError, selectedProject]);
 
   const discardChanges = useCallback(
     async (filePath: string) => {
@@ -475,12 +618,12 @@ export function useGitPanelController({
           return;
         }
 
-        console.error('Discard failed:', data.error);
+        reportOperationError(data.error || 'Discard failed');
       } catch (error) {
-        console.error('Error discarding changes:', error);
+        reportOperationError(error instanceof Error ? error.message : 'Discard failed');
       }
     },
-    [fetchGitStatus, selectedProject],
+    [fetchGitStatus, reportOperationError, selectedProject],
   );
 
   const deleteUntrackedFile = useCallback(
@@ -498,12 +641,12 @@ export function useGitPanelController({
           return;
         }
 
-        console.error('Delete failed:', data.error);
+        reportOperationError(data.error || 'Delete failed');
       } catch (error) {
-        console.error('Error deleting untracked file:', error);
+        reportOperationError(error instanceof Error ? error.message : 'Delete failed');
       }
     },
-    [fetchGitStatus, selectedProject],
+    [fetchGitStatus, reportOperationError, selectedProject],
   );
 
   const stageFiles = useCallback(
@@ -517,7 +660,7 @@ export function useGitPanelController({
 
         const data = await readJson<GitOperationResponse>(response);
         if (!data.success) {
-          setOperationError(data.error ?? 'Stage failed');
+          reportOperationError(data.error ?? 'Stage failed');
           return false;
         }
 
@@ -525,11 +668,11 @@ export function useGitPanelController({
         await fetchGitStatus();
         return true;
       } catch (error) {
-        setOperationError(error instanceof Error ? error.message : 'Stage failed');
+        reportOperationError(error instanceof Error ? error.message : 'Stage failed');
         return false;
       }
     },
-    [fetchGitStatus, selectedProject],
+    [fetchGitStatus, reportOperationError, selectedProject],
   );
 
   const unstageFiles = useCallback(
@@ -543,70 +686,18 @@ export function useGitPanelController({
 
         const data = await readJson<GitOperationResponse>(response);
         if (!data.success) {
-          setOperationError(data.error ?? 'Unstage failed');
+          reportOperationError(data.error ?? 'Unstage failed');
           return false;
         }
 
         await fetchGitStatus();
         return true;
       } catch (error) {
-        setOperationError(error instanceof Error ? error.message : 'Unstage failed');
+        reportOperationError(error instanceof Error ? error.message : 'Unstage failed');
         return false;
       }
     },
-    [fetchGitStatus, selectedProject],
-  );
-
-  const fetchRecentCommits = useCallback(async () => {
-    if (!selectedProject) {
-      return;
-    }
-
-    const projectId = selectedProject.projectId;
-
-    setIsLoadingCommits(true);
-    try {
-      const response = await api.git.commits(projectId, { limit: RECENT_COMMITS_LIMIT });
-      const data = await readJson<GitCommitsResponse>(response);
-
-      if (selectedProjectIdRef.current !== projectId) {
-        return;
-      }
-
-      if (!data.error && data.commits) {
-        setRecentCommits(data.commits);
-      }
-    } catch (error) {
-      console.error('Error fetching commits:', error);
-    } finally {
-      if (selectedProjectIdRef.current === projectId) {
-        setIsLoadingCommits(false);
-        setHasLoadedCommits(true);
-      }
-    }
-  }, [selectedProject]);
-
-  const fetchCommitDiff = useCallback(
-    async (commitHash: string) => {
-      if (!selectedProject) {
-        return;
-      }
-
-      try {
-        const response = await api.git.commitDiff(selectedProject.projectId, commitHash);
-        const data = await readJson<GitDiffResponse>(response);
-
-        if (!data.error && data.diff) {
-          setCommitDiffs((previous) => ({
-            ...previous,
-            [commitHash]: data.diff as string,
-          }));
-        }
-      } catch (error) {
-        console.error('Error fetching commit diff:', error);
-      }
-    },
-    [selectedProject],
+    [fetchGitStatus, reportOperationError, selectedProject],
   );
 
   const generateCommitMessage = useCallback(
@@ -648,25 +739,22 @@ export function useGitPanelController({
 
         const data = await readJson<GitOperationResponse>(response);
         if (data.success) {
-          void fetchGitStatus();
-          void fetchRemoteStatus();
+          void refreshAll();
           return true;
         }
 
-        console.error('Commit failed:', data.error);
+        reportOperationError(data.error || 'Commit failed');
         return false;
       } catch (error) {
-        console.error('Error committing changes:', error);
+        reportOperationError(error instanceof Error ? error.message : 'Commit failed');
         return false;
       }
     },
-    [fetchGitStatus, fetchRemoteStatus, selectedProject],
+    [refreshAll, reportOperationError, selectedProject],
   );
 
   const createInitialCommit = useCallback(async () => {
-    if (!selectedProject) {
-      throw new Error('No project selected');
-    }
+    if (!selectedProject) return false;
 
     setIsCreatingInitialCommit(true);
     try {
@@ -674,19 +762,19 @@ export function useGitPanelController({
 
       const data = await readJson<GitOperationResponse>(response);
       if (data.success) {
-        void fetchGitStatus();
-        void fetchRemoteStatus();
+        void refreshAll();
         return true;
       }
 
-      throw new Error(data.error || 'Failed to create initial commit');
+      reportOperationError(data.error || 'Failed to create initial commit');
+      return false;
     } catch (error) {
-      console.error('Error creating initial commit:', error);
-      throw error;
+      reportOperationError(error instanceof Error ? error.message : 'Failed to create initial commit');
+      return false;
     } finally {
       setIsCreatingInitialCommit(false);
     }
-  }, [fetchGitStatus, fetchRemoteStatus, selectedProject]);
+  }, [refreshAll, reportOperationError, selectedProject]);
 
   const initRepository = useCallback(async () => {
     if (!selectedProject) {
@@ -707,9 +795,7 @@ export function useGitPanelController({
         return false;
       }
 
-      void fetchGitStatus();
-      void fetchBranches();
-      void fetchRemoteStatus();
+      void refreshAll();
       return true;
     } catch (error) {
       if (selectedProjectIdRef.current === projectId) {
@@ -719,7 +805,7 @@ export function useGitPanelController({
     } finally {
       setIsInitializingRepository(false);
     }
-  }, [fetchBranches, fetchGitStatus, fetchRemoteStatus, selectedProject]);
+  }, [refreshAll, selectedProject]);
 
   const openFile = useCallback(
     async (filePath: string) => {
@@ -735,6 +821,7 @@ export function useGitPanelController({
       try {
         const response = await api.git.fileWithDiff(selectedProject.projectId, filePath);
         const data = await readJson<GitFileWithDiffResponse>(response);
+        if (selectedProjectIdRef.current !== selectedProject.projectId) return;
 
         if (data.error) {
           console.error('Error fetching file with diff:', data.error);
@@ -747,6 +834,7 @@ export function useGitPanelController({
           new_string: data.currentContent || '',
         });
       } catch (error) {
+        if (selectedProjectIdRef.current !== selectedProject.projectId) return;
         console.error('Error opening file:', error);
         onFileOpen(filePath);
       }
@@ -754,15 +842,7 @@ export function useGitPanelController({
     [onFileOpen, selectedProject],
   );
 
-  const refreshAll = useCallback(() => {
-    void fetchGitStatus();
-    void fetchBranches();
-    void fetchRemoteStatus();
-  }, [fetchBranches, fetchGitStatus, fetchRemoteStatus]);
-
   useEffect(() => {
-    const controller = new AbortController();
-
     // Reset repository-scoped state when project changes to avoid stale UI.
     setCurrentBranch('');
     setBranches([]);
@@ -776,29 +856,43 @@ export function useGitPanelController({
     setIsLoading(false);
     setIsLoadingCommits(false);
     setHasLoadedCommits(false);
+    setCommitsError(null);
+    setCommitDiffErrors({});
     setOperationError(null);
 
-    if (!selectedProject) {
-      return () => {
-        controller.abort();
-      };
-    }
-
-    void fetchGitStatus(controller.signal);
-    void fetchBranches();
-    void fetchRemoteStatus();
+    if (selectedProject) refreshAll();
 
     return () => {
-      controller.abort();
+      refreshControllerRef.current?.abort();
+      refreshControllerRef.current = null;
+      invalidateHistoryRequests();
     };
-  }, [fetchBranches, fetchGitStatus, fetchRemoteStatus, selectedProject]);
+  }, [invalidateHistoryRequests, refreshAll, selectedProject]);
 
   useEffect(() => {
-    if (!selectedProject || activeView !== 'history') {
-      return;
+    if (!selectedProject) return;
+    const serverPath = selectedProject.fullPath ?? selectedProject.path;
+    const refreshWhenVisible = () => {
+      if (document.visibilityState !== 'hidden') refreshAll();
+    };
+    const unsubscribe = isDesktop() ? onWorkspaceSyncStateChanged(info => {
+      // A ready event confirms that native synchronization and workspace handback finished.
+      if (info.serverPath === serverPath && info.status === 'ready') refreshWhenVisible();
+    }) : undefined;
+    window.addEventListener('focus', refreshWhenVisible);
+    return () => {
+      unsubscribe?.();
+      window.removeEventListener('focus', refreshWhenVisible);
+    };
+  }, [refreshAll, selectedProject]);
+
+  useEffect(() => {
+    // Project initialization already starts this read when History is visible.
+    if (selectedProject && activeView === 'history' && !commitsControllerRef.current) {
+      void fetchRecentCommits();
     }
-    void fetchRecentCommits();
-  }, [activeView, fetchRecentCommits, selectedProject]);
+    return invalidateHistoryRequests;
+  }, [activeView, fetchRecentCommits, invalidateHistoryRequests, selectedProject]);
 
   return {
     gitStatus,
@@ -806,15 +900,19 @@ export function useGitPanelController({
     isLoading,
     // History is "loading" until the first commits response for this project
     // lands, so an empty list never renders before the data exists.
-    isLoadingCommits: isLoadingCommits || !hasLoadedCommits,
+    isLoadingCommits: isLoadingCommits || (!hasLoadedCommits && !commitsError),
+    commitsError,
+    retryCommits: fetchRecentCommits,
     currentBranch,
     branches,
     localBranches,
     remoteBranches,
     recentCommits,
     commitDiffs,
+    commitDiffErrors,
     remoteStatus,
     isCreatingBranch,
+    isBranchBusy,
     isFetching,
     isPulling,
     isPushing,
@@ -823,6 +921,7 @@ export function useGitPanelController({
     isInitializingRepository,
     operationError,
     clearOperationError,
+    reportOperationError,
     refreshAll,
     switchBranch,
     createBranch,
@@ -836,6 +935,7 @@ export function useGitPanelController({
     stageFiles,
     unstageFiles,
     fetchCommitDiff,
+    fetchFileDiff,
     generateCommitMessage,
     commitChanges,
     createInitialCommit,

@@ -124,7 +124,7 @@ export default function FileChangeItem({
         </div>
 
         <div className="max-h-96 overflow-y-auto">
-          {diff && <GitDiffViewer diff={diff} isMobile={isMobile} wrapText={wrapText} />}
+          {isExpanded && diff && <GitDiffViewer diff={diff} isMobile={isMobile} wrapText={wrapText} />}
         </div>
       </div>
     </div>

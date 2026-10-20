@@ -1,8 +1,9 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
+import { PaletteOpsProvider, usePaletteOpsRegister } from '@/modules/command-palette';
 import { WorkspaceSyncBar } from '@/modules/project-workspace/WorkspaceSyncBar';
-import type { ChisaSyncInfo, ChisaWorkspaceSyncEvent } from '@/shared/types';
+import type { ChisaGitRecoveryResponse, ChisaSyncInfo, ChisaWorkspaceSyncEvent } from '@/shared/types';
 
 const native = vi.hoisted(() => ({
   desktop: true,
@@ -11,6 +12,8 @@ const native = vi.hoisted(() => ({
   getProjectSync: vi.fn<(serverPath: string) => Promise<ChisaSyncInfo>>(),
   syncProject: vi.fn<(serverPath: string) => Promise<Record<string, unknown>>>(),
   confirmProjectEmpty: vi.fn<(serverPath: string, bindingEpoch: string) => Promise<Record<string, unknown>>>(),
+  getProjectGitRecovery: vi.fn<() => Promise<ChisaGitRecoveryResponse>>(),
+  recoverProjectGit: vi.fn<() => Promise<Record<string, unknown>>>(),
   listeners: new Set<(info: ChisaSyncInfo) => void>(),
   operationListeners: new Set<(event: ChisaWorkspaceSyncEvent) => void>(),
 }));
@@ -23,7 +26,7 @@ vi.mock('@/shared/chisa', () => ({
   SERVER_CONNECTION_CHANGED_EVENT: 'server-connection-changed',
   getServerConnectionVersion: () => native.connectionVersion,
   isDesktop: () => native.desktop,
-  FrontendBridge: { getProjectSync: native.getProjectSync, syncProject: native.syncProject, confirmProjectEmpty: native.confirmProjectEmpty },
+  FrontendBridge: { getProjectSync: native.getProjectSync, syncProject: native.syncProject, confirmProjectEmpty: native.confirmProjectEmpty, getProjectGitRecovery: native.getProjectGitRecovery, recoverProjectGit: native.recoverProjectGit },
   onWorkspaceSyncStateChanged: (listener: (info: ChisaSyncInfo) => void) => {
     native.listeners.add(listener);
     return () => native.listeners.delete(listener);
@@ -92,6 +95,29 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+test('completed manual sync releases its busy state while the follow-up snapshot is still pending', async () => {
+  const snapshot = deferred<ChisaSyncInfo>();
+  native.getProjectSync.mockResolvedValueOnce(observation('ready')).mockReturnValueOnce(snapshot.promise);
+  render(<WorkspaceSyncBar serverPath={PROJECT} />);
+  await settle();
+  fireEvent.click(syncButton());
+  await settle();
+  expect(native.syncProject).toHaveBeenCalledExactlyOnceWith(PROJECT);
+  expect(syncButton().disabled).toBe(false);
+  expect(statusText()).toBe('已同步');
+  await act(async () => { snapshot.resolve(observation('ready')); });
+});
+
+test('multiline synchronization failures stay in details and the banner shows a concise summary', async () => {
+  const detail = '同步确认已中断: Traceback (most recent call last):\nRuntimeError: docs/example.md: unmerged\nfatal: git-write-tree: error building trees';
+  native.getProjectSync.mockResolvedValueOnce({ ...observation('blocked'), detail });
+  render(<WorkspaceSyncBar serverPath={PROJECT} />);
+  await settle();
+  expect(screen.getByRole('alert').textContent).toBe('Git 合并冲突导致同步未完成，请查看详情。当前修改已保留。');
+  expect(screen.getByRole('alert').textContent).not.toContain('Traceback');
+  expect(screen.getByText(/RuntimeError:/).closest('details')).not.toBeNull();
+});
+
 test('the browser-only workspace does not expose native synchronization or call the bridge', async () => {
   native.desktop = false;
   const view = render(<WorkspaceSyncBar serverPath={PROJECT} />);
@@ -117,7 +143,7 @@ test('a cached ready operation event cannot turn green without an authoritative 
   expect(screen.queryByText('状态检查于', { exact: false })).toBeNull();
 });
 
-test('manual synchronization targets the selected project and stays busy through engine confirmation', async () => {
+test('manual synchronization targets the selected project and releases busy before engine confirmation', async () => {
   const transfer = deferred<Record<string, unknown>>();
   const confirmed = deferred<ChisaSyncInfo>();
   native.getProjectSync.mockResolvedValueOnce(observation('needs-sync'));
@@ -135,8 +161,8 @@ test('manual synchronization targets the selected project and stays busy through
 
   await act(async () => { transfer.resolve({ ok: true }); });
   expect(native.getProjectSync).toHaveBeenLastCalledWith(PROJECT);
-  expect(statusText()).toBe('正在同步');
-  expect(syncButton().disabled).toBe(true);
+  expect(statusText()).toBe('需要同步');
+  expect(syncButton().disabled).toBe(false);
   await act(async () => { confirmed.resolve(observation('ready')); });
   expect(statusText()).toBe('已同步');
   expect(syncButton().disabled).toBe(false);
@@ -173,17 +199,44 @@ test('an unavailable engine query reports uncertainty rather than retaining gree
   expect(screen.getByRole('alert').textContent).toBe('Daemon unavailable');
 });
 
-test.each([
-  ['reserved', '云端任务执行中'],
-  ['unbound', '未绑定本地目录'],
-])('%s prevents a manual transfer that cannot safely begin', async (status, label) => {
-  native.getProjectSync.mockResolvedValueOnce(observation(status));
+test.each(['claude', 'pi'] as const)('the %s task prevents a manual transfer while explaining that automatic sync continues', async taskOwner => {
+  native.getProjectSync.mockResolvedValueOnce({ ...observation('reserved'), taskOwner });
   render(<WorkspaceSyncBar serverPath={PROJECT} />);
   await settle();
-  expect(statusText()).toBe(label);
+  expect(statusText()).toBe(taskOwner === 'pi' ? 'Pi 正在操作项目' : '云端任务执行中');
   expect(syncButton().disabled).toBe(true);
+  expect(syncButton().title).toBe('任务正在使用工作区，自动同步继续运行；任务结束后可手动同步');
+  expect(screen.getByText('任务正在使用工作区，自动同步继续运行；任务结束后可手动同步。').closest('details')).not.toBeNull();
+  expect(screen.queryByText(/暂停自动同步/)).toBeNull();
   fireEvent.click(syncButton());
   expect(native.syncProject).not.toHaveBeenCalled();
+});
+
+test('an unbound project opens the registered sync settings without implying that a folder picker binds it', async () => {
+  const openSettings = vi.fn();
+  function RegisteredSyncBar() {
+    usePaletteOpsRegister({ openSettings });
+    return <WorkspaceSyncBar serverPath={PROJECT} />;
+  }
+  native.getProjectSync.mockResolvedValueOnce({ ...observation('unbound'), bindingEpoch: '', localPath: undefined });
+  render(<PaletteOpsProvider><RegisteredSyncBar /></PaletteOpsProvider>);
+  await settle();
+
+  expect(statusText()).toBe('未绑定本地目录');
+  expect(screen.queryByRole('button', { name: '立即同步' })).toBeNull();
+  expect(screen.getByText('当前 VPS 项目尚未绑定本地目录。打开本地目录会进入其对应项目。').closest('details')).toBeNull();
+  expect(screen.getByText(/此操作不会把本地目录绑定到当前 VPS 项目/).closest('details')).not.toBeNull();
+  const settings = screen.getByRole<HTMLButtonElement>('button', { name: '查看同步设置' });
+  expect(settings.disabled).toBe(false);
+  fireEvent.click(settings);
+  expect(openSettings).toHaveBeenCalledExactlyOnceWith('chisa');
+  expect(native.syncProject).not.toHaveBeenCalled();
+  expect(native.confirmProjectEmpty).not.toHaveBeenCalled();
+
+  emit(observation('ready'));
+  expect(screen.queryByRole('button', { name: '查看同步设置' })).toBeNull();
+  expect(screen.queryByText(/当前 VPS 项目尚未绑定本地目录/)).toBeNull();
+  expect(syncButton().disabled).toBe(false);
 });
 
 test('a newer reservation observation defeats a slow ready snapshot without launching another query', async () => {
@@ -563,4 +616,41 @@ test('connection replacement clears clear-results and receives events for the ne
   expect(screen.queryByText(/old-backup/)).toBeNull();
   emit(observation('ready'));
   expect(statusText()).toBe('已同步');
+});
+
+test('Git recovery is available from an authoritative blocked state and refreshes status without another sync', async () => {
+  native.getProjectSync.mockResolvedValueOnce({ ...observation('blocked'), gitRecoveryRequired: true });
+  native.getProjectGitRecovery.mockResolvedValueOnce({ ok: true, recovery: {
+    token: 'bar-review', serverPath: PROJECT, bindingEpoch: 'binding-a',
+    local: { branch: 'feature', head: 'local-head', staged: true, operation: '' },
+    remote: { branch: 'main', head: 'remote-head', staged: false, operation: '' },
+    localAllowed: true, localReason: '', remoteAllowed: true, remoteReason: '',
+  } });
+  native.recoverProjectGit.mockResolvedValueOnce({ ok: true });
+  render(<WorkspaceSyncBar serverPath={PROJECT} />);
+  await settle();
+  expect(native.getProjectGitRecovery).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button', { name: '恢复 Git 状态' }));
+  await settle();
+  expect(native.getProjectGitRecovery).toHaveBeenCalledExactlyOnceWith(PROJECT, 'binding-a');
+  fireEvent.click(screen.getByRole('radio', { name: '以本地 Git 状态为准' }));
+  fireEvent.click(screen.getByRole('button', { name: '确认恢复 Git 状态' }));
+  await settle();
+  expect(native.recoverProjectGit).toHaveBeenCalledExactlyOnceWith(PROJECT, 'binding-a', 'bar-review', 'local');
+  expect(native.getProjectSync).toHaveBeenCalledTimes(2);
+  expect(statusText()).toBe('已同步');
+  expect(native.syncProject).not.toHaveBeenCalled();
+  expect(screen.queryByRole('dialog')).toBeNull();
+});
+
+test('a native connection failure revokes the Git recovery entry backed by cached blocked state', async () => {
+  native.getProjectSync.mockResolvedValueOnce({ ...observation('blocked'), gitRecoveryRequired: true });
+  render(<WorkspaceSyncBar serverPath={PROJECT} />);
+  await settle();
+  expect(screen.getByRole('button', { name: '恢复 Git 状态' })).toBeDefined();
+  native.getProjectSync.mockRejectedValueOnce(new Error('native transport disconnected'));
+  fireEvent.focus(window);
+  await settle();
+  expect(screen.queryByRole('button', { name: '恢复 Git 状态' })).toBeNull();
+  expect(native.getProjectGitRecovery).not.toHaveBeenCalled();
 });

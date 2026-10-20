@@ -18,9 +18,11 @@ import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { claudeConnectionsService } from '@/modules/providers/services/claude-connections.service.js';
+import { prepareManagedHiRoute, releaseManagedHiRoute } from '@/modules/providers/services/hiroute-managed.service.js';
+import { hirouteService } from '@/modules/providers/services/hiroute.service.js';
 import { workspaceQuery as query } from '@/modules/workspace-bridge/index.js';
 import { AppError, extractClaudeResolvedModel } from '@/shared/index.js';
-
 import {
   appendFilesInputTag,
   buildClaudeUserContent,
@@ -243,7 +245,7 @@ function matchesToolPermission(entry, toolName, input) {
 }
 
 function mapCliOptionsToSDK(options = {}) {
-  const { providerSessionId, cwd, toolsSettings, permissionMode, effort, resumeAnchorId, resumeFromScratch } = options;
+  const { providerSessionId, cwd, toolsSettings, permissionMode, effort, resumeAnchorId, resumeFromScratch, sessionId, workspaceMode } = options;
 
   const sdkOptions = {};
 
@@ -268,6 +270,10 @@ function mapCliOptionsToSDK(options = {}) {
   if (cwd) {
     sdkOptions.cwd = cwd;
   }
+  // Kept only until workspaceQuery creates the session worktree; it is removed
+  // before the object reaches the Claude SDK, which does not consume it.
+  if (sessionId) sdkOptions.chisaSessionId = sessionId;
+  if (workspaceMode === 'shared' || workspaceMode === 'isolated') sdkOptions.workspaceMode = workspaceMode;
 
   if (permissionMode && permissionMode !== 'default') {
     sdkOptions.permissionMode = permissionMode;
@@ -802,6 +808,12 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
   // Hoisted above the try so the catch's cleanup can tell whether this run
   // still owns the activeSessions entry (or was superseded by a newer run).
   let queryInstance = null;
+  let managedLease = false;
+  const releaseManagedLease = async () => {
+    if (!managedLease) return;
+    managedLease = false;
+    await releaseManagedHiRoute(ws?.userId);
+  };
 
   const finishLifecycle = () => {
     if (idleReleaseTimer) { clearTimeout(idleReleaseTimer); idleReleaseTimer = null; }
@@ -836,6 +848,16 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
       effortModels,
     });
     sdkOptions.abortController = lifecycle.controller;
+    // Managed routing is an explicit model selection, independent of the saved active endpoint.
+    if (options.model === 'hiroute') {
+      const connection = await prepareManagedHiRoute(ws?.userId, lifecycle.controller.signal);
+      managedLease = true;
+      lifecycle.controller.signal.throwIfAborted();
+      hirouteService.applyToOptions(sdkOptions, connection);
+    } else {
+      // Bind ordinary runs to the authenticated writer's active saved endpoint.
+      claudeConnectionsService.applyActiveToOptions(sdkOptions, ws?.userId);
+    }
 
     const mcpServers = await loadMcpConfig(options.cwd);
     lifecycle.controller.signal.throwIfAborted();
@@ -1126,6 +1148,7 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
 
     // Admit the next run only once the iterator's real process and workspace
     // cleanup have completed. Clear this owner before publishing the terminal.
+    await releaseManagedLease();
     finishLifecycle();
     const wasAborted = lifecycle.cancelled || (!superseded && sessionKey() ? abortedSessionIds.delete(sessionKey()) : false);
     if (!turnCompleteSent && !superseded) {
@@ -1155,6 +1178,7 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
 
   } catch (error) {
     console.error('SDK query error:', error);
+    await releaseManagedLease();
 
     // Clean up session on error — only while this run still owns the map entry
     // (a superseding run may have replaced it).
@@ -1186,7 +1210,10 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
     // Workspace cleanup errors remain failures, never a successful cancellation.
     ws.send(createNormalizedMessage({ kind: 'error', content: errorContent, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
     if (!turnCompleteSent) {
-      ws.send(createCompleteMessage({ provider: 'claude', sessionId: capturedSessionId || sessionId || null, exitCode: 1 }));
+      const terminal = createCompleteMessage({ provider: 'claude', sessionId: capturedSessionId || sessionId || null, exitCode: 1 });
+      // The registry receives this before the dispatcher catches the error; retain an unsent queue only for confirmed pre-SDK rejection.
+      if (error?.workspaceAdmissionRejected === true && !error?.workspaceCleanupError && !error?.cleanupError) terminal.workspaceAdmissionRejected = true;
+      ws.send(terminal);
     }
     notifyRunFailed({
       userId: ws?.userId || null,
@@ -1195,10 +1222,17 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
       sessionName: sessionSummary,
       error
     });
+    // The websocket registry deduplicates terminal events. The detached
+    // dispatcher still needs the original admission code or actual failure.
+    throw error;
   } finally {
     // Always close stdin — otherwise an aborted or failed run leaves the CLI
     // process (and its MCP servers) alive until the server exits.
-    finishLifecycle();
+    try {
+      await releaseManagedLease();
+    } finally {
+      finishLifecycle();
+    }
   }
 }
 
@@ -1329,4 +1363,3 @@ export const claudeRuntime = {
     listPending: getPendingApprovalsForSession,
   },
 };
-

@@ -7,12 +7,12 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { mock } from 'node:test';
 
+import { createSdkMcpServer, tool, type Options } from '@anthropic-ai/claude-agent-sdk';
 
-import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
-
+import { claudeConnectionsService } from '@/modules/providers/services/claude-connections.service.js';
 import { ClaudeSessionsProvider } from '@/modules/providers/list/claude/claude-sessions.provider.js';
 import type { ProviderRuntimeContext } from '@/shared/index.js';
-import type { NormalizedMessage } from '@/shared/types.js';
+import type { HiRouteConnection, NormalizedMessage } from '@/shared/types.js';
 import { WORKSPACES_ROOT } from '@/shared/index.js';
 
 function gate() {
@@ -24,10 +24,17 @@ function gate() {
 let queries = 0;
 let failedNotifications = 0;
 let stoppedNotifications = 0;
+let managedReleases: unknown[] = [];
+let releaseScenario: () => Promise<void> = async () => {};
 let scenario: (input: Parameters<typeof import('@anthropic-ai/claude-agent-sdk').query>[0]) => unknown;
 mock.module('@anthropic-ai/claude-agent-sdk', {
   namedExports: { tool, createSdkMcpServer, query: (input: Parameters<typeof import('@anthropic-ai/claude-agent-sdk').query>[0]) => { queries++; return scenario(input); } },
 });
+let managedScenario: (userId: unknown, signal?: AbortSignal) => Promise<HiRouteConnection> = async () => { throw new Error('Managed HiRoute must be selected explicitly'); };
+mock.module('@/modules/providers/services/hiroute-managed.service.js', { namedExports: {
+  prepareManagedHiRoute: (userId: unknown, signal?: AbortSignal) => managedScenario(userId, signal),
+  releaseManagedHiRoute: async (userId: unknown) => { managedReleases.push(userId); await releaseScenario(); },
+} });
 mock.module('@/shared/claude-cli-path.js', { namedExports: { resolveClaudeCodeExecutablePath: () => undefined } });
 mock.module('@/modules/notifications/index.js', { namedExports: {
   createNotificationEvent: (event: unknown) => event,
@@ -57,6 +64,8 @@ async function fixture(run: (cwd: string, context: ProviderRuntimeContext, frame
   queries = 0;
   failedNotifications = 0;
   stoppedNotifications = 0;
+  managedReleases = [];
+  releaseScenario = async () => {};
   try { await run(cwd, context, []); }
   finally { mock.restoreAll(); await rm(cwd, { recursive: true, force: true }); }
 }
@@ -189,6 +198,161 @@ test('Claude streams observed main-session versions without rewriting the pinned
     const updates = frames.filter(frame => frame.kind === 'status' && frame.text === 'model_resolved');
     assert.equal(updates.length, 1);
     assert.equal(updates[0].model, 'claude-opus-5-5');
+  });
+});
+
+test('explicit HiRoute awaits managed preparation and bypasses the saved active connection', { timeout: 5000 }, async () => {
+  await fixture(async (cwd, context, frames) => {
+    const entered = gate();
+    const ready = gate();
+    let managedSignal: AbortSignal | undefined;
+    managedScenario = async (userId, signal) => {
+      assert.equal(userId, 42);
+      assert.ok(signal instanceof AbortSignal);
+      assert.equal(signal.aborted, false);
+      managedSignal = signal;
+      entered.resolve();
+      await ready.promise;
+      return { enabled: true, baseUrl: 'https://managed.fixture', routeModel: 'plan/managed', authToken: 'managed-fixture-token' };
+    };
+    mock.method(claudeConnectionsService, 'applyActiveToOptions', () => { throw new Error('Saved active endpoint must not override managed routing'); });
+    // Session readback can return an ordinary model; explicit HiRoute selection still owns routing.
+    context.resolveResumeModel = async () => 'sonnet';
+    scenario = input => {
+      assert.equal(input.options?.abortController?.signal, managedSignal);
+      assert.equal(input.options?.model, 'plan/managed');
+      assert.equal(input.options?.env?.ANTHROPIC_BASE_URL, 'https://managed.fixture');
+      assert.equal(input.options?.env?.ANTHROPIC_AUTH_TOKEN, 'managed-fixture-token');
+      assert.equal(input.options?.env?.ANTHROPIC_API_KEY, '');
+      assert.equal(input.options?.effort, undefined);
+      return Object.assign((async function* () { yield { type: 'result', subtype: 'success' }; })(), { close() {} });
+    };
+    const run = queryClaudeSDK('fixture', { cwd, sessionId: 'managed-fixture', model: 'hiroute', effort: 'high' }, { userId: 42, send: (frame: NormalizedMessage) => frames.push(frame) }, context);
+    await entered.promise;
+    assert.equal(queries, 0);
+    ready.resolve();
+    await run;
+    assert.equal(queries, 1);
+    assert.deepEqual(managedReleases, [42]);
+    assert.equal(frames.find(frame => frame.kind === 'complete')?.success, true);
+  });
+});
+
+test('HiRoute preparation consumes lifecycle cancellation before the SDK launches', { timeout: 5000 }, async () => {
+  await fixture(async (cwd, context, frames) => {
+    const entered = gate();
+    let managedSignal: AbortSignal | undefined;
+    managedScenario = async (_userId, signal) => {
+      assert.ok(signal instanceof AbortSignal);
+      managedSignal = signal;
+      entered.resolve();
+      await new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+      throw new Error('Preparation must reject cancellation');
+    };
+    scenario = () => { throw new Error('SDK must not launch'); };
+    const run = queryClaudeSDK('fixture', { cwd, sessionId: 'managed-cancel-fixture', model: 'hiroute' }, { userId: 42, send: (frame: NormalizedMessage) => frames.push(frame) }, context);
+    await entered.promise;
+    const stop = abortClaudeSDKSession('managed-cancel-fixture');
+    assert.equal(managedSignal?.aborted, true);
+    assert.equal(await stop, true);
+    await run;
+    assert.equal(queries, 0);
+    assert.deepEqual(managedReleases, []);
+    assert.equal(frames.some(frame => frame.kind === 'complete' || frame.kind === 'error'), false);
+  });
+});
+
+test('managed preparation failure reports an error before launching the SDK', { timeout: 5000 }, async () => {
+  await fixture(async (cwd, context, frames) => {
+    managedScenario = async () => { throw new Error('Managed fixture is unavailable'); };
+    scenario = () => { throw new Error('SDK must not launch'); };
+    await assert.rejects(queryClaudeSDK('fixture', { cwd, sessionId: 'managed-failure-fixture', model: 'hiroute' }, { userId: 42, send: (frame: NormalizedMessage) => frames.push(frame) }, context), /Managed fixture is unavailable/);
+    assert.equal(queries, 0);
+    assert.equal(frames.find(frame => frame.kind === 'error')?.content, 'Managed fixture is unavailable');
+    assert.equal(frames.find(frame => frame.kind === 'complete')?.success, false);
+  });
+});
+
+test('Claude preserves the original workspace admission failure for the detached dispatcher', { timeout: 5000 }, async () => {
+  await fixture(async (cwd, context, frames) => {
+    const original = Object.assign(new Error('Workspace admission fixture is busy'), { code: 'WORKSPACE_BUSY', workspaceAdmissionRejected: true });
+    context.resolveResumeModel = async () => { throw original; };
+    scenario = () => { throw new Error('SDK must not launch'); };
+    await assert.rejects(queryClaudeSDK('fixture', { cwd, sessionId: 'busy-propagation-fixture' }, { send: (frame: NormalizedMessage) => frames.push(frame) }, context), error => error === original);
+    assert.equal(queries, 0);
+    assert.equal(frames.filter(frame => frame.kind === 'error').length, 1);
+    assert.equal(frames.filter(frame => frame.kind === 'complete').length, 1);
+    assert.equal(frames.find(frame => frame.kind === 'complete')?.success, false);
+    assert.equal(frames.find(frame => frame.kind === 'complete')?.workspaceAdmissionRejected, true);
+  });
+});
+
+test('managed gateway is retained through SDK teardown and released before completion', { timeout: 5000 }, async () => {
+  await fixture(async (cwd, context, frames) => {
+    const streamed = gate();
+    const teardown = gate();
+    const releasing = gate();
+    const released = gate();
+    managedScenario = async () => ({ enabled: true, baseUrl: 'https://managed.fixture', routeModel: 'plan/managed', authToken: 'fixture' });
+    releaseScenario = async () => { releasing.resolve(); await released.promise; };
+    scenario = () => Object.assign((async function* () { yield { type: 'result', subtype: 'success' }; streamed.resolve(); await teardown.promise; })(), { close() {} });
+    const run = queryClaudeSDK('fixture', { cwd, sessionId: 'managed-release-fixture', model: 'hiroute' }, { userId: 42, send: (frame: NormalizedMessage) => frames.push(frame) }, context);
+    await streamed.promise;
+    assert.deepEqual(managedReleases, []);
+    teardown.resolve();
+    await releasing.promise;
+    assert.equal(frames.some(frame => frame.kind === 'complete'), false);
+    released.resolve();
+    await run;
+    assert.deepEqual(managedReleases, [42]);
+    assert.equal(frames.find(frame => frame.kind === 'complete')?.success, true);
+  });
+});
+
+test('SDK failure releases the acquired gateway before publishing failure', { timeout: 5000 }, async () => {
+  await fixture(async (cwd, context, frames) => {
+    managedScenario = async () => ({ enabled: true, baseUrl: 'https://managed.fixture', routeModel: 'plan/managed', authToken: 'fixture' });
+    scenario = () => { throw new Error('SDK fixture failed'); };
+    await assert.rejects(queryClaudeSDK('fixture', { cwd, sessionId: 'managed-sdk-error-fixture', model: 'hiroute' }, { userId: 42, send: (frame: NormalizedMessage) => {
+      if (frame.kind === 'error' || frame.kind === 'complete') assert.deepEqual(managedReleases, [42]);
+      frames.push(frame);
+    } }, context), /SDK fixture failed/);
+    assert.deepEqual(managedReleases, [42]);
+    assert.equal(frames.find(frame => frame.kind === 'complete')?.success, false);
+  });
+});
+
+test('late successful preparation after cancellation releases its acquired gateway without launching SDK', { timeout: 5000 }, async () => {
+  await fixture(async (cwd, context) => {
+    const entered = gate();
+    const prepared = gate();
+    managedScenario = async () => { entered.resolve(); await prepared.promise; return { enabled: true, baseUrl: 'https://managed.fixture', routeModel: 'plan/managed', authToken: 'fixture' }; };
+    const run = queryClaudeSDK('fixture', { cwd, sessionId: 'managed-late-fixture', model: 'hiroute' }, { userId: 42, send() {} }, context);
+    await entered.promise;
+    const stop = abortClaudeSDKSession('managed-late-fixture');
+    prepared.resolve();
+    assert.equal(await stop, true);
+    await run;
+    assert.equal(queries, 0);
+    assert.deepEqual(managedReleases, [42]);
+  });
+});
+
+test('ordinary Claude selection applies only the saved active connection', { timeout: 5000 }, async () => {
+  await fixture(async (cwd, context) => {
+    managedScenario = async () => { throw new Error('Ordinary runs must not prepare HiRoute'); };
+    const active = mock.method(claudeConnectionsService, 'applyActiveToOptions', (options: Options, userId: unknown) => {
+      assert.equal(userId, 42);
+      assert.ok(options.abortController);
+      options.model = 'saved-fixture-model';
+    });
+    scenario = input => {
+      assert.equal(input.options?.model, 'saved-fixture-model');
+      return Object.assign((async function* () { yield { type: 'result', subtype: 'success' }; })(), { close() {} });
+    };
+    await queryClaudeSDK('fixture', { cwd, sessionId: 'saved-fixture', model: 'sonnet' }, { userId: 42, send() {} }, context);
+    assert.equal(active.mock.callCount(), 1);
+    assert.equal(queries, 1);
   });
 });
 

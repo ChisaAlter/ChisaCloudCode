@@ -23,8 +23,14 @@ const ULTRACODE_EFFORT_OPTION = {
   description: 'Highest effort plus standing workflow orchestration.',
 };
 
+/** Providers model APIs and the Claude runtime share this curated model and effort catalog. */
 export const CLAUDE_PREDEFINED_MODELS: ProviderModelsDefinition = {
   OPTIONS: [
+    {
+      value: 'hiroute',
+      label: 'HiRoute',
+      description: 'Automatically route across your Claude subscription and saved model connections.',
+    },
     {
       value: 'default',
       label: 'Default (auto)',

@@ -497,7 +497,9 @@ test('an attachment upload finishing after a session switch cannot dispatch the 
   });
   let submitting!: Promise<void>;
   await act(async () => { submitting = view.result.current.handleSubmit(submitEvent()); });
+  assert.equal(view.result.current.isPreparingSend, true);
   await act(async () => { view.rerender({ session: { id: 'session-b' }, project: PROJECT }); });
+  assert.equal(view.result.current.isPreparingSend, false);
   await act(async () => { view.result.current.setInput('B draft'); });
   await act(async () => { upload.resolve(okJson({ attachments: [{ name: 'image.png' }] })); await submitting; });
   assert.equal(cloudSend.mock.calls.length, 0);
@@ -562,7 +564,9 @@ test('repeated submits during new-session allocation create and send only one re
     await view.result.current.handleSubmit(submitEvent());
   });
   assert.equal(transport.createSession.mock.calls.length, 1);
+  assert.equal(view.result.current.isPreparingSend, true);
   await act(async () => { created.resolve(okJson({ data: { sessionId: 'new-session' } })); await submitting; });
+  assert.equal(view.result.current.isPreparingSend, false);
   assert.equal(cloudSend.mock.calls.length, 1);
   assert.equal(established.mock.calls.length, 1);
   assert.equal(userEcho.mock.calls.filter(([message]) => message.type === 'user').length, 1);

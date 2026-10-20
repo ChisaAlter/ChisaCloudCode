@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawn as realSpawn } from 'node:child_process';
 import * as childProcess from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, request as httpRequest } from 'node:http';
 import type { IncomingMessage } from 'node:http';
 import path from 'node:path';
@@ -56,7 +57,7 @@ mock.module('node:child_process', {
     return spawnWorker(args, options ?? {});
   } },
 });
-const { workspaceQuery, workspaceRequestScope, bridgeFileSystem, withWorkspaceMutation, executeSyncTransportWorker, prepareSyncTransportPreview, isWorkspaceBindingRoot } = await import('@/modules/workspace-bridge/index.js');
+const { workspaceQuery, workspaceRequestScope, bridgeFileSystem, bridgeGitFileSystem, withWorkspaceWriteOperation, withWorkspaceGitReadOperation, runWorkspaceCommand, runWorkspaceGitBranchOperation, withWorkspaceMutation, executeSyncTransportWorker, prepareSyncTransportPreview, isWorkspaceBindingRoot } = await import('@/modules/workspace-bridge/index.js');
 const { registerWorkspaceSyncRecoveryTransport } = await import('@/shared/index.js');
 
 type ControlFixture = {
@@ -65,7 +66,7 @@ type ControlFixture = {
   close: () => Promise<void>;
 };
 
-async function withWorkspace(run: (cwd: string, bridge: ControlFixture) => Promise<void>) {
+async function withWorkspace(run: (cwd: string, bridge: ControlFixture) => Promise<void>, protocol = 2) {
   await mkdir(WORKSPACES_ROOT, { recursive: true });
   const cwd = await mkdtemp(path.join(path.resolve(WORKSPACES_ROOT), '.chisa-cancel-qa-\u8f7d\u8d27\u8f66-%-'));
   let fixtureError: unknown;
@@ -110,7 +111,7 @@ async function withWorkspace(run: (cwd: string, bridge: ControlFixture) => Promi
   const address = server.address();
   assert.ok(address && typeof address !== 'string');
   bridge.marker = {
-    protocol: 2, port: address.port, token: 'fixture', bindingEpoch: 'fixture-epoch',
+    protocol, port: address.port, token: 'fixture', bindingEpoch: 'fixture-epoch',
   };
   await writeFile(path.join(cwd, '.chisa-bridge.json'), JSON.stringify(bridge.marker));
   queries = 0;
@@ -820,5 +821,312 @@ test('recovery-only transports block new admission but still settle the original
     await pending;
     assert.deepEqual(operations, ['sync_begin', 'sync_end', 'sync_released']);
     assert.equal(existsSync(cwd + '.chisa-lease'), false);
+  });
+});
+
+
+
+test('idle Git reads use the native owner for commands and files without synchronization', async () => {
+  await withWorkspace(async (cwd, bridge) => {
+    bridge.marker.localGitRead = true;
+    await writeFile(path.join(cwd, '.chisa-bridge.json'), JSON.stringify(bridge.marker));
+    const calls: Record<string, unknown>[] = [];
+    bridge.handle = async request => {
+      calls.push(request);
+      assert.equal(request.op, 'git_read');
+      if (request.action === 'prepare') return Response.json({ ok: true, localGitRead: true });
+      if (request.action === 'read') return Response.json({ ok: true, b64: Buffer.from('owner file').toString('base64') });
+      assert.equal(request.action, 'command');
+      assert.deepEqual(request.argv, ['git', '--no-optional-locks', 'branch', '-a']);
+      assert.equal(request.readOnly, undefined);
+      return Response.json({ ok: true, stdout: '* owner-branch\n', stderr: '', exitCode: 0 });
+    };
+    spawnWorker = () => { throw new Error('native reads must not start Docker'); };
+    await withWorkspaceGitReadOperation(cwd, async () => {
+      assert.match((await runWorkspaceCommand(cwd, 'git', ['branch', '-a'], { readOnly: true }))!.stdout!, /owner-branch/);
+      assert.equal(await bridgeGitFileSystem({} as never).readFile(path.join(cwd, 'readme.txt'), 'utf8'), 'owner file');
+    });
+    assert.deepEqual(calls.map(call => call.action), ['prepare', 'command', 'read']);
+    assert.equal(existsSync(cwd + '.chisa-lease'), false);
+  });
+});
+
+
+test('one Git write reservation encloses all commands and waits for handback', async () => {
+  await withWorkspace(async (cwd, bridge) => {
+    const operations: string[] = [];
+    const syncing = gate();
+    const synchronized = gate();
+    const work = gate();
+    const entered = gate();
+    const leaseIds: string[] = [];
+    bridge.handle = async request => {
+      operations.push(String(request.op));
+      if (request.op === 'sync_end') { assert.equal(request.changed, true); syncing.resolve(); await synchronized.promise; }
+      return Response.json({ ok: true });
+    };
+    spawnWorker = args => {
+      const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), kill() {} });
+      if (args[0] === 'run') {
+        leaseIds.push(JSON.parse(readFileSync(cwd + '.chisa-lease/state.json', 'utf8')).id);
+        assert.ok(args.includes(cwd + ':/workspace:rw'));
+        child.stdin.once('finish', () => queueMicrotask(() => { child.stdout.write(JSON.stringify({ ok: true, stdout: '', exitCode: 0 })); child.emit('close', 0); }));
+      } else queueMicrotask(() => child.emit('close', 0));
+      return child;
+    };
+    let completed = false;
+    const operation = withWorkspaceWriteOperation(cwd, async () => {
+      entered.resolve(); await work.promise;
+      await runWorkspaceCommand(cwd, 'git', ['status', '--porcelain']);
+      await runWorkspaceCommand(cwd, 'git', ['commit', '-m', 'index only']);
+    }).then(() => { completed = true; });
+    await entered.promise;
+    await assert.rejects(withWorkspaceWriteOperation(cwd, async () => {}), { code: 'WORKSPACE_BUSY' });
+    await assert.rejects(bridgeGitFileSystem({} as never).unlink(path.join(cwd, 'file.txt')), { code: 'WORKSPACE_BUSY' });
+    work.resolve();
+    await syncing.promise;
+    assert.equal(completed, false);
+    assert.deepEqual(operations, ['sync_begin', 'sync_end']);
+    assert.equal(leaseIds.length, 2);
+    assert.equal(new Set(leaseIds).size, 1);
+    synchronized.resolve();
+    await operation;
+    assert.equal(completed, true);
+    assert.deepEqual(operations, ['sync_begin', 'sync_end', 'sync_released']);
+    assert.equal(existsSync(cwd + '.chisa-lease'), false);
+  });
+});
+
+
+test('mapped branch operations use the native capability without preholding a lease', async () => {
+  await withWorkspace(async (cwd, bridge) => {
+    bridge.marker.localGitRead = true;
+    await writeFile(path.join(cwd, '.chisa-bridge.json'), JSON.stringify(bridge.marker));
+    const calls: Record<string, unknown>[] = [];
+    bridge.handle = async request => {
+      calls.push(request);
+      assert.equal(existsSync(cwd + '.chisa-lease'), false);
+      if (request.op === 'git_read') return Response.json({ ok: true, localGitRead: true, gitBranch: true });
+      assert.deepEqual(request, { op: 'git_branch', action: 'delete', branch: 'feature/old', force: true });
+      return Response.json({ ok: true, stdout: 'Deleted branch feature/old', stderr: '', exitCode: 0 });
+    };
+    assert.equal((await runWorkspaceGitBranchOperation(cwd, 'delete', 'feature/old', true))!.exitCode, 0);
+    assert.deepEqual(calls.map(call => call.op), ['git_read', 'git_branch']);
+    for (const code of ['WORKSPACE_GIT_DIRTY', 'WORKSPACE_GIT_BRANCH_EXISTS', 'WORKSPACE_GIT_BRANCH_MISSING', 'WORKSPACE_GIT_REJECTED', 'SYNC_BLOCKED', 'WORKSPACE_RELEASE_FAILED']) {
+      bridge.handle = async request => request.op === 'git_read'
+        ? Response.json({ ok: true, localGitRead: true, gitBranch: true })
+        : Response.json({ ok: false, code, error: 'Owner repository needs attention' });
+      await assert.rejects(runWorkspaceGitBranchOperation(cwd, 'create', 'feature/new'), { code, statusCode: 409, message: 'Owner repository needs attention' });
+    }
+    bridge.handle = async () => Response.json({ ok: true, localGitRead: true });
+    await assert.rejects(runWorkspaceGitBranchOperation(cwd, 'create', 'feature/new'), { code: 'WORKSPACE_GIT_UNSUPPORTED', statusCode: 409 });
+  });
+});
+
+
+test('local shared-root write sessions serialize by project root', async () => {
+  await withWorkspace(async cwd => {
+    const first = workspaceQuery({ prompt: 'first local write', options: { cwd } });
+    await first.next();
+    await started.promise;
+
+    closed = gate();
+    started = gate();
+    const second = workspaceQuery({ prompt: 'second local write', options: { cwd } });
+    const secondNext = second.next();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(queries, 1);
+
+    await first.interrupt();
+    await first.next();
+    await started.promise;
+    assert.equal(queries, 2);
+
+    await second.interrupt();
+    await secondNext;
+  }, 1);
+});
+
+
+test('plan sessions can inspect a synced workspace without claiming the shared write lease', async () => {
+  await withWorkspace(async (cwd, bridge) => {
+    const operations: string[] = [];
+    bridge.handle = request => {
+      operations.push(String(request.op));
+      return Response.json({ ok: true });
+    };
+    const query = workspaceQuery({ prompt: 'inspect only', options: { cwd, permissionMode: 'plan' } });
+    await query.next();
+    assert.equal(existsSync(cwd + '.chisa-lease'), false);
+    const write = tools!.tools!.find(definition => definition.name === 'write_file')!;
+    const writeResult = await write.handler({ path: '/workspace/blocked.txt', content: 'nope', expectedHash: null }, {});
+    assert.equal(writeResult.isError, true);
+    const writeMessage = writeResult.content?.[0];
+    assert.equal(writeMessage?.type, 'text');
+    assert.match(writeMessage.type === 'text' ? writeMessage.text : '', /只读/);
+    const next = query.next();
+    await started.promise;
+    await query.interrupt();
+    await next;
+    assert.deepEqual(operations, []);
+    assert.equal(queries, 1);
+  });
+});
+
+
+test('write sessions use a retained isolated Git worktree instead of the synced root', async () => {
+  await withWorkspace(async (cwd, bridge) => {
+    const operations: string[] = [];
+    bridge.handle = request => { operations.push(String(request.op)); return Response.json({ ok: true }); };
+    const runRealGit = (args: string[]) => new Promise<void>((resolve, reject) => {
+      const child = realSpawn('git', args, { cwd, windowsHide: true });
+      child.once('error', reject);
+      child.once('close', code => code === 0 ? resolve() : reject(new Error(`git exited ${code}`)));
+    });
+    await runRealGit(['init', '-b', 'main']);
+    await runRealGit(['-c', 'user.name=QA', '-c', 'user.email=qa@localhost', 'commit', '--allow-empty', '-m', 'fixture']);
+    await writeFile(path.join(cwd, 'uncommitted.txt'), 'current synchronized snapshot');
+    const worktreeName = `session-worktree-1-${createHash('sha256').update('session-worktree-1').digest('hex').slice(0, 12)}`;
+    const worktreeRoot = `${cwd}.chisa-worktrees/${worktreeName}`;
+    spawnWorker = (args, options) => {
+      if (args[0] === 'run') {
+        const child = Object.assign(new EventEmitter(), {
+          stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), kill() {},
+        });
+        let input = '';
+        child.stdin.on('data', chunk => { input += chunk.toString(); });
+        child.stdin.once('finish', () => queueMicrotask(() => {
+          void (async () => {
+            const request = JSON.parse(input || '{}') as { op?: string; path?: string; b64?: string };
+            if (request.op === 'write' && request.path === '/workspace/isolated.txt') {
+              await writeFile(path.join(worktreeRoot, 'isolated.txt'), Buffer.from(request.b64 || '', 'base64'));
+            }
+            child.stdout.write(JSON.stringify({ ok: true, stdout: '', exitCode: 0 }));
+            child.emit('close', 0);
+          })();
+        }));
+        return child;
+      }
+      if (args[0] === 'rm') {
+        const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), kill() {} });
+        queueMicrotask(() => child.emit('close', 0));
+        return child;
+      }
+      return realSpawn('git', args, options as Parameters<typeof realSpawn>[2]);
+    };
+    const query = workspaceQuery({ prompt: 'edit in isolation', options: { cwd, chisaSessionId: 'session-worktree-1' } as never });
+    await query.next();
+    await started.promise;
+    assert.equal(existsSync(worktreeRoot), true);
+    const marker = JSON.parse(readFileSync(`${worktreeRoot}/.chisa-bridge.json`, 'utf8')) as Record<string, unknown>;
+    assert.equal(marker.execution, 'isolated-worktree');
+    assert.equal(marker.sessionId, 'session-worktree-1');
+    assert.equal(await readFile(path.join(worktreeRoot, 'uncommitted.txt'), 'utf8'), 'current synchronized snapshot');
+    assert.equal(existsSync(cwd + '.chisa-lease'), false);
+    const write = tools!.tools!.find(definition => definition.name === 'write_file')!;
+    const writeResult = await write.handler({ path: '/workspace/isolated.txt', content: 'isolated', expectedHash: null }, {});
+    assert.equal(writeResult.isError, undefined);
+    assert.deepEqual(operations, []);
+    assert.equal(existsSync(path.join(cwd, 'isolated.txt')), false);
+    assert.equal((await readFile(path.join(worktreeRoot, 'isolated.txt'), 'utf8')), 'isolated');
+    assert.equal(existsSync(`${worktreeRoot}.chisa-lease`), true);
+    await query.interrupt();
+    await query.next();
+    assert.deepEqual(bridge.marker, { protocol: 2, port: bridge.marker.port, token: 'fixture', bindingEpoch: 'fixture-epoch' });
+    await runRealGit(['worktree', 'remove', '--force', worktreeRoot]);
+    await runRealGit(['worktree', 'prune']);
+  });
+});
+
+
+test('isolated startup reserves the source until worktree creation or shared lease handoff', { timeout: 10_000 }, async () => {
+  for (const createsWorktree of [true, false]) {
+    await withWorkspace(async (cwd, bridge) => {
+      bridge.marker.localGitRead = true;
+      await writeFile(path.join(cwd, '.chisa-bridge.json'), JSON.stringify(bridge.marker));
+      const probing = gate();
+      const finishProbe = gate();
+      const syncing = gate();
+      const finishSync = gate();
+      const operations: string[] = [];
+      let holdSync = !createsWorktree;
+      bridge.handle = async request => {
+        operations.push(String(request.op));
+        if (request.op === 'git_read') return Response.json({ ok: true, localGitRead: true, gitBranch: true });
+        if (request.op === 'sync_begin' && holdSync) {
+          holdSync = false;
+          syncing.resolve();
+          await finishSync.promise;
+        }
+        return Response.json({ ok: true });
+      };
+      spawnWorker = args => {
+        const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), kill() {} });
+        if (args[0] === 'rev-parse') {
+          probing.resolve();
+          void finishProbe.promise.then(() => {
+            if (createsWorktree) child.stdout.write(cwd + '\n');
+            child.emit('close', createsWorktree ? 0 : 1);
+          });
+        } else {
+          assert.deepEqual(args.slice(0, 3), ['worktree', 'add', '-b']);
+          void mkdir(args[4]!, { recursive: true }).then(() => child.emit('close', 0));
+        }
+        return child;
+      };
+      const query = workspaceQuery({ prompt: 'reserve isolated startup', options: { cwd, chisaSessionId: 'startup-race' } as never });
+      const next = query.next();
+      let writes = 0;
+      const write = () => withWorkspaceWriteOperation(cwd, async () => { writes++; });
+      try {
+        await probing.promise;
+        assert.equal(queries, 0);
+        assert.equal(existsSync(cwd + '.chisa-lease'), false);
+        await assert.rejects(write(), { code: 'WORKSPACE_BUSY', statusCode: 409 });
+        await assert.rejects(runWorkspaceGitBranchOperation(cwd, 'create', 'during-probe'), { code: 'WORKSPACE_BUSY', statusCode: 409 });
+        assert.deepEqual(operations, []);
+        assert.equal(writes, 0);
+        finishProbe.resolve();
+        if (!createsWorktree) {
+          await syncing.promise;
+          assert.equal(existsSync(cwd + '.chisa-lease'), true);
+          await assert.rejects(write(), { code: 'WORKSPACE_BUSY', statusCode: 409 });
+          await assert.rejects(runWorkspaceGitBranchOperation(cwd, 'create', 'during-handoff'), { code: 'WORKSPACE_BUSY', statusCode: 409 });
+          finishSync.resolve();
+        }
+        await next;
+        await started.promise;
+        assert.equal(queries, 1);
+        if (createsWorktree) {
+          assert.equal(existsSync(cwd + '.chisa-lease'), false);
+          await write();
+          assert.equal(writes, 1);
+        } else {
+          await assert.rejects(write(), { code: 'WORKSPACE_BUSY', statusCode: 409 });
+        }
+      } finally {
+        finishProbe.resolve();
+        finishSync.resolve();
+        await next;
+        await query.interrupt();
+        await query.next();
+        const worktreeParent = path.resolve(cwd + '.chisa-worktrees');
+        assert.equal(path.dirname(worktreeParent), path.resolve(WORKSPACES_ROOT));
+        await rm(worktreeParent, { recursive: true, force: true });
+      }
+      await write();
+      assert.equal(writes, createsWorktree ? 2 : 1);
+      assert.equal(existsSync(cwd + '.chisa-lease'), false);
+    });
+  }
+});
+
+
+test('corrupt shared lease reports a recoverable state error', async () => {
+  await withWorkspace(async (cwd) => {
+    await mkdir(cwd + '.chisa-lease', { recursive: true });
+    await writeFile(cwd + '.chisa-lease/state.json', '{broken');
+    const query = workspaceQuery({ prompt: 'corrupt lease', options: { cwd } });
+    await assert.rejects(query.next(), { code: 'WORKSPACE_LEASE_CORRUPT', statusCode: 503 });
   });
 });

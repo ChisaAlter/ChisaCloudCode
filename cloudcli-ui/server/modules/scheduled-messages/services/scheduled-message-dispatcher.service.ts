@@ -2,22 +2,23 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 
 import { scheduledMessagesDb, sessionDraftsDb } from '@/modules/database/index.js';
 import type { QueuedSessionMessageRecord, ScheduledMessageRow } from '@/modules/database/index.js';
-import { chatRunRegistry, runDetachedChatTurn } from '@/modules/websocket/index.js';
+import { isChatRunInFlight, onChatRunSettled, runDetachedChatTurn } from '@/modules/websocket/index.js';
 import type { ProviderRuntimeGateway } from '@/modules/websocket/index.js';
 
-/**
- * How often due messages are looked for.
- *
- * A minute is the granularity the composer offers, and a claim is indexed on
- * `(status, scheduled_for)`, so the poll is one cheap query. Anything finer
- * would buy precision nobody asked for.
- */
+// Completion wakes the queue immediately; polling also catches persisted edits
+// and workspace changes that did not come from a chat run in this process.
 const POLL_INTERVAL_MS = 30_000;
-
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+let wakeTimer: ReturnType<typeof setImmediate> | null = null;
+let removeSettledListener: (() => void) | null = null;
 let dispatchInFlight = false;
+let dispatchRequested = false;
+const sessionDispatches = new Map<string, Promise<void>>();
+// Due schedules may interrupt an active queued turn, but remain ordered against other schedules.
+const scheduledDispatches = new Map<string, Promise<void>>();
 let dispatcherRuntime: ProviderRuntimeGateway | null = null;
 let dispatcherScope: ReturnType<typeof AsyncLocalStorage.snapshot> | null = null;
+let wakeDispatcher: (() => void) | null = null;
 
 type StoredQueuedMessage = {
   content: string;
@@ -38,23 +39,35 @@ function readOptions(raw: string): Record<string, unknown> {
 }
 
 function readQueuedMessage(value: unknown): StoredQueuedMessage | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return null;
-  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
   const content = typeof record.content === 'string' ? record.content : '';
   const attachments = Array.isArray(record.attachments)
     ? record.attachments
-    : Array.isArray(record.images)
-      ? record.images
-      : [];
-  if (!content.trim() && attachments.length === 0) {
-    return null;
-  }
+    : Array.isArray(record.images) ? record.images : [];
+  if (!content.trim() && attachments.length === 0) return null;
   const options = record.options && typeof record.options === 'object' && !Array.isArray(record.options)
     ? record.options as Record<string, unknown>
     : {};
   return { content, options, attachments, autoSend: record.autoSend !== false };
+}
+
+function reportDispatchError(error: unknown): void {
+  console.error('[ScheduledMessages] Dispatch failed', {
+    error: error instanceof Error ? error.message : String(error),
+  });
+}
+
+function enqueueSessionDispatch(sessionId: string, operation: () => Promise<void>, scheduled = false): Promise<void> {
+  // Only this session waits for its preceding dispatch. A different session's
+  // admission never depends on a provider stream or workspace handback here.
+  const dispatches = scheduled ? scheduledDispatches : sessionDispatches;
+  const previous = dispatches.get(sessionId);
+  const task = previous ? previous.catch(() => {}).then(operation) : Promise.resolve().then(operation);
+  dispatches.set(sessionId, task);
+  const forget = () => { if (dispatches.get(sessionId) === task) dispatches.delete(sessionId); };
+  void task.then(forget, (error: unknown) => { forget(); reportDispatchError(error); });
+  return task;
 }
 
 async function sendClaimedQueuedMessage(
@@ -85,7 +98,7 @@ async function sendClaimedQueuedMessage(
 
   // The registry check and run reservation are separate operations. If a run
   // wins that tiny race, put the turn back so the next poll tries again.
-  if (!result.started && result.reason === 'busy') {
+  if (!result.started && (result.retryable || result.reason === 'busy')) {
     sessionDraftsDb.restoreQueuedMessage(candidate);
     return;
   }
@@ -94,30 +107,25 @@ async function sendClaimedQueuedMessage(
     return;
   }
   sessionDraftsDb.completeQueuedMessage(candidate);
-  // A wake while this session was running could not claim its next turn.
-  // Read the fresh envelope only after the current owner has settled.
   const next = sessionDraftsDb.listQueuedMessages().find(row => row.userId === candidate.userId && row.sessionId === candidate.sessionId);
-  if (next) await dispatchQueuedCandidate(next, runtime);
+  if (next && readQueuedMessage(next.queuedMessage)?.autoSend !== false && !isChatRunInFlight(next.sessionId) && sessionDraftsDb.claimQueuedMessage(next)) {
+    await sendClaimedQueuedMessage(next, runtime);
+  }
 }
 
-async function dispatchQueuedCandidate(candidate: QueuedSessionMessageRecord, runtime: ProviderRuntimeGateway): Promise<boolean> {
-  if (readQueuedMessage(candidate.queuedMessage)?.autoSend === false || chatRunRegistry.isProcessing(candidate.sessionId)) return false;
-  if (!sessionDraftsDb.claimQueuedMessage(candidate)) return false;
-  await sendClaimedQueuedMessage(candidate, runtime);
-  return true;
+/** Scheduled dispatcher and tests claim idle-session queued turns once; tests may await completion. */
+export async function dispatchQueuedMessages(runtime: ProviderRuntimeGateway, waitForCompletion = true): Promise<number> {
+  const tasks: Promise<void>[] = [];
+  for (const candidate of sessionDraftsDb.listQueuedMessages()) {
+    if (readQueuedMessage(candidate.queuedMessage)?.autoSend === false || sessionDispatches.has(candidate.sessionId) || scheduledDispatches.has(candidate.sessionId) || isChatRunInFlight(candidate.sessionId)) continue;
+    if (!sessionDraftsDb.claimQueuedMessage(candidate)) continue;
+    tasks.push(enqueueSessionDispatch(candidate.sessionId, () => sendClaimedQueuedMessage(candidate, runtime)));
+  }
+  if (waitForCompletion) await Promise.all(tasks);
+  return tasks.length;
 }
 
-/** Sends every persisted queued turn whose session is currently idle. */
-export async function dispatchQueuedMessages(runtime: ProviderRuntimeGateway): Promise<number> {
-  const candidates = sessionDraftsDb.listQueuedMessages();
-  const results = await Promise.all(candidates.map(candidate => dispatchQueuedCandidate(candidate, runtime)));
-  return results.filter(Boolean).length;
-}
-
-async function sendClaimedMessage(
-  row: ScheduledMessageRow,
-  runtime: ProviderRuntimeGateway,
-): Promise<void> {
+async function sendClaimedMessage(row: ScheduledMessageRow, runtime: ProviderRuntimeGateway): Promise<void> {
   try {
     const result = await runDetachedChatTurn(
       {
@@ -125,111 +133,81 @@ async function sendClaimedMessage(
         userId: row.user_id,
         content: row.content,
         options: readOptions(row.options),
-        // The user picked this time on purpose; a run that happens to be going
-        // is aborted so the scheduled message lands when it was due, instead
-        // of being recorded as "not sent — session was busy".
+        // A schedule deliberately interrupts the current run. Other due turns
+        // for this same session still wait in order behind this dispatch.
         interruptActiveRun: true,
       },
       { runtime },
     );
-
-    // Recorded rather than retried, and recorded whether the run never started
-    // (deleted session, unavailable provider) or started and then failed.
-    // Silently dropping a message the user scheduled is worse than telling
-    // them it did not go.
     if (!result.started || result.error) {
       scheduledMessagesDb.markFailed(row.id, result.error ?? 'The session was unavailable when this was due.');
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    scheduledMessagesDb.markFailed(row.id, message);
+    scheduledMessagesDb.markFailed(row.id, error instanceof Error ? error.message : String(error));
   }
 }
 
-/**
- * Sends every message whose time has come.
- *
- * Exported so a test can drive one pass without waiting on the timer.
- */
+/** Scheduled dispatcher and tests claim due messages atomically and serialize only within each session. */
 export async function dispatchDueScheduledMessages(
   runtime: ProviderRuntimeGateway,
   now: Date = new Date(),
+  waitForCompletion = true,
 ): Promise<number> {
-  // Claimed before any of them runs, so a long turn cannot let the next poll
-  // pick the same message up again.
   const due = scheduledMessagesDb.claimDue(now);
-  if (due.length === 0) {
-    return 0;
-  }
-
-  // Sequentially: a session can only have one run at a time, and two due
-  // messages for the same session must not race each other into it.
-  for (const row of due) {
-    await sendClaimedMessage(row, runtime);
-  }
-
+  const tasks = due.map(row => enqueueSessionDispatch(row.session_id, () => sendClaimedMessage(row, runtime), true));
+  if (waitForCompletion) await Promise.all(tasks);
   return due.length;
 }
 
-function startDispatchPass(runtime: ProviderRuntimeGateway): void {
-  if (dispatchInFlight) return;
-  dispatchInFlight = true;
-  void dispatchDueScheduledMessages(runtime)
-    .then(() => dispatchQueuedMessages(runtime))
-    .catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error('[ScheduledMessages] Dispatch pass failed', { error: message });
-    })
-    .finally(() => {
-      dispatchInFlight = false;
-    });
-}
-
-/** The User draft-save adapter wakes persisted queued sends without waiting for a model turn. */
-export function wakeQueuedMessageDispatcher(): void {
-  if (dispatcherRuntime && dispatcherScope) {
-    const runtime = dispatcherRuntime;
-    // Draft-save is an HTTP operation; the queued turn keeps the startup
-    // background scope instead of inheriting that request's cancellation.
-    // DB claims and the run registry serialize each session. An explicit
-    // send in another idle session must not wait for a long-running turn.
-    dispatcherScope(() => {
-      void dispatchQueuedMessages(runtime).catch((error: unknown) => {
-        console.error('[ScheduledMessages] Queued dispatch failed', { error: error instanceof Error ? error.message : String(error) });
-      });
-    });
-  }
-}
-
-/**
- * Starts the poll that sends scheduled messages.
- *
- * The schedule lives in the database, so a message stays scheduled across a
- * restart and one that came due while the server was down is sent on the first
- * poll after it comes back, rather than being skipped.
- */
+/** Server startup catches up persisted schedules; completion events wake queues after actual handback. */
 export function initializeScheduledMessageDispatcher(runtime: ProviderRuntimeGateway): void {
-  if (pollTimer) {
-    return;
-  }
-
+  if (pollTimer) return;
   dispatcherRuntime = runtime;
   dispatcherScope = AsyncLocalStorage.snapshot();
-  const poll = () => dispatcherScope?.(() => startDispatchPass(runtime));
-
-  pollTimer = setInterval(poll, POLL_INTERVAL_MS);
-  // Never keep the process alive just to poll for scheduled messages.
+  const wake = () => {
+    if (!pollTimer || wakeTimer) return;
+    // Defer until detached dispatch bookkeeping has released its session entry.
+    wakeTimer = setImmediate(() => {
+      wakeTimer = null;
+      dispatcherScope?.(() => { void dispatchQueuedMessages(runtime, false).catch(reportDispatchError); });
+    });
+    wakeTimer.unref?.();
+  };
+  const poll = () => {
+    if (dispatchInFlight) { dispatchRequested = true; return; }
+    dispatchInFlight = true;
+    // This gate covers admission only, never a provider run. Due messages are
+    // enqueued first, preserving their priority over a queued composer turn.
+    void dispatchDueScheduledMessages(runtime, new Date(), false)
+      .then(() => dispatchQueuedMessages(runtime, false))
+      .catch(reportDispatchError)
+      .finally(() => {
+        dispatchInFlight = false;
+        if (dispatchRequested) { dispatchRequested = false; wake(); }
+      });
+  };
+  wakeDispatcher = wake;
+  removeSettledListener = onChatRunSettled(wake);
+  pollTimer = setInterval(() => dispatcherScope?.(poll), POLL_INTERVAL_MS);
   pollTimer.unref?.();
-
-  // Catch up on anything that came due while the server was not running.
   poll();
 }
 
+/** Server shutdown removes polling and completion listeners without cancelling already admitted turns. */
 export function closeScheduledMessageDispatcher(): void {
   dispatcherRuntime = null;
   dispatcherScope = null;
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  }
+  wakeDispatcher = null;
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = null;
+  if (wakeTimer) clearImmediate(wakeTimer);
+  wakeTimer = null;
+  removeSettledListener?.();
+  removeSettledListener = null;
+  dispatchRequested = false;
+}
+
+/** User draft-save wakes admission in the dispatcher startup scope, detached from HTTP cancellation. */
+export function wakeQueuedMessageDispatcher(): void {
+  if (dispatcherRuntime && dispatcherScope) dispatcherScope(() => wakeDispatcher?.());
 }

@@ -13,11 +13,13 @@ import (
 )
 
 // A checkpoint is the Git part of the same file synchronization, not a second
-// repository. Index trees preserve staged edits without copying OS-specific indexes.
+// repository. Clean indexes use trees; unresolved indexes use portable stage
+// listings, never OS-specific index bytes. String fields retain value semantics.
 type syncGitState struct {
-	Head   string `json:"head"`
-	Branch string `json:"branch"`
-	Index  string `json:"index"`
+	Head       string `json:"head"`
+	Branch     string `json:"branch"`
+	Index      string `json:"index"`
+	Operations string `json:"operations,omitempty"`
 }
 
 type syncGitPending struct {
@@ -27,6 +29,7 @@ type syncGitPending struct {
 }
 
 type syncGitCheckpoint struct {
+	Version   int             `json:"version,omitempty"`
 	Root      string          `json:"root"`
 	LocalPath string          `json:"localPath"`
 	Epoch     string          `json:"epoch"`
@@ -59,6 +62,11 @@ func loadGitCheckpoint(m *Mapping) (*syncGitCheckpoint, error) {
 }
 
 func saveGitCheckpoint(m *Mapping, r *syncGitCheckpoint) error {
+	// Keep a legacy pending journal's comparison rules until both endpoints
+	// finish; a crash after saving it must not strand an unobserved ORIG_HEAD.
+	if r.Pending == nil {
+		r.Version = 2
+	}
 	file := syncGitCheckpointPath(m)
 	if err := os.MkdirAll(filepath.Dir(file), 0700); err != nil {
 		return err
@@ -86,11 +94,69 @@ func saveGitCheckpoint(m *Mapping, r *syncGitCheckpoint) error {
 }
 
 func readLocalGitState(ctx context.Context, m *Mapping) (s syncGitState, err error) {
-	_, guard, err := gitIndexGuard(ctx, m)
+	preview, _ := ctx.Value(syncGitPreviewKey{}).(bool)
+	var index string
+	if preview {
+		index, err = gitOutputContext(ctx, m.LocalPath, "rev-parse", "--git-path", "index")
+		if err != nil {
+			return s, err
+		}
+		if !filepath.IsAbs(index) {
+			index = filepath.Join(m.LocalPath, index)
+		}
+	} else {
+		var guard *locking.Locker
+		index, guard, err = gitIndexGuard(ctx, m)
+		if err != nil {
+			return s, err
+		}
+		defer guard.Close()
+	}
+	if _, err := os.Lstat(index + ".lock"); err == nil {
+		return s, fmt.Errorf("Git 暂存区正在写入，请等待操作完成后重试")
+	} else if !os.IsNotExist(err) {
+		return s, err
+	}
+	// write-tree can populate cache-tree extensions. Read a private index so a
+	// read-only observation cannot invalidate its own metadata evidence.
+	content, err := os.ReadFile(index)
+	missing := os.IsNotExist(err)
+	if err != nil && !missing {
+		return s, err
+	}
+	temporaryDirectory := filepath.Dir(index)
+	if preview {
+		temporaryDirectory = ""
+	}
+	temporary, err := os.CreateTemp(temporaryDirectory, "chisa-read-index-*")
 	if err != nil {
 		return s, err
 	}
-	defer guard.Close()
+	defer os.Remove(temporary.Name())
+	if !missing {
+		_, err = temporary.Write(content)
+	}
+	closeErr := temporary.Close()
+	if err != nil {
+		return s, err
+	}
+	if closeErr != nil {
+		return s, closeErr
+	}
+	if missing {
+		if err = os.Remove(temporary.Name()); err != nil {
+			return s, err
+		}
+	}
+	env := []string{"GIT_INDEX_FILE=" + temporary.Name(), "GIT_OPTIONAL_LOCKS=0"}
+	if preview {
+		var discard func()
+		ctx, discard, err = syncGitPreviewObjectsContext(ctx, m)
+		if err != nil {
+			return s, err
+		}
+		defer discard()
+	}
 
 	if s.Head, err = gitOutputContext(ctx, m.LocalPath, "rev-parse", "--verify", "HEAD^{commit}"); err != nil {
 		return
@@ -102,7 +168,15 @@ func readLocalGitState(ctx context.Context, m *Mapping) (s syncGitState, err err
 	if err != nil {
 		return
 	}
-	s.Index, err = gitOutputContext(ctx, m.LocalPath, "write-tree")
+	s.Index, err = readGitIndexState(ctx, m, env)
+	if err != nil {
+		return
+	}
+	paths, pathErr := localGitOperationPaths(ctx, m)
+	if pathErr != nil {
+		return s, pathErr
+	}
+	s.Operations, err = readGitOperations(paths)
 	return
 }
 
@@ -152,8 +226,12 @@ func removeOwnedIndexLock(index string) error {
 }
 
 func readRemoteGitState(ctx context.Context, m *Mapping) (syncGitState, error) {
-	q, _ := json.Marshal(map[string]any{"root": m.ServerPath, "op": "read"})
-	out, err := syncRemoteScript(ctx, m, "setpriv --reuid=1000 --regid=1000 --clear-groups env HOME=/nonexistent python3 -c "+shellQuote(syncGitApplyWorker), bytes.NewReader(q))
+	op := "read"
+	if preview, _ := ctx.Value(syncGitPreviewKey{}).(bool); preview {
+		op = "preview"
+	}
+	q, _ := json.Marshal(map[string]any{"root": m.ServerPath, "op": op})
+	out, err := syncGitMetadataRemoteScript(ctx, m, "setpriv --reuid=1000 --regid=1000 --clear-groups env HOME=/nonexistent python3 -c "+shellQuote(syncGitApplyWorker), bytes.NewReader(q))
 	if err != nil {
 		return syncGitState{}, err
 	}
@@ -167,13 +245,27 @@ func readRemoteGitState(ctx context.Context, m *Mapping) (syncGitState, error) {
 func gitTransitionMatches(s, before, after syncGitState) bool {
 	return (s.Head == before.Head || s.Head == after.Head) &&
 		(s.Branch == before.Branch || s.Branch == after.Branch) &&
-		(s.Index == before.Index || s.Index == after.Index)
+		(s.Index == before.Index || s.Index == after.Index) &&
+		gitOperationsTransitionMatches(s.Operations, before.Operations, after.Operations)
 }
 
 func selectGitState(ctx context.Context, m *Mapping, r *syncGitCheckpoint, local, remote syncGitState) (syncGitState, error) {
+	source, _ := ctx.Value(syncGitSourceKey{}).(string)
+	if source != "" && source != "local" && source != "remote" {
+		return syncGitState{}, fmt.Errorf("无效的 Git 状态来源")
+	}
+	states := []syncGitState{local, remote, r.State}
+	if r.Pending != nil {
+		states = append(states, r.Pending.Local, r.Pending.Remote, r.Pending.Desired)
+	}
+	for _, state := range states {
+		if _, err := decodeGitOperations(state.Operations); err != nil {
+			return syncGitState{}, err
+		}
+	}
 	if r.Pending != nil {
 		p := r.Pending
-		if gitTransitionMatches(local, p.Local, p.Desired) && gitTransitionMatches(remote, p.Remote, p.Desired) {
+		if gitCheckpointTransitionMatches(local, p.Local, p.Desired, r.Version) && gitCheckpointTransitionMatches(remote, p.Remote, p.Desired, r.Version) {
 			return p.Desired, nil
 		}
 		return syncGitState{}, fmt.Errorf("上次 Git 同步未完成后又有新修改；已保留两端，请先核对修改")
@@ -182,17 +274,16 @@ func selectGitState(ctx context.Context, m *Mapping, r *syncGitCheckpoint, local
 		return local, nil
 	}
 	if r.State.Head != "" {
-		if local == r.State {
+		if gitLegacyCheckpointEqual(local, r.State, r.Version) {
 			return remote, nil
 		}
-		if remote == r.State {
+		if gitLegacyCheckpointEqual(remote, r.State, r.Version) {
 			return local, nil
 		}
 		return syncGitState{}, fmt.Errorf("两端在上次同步后都更改了分支、提交或暂存区；已保留双方修改")
 	}
 	// Upgrade from the old file-only checkpoint. Ownership identifies the side
 	// returning its workspace, including a branch switch to an unrelated commit.
-	source, _ := ctx.Value(syncGitSourceKey{}).(string)
 	if source != "" {
 		receiver, desired := local, remote
 		if source == "local" {
@@ -202,13 +293,14 @@ func selectGitState(ctx context.Context, m *Mapping, r *syncGitCheckpoint, local
 		if err != nil {
 			return syncGitState{}, err
 		}
-		if receiver.Index != tree && receiver.Index != desired.Index {
-			return syncGitState{}, fmt.Errorf("接收端存在独立暂存修改，已保留两端，未覆盖")
+		if (receiver.Index != tree && receiver.Index != desired.Index) ||
+			(receiver.Operations != desired.Operations && !gitOnlyInertOperations(receiver.Operations)) {
+			return syncGitState{}, fmt.Errorf("接收端存在独立暂存修改或 Git 操作，已保留两端，未覆盖")
 		}
 		return desired, nil
 	}
 	if local.Branch != remote.Branch {
-		return syncGitState{}, fmt.Errorf("首次 Git 状态同步无法确定分支切换方向；已保留两端")
+		return syncGitState{}, &syncGitDirectionError{detail: "首次 Git 状态同步无法确定分支切换方向；已保留两端"}
 	}
 
 	if local.Head == remote.Head {
@@ -216,10 +308,10 @@ func selectGitState(ctx context.Context, m *Mapping, r *syncGitCheckpoint, local
 		if err != nil {
 			return syncGitState{}, err
 		}
-		if local.Index == tree {
+		if local.Index == tree && (gitOnlyInertOperations(local.Operations) || local.Operations == remote.Operations) {
 			return remote, nil
 		}
-		if remote.Index == tree {
+		if remote.Index == tree && (gitOnlyInertOperations(remote.Operations) || remote.Operations == local.Operations) {
 			return local, nil
 		}
 	} else {
@@ -230,7 +322,7 @@ func selectGitState(ctx context.Context, m *Mapping, r *syncGitCheckpoint, local
 				if e != nil {
 					return syncGitState{}, e
 				}
-				if pair[0].Index == tree {
+				if pair[0].Index == tree && (gitOnlyInertOperations(pair[0].Operations) || pair[0].Operations == pair[1].Operations) {
 					return pair[1], nil
 				}
 				break
@@ -240,11 +332,20 @@ func selectGitState(ctx context.Context, m *Mapping, r *syncGitCheckpoint, local
 			}
 		}
 	}
-	return syncGitState{}, fmt.Errorf("两端 Git 提交或暂存修改存在冲突；已保留双方修改")
+	return syncGitState{}, &syncGitDirectionError{detail: "两端 Git 提交或暂存修改存在冲突；已保留双方修改"}
 }
 
 func localGitSnapshot(ctx context.Context, m *Mapping, s syncGitState, ref string) (string, error) {
-	commit, err := gitOutputContext(ctx, m.LocalPath, "-c", "user.name=Chisa Sync", "-c", "user.email=sync@localhost", "commit-tree", s.Index, "-p", s.Head, "-m", "Chisa sync recovery: "+s.Branch)
+	tree, parents, err := gitSnapshotTree(ctx, m, s)
+	if err != nil {
+		return "", err
+	}
+	args := []string{"-c", "user.name=Chisa Sync", "-c", "user.email=sync@localhost", "commit-tree", tree}
+	for _, parent := range parents {
+		args = append(args, "-p", parent)
+	}
+	args = append(args, "-m", "Chisa sync recovery: "+s.Branch)
+	commit, err := gitOutputContext(ctx, m.LocalPath, args...)
 	if err != nil {
 		return "", err
 	}
@@ -253,7 +354,11 @@ func localGitSnapshot(ctx context.Context, m *Mapping, s syncGitState, ref strin
 }
 
 func remoteGitSnapshot(ctx context.Context, m *Mapping, s syncGitState, ref string) (string, error) {
-	return syncRemoteScript(ctx, m, "set -e\ncommit=$("+serverGit(m, "-c", "user.name=Chisa Sync", "-c", "user.email=sync@localhost", "commit-tree", s.Index, "-p", s.Head, "-m", "Chisa sync recovery: "+s.Branch)+")\n"+serverGit(m, "update-ref", ref)+" \"$commit\"\nprintf '%s' \"$commit\"", nil)
+	q, err := json.Marshal(map[string]any{"root": m.ServerPath, "op": "snapshot", "state": s, "backup": ref})
+	if err != nil {
+		return "", err
+	}
+	return syncRemoteScript(ctx, m, "setpriv --reuid=1000 --regid=1000 --clear-groups env HOME=/nonexistent python3 -c "+shellQuote(syncGitApplyWorker), bytes.NewReader(q))
 }
 
 // Preserve an inactive branch's independent history and any worktree that is
@@ -298,7 +403,7 @@ func localGitTarget(ctx context.Context, m *Mapping, before, desired syncGitStat
 	if err != nil {
 		return "", err
 	}
-	if desired.Branch != before.Branch && old != desired.Head {
+	if desired.Branch != before.Branch && old != desired.Head && !gitRebaseOwnsTarget(before, desired.Branch, old) {
 		if _, err := gitOutputContext(ctx, m.LocalPath, "merge-base", "--is-ancestor", old, desired.Head); err != nil {
 			if gitExitCode(err) == 1 {
 				return "", fmt.Errorf("目标 Git 分支包含独立提交，已保留其历史，请先处理分支冲突")
@@ -350,7 +455,15 @@ func applyLocalGitState(ctx context.Context, m *Mapping, before, desired syncGit
 	if err != nil && gitExitCode(err) != 1 {
 		return err
 	}
-	current.Index, err = gitOutputContextEnv(ctx, m.LocalPath, env, "write-tree")
+	current.Index, err = readGitIndexState(ctx, m, env)
+	if err != nil {
+		return err
+	}
+	paths, err := localGitOperationPaths(ctx, m)
+	if err != nil {
+		return err
+	}
+	current.Operations, err = readGitOperations(paths)
 	if err != nil {
 		return err
 	}
@@ -361,7 +474,22 @@ func applyLocalGitState(ctx context.Context, m *Mapping, before, desired syncGit
 	if err != nil {
 		return err
 	}
-	if _, err = gitOutputContextEnv(ctx, m.LocalPath, env, "read-tree", desired.Index); err != nil {
+	rebaseBranch, rebaseHead, err := gitRebaseOriginal(desired)
+	if err != nil {
+		return err
+	}
+	rebaseOld := ""
+	if rebaseBranch != "" {
+		rebaseTarget := syncGitState{Branch: rebaseBranch, Head: rebaseHead}
+		rebaseOld, err = localGitTarget(ctx, m, before, rebaseTarget)
+		if err != nil {
+			return err
+		}
+	}
+	if err = installGitIndexState(ctx, m, env, desired.Index); err != nil {
+		return err
+	}
+	if _, err = decodeGitOperations(desired.Operations); err != nil {
 		return err
 	}
 
@@ -375,16 +503,24 @@ func applyLocalGitState(ctx context.Context, m *Mapping, before, desired syncGit
 				return err
 			}
 		}
-		if _, err = gitOutputContext(ctx, m.LocalPath, "update-ref", desired.Branch, desired.Head, old); err != nil {
+	}
+	if err = applyLocalGitHead(ctx, m, before, desired, old); err != nil {
+		return err
+	}
+	// Detach HEAD before restoring a rebase's original branch, otherwise HEAD
+	// could follow that ref and invalidate its own compare-and-swap expectation.
+	if rebaseBranch != "" {
+		if strings.Trim(rebaseOld, "0") != "" && rebaseOld != rebaseHead {
+			if _, err = gitOutputContext(ctx, m.LocalPath, "update-ref", backup+"-rebase-branch", rebaseOld); err != nil {
+				return err
+			}
+		}
+		if _, err = gitOutputContext(ctx, m.LocalPath, "update-ref", rebaseBranch, rebaseHead, rebaseOld); err != nil {
 			return err
 		}
-		if _, err = gitOutputContext(ctx, m.LocalPath, "symbolic-ref", "HEAD", desired.Branch); err != nil {
-			return err
-		}
-	} else {
-		if _, err = gitOutputContext(ctx, m.LocalPath, "update-ref", "--no-deref", "HEAD", desired.Head, before.Head); err != nil {
-			return err
-		}
+	}
+	if err = applyGitOperations(paths, before.Operations, desired.Operations); err != nil {
+		return err
 	}
 	// Deliberately omit -u: Mutagen owns worktree bytes, including untracked files.
 	content, err = os.ReadFile(temporary.Name())
@@ -440,12 +576,43 @@ func syncGitStateContext(ctx context.Context, m *Mapping) error {
 	if err != nil {
 		return err
 	}
-	if local == remote && local == desired {
-		r.State, r.Pending = desired, nil
-		return saveGitCheckpoint(m, r)
+	if err = applyPreparedGitState(ctx, m, r, local, remote, desired); err != nil {
+		return err
 	}
-	// Transfer a temporary commit whose tree is the staged snapshot and whose
-	// parent is the actual HEAD. Neither user's branch receives this commit.
+	actual, err := readLocalGitState(ctx, m)
+	if err != nil {
+		return err
+	}
+	other, err := readRemoteGitState(ctx, m)
+	if err != nil {
+		return err
+	}
+	if actual != desired || other != desired {
+		return fmt.Errorf("Git 交接期间又有新修改；已保留修改，请重新同步")
+	}
+	return finishGitCheckpoint(m, r, desired)
+}
+
+func finishGitCheckpoint(m *Mapping, r *syncGitCheckpoint, desired syncGitState) error {
+	if r.Pending == nil && r.Version >= 2 && r.State == desired {
+		return nil
+	}
+	r.State, r.Pending = desired, nil
+	return saveGitCheckpoint(m, r)
+}
+
+// Selection is fixed before any file flush. Applying never silently selects a
+// different source after external Git changes while file contents were moving.
+func applyPreparedGitState(ctx context.Context, m *Mapping, r *syncGitCheckpoint, local, remote, desired syncGitState) error {
+	if local == remote && local == desired {
+		return nil
+	}
+	cfg := workspaceSyncConfig(ctx)
+	url := cfg.SSHUser + "@" + cfg.SSHHost + ":" + m.ServerPath
+	var err error
+	// Transfer an ordinary recovery commit that retains every stage/operation
+	// object. Unresolved indexes use a synthetic tree, never a conflicted tree.
+	// Neither user's branch receives this commit.
 	ref := "refs/chisa/transfer/" + randHex(16)
 	if desired == remote {
 		if _, err = remoteGitSnapshot(ctx, m, desired, ref); err != nil {
@@ -482,6 +649,5 @@ func syncGitStateContext(ctx context.Context, m *Mapping) error {
 			return err
 		}
 	}
-	r.State, r.Pending = desired, nil
-	return saveGitCheckpoint(m, r)
+	return nil
 }

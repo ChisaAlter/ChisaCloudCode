@@ -1,4 +1,5 @@
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { cp } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -12,12 +13,12 @@ import type { SpawnedProcess } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { RequestHandler } from 'express';
 
-import type { FileTreeFileSystem, WorkspaceGitFileSystem } from '@/shared/index.js';
+import type { FileTreeFileSystem, SessionWorkspaceMode, WorkspaceGitFileSystem } from '@/shared/index.js';
 import { AppError, WORKSPACES_ROOT, getWorkspaceSyncNetwork, isWorkspaceSyncControlHost, isWorkspaceSyncRecoveryOnly } from '@/shared/index.js';
 
-type Binding = { root: string; host: string; port: number; token: string; bindingEpoch: string; readBatch: boolean; vps: boolean };
+type Binding = { root: string; host: string; port: number; token: string; bindingEpoch: string; readBatch: boolean; localGitRead: boolean; vps: boolean; isolated: boolean; sessionId?: string };
 type RpcStats = { size: number; mtime: number; mode: number; dir: boolean; symlink: boolean };
-type RpcResult = Partial<RpcStats> & { ok?: boolean; error?: string; code?: string; b64?: string; hash?: string; path?: string; entries?: Array<{ name: string; dir: boolean; stats?: RpcStats }>; results?: RpcResult[]; stdout?: string; stderr?: string; exitCode?: number; truncated?: boolean };
+type RpcResult = Partial<RpcStats> & { ok?: boolean; error?: string; code?: string; localGitRead?: boolean; gitBranch?: boolean; b64?: string; hash?: string; path?: string; entries?: Array<{ name: string; dir: boolean; stats?: RpcStats }>; results?: RpcResult[]; stdout?: string; stderr?: string; exitCode?: number; truncated?: boolean };
 type FileTreeReadRequest = { op: 'stat' | 'lstat' | 'list'; path: string; includeStats?: boolean };
 type PendingFileTreeRead = { request: FileTreeReadRequest; resolve(result: RpcResult): void; reject(error: unknown): void };
 type WorkspaceRequestScope = { signal: AbortSignal; deadline: number; id: string };
@@ -68,9 +69,9 @@ function controlScope(signal?: AbortSignal, cleanup = false) {
   return { deadline, signal: cancellation ? AbortSignal.any([timeout, cancellation]) : timeout };
 }
 
-function refreshedBinding(binding: Binding): Binding {
-  const current = resolveWorkspaceBinding(binding.root);
-  if (!current || current.root !== binding.root || current.host !== binding.host || current.token !== binding.token || current.bindingEpoch !== binding.bindingEpoch || current.vps !== binding.vps) {
+function refreshedBinding(binding: Binding, candidate = binding.root, pinnedRead = false): Binding {
+  const current = resolveWorkspaceBinding(candidate);
+  if (!current || current.root !== binding.root || current.token !== binding.token || current.host !== binding.host || current.bindingEpoch !== binding.bindingEpoch || current.vps !== binding.vps || current.isolated !== binding.isolated || current.sessionId !== binding.sessionId || (pinnedRead && (current.port !== binding.port || current.readBatch !== binding.readBatch || current.localGitRead !== binding.localGitRead))) {
     throw new AppError('Workspace binding changed; synchronize the selected project before continuing', { code: 'STALE_BINDING', statusCode: 409 });
   }
   return current;
@@ -113,11 +114,16 @@ function resolveWorkspaceBinding(candidate: string): Binding | null {
   while (root !== boundary) {
     const marker = path.join(root, '.chisa-bridge.json');
     if (existsSync(marker)) {
-      const value = JSON.parse(readFileSync(marker, 'utf8')) as Record<string, unknown>;
-      if ((value.protocol !== 1 && value.protocol !== 2) || !Number.isInteger(value.port) || Number(value.port) < 1024 || Number(value.port) > 65535 || typeof value.token !== 'string' || typeof value.bindingEpoch !== 'string') throw new Error('Invalid workspace binding');
+      let value: Record<string, unknown>;
+      try {
+        value = JSON.parse(readFileSync(marker, 'utf8')) as Record<string, unknown>;
+      } catch {
+        throw new AppError('This workspace binding has damaged metadata; recover it before starting again', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
+      }
+      if ((value.protocol !== 1 && value.protocol !== 2) || !Number.isInteger(value.port) || Number(value.port) < 1024 || Number(value.port) > 65535 || typeof value.token !== 'string' || typeof value.bindingEpoch !== 'string') throw new AppError('Invalid workspace binding metadata', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
       const host = value.controlHost === undefined ? '127.0.0.1' : value.controlHost;
-      if (typeof host !== 'string' || !isWorkspaceSyncControlHost(host)) throw new Error('Invalid workspace transport address');
-      return { root, host, port: Number(value.port), token: value.token, bindingEpoch: value.bindingEpoch, readBatch: value.readBatch === true, vps: value.protocol === 2 };
+      if (typeof host !== 'string' || !isWorkspaceSyncControlHost(host)) throw new AppError('Invalid workspace transport address', { code: 'WORKSPACE_UNAVAILABLE', statusCode: 503 });
+      return { root, host, port: Number(value.port), token: value.token, bindingEpoch: value.bindingEpoch, readBatch: value.readBatch === true, localGitRead: value.localGitRead === true, vps: value.protocol === 2, isolated: value.execution === 'isolated-worktree', sessionId: typeof value.sessionId === 'string' ? value.sessionId : undefined };
     }
     root = path.dirname(root);
   }
@@ -127,6 +133,119 @@ function resolveWorkspaceBinding(candidate: string): Binding | null {
 /** Worktrees checks this before removing a directory: an independently bound root must be unbound first so its return-synchronization callback stays available. */
 export function isWorkspaceBindingRoot(candidate: string): boolean {
   return resolveWorkspaceBinding(candidate)?.root === path.resolve(candidate);
+}
+
+type GitProcessResult = { code: number | null; stdout: string; stderr: string };
+
+function runGit(args: string[], cwd: string, signal?: AbortSignal): Promise<GitProcessResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], signal, windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.once('error', reject);
+    child.once('close', code => resolve({ code, stdout, stderr }));
+  });
+}
+
+function sessionWorktreeName(sessionId: string): string {
+  const readable = sessionId.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'session';
+  // Keep the directory recognizable while making sanitized ids collision-resistant
+  // (`a/b` and `a-b` must never share a retained worktree).
+  const suffix = createHash('sha256').update(sessionId).digest('hex').slice(0, 12);
+  return `${readable}-${suffix}`;
+}
+
+/**
+ * Creates or reuses a per-session Git worktree. The worktree is deliberately
+ * retained after the run so the user can inspect and merge it manually. A
+ * non-Git synchronized directory returns null and remains on the shared-write
+ * path rather than pretending that a copy is mergeable.
+ */
+async function createSessionWorktree(binding: Binding, sessionId: string, signal?: AbortSignal): Promise<Binding | null> {
+  if (!binding.vps || binding.isolated) return binding;
+  const parent = binding.root + '.chisa-worktrees';
+  const worktreeRoot = path.join(parent, sessionWorktreeName(sessionId));
+  const metadataPath = path.join(worktreeRoot, '.chisa-session.json');
+  const markerPath = path.join(worktreeRoot, '.chisa-bridge.json');
+  const existingMarker = existsSync(markerPath) && existsSync(metadataPath);
+  if (existingMarker) {
+    let metadata: { sessionId?: string; bindingEpoch?: string; sourceRoot?: string; branch?: string };
+    try {
+      metadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as typeof metadata;
+    } catch {
+      throw new AppError('This session worktree has damaged metadata; recover it from Worktrees before starting again', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
+    }
+    const existing = resolveWorkspaceBinding(worktreeRoot);
+    if (
+      metadata.sessionId !== sessionId
+      || metadata.bindingEpoch !== binding.bindingEpoch
+      || metadata.sourceRoot !== binding.root
+      || !metadata.branch
+      || !existing?.isolated
+      || existing.sessionId !== sessionId
+      || existing.bindingEpoch !== binding.bindingEpoch
+    ) {
+      throw new AppError('This session worktree belongs to a different project binding; recover it from Worktrees before starting again', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
+    }
+    return existing;
+  }
+  if (existsSync(worktreeRoot)) throw new AppError('Session worktree path already exists; recover it from Worktrees before starting again', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
+
+  const repository = await runGit(['rev-parse', '--show-toplevel'], binding.root, signal);
+  if (repository.code !== 0 || !repository.stdout.trim()) return null;
+  // A marker on a repository subdirectory would make the sibling worktree
+  // path ambiguous. Keep that case on the shared-write path until a
+  // repository-root-aware worktree mapping is available.
+  if (path.resolve(repository.stdout.trim()) !== path.resolve(binding.root)) return null;
+  const branch = `chisa/session/${sessionWorktreeName(sessionId)}`;
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const created = await runGit(['worktree', 'add', '-b', branch, worktreeRoot, 'HEAD'], binding.root, signal);
+  if (created.code !== 0) throw new AppError('Could not create the isolated session worktree', { code: 'WORKSPACE_WORKTREE_CREATE_FAILED', statusCode: 503, details: created.stderr.trim() });
+  try {
+    // Include the synchronized working tree's uncommitted snapshot without
+    // touching its index. Git owns the worktree metadata; project files are
+    // copied over it and can be merged back through the normal Worktrees UI.
+    signal?.throwIfAborted();
+    await cp(binding.root, worktreeRoot, {
+      recursive: true,
+      force: true,
+      filter: source => {
+        signal?.throwIfAborted();
+        const relative = path.relative(binding.root, source);
+        if (!relative) return true;
+        const first = relative.split(path.sep)[0];
+        return !['.git', '.chisa-bridge.json', '.chisa-lease', '.chisa-worktrees'].includes(first);
+      },
+    });
+    signal?.throwIfAborted();
+    const marker = JSON.parse(readFileSync(path.join(binding.root, '.chisa-bridge.json'), 'utf8')) as Record<string, unknown>;
+    writeFileSync(markerPath, JSON.stringify({ ...marker, execution: 'isolated-worktree', sessionId }), { mode: 0o600 });
+    writeFileSync(metadataPath, JSON.stringify({ sessionId, bindingEpoch: binding.bindingEpoch, sourceRoot: binding.root, branch, createdAt: new Date().toISOString() }), { mode: 0o600 });
+    const isolated = resolveWorkspaceBinding(worktreeRoot);
+    if (!isolated) throw new AppError('Isolated session worktree was created without a valid workspace marker', { code: 'WORKSPACE_WORKTREE_CREATE_FAILED', statusCode: 503 });
+    return isolated;
+  } catch (error) {
+    let rollbackError: unknown;
+    const removed = await runGit(['worktree', 'remove', '--force', worktreeRoot], binding.root);
+    if (removed.code !== 0) rollbackError = new Error(removed.stderr.trim() || `git worktree remove exited ${removed.code}`);
+    // The branch was created together with this worktree. Remove it as part
+    // of rollback so a failed snapshot does not strand the session id.
+    const deleted = await runGit(['branch', '-D', branch], binding.root);
+    if (deleted.code !== 0) rollbackError ??= new Error(deleted.stderr.trim() || `git branch delete exited ${deleted.code}`);
+    if (rollbackError) {
+      throw new AppError('Isolated session worktree creation failed and cleanup was not confirmed; recover it from Worktrees before retrying', {
+        code: 'WORKSPACE_WORKTREE_ROLLBACK_FAILED',
+        statusCode: 503,
+        details: {
+          creationError: error instanceof Error ? error.message : String(error),
+          cleanupError: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+        },
+      });
+    }
+    throw error;
+  }
 }
 
 function virtualPath(binding: Binding, candidate: string): string {
@@ -142,13 +261,13 @@ function checkRpcResult(result: RpcResult, statusCode?: number): RpcResult {
     const code = result.code || 'WORKSPACE_OPERATION_FAILED';
     // Filesystem existence errors remain errno errors for existing callers.
     if (code === 'ENOENT') throw Object.assign(new Error(result.error), { code });
-    throw new AppError(result.error || 'Workspace operation failed', { code, statusCode: statusCode ?? (code === 'CONTENT_CONFLICT' ? 409 : code === 'WORKSPACE_UNAVAILABLE' ? 503 : 400) });
+    throw new AppError(result.error || 'Workspace operation failed', { code, statusCode: statusCode ?? (['CONTENT_CONFLICT', 'WORKSPACE_BUSY', 'WORKSPACE_GIT_UNSUPPORTED', 'WORKSPACE_GIT_CHANGED', 'WORKSPACE_GIT_OPERATION_IN_PROGRESS', 'WORKSPACE_GIT_CONFLICT', 'WORKSPACE_GIT_OPERATION', 'WORKSPACE_GIT_DIRTY', 'WORKSPACE_GIT_BRANCH_EXISTS', 'WORKSPACE_GIT_BRANCH_MISSING', 'WORKSPACE_GIT_REJECTED', 'SYNC_BLOCKED', 'SYNC_PAUSE_UNCONFIRMED', 'WORKSPACE_RELEASE_FAILED'].includes(code) ? 409 : code === 'WORKSPACE_UNAVAILABLE' ? 503 : 400) });
   }
   return result;
 }
 
 async function desktopControl(binding: Binding, request: Record<string, unknown>, cancellation?: AbortSignal, cleanup = false): Promise<RpcResult> {
-  binding = refreshedBinding(binding);
+  binding = scopedGitReadBinding(binding.root) ?? refreshedBinding(binding, binding.root, request.op === 'git_read');
   // The Go bridge expects the path's UTF-8 wire bytes in this header.
   const workspaceHeader = Buffer.from(binding.root, 'utf8').toString('latin1');
   const { signal, deadline } = controlScope(cancellation, cleanup);
@@ -211,7 +330,33 @@ function leaseDirectory(binding: Binding): string { return binding.root + '.chis
 function readLease(binding: Binding): WorkspaceLease | null {
   const directory = leaseDirectory(binding);
   if (!existsSync(directory)) return null;
-  return JSON.parse(readFileSync(path.join(directory, 'state.json'), 'utf8')) as WorkspaceLease;
+  const statePath = path.join(directory, 'state.json');
+  let raw: string;
+  try {
+    raw = readFileSync(statePath, 'utf8');
+  } catch (error) {
+    const failure = error as NodeJS.ErrnoException;
+    throw new AppError('Workspace reservation state could not be read; check the project permissions and synchronization state.', {
+      code: 'WORKSPACE_LEASE_UNAVAILABLE',
+      statusCode: 503,
+      details: { statePath, errorName: failure.name, transportCode: failure.code },
+    });
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<WorkspaceLease>;
+    if (
+      (parsed.owner !== 'claude' && parsed.owner !== 'sync-needed' && parsed.owner !== 'pi' && parsed.owner !== 'sync')
+      || typeof parsed.id !== 'string'
+      || typeof parsed.epoch !== 'string'
+    ) throw new Error('invalid lease fields');
+    return parsed as WorkspaceLease;
+  } catch (error) {
+    throw new AppError('Workspace reservation state is damaged; synchronize the project to recover it.', {
+      code: 'WORKSPACE_LEASE_CORRUPT',
+      statusCode: 503,
+      details: { statePath, errorName: error instanceof Error ? error.name : 'Error' },
+    });
+  }
 }
 function saveLease(binding: Binding, lease: WorkspaceLease): void {
   const file = path.join(leaseDirectory(binding), 'state.json');
@@ -221,14 +366,34 @@ function saveLease(binding: Binding, lease: WorkspaceLease): void {
 function claimWorkspace(binding: Binding): WorkspaceLease {
   requireWorkspaceAdmission(binding);
   const processStat = process.platform === 'linux' ? readFileSync('/proc/self/stat', 'utf8') : '';
-  const identity = process.platform === 'linux' ? {
-    processStartTime: processStat.slice(processStat.lastIndexOf(')') + 2).trim().split(/\s+/)[19],
-    bootId: readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(),
-  } : {};
-  try { mkdirSync(leaseDirectory(binding), { mode: 0o700 }); }
-  catch { throw new AppError('Workspace is reserved or waiting for synchronization. Finish the current task or synchronize it in desktop settings.', { code: 'WORKSPACE_BUSY', statusCode: 409 }); }
+  const identity = process.platform === 'linux' ? { processStartTime: processStat.slice(processStat.lastIndexOf(')') + 2).trim().split(/\s+/)[19], bootId: readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() } : {};
+  try {
+    mkdirSync(leaseDirectory(binding), { mode: 0o700 });
+  } catch (error) {
+    const failure = error as NodeJS.ErrnoException;
+    if (failure.code === 'EEXIST') {
+      // Preserve an unreadable/damaged lease diagnosis instead of turning it
+      // into a generic busy state that gives the user no recovery direction.
+      readLease(binding);
+      throw new AppError('Workspace is reserved or waiting for synchronization. Finish the current task or synchronize it in desktop settings.', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+    }
+    throw new AppError('Workspace reservation could not be created; check the project permissions and synchronization state.', {
+      code: 'WORKSPACE_LEASE_UNAVAILABLE',
+      statusCode: 503,
+      details: { errorName: failure.name, transportCode: failure.code },
+    });
+  }
   const lease: WorkspaceLease = { owner: 'claude', id: randomUUID(), epoch: binding.bindingEpoch, pid: process.pid, ...identity, mayWrite: false };
-  saveLease(binding, lease);
+  try {
+    saveLease(binding, lease);
+  } catch (error) {
+    try { rmSync(leaseDirectory(binding), { recursive: true, force: true }); } catch { /* preserve the write error */ }
+    throw new AppError('Workspace reservation could not be persisted; synchronize the project before retrying.', {
+      code: 'WORKSPACE_LEASE_UNAVAILABLE',
+      statusCode: 503,
+      details: { errorName: error instanceof Error ? error.name : 'Error' },
+    });
+  }
   activeWorkspaceLeases.set(binding.root, lease);
   return lease;
 }
@@ -237,6 +402,14 @@ async function releaseWorkspace(binding: Binding, lease: WorkspaceLease, prepare
   const latest = readLease(binding);
   const mayWrite = !prepared || (latest?.id === lease.id ? latest.mayWrite !== false : true);
   if (!latest || latest.id !== lease.id || latest.epoch !== lease.epoch) throw new AppError('Workspace reservation changed before cleanup', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+  if (binding.isolated) {
+    if (latest.cleanupPending?.length) throw new AppError('Workspace container cleanup failed; remove the retained session worktree before continuing', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
+    const jobMarker = path.join(leaseDirectory(binding), 'sync-job.json');
+    if (existsSync(jobMarker)) throw new AppError('A remote synchronization command has not confirmed exit; remove the retained session worktree before continuing', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
+    rmSync(leaseDirectory(binding), { recursive: true });
+    if (activeWorkspaceLeases.get(binding.root)?.id === lease.id) activeWorkspaceLeases.delete(binding.root);
+    return;
+  }
   saveLease(binding, { ...latest, mayWrite, owner: 'sync-needed' });
   if (activeWorkspaceLeases.get(binding.root)?.id === lease.id) activeWorkspaceLeases.delete(binding.root);
   if (latest.cleanupPending?.length) throw new AppError('Workspace container cleanup failed; use Sync now to stop it safely before continuing', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
@@ -339,6 +512,7 @@ async function vpsWorker(binding: Binding, request: Record<string, unknown>, sig
   const operation = previous.catch(() => {}).then(async () => {
     signal?.throwIfAborted();
     binding = refreshedBinding(binding);
+    rejectExclusiveWorkspaceWrite(binding);
     const current = admittedWorkspaceLease(binding);
     rejectBorrowedPreparedReservation(binding, current);
     const readOnly = workspaceRequestReadOnly(request);
@@ -364,7 +538,7 @@ async function vpsWorker(binding: Binding, request: Record<string, unknown>, sig
 
 async function runVPSWorker(binding: Binding, request: Record<string, unknown>, lease: WorkspaceLease | null, signal?: AbortSignal): Promise<RpcResult> {
   // The kernel enforces read-only commands; command text is never used to guess writes.
-  const readOnly = request.op === 'exec' && request.readOnly === true;
+  const readOnly = workspaceRequestReadOnly(request);
   const name = 'chisa-rpc-' + randomUUID();
   recordContainer(binding, name, true, lease);
   const args = ['run', '--rm', '--interactive', '--name', name,
@@ -522,6 +696,8 @@ export async function withWorkspaceMutation<T>(candidate: string | string[], ope
       signal?.throwIfAborted();
       for (const initial of orderedBindings) {
         const binding = refreshedBinding(initial);
+        rejectExclusiveWorkspaceWrite(binding);
+        if (sharedWorkspaceExecutions.has(binding.root)) throw new AppError("Workspace is in use by a task", { code: "WORKSPACE_BUSY", statusCode: 409 });
         claims.push({ binding, lease: claimWorkspace(binding), prepared: false });
       }
       for (const claim of claims) {
@@ -548,13 +724,188 @@ export async function withWorkspaceMutation<T>(candidate: string | string[], ope
   return enqueueRoots(0);
 }
 
+type GitReadScope = { binding: Binding; cwd: string; native: boolean };
+type WorkspaceWriteScope = { binding: Binding; lease: WorkspaceLease | null; active: boolean };
+const gitReadScopes = new AsyncLocalStorage<GitReadScope>();
+const writeScopes = new AsyncLocalStorage<WorkspaceWriteScope>();
+const exclusiveWorkspaceWrites = new Map<string, WorkspaceWriteScope>();
+
+function scopedGitReadBinding(candidate: string): Binding | undefined {
+  const scope = gitReadScopes.getStore();
+  if (!scope) return undefined;
+  // Re-resolve both the selected project and each read path against the pinned
+  // identity. A removed or nested replacement marker must never select a fallback.
+  refreshedBinding(scope.binding, scope.cwd, true);
+  refreshedBinding(scope.binding, candidate, true);
+  return scope.binding;
+}
+
+/** Branch routes mutate the desktop's complete refs through its account-bound protocol. */
+export async function runWorkspaceGitBranchOperation(cwd: string, action: 'checkout' | 'create' | 'delete', branch: string, force?: boolean): Promise<RpcResult | null> {
+  checkWorkspaceRequest();
+  const binding = resolveWorkspaceBinding(cwd);
+  if (!binding || binding.isolated) return null;
+  requireWorkspaceAdmission(binding);
+  if (readLease(binding) || exclusiveWorkspaceWrites.has(binding.root) || workspaceOperations.has(binding.root) || sharedWorkspaceExecutions.has(binding.root)) {
+    throw new AppError('Workspace is in use by a task or synchronization', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+  }
+  const capability = binding.localGitRead ? await desktopControl(binding, { op: 'git_read', action: 'prepare' }) : null;
+  if (!capability?.gitBranch) throw new AppError('Update the desktop client before changing workspace branches', { code: 'WORKSPACE_GIT_UNSUPPORTED', statusCode: 409 });
+  return desktopControl(binding, { op: 'git_branch', action, branch, ...(action === 'delete' ? { force: force === true } : {}) });
+}
+
+/** Git routes select one source for the whole read, including file-content reads. */
+export async function withWorkspaceGitReadOperation<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
+  checkWorkspaceRequest();
+  const binding = resolveWorkspaceBinding(cwd);
+  if (!binding) return operation();
+  let native = false;
+  // Native Git reads inspect the owning repository, including refs/remotes that
+  // are deliberately absent from the synchronized execution replica.
+  if (binding.localGitRead && !binding.isolated && !readLease(binding) && !exclusiveWorkspaceWrites.has(binding.root)) {
+    try { native = (await desktopControl(binding, { op: 'git_read', action: 'prepare' })).localGitRead === true; }
+    catch (error) {
+      // A task can claim ownership between this observation and native admission.
+      // Select the replica once; never switch sources halfway through a response.
+      if (!(error instanceof AppError) || error.code !== 'WORKSPACE_BUSY') throw error;
+    }
+  }
+  // Admission itself is asynchronous: do not enter with a replaced capability.
+  refreshedBinding(binding, cwd, true);
+  return gitReadScopes.run({ binding, cwd, native }, async () => {
+    const result = await operation();
+    // Routes buffer their JSON until this scope returns. Discard a response if
+    // rebinding happened during the final request or was caught by its handler.
+    checkWorkspaceRequest();
+    refreshedBinding(binding, cwd, true);
+    return result;
+  });
+}
+
+/** Git mutations hold one exclusive reservation through preflight, writes and handback. */
+export async function withWorkspaceWriteOperation<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
+  checkWorkspaceRequest();
+  const binding = resolveWorkspaceBinding(cwd);
+  if (!binding) return operation();
+  requireWorkspaceAdmission(binding);
+  if (readLease(binding) || exclusiveWorkspaceWrites.has(binding.root) || workspaceOperations.has(binding.root) || preparedWorkspaceWorkers.has(binding.root) || sharedWorkspaceExecutions.has(binding.root)) {
+    throw new AppError('Workspace is in use by a task or synchronization; wait for it to finish before changing Git.', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+  }
+  const scope: WorkspaceWriteScope = { binding, lease: binding.vps ? claimWorkspace(binding) : null, active: true };
+  exclusiveWorkspaceWrites.set(binding.root, scope);
+  let prepared = false;
+  try {
+    return await completeWithCleanup(async () => {
+      if (binding.vps && !binding.isolated) {
+        await desktopControl(binding, { op: 'sync_begin', runId: scope.lease!.id });
+        prepared = true;
+      }
+      checkWorkspaceRequest();
+      refreshedBinding(binding);
+      return writeScopes.run(scope, operation);
+    }, async () => {
+      scope.active = false;
+      if (scope.lease) {
+        await preparedWorkspaceWorkers.get(binding.root)?.catch(() => {});
+        await waitPreparedPreviewStartups(binding.root);
+        await releaseWorkspace(binding, scope.lease, prepared);
+      }
+    });
+  } finally {
+    if (exclusiveWorkspaceWrites.get(binding.root) === scope) exclusiveWorkspaceWrites.delete(binding.root);
+  }
+}
+
+function scopedWriteLease(binding: Binding): WorkspaceWriteScope | undefined {
+  const scope = writeScopes.getStore();
+  if (scope?.binding.root !== binding.root) return undefined;
+  if (!scope.active || exclusiveWorkspaceWrites.get(binding.root) !== scope) throw new AppError('Git operation reservation has ended', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+  if (scope.lease) {
+    const lease = readLease(binding);
+    if (!lease || lease.id !== scope.lease.id || lease.epoch !== scope.lease.epoch || lease.owner !== 'claude') throw new AppError('Git operation reservation changed', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+  }
+  return scope;
+}
+
+function rejectExclusiveWorkspaceWrite(binding: Binding): void {
+  if (exclusiveWorkspaceWrites.has(binding.root) && !scopedWriteLease(binding)) {
+    throw new AppError('Workspace is reserved by another Git operation', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+  }
+}
+
+/**
+ * Local bridge bindings do not have the VPS sync lease protocol. Keep a
+ * process-local project execution barrier for the shared-root fallback so two
+ * sessions cannot mutate the same non-Git workspace concurrently. Git sessions
+ * leave this barrier by switching to their retained session worktree first.
+ */
+const sharedWorkspaceExecutions = new Map<string, Promise<void>>();
+
+function abortableBarrier(signal?: AbortSignal): Promise<never> {
+  return new Promise((_, reject) => {
+    if (signal?.aborted) { reject(signal.reason); return; }
+    signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+  });
+}
+
+async function acquireSharedWorkspaceExecution(root: string, signal?: AbortSignal): Promise<() => void> {
+  const previous = sharedWorkspaceExecutions.get(root) ?? Promise.resolve();
+  let release!: () => void;
+  let cancelled = false;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const current = previous.catch(() => {}).then(async () => {
+    if (cancelled) return;
+    await held;
+  });
+  sharedWorkspaceExecutions.set(root, current);
+  try {
+    await Promise.race([previous, abortableBarrier(signal)]);
+    signal?.throwIfAborted();
+    return () => {
+      release();
+      if (sharedWorkspaceExecutions.get(root) === current) sharedWorkspaceExecutions.delete(root);
+    };
+  } catch (error) {
+    cancelled = true;
+    // Leave the queue entry until the preceding owner has finished. This lets
+    // the next waiter pass through without making a cancelled waiter reorder
+    // project execution.
+    current.finally(() => {
+      if (sharedWorkspaceExecutions.get(root) === current) sharedWorkspaceExecutions.delete(root);
+    }).catch(() => {});
+    throw error;
+  }
+}
+
 async function rpc(binding: Binding, request: Record<string, unknown>, signal?: AbortSignal): Promise<RpcResult> {
   signal = operationSignal(signal);
   signal?.throwIfAborted();
-  binding = refreshedBinding(binding);
+  binding = scopedGitReadBinding(binding.root) ?? refreshedBinding(binding);
+  const gitRead = gitReadScopes.getStore();
+  if (gitRead?.native && !workspaceRequestWrites(request)) {
+    if (!['stat', 'lstat', 'read', 'realpath'].includes(String(request.op))) {
+      throw new AppError('This read is not supported by the selected native Git source', { code: 'WORKSPACE_GIT_UNSUPPORTED', statusCode: 409 });
+    }
+    const result = await desktopControl(binding, { op: 'git_read', action: request.op, path: request.path }, signal);
+    scopedGitReadBinding(binding.root);
+    return result;
+  }
+  const writes = workspaceRequestWrites(request);
+  if (writes) rejectExclusiveWorkspaceWrite(binding);
   if (!binding.vps) return desktopControl(binding, request, signal);
-  // File Tree and Git requests share the same serialization as model tools.
-  return enqueueWorkspaceOperation(binding.root, async () => {
+  // Snapshot reads remain available during a task or failed synchronization.
+  // The kernel mounts the replica read-only; no ownership is borrowed.
+  if (!writes) return runVPSWorker(binding, request, null, signal);
+  requireWorkspaceAdmission(binding);
+  const scope = scopedWriteLease(binding);
+  if (scope?.lease) {
+    const current = readLease(binding)!;
+    if (current.mayWrite !== true) saveLease(binding, { ...current, mayWrite: true });
+    return String(request.op).startsWith('preview_') ? desktopControl(binding, request, signal) : runVPSWorker(binding, request, scope.lease, signal);
+  }
+  // File Tree and model tools retain their existing per-command serialization.
+  const previous = workspaceOperations.get(binding.root) ?? Promise.resolve();
+  const operation = previous.catch(() => {}).then(async () => {
     signal?.throwIfAborted();
     binding = refreshedBinding(binding);
     const current = admittedWorkspaceLease(binding);
@@ -566,13 +917,14 @@ async function rpc(binding: Binding, request: Record<string, unknown>, signal?: 
     const lease = current ?? claimWorkspace(binding);
     let prepared = Boolean(current);
     return completeWithCleanup(async () => {
-      if (!current) {
+      if (!current && !binding.isolated) {
         await desktopControl(binding, { op: 'sync_begin', runId: lease.id }, signal);
         prepared = true;
       }
       signal?.throwIfAborted();
       binding = refreshedBinding(binding);
-      const readOnly = workspaceRequestReadOnly(request);
+      const readOnly = ['stat', 'lstat', 'list', 'batch', 'realpath', 'read', 'search', 'grep', 'preview_status'].includes(String(request.op))
+        || (request.op === 'exec' && request.readOnly === true);
       // Mark before execution so cancellation or a failed write still follows full recovery.
       if (!readOnly && lease.mayWrite !== true) saveLease(binding, { ...readLease(binding)!, mayWrite: true });
       return String(request.op).startsWith('preview_') ? await desktopControl(binding, request, signal) : await vpsWorker(binding, request, signal);
@@ -584,21 +936,34 @@ async function rpc(binding: Binding, request: Record<string, unknown>, signal?: 
       }
     }, signal);
   });
+  workspaceOperations.set(binding.root, operation);
+  try { return await operation; }
+  finally { if (workspaceOperations.get(binding.root) === operation) workspaceOperations.delete(binding.root); }
 }
 
 async function fileCall(candidate: string, op: string, extra: Record<string, unknown> = {}): Promise<RpcResult | null> {
   checkWorkspaceRequest();
-  const binding = resolveWorkspaceBinding(candidate);
-  return binding ? rpc(binding, { op, path: virtualPath(binding, candidate), ...extra }) : null;
+  const binding = scopedGitReadBinding(candidate) ?? resolveWorkspaceBinding(candidate);
+  if (!binding) return null;
+  const result = await rpc(binding, { op, path: virtualPath(binding, candidate), ...extra });
+  scopedGitReadBinding(candidate);
+  return result;
 }
 
-/** Used by the Git router; arguments execute inside the same project container. */
-export async function runWorkspaceCommand(cwd: string, command: string, args: string[]): Promise<RpcResult | null> {
+/** Git routes explicitly mark reads; mapped desktop reads use the selected owner capability. */
+export async function runWorkspaceCommand(cwd: string, command: string, args: string[], options: { readOnly?: boolean } = {}): Promise<RpcResult | null> {
   checkWorkspaceRequest();
-  const binding = resolveWorkspaceBinding(cwd);
+  const binding = scopedGitReadBinding(cwd) ?? resolveWorkspaceBinding(cwd);
   if (!binding) return null;
   const workspaceArgs = args.map(arg => arg === binding.root || arg.startsWith(binding.root + path.sep) ? virtualPath(binding, arg) : arg);
-  const result = await rpc(binding, { op: 'exec', path: virtualPath(binding, cwd), argv: [command, ...workspaceArgs], timeoutSeconds: 60 });
+  const gitRead = gitReadScopes.getStore();
+  if (options.readOnly && gitRead?.native && command !== 'git') {
+    throw new AppError('This command is not supported by the selected native Git source', { code: 'WORKSPACE_GIT_UNSUPPORTED', statusCode: 409 });
+  }
+  const result = options.readOnly && command === 'git' && gitRead?.native
+    ? await desktopControl(binding, { op: 'git_read', action: 'command', path: virtualPath(binding, cwd), argv: ['git', '--no-optional-locks', ...workspaceArgs] })
+    : await rpc(binding, { op: 'exec', path: virtualPath(binding, cwd), argv: [command, ...(command === 'git' ? ['--literal-pathspecs', ...(options.readOnly ? ['--no-optional-locks'] : [])] : []), ...workspaceArgs], timeoutSeconds: 60, readOnly: options.readOnly === true });
+  scopedGitReadBinding(cwd);
   // Git's repository-root response is a path consumed by server routing.
   if (command === 'git' && args[0] === 'rev-parse' && args[1] === '--show-toplevel' && result.exitCode === 0) {
     const root = result.stdout?.trim();
@@ -638,12 +1003,16 @@ export function bridgeFileSystem(base: FileTreeFileSystem): FileTreeFileSystem {
 
   async function readCall(candidate: string, op: FileTreeReadRequest['op'], includeStats = false): Promise<RpcResult | null> {
     checkWorkspaceRequest();
-    const binding = resolveWorkspaceBinding(candidate);
+    const binding = scopedGitReadBinding(candidate) ?? resolveWorkspaceBinding(candidate);
     if (!binding) return null;
     const request: FileTreeReadRequest = { op, path: virtualPath(binding, candidate), ...(includeStats ? { includeStats: true } : {}) };
-    if (!binding.readBatch) return rpc(binding, request);
+    if (!binding.readBatch || gitReadScopes.getStore()?.native) {
+      const result = await rpc(binding, request);
+      scopedGitReadBinding(candidate);
+      return result;
+    }
     const key = JSON.stringify([binding.root, binding.bindingEpoch, binding.port, binding.token, requestScopes.getStore()?.id]);
-    return new Promise<RpcResult>((resolve, reject) => {
+    const result = await new Promise<RpcResult>((resolve, reject) => {
       let pending = pendingReads.get(key);
       if (!pending) {
         pending = [];
@@ -656,6 +1025,8 @@ export function bridgeFileSystem(base: FileTreeFileSystem): FileTreeFileSystem {
       }
       pending.push({ request, resolve, reject });
     });
+    scopedGitReadBinding(candidate);
+    return result;
   }
 
   async function stats(candidate: string, op: 'stat' | 'lstat') {
@@ -684,9 +1055,10 @@ export function bridgeFileSystem(base: FileTreeFileSystem): FileTreeFileSystem {
     },
     async realpath(p) {
       checkWorkspaceRequest();
-      const binding = resolveWorkspaceBinding(p);
+      const binding = scopedGitReadBinding(p) ?? resolveWorkspaceBinding(p);
       if (!binding) return base.realpath(p);
       const result = await rpc(binding, { op: 'realpath', path: virtualPath(binding, p) });
+      scopedGitReadBinding(p);
       return path.join(binding.root, path.relative('/workspace', result.path!));
     },
     async readTextFile(p) { const result = await fileCall(p, 'read'); return result ? Buffer.from(result.b64!, 'base64').toString('utf8') : base.readTextFile(p); },
@@ -727,9 +1099,14 @@ export function bridgeFileSystem(base: FileTreeFileSystem): FileTreeFileSystem {
       await rpc(binding, { op: 'copy', path: virtualPath(binding, p), destination: virtualPath(binding, destination) });
     },
     createReadStream(p) {
-      const binding = resolveWorkspaceBinding(p);
+      checkWorkspaceRequest();
+      const binding = scopedGitReadBinding(p) ?? resolveWorkspaceBinding(p);
       if (!binding) return base.createReadStream(p);
-      return Readable.from((async function* () { const result = await rpc(binding, { op: 'read', path: virtualPath(binding, p) }); yield Buffer.from(result.b64!, 'base64'); })());
+      return Readable.from((async function* () {
+        const result = await rpc(binding, { op: 'read', path: virtualPath(binding, p) });
+        scopedGitReadBinding(p);
+        yield Buffer.from(result.b64!, 'base64');
+      })());
     },
   };
 }
@@ -751,8 +1128,9 @@ export function bridgeGitFileSystem(base: WorkspaceGitFileSystem): WorkspaceGitF
   };
 }
 
-function workspaceTools(binding: Binding, signal?: AbortSignal) {
+function workspaceTools(binding: Binding, signal?: AbortSignal, readOnlySession = false) {
   async function result(request: Record<string, unknown>) {
+    if (readOnlySession && workspaceRequestWrites(request)) return { isError: true, content: [{ type: 'text' as const, text: '当前会话为只读检查模式，不能修改文件、运行写命令或控制预览。' }] };
     try { return { content: [{ type: 'text' as const, text: JSON.stringify(await rpc(binding, request, signal)) }] }; }
     catch (error) { return { isError: true, content: [{ type: 'text' as const, text: error instanceof Error ? error.message : 'Workspace operation failed' }] }; }
   }
@@ -858,8 +1236,14 @@ function ownClaudeDescendants(child: ChildProcess, owner: Buffer) {
 
 /** Used by Claude runtime; bound workspaces expose only their project tools. */
 export function workspaceQuery(input: Parameters<typeof sdkQuery>[0], onProcessExit?: () => void): ReturnType<typeof sdkQuery> {
-  const binding = input.options?.cwd ? resolveWorkspaceBinding(input.options.cwd) : null;
+  let binding = input.options?.cwd ? resolveWorkspaceBinding(input.options.cwd) : null;
   const options = input.options ?? {};
+  const sessionOptions = options as typeof options & { chisaSessionId?: unknown; sessionId?: unknown; workspaceMode?: unknown };
+  const sessionId = typeof sessionOptions.chisaSessionId === 'string' ? sessionOptions.chisaSessionId : typeof sessionOptions.sessionId === 'string' ? sessionOptions.sessionId : null;
+  const workspaceMode: SessionWorkspaceMode = sessionOptions.workspaceMode === 'shared' ? 'shared' : 'isolated';
+  if ('chisaSessionId' in sessionOptions) delete sessionOptions.chisaSessionId;
+  if ('workspaceMode' in sessionOptions) delete sessionOptions.workspaceMode;
+  const readOnlySession = binding !== null && options.permissionMode === 'plan';
   const cancellation = new AbortController();
   let stopOwnedDescendants = () => {};
   let waitOwnedDescendants = async () => {};
@@ -869,7 +1253,7 @@ export function workspaceQuery(input: Parameters<typeof sdkQuery>[0], onProcessE
   if (externalSignal?.aborted) cancelFromCaller();
   if (binding) {
     options.tools = ['AskUserQuestion', 'ExitPlanMode', 'TodoWrite'];
-    options.mcpServers = { workspace: workspaceTools(binding, cancellation.signal) };
+    options.mcpServers = { workspace: workspaceTools(binding, cancellation.signal, readOnlySession) };
     options.strictMcpConfig = true;
     // Workspace permissions are resolved by the runtime's policy callback, including aliases for the native tools they replace.
     options.allowedTools = (options.allowedTools ?? []).filter(entry => !entry.startsWith('mcp__workspace'));
@@ -914,10 +1298,12 @@ export function workspaceQuery(input: Parameters<typeof sdkQuery>[0], onProcessE
     return child as unknown as SpawnedProcess;
   };
   let active: ReturnType<typeof sdkQuery> | undefined;
+  let sdkStarted = false;
   let cancelled = false;
   let cleanup: Promise<void> | undefined;
   const stream = (async function* () {
     let lease: WorkspaceLease | undefined;
+    let releaseSharedExecution: (() => void) | undefined;
     let prepared = false;
     let primary: unknown;
     let failed = false;
@@ -925,14 +1311,42 @@ export function workspaceQuery(input: Parameters<typeof sdkQuery>[0], onProcessE
     let cleanupFailed = false;
     try {
       cancellation.signal.throwIfAborted();
-      if (binding) requireWorkspaceAdmission(binding);
-      if (binding?.vps) {
+      if (binding) {
+        requireWorkspaceAdmission(binding);
+        if (!readOnlySession) rejectExclusiveWorkspaceWrite(binding);
+      }
+      if (binding?.vps && !readOnlySession && workspaceMode === 'isolated' && sessionId) {
+        // Worktree creation probes and copies the source before it has its own
+        // binding. Keep Git writes out until isolation or a shared lease owns it.
+        releaseSharedExecution = await acquireSharedWorkspaceExecution(binding.root, cancellation.signal);
+        binding = refreshedBinding(binding);
+        rejectExclusiveWorkspaceWrite(binding);
+        const isolated = await createSessionWorktree(binding, sessionId, cancellation.signal);
+        if (isolated) {
+          binding = isolated;
+          options.cwd = isolated.root;
+          options.mcpServers = { workspace: workspaceTools(binding, cancellation.signal, false) };
+          releaseSharedExecution();
+          releaseSharedExecution = undefined;
+        }
+      }
+      if (binding && !readOnlySession && !binding.isolated && !binding.vps) {
+        releaseSharedExecution ??= await acquireSharedWorkspaceExecution(binding.root, cancellation.signal);
+      }
+      if (binding?.vps && !readOnlySession) {
+        // Transfer admission synchronously so Git cannot enter between the
+        // worktree fallback and ownership of the shared source workspace.
         lease = claimWorkspace(binding);
-        await desktopControl(binding, { op: 'sync_begin', runId: lease.id }, cancellation.signal);
-        prepared = true;
+        releaseSharedExecution?.();
+        releaseSharedExecution = undefined;
+        if (!binding.isolated) {
+          await desktopControl(binding, { op: 'sync_begin', runId: lease.id }, cancellation.signal);
+          prepared = true;
+        }
       }
       if (cancelled) return;
       cancellation.signal.throwIfAborted();
+      sdkStarted = true;
       active = sdkQuery({ ...input, options });
       yield* active;
     } catch (error) {
@@ -946,6 +1360,8 @@ export function workspaceQuery(input: Parameters<typeof sdkQuery>[0], onProcessE
         active?.close();
         await processExit;
         await waitOwnedDescendants();
+        releaseSharedExecution?.();
+        releaseSharedExecution = undefined;
         if (!lease || !binding) return;
         // The lease must outlive any command still shutting down in Docker.
         await workspaceOperations.get(binding.root)?.catch(() => {});
@@ -961,6 +1377,11 @@ export function workspaceQuery(input: Parameters<typeof sdkQuery>[0], onProcessE
       finally { externalSignal?.removeEventListener('abort', cancelFromCaller); }
     }
     if (cleanupFailed) throw cleanupFailure;
+    // Queue retries are safe only when workspace admission failed before the
+    // SDK started, and the attempted reservation was successfully cleaned up.
+    if (failed && !sdkStarted && primary instanceof Error && 'code' in primary && primary.code === 'WORKSPACE_BUSY') {
+      Object.assign(primary, { workspaceAdmissionRejected: true });
+    }
     if (failed) throw primary;
   })();
   const wrapped: typeof stream = new Proxy(stream, {
@@ -995,4 +1416,11 @@ export function workspaceQuery(input: Parameters<typeof sdkQuery>[0], onProcessE
     },
   });
   return wrapped as unknown as ReturnType<typeof sdkQuery>;
+}
+
+
+
+function workspaceRequestWrites(request: Record<string, unknown>): boolean {
+  if (request.op === 'exec') return request.readOnly !== true;
+  return !workspaceRequestReadOnly(request);
 }

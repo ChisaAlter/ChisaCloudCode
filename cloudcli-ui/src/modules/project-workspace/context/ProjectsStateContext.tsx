@@ -21,6 +21,7 @@ type ProjectMainState = Pick<
   | 'setActiveTab'
   | 'setSidebarOpen'
   | 'isLoadingProjects'
+  | 'projectsLoadFailed'
   | 'openSettings'
   | 'externalMessageUpdate'
   | 'newSessionTrigger'
@@ -93,6 +94,7 @@ export function ProjectsStateProvider({
       setActiveTab: state.setActiveTab,
       setSidebarOpen: state.setSidebarOpen,
       isLoadingProjects: state.isLoadingProjects,
+      projectsLoadFailed: state.projectsLoadFailed,
       openSettings: state.openSettings,
       externalMessageUpdate: state.externalMessageUpdate,
       newSessionTrigger: state.newSessionTrigger,
@@ -105,6 +107,7 @@ export function ProjectsStateProvider({
       state.externalMessageUpdate,
       state.handleProjectSelect,
       state.isLoadingProjects,
+      state.projectsLoadFailed,
       state.newSessionTrigger,
       state.openSettings,
       state.refreshProjectsSilently,

@@ -1,4 +1,5 @@
 import { memo, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
 
 import { useProjectMainState } from '@/modules/project-workspace/context/ProjectsStateContext';
 import type { SessionEstablishedContext, SessionNavigationOptions,ProjectWorkspaceShellProps } from '@/shared/types';
@@ -11,6 +12,7 @@ function ProjectMainRegion({
   sendMessage,
   navigate,
 }: ProjectWorkspaceShellProps) {
+  const { t } = useTranslation('common');
   const {
     projects,
     selectedProject,
@@ -19,6 +21,7 @@ function ProjectMainRegion({
     setActiveTab,
     setSidebarOpen,
     isLoadingProjects,
+    projectsLoadFailed,
     openSettings,
     externalMessageUpdate,
     newSessionTrigger,
@@ -50,25 +53,35 @@ function ProjectMainRegion({
   }, [refreshProjectsSilently]);
 
   return (
-    <WorkspaceMain
-      projects={projects}
-      selectedProject={selectedProject}
-      selectedSession={selectedSession}
-      activeTab={activeTab}
-      setActiveTab={setActiveTab}
-      ws={ws}
-      sendMessage={sendMessage}
-      isMobile={isMobile}
-      onMenuClick={handleOpenSidebar}
-      isLoading={isLoadingProjects}
-      onNavigateToSession={handleNavigateToSession}
-      onSessionEstablished={handleSessionEstablished}
-      onShowSettings={openSettings}
-      externalMessageUpdate={externalMessageUpdate}
-      newSessionTrigger={newSessionTrigger}
-      onProjectSelect={handleProjectSelect}
-      onProjectsRefresh={handleProjectsRefresh}
-    />
+    <>
+      {projectsLoadFailed && (
+        <div role="alert" className="flex items-center justify-between gap-3 border-b border-border bg-muted px-4 py-2 text-sm">
+          <span>{t('misc.projectsLoadFailed', { defaultValue: 'Could not load projects and sessions. Check your connection and retry.' })}</span>
+          <button type="button" onClick={handleProjectsRefresh} disabled={isLoadingProjects} className="shrink-0 rounded px-3 py-1 hover:bg-accent disabled:opacity-50">
+            {t('buttons.retry')}
+          </button>
+        </div>
+      )}
+      <WorkspaceMain
+        projects={projects}
+        selectedProject={selectedProject}
+        selectedSession={selectedSession}
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        ws={ws}
+        sendMessage={sendMessage}
+        isMobile={isMobile}
+        onMenuClick={handleOpenSidebar}
+        isLoading={isLoadingProjects}
+        onNavigateToSession={handleNavigateToSession}
+        onSessionEstablished={handleSessionEstablished}
+        onShowSettings={openSettings}
+        externalMessageUpdate={externalMessageUpdate}
+        newSessionTrigger={newSessionTrigger}
+        onProjectSelect={handleProjectSelect}
+        onProjectsRefresh={handleProjectsRefresh}
+      />
+    </>
   );
 }
 

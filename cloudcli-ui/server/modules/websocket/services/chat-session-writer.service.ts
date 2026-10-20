@@ -127,6 +127,16 @@ export class ChatSessionWriter {
     this.connections.add(newConnection);
   }
 
+  /**
+   * Broadcasts a gateway lifecycle event without passing it through the
+   * provider transcript sequence. The run registry uses this for admission and
+   * preparation status, while `chat.subscribe` supplies the current snapshot
+   * after reconnect.
+   */
+  sendGatewayEvent(event: Record<string, unknown>): void {
+    this.forwardGateway(event);
+  }
+
   setSessionId(sessionId: string): void {
     this.captureProviderSessionId(sessionId);
   }
@@ -142,6 +152,17 @@ export class ChatSessionWriter {
 
     this.providerSessionId = providerSessionId;
     this.options.onProviderSessionId(providerSessionId);
+  }
+
+  private forwardGateway(event: Record<string, unknown>): void {
+    const payload = JSON.stringify(event);
+    for (const connection of this.connections) {
+      if (connection.readyState === WS_OPEN_STATE) {
+        connection.send(payload);
+      } else {
+        this.connections.delete(connection);
+      }
+    }
   }
 
   private forward(message: NormalizedMessage): void {

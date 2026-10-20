@@ -160,9 +160,9 @@ export async function terminateProviderProcess(child: ChildProcess): Promise<voi
 }
 
 /**
- * The workspace bridge and managed preview service resolve a canonical project
- * to its enrolled account network. Unmanaged legacy workspaces return undefined;
- * a neighboring path must never inherit an account's network registration.
+ * Workspace bridge workers and managed previews resolve their account network
+ * from the nearest inspected root registration. Descendants, including session
+ * worktrees beneath the account root, inherit it; sibling prefixes do not.
  */
 export function getWorkspaceSyncNetwork(candidate: string): string | undefined {
   let current = path.resolve(candidate);
@@ -351,8 +351,9 @@ export function normalizeProjectPath(inputPath: string): string {
  * Validates that a user-supplied workspace path is safe to use.
  *
  * Call this before any filesystem mutation that creates or registers projects.
- * The function resolves symlinks, enforces `WORKSPACES_ROOT` containment, and
- * blocks known system directories.
+ * The function resolves existing ancestors and symlinks, enforces canonical
+ * `WORKSPACES_ROOT` containment, and blocks known system directories. An explicit
+ * safe workspace below /opt may override only that ancestor's blanket ban.
  */
 export async function validateWorkspacePath(requestedPath: string): Promise<WorkspacePathValidationResult> {
   try {
@@ -367,40 +368,23 @@ export async function validateWorkspacePath(requestedPath: string): Promise<Work
     const absolutePath = path.resolve(normalizedRequestedPath);
     const normalizedPath = normalizeProjectPath(absolutePath);
 
-    if (FORBIDDEN_WORKSPACE_PATHS.includes(normalizedPath) || normalizedPath === '/') {
-      return {
-        valid: false,
-        error: 'Cannot use system-critical directories as workspace locations',
-      };
-    }
-
-    let resolvedPath = normalizeProjectPath(absolutePath);
-    try {
-      await access(absolutePath);
-      resolvedPath = normalizeProjectPath(await realpath(absolutePath));
-    } catch (error) {
-      const fileError = error as NodeJS.ErrnoException;
-      if (fileError.code !== 'ENOENT') {
-        throw fileError;
-      }
-
-      // A nested new directory may have a symlink above its missing parents.
-      // Resolve the nearest existing ancestor before checking containment.
-      let ancestorPath = path.dirname(absolutePath);
-      const missingSegments = [path.basename(absolutePath)];
-      for (;;) {
-        try {
-          const ancestorRealPath = await realpath(ancestorPath);
-          resolvedPath = normalizeProjectPath(path.join(ancestorRealPath, ...missingSegments));
-          break;
-        } catch (ancestorError) {
-          const parentPath = path.dirname(ancestorPath);
-          if ((ancestorError as NodeJS.ErrnoException).code !== 'ENOENT' || parentPath === ancestorPath) {
-            throw ancestorError;
-          }
-          missingSegments.unshift(path.basename(ancestorPath));
-          ancestorPath = parentPath;
+    // Resolve the nearest existing ancestor as well as existing directories: a
+    // missing nested project must not hide a symlink that escapes the workspace.
+    let existingAncestor = absolutePath;
+    const missingSegments: string[] = [];
+    let resolvedPath: string;
+    while (true) {
+      try {
+        resolvedPath = normalizeProjectPath(path.join(await realpath(existingAncestor), ...missingSegments));
+        break;
+      } catch (error) {
+        const fileError = error as NodeJS.ErrnoException;
+        const parentPath = path.dirname(existingAncestor);
+        if (fileError.code !== 'ENOENT' || parentPath === existingAncestor) {
+          throw fileError;
         }
+        missingSegments.unshift(path.basename(existingAncestor));
+        existingAncestor = parentPath;
       }
     }
 
@@ -415,34 +399,30 @@ export async function validateWorkspacePath(requestedPath: string): Promise<Work
       };
     }
 
-    // Enrollment can authorize a dedicated root under /opt or another system
-    // parent. Only its canonical subtree is allowed; a system root or HOME
-    // itself never grants this exception.
-    const dedicatedConfiguredRoot = Boolean(
-      process.env.WORKSPACES_ROOT
-      && path.isAbsolute(process.env.WORKSPACES_ROOT)
-      && resolvedWorkspaceRoot !== normalizeProjectPath(await realpath(os.homedir()))
-      && !FORBIDDEN_WORKSPACE_PATHS.some(forbiddenPath =>
-        normalizeProjectPath(forbiddenPath) === resolvedWorkspaceRoot),
-    );
-    for (const forbiddenPath of FORBIDDEN_WORKSPACE_PATHS) {
-      const normalizedForbiddenPath = normalizeProjectPath(forbiddenPath);
-      if (
-        resolvedPath === normalizedForbiddenPath
-        || resolvedPath.startsWith(`${normalizedForbiddenPath}${path.sep}`)
-      ) {
-        if (dedicatedConfiguredRoot) continue;
-        // Allow specific user-writable folders under /var.
-        if (
-          normalizedForbiddenPath === '/var'
-          && (resolvedPath.startsWith('/var/tmp') || resolvedPath.startsWith('/var/folders'))
-        ) {
+    // /opt is a common deployment location. Only an explicitly configured,
+    // contained workspace below it may override that ancestor ban; /opt itself
+    // and every other critical directory remain forbidden, including via links.
+    const allowConfiguredOptWorkspace = Boolean(process.env.WORKSPACES_ROOT?.trim())
+      && resolvedWorkspaceRoot.startsWith(`/opt${path.sep}`);
+    for (const checkedPath of [normalizedPath, resolvedPath]) {
+      for (const forbiddenPath of FORBIDDEN_WORKSPACE_PATHS) {
+        const normalizedForbiddenPath = normalizeProjectPath(forbiddenPath);
+        if (checkedPath === normalizedForbiddenPath || checkedPath === path.parse(checkedPath).root) {
+          return { valid: false, error: 'Cannot use system-critical directories as workspace locations' };
+        }
+        if (!checkedPath.startsWith(`${normalizedForbiddenPath}${path.sep}`)) {
           continue;
         }
-        return {
-          valid: false,
-          error: `Cannot create workspace in system directory: ${forbiddenPath}`,
-        };
+        if (normalizedForbiddenPath === '/opt' && allowConfiguredOptWorkspace) {
+          continue;
+        }
+        // Preserve the existing user-writable /var locations, with segment boundaries.
+        if (normalizedForbiddenPath === '/var' && ['/var/tmp', '/var/folders'].some(
+          allowedPath => checkedPath === allowedPath || checkedPath.startsWith(`${allowedPath}${path.sep}`),
+        )) {
+          continue;
+        }
+        return { valid: false, error: `Cannot create workspace in system directory: ${forbiddenPath}` };
       }
     }
 
@@ -1365,3 +1345,40 @@ export const extractClaudeResolvedModel = (event: ClaudeModelEvent): string | nu
     && !['default', 'best', 'fable', 'sonnet', 'sonnet[1m]', 'opus', 'opus[1m]', 'haiku', 'opusplan'].includes(normalized)
     ? normalized : null;
 };
+
+
+
+//----------------- CLAUDE CONNECTION VALIDATION ------------
+/** Providers runtime resolves only authenticated positive integer identities; missing identities select no override. */
+export function normalizeConnectionUserId(value: unknown): number | null {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+
+
+/** Providers settings operations require an authenticated identity, never an id supplied in request data. */
+export function requireConnectionUserId(value: unknown): number {
+  const id = normalizeConnectionUserId(value);
+  if (!id) throw new AppError('Authentication is required.', { code: 'UNAUTHORIZED', statusCode: 401 });
+  return id;
+}
+
+
+
+/** Providers normalizes Messages base URLs while rejecting credentials, query secrets, and API suffixes. */
+export function normalizeClaudeEndpointUrl(value: string): string {
+  try {
+    if (/[\s?#]/.test(value)) throw new Error('Invalid URL');
+    const url = new URL(value);
+    const pathname = decodeURIComponent(url.pathname).replace(/\/+$/, '');
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash
+      || /\/v1(?:\/messages)?$/i.test(pathname)) throw new Error('Invalid URL');
+    return url.toString().replace(/\/+$/, '');
+  } catch {
+    throw new AppError('Use an HTTP(S) base URL without credentials, query, fragment, /v1 or /v1/messages.', {
+      code: 'INVALID_CONNECTION_URL', statusCode: 400,
+    });
+  }
+}

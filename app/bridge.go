@@ -73,11 +73,18 @@ type bridgeRequest struct {
 }
 
 var bridgeRequests sync.Map
+var frontendRequestsMu sync.Mutex
+var frontendRequestsClosed bool
 
 // Reserve before sending so cancellation also works before HTTP forwarding starts.
 func (FrontendBridge) BeginServerRequest() string {
 	serverConnectionMu.RLock()
 	defer serverConnectionMu.RUnlock()
+	frontendRequestsMu.Lock()
+	defer frontendRequestsMu.Unlock()
+	if frontendRequestsClosed {
+		return ""
+	}
 	if apiConnection == nil {
 		return ""
 	}
@@ -88,10 +95,38 @@ func (FrontendBridge) BeginServerRequest() string {
 	return id
 }
 
+// The window owns frontend reservations, not the account connection: native Pi
+// handback and preview recovery still need that connection after the window exits.
+// Serialize closure with Begin so already-queued bridge calls cannot reserve a
+// new request after the window has gone away.
+func closeFrontendServerRequests() {
+	frontendRequestsMu.Lock()
+	defer frontendRequestsMu.Unlock()
+	frontendRequestsClosed = true
+	bridgeRequests.Range(func(_, pending any) bool {
+		pending.(*bridgeRequest).cancel()
+		return true
+	})
+}
+
 func (FrontendBridge) CancelServerRequest(id string) {
 	if pending, ok := bridgeRequests.Load(id); ok {
 		pending.(*bridgeRequest).cancel()
 	}
+}
+
+// Native transport failures keep the same HTTP-style contract as service errors.
+// In particular, callers must not mistake a failed response for an empty result.
+func bridgeErrorResponse(status int, code, message string) BridgeResponse {
+	raw, _ := json.Marshal(map[string]any{"error": map[string]string{"code": code, "message": message}})
+	return BridgeResponse{Status: status, Headers: map[string]string{"Content-Type": "application/json", "X-Chisa-Error": code}, BodyB64: base64.StdEncoding.EncodeToString(raw)}
+}
+
+func bridgeInterruptedResponse(ctx context.Context) BridgeResponse {
+	if ctx.Err() == context.DeadlineExceeded {
+		return bridgeErrorResponse(499, "REQUEST_TIMED_OUT", "请求已超时；涉及工作区的操作请先确认同步状态")
+	}
+	return bridgeErrorResponse(499, "REQUEST_INTERRUPTED", "请求已中断；涉及工作区的操作请先确认同步状态")
 }
 
 // ServerRequest forwards account APIs over the independently verified service connection.
@@ -101,16 +136,13 @@ func (FrontendBridge) ServerRequest(id, method, path string, headers map[string]
 	resp := BridgeResponse{Status: 502, Headers: map[string]string{}, BodyB64: ""}
 	pending, ok := bridgeRequests.Load(id)
 	if !ok {
-		resp.Status = 499
-		resp.Headers["X-Chisa-Error"] = "request canceled"
-		return resp
+		return bridgeErrorResponse(499, "REQUEST_CANCELED", "请求已取消")
 	}
 	request := pending.(*bridgeRequest)
 	defer request.cancel()
 	defer bridgeRequests.Delete(id)
 	if request.ctx.Err() != nil {
-		resp.Status = 499
-		return resp
+		return bridgeInterruptedResponse(request.ctx)
 	}
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
@@ -148,22 +180,20 @@ func (FrontendBridge) ServerRequest(id, method, path string, headers map[string]
 	}
 	deadline, _ := request.ctx.Deadline()
 	req.Header.Set(workspaceDeadlineHeader, strconv.FormatInt(deadline.UnixMilli(), 10))
+	trace := newServerRequestTrace(started, request.connection.version, req.Method, endpoint.Path)
+	req = req.WithContext(trace.context(req.Context()))
+	slowLog := time.AfterFunc(15*time.Second, func() { trace.log("slow", nil, -1, -1) })
+	defer slowLog.Stop()
 	up, err := request.connection.client.Do(req)
 	if err != nil {
 		if request.ctx.Err() != nil {
-			resp.Status = 499
-			resp.Headers["X-Chisa-Error"] = "request interrupted; operation may require workspace recovery"
-			return resp
+			return bridgeInterruptedResponse(request.ctx)
 		}
-		requestError := err
-		if wrapped, ok := err.(*url.Error); ok {
-			requestError = wrapped.Err
-		}
-		log.Printf("[server-request] endpoint=%s elapsed=%s error=%v", endpoint.Path, time.Since(started), requestError)
-		resp.BodyB64 = b64encode(`{"error":{"message":"无法连接账号服务，请检查服务地址、网络和客户端证书"}}`)
-		return resp
+		trace.log("transport-failed", err, 0, -1)
+		return bridgeErrorResponse(502, "UPSTREAM_CONNECTION_FAILED", "无法连接账号服务，请检查服务地址、网络和客户端证书")
 	}
 	defer up.Body.Close()
+	trace.response(up)
 	resp.Status = up.StatusCode
 	for k := range up.Header {
 		lk := strings.ToLower(k)
@@ -173,24 +203,23 @@ func (FrontendBridge) ServerRequest(id, method, path string, headers map[string]
 	}
 	raw, readErr := io.ReadAll(io.LimitReader(up.Body, 64*1024*1024+1))
 	if request.ctx.Err() != nil {
-		return BridgeResponse{Status: 499, Headers: map[string]string{}}
+		return bridgeInterruptedResponse(request.ctx)
 	}
 	if readErr != nil || len(raw) > 64*1024*1024 {
 		if readErr != nil {
-			log.Printf("[server-request] endpoint=%s elapsed=%s error=%v", endpoint.Path, time.Since(started), readErr)
-		} else {
-			log.Printf("[server-request] endpoint=%s elapsed=%s error=upstream response exceeds bridge limit", endpoint.Path, time.Since(started))
+			trace.log("body-failed", readErr, len(raw), up.ContentLength)
+			return bridgeErrorResponse(502, "UPSTREAM_RESPONSE_READ_FAILED", "账号服务响应中断，请先检查操作结果再重试")
 		}
-		resp.Status = 502
-		resp.Headers["X-Chisa-Error"] = "upstream response exceeds bridge limit"
-		return resp
+		trace.log("response-too-large", nil, len(raw), up.ContentLength)
+		return bridgeErrorResponse(502, "UPSTREAM_RESPONSE_TOO_LARGE", "账号服务响应超过客户端接收上限")
 	}
+	trace.complete()
 	responseConnection := request.connection
 	if resp.Status == http.StatusOK && (endpoint.Path == "/api/auth/login" || endpoint.Path == "/api/auth/user") {
 		serverConnectionMu.Lock()
 		if apiConnection != request.connection {
 			serverConnectionMu.Unlock()
-			return BridgeResponse{Status: 499, Headers: map[string]string{}}
+			return bridgeErrorResponse(499, "CONNECTION_CHANGED", "账号连接已改变，请重新发起请求")
 		}
 		var payload struct {
 			Token              string          `json:"token"`
@@ -269,7 +298,7 @@ func (FrontendBridge) ServerRequest(id, method, path string, headers map[string]
 	serverConnectionMu.Lock()
 	if apiConnection != responseConnection || responseConnection.ctx.Err() != nil {
 		serverConnectionMu.Unlock()
-		return BridgeResponse{Status: 499, Headers: map[string]string{}}
+		return bridgeErrorResponse(499, "CONNECTION_CHANGED", "账号连接已改变，请重新发起请求")
 	}
 	recordNativeRefreshedToken(responseConnection, up.Header, resp.Status)
 	serverConnectionMu.Unlock()
@@ -288,7 +317,7 @@ func recordNativeRefreshedToken(connection *serverConnection, headers http.Heade
 }
 
 func loginConnectionError() BridgeResponse {
-	return BridgeResponse{Status: 502, Headers: map[string]string{"Content-Type": "application/json"}, BodyB64: b64encode(`{"error":{"message":"登录成功，但无法保存对应服务连接；请重试"}}`)}
+	return bridgeErrorResponse(502, "LOGIN_CONNECTION_SAVE_FAILED", "登录成功，但无法保存对应服务连接；请重试")
 }
 
 // SelectLocalFolder 原生目录选择器 → 静默建立同步与服务器映射
@@ -402,14 +431,20 @@ func (FrontendBridge) ConnectServer(rawURL string) map[string]any {
 		return map[string]any{"ok": false, "error": err.Error()}
 	}
 	serverConnectionMu.Lock()
-	defer serverConnectionMu.Unlock()
-	if apiConnection != nil && apiConnection.loginURL == u {
-		return map[string]any{"ok": true, "serverUrl": u, "changed": false}
-	}
+	previous := apiConnection
 	next, err := newServerConnection(u, u)
+	serverConnectionMu.Unlock()
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error()}
 	}
+	// Probe without holding the account lock so a slow server cannot freeze state reads.
+	adopted := false
+	defer func() {
+		if !adopted {
+			next.cancel()
+			next.client.CloseIdleConnections()
+		}
+	}()
 	ctx, cancel := context.WithTimeout(next.ctx, 15*time.Second)
 	defer cancel()
 	request, _ := http.NewRequestWithContext(ctx, "GET", u+"/api/auth/status", nil)
@@ -418,10 +453,25 @@ func (FrontendBridge) ConnectServer(rawURL string) map[string]any {
 		next.cancel()
 		return map[string]any{"ok": false, "error": "账号服务连接失败，请检查 HTTPS 地址、网络和客户端证书"}
 	}
-	response.Body.Close()
-	if response.StatusCode != 200 {
-		next.cancel()
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
 		return map[string]any{"ok": false, "error": fmt.Sprintf("账号服务返回 HTTP %d", response.StatusCode)}
+	}
+	// A generic website's HTTP 200 is not proof of a compatible account service.
+	var status struct {
+		IsAuthenticated *bool `json:"isAuthenticated"`
+	}
+	raw, err := io.ReadAll(io.LimitReader(response.Body, 64*1024+1))
+	if err != nil || len(raw) > 64*1024 || json.Unmarshal(raw, &status) != nil || status.IsAuthenticated == nil {
+		return map[string]any{"ok": false, "error": "服务器响应无效，请填写 ChisaCloudCode 账号服务地址"}
+	}
+	serverConnectionMu.Lock()
+	defer serverConnectionMu.Unlock()
+	if apiConnection != previous {
+		return map[string]any{"ok": false, "error": "账号连接已改变，请重新连接服务器"}
+	}
+	if previous != nil && previous.loginURL == u {
+		return map[string]any{"ok": true, "serverUrl": u, "changed": false}
 	}
 	cfg := store.config()
 	cfg.LoginURL, cfg.APIURL, cfg.WorkspaceServerURL = u, u, ""
@@ -430,6 +480,7 @@ func (FrontendBridge) ConnectServer(rawURL string) map[string]any {
 		return map[string]any{"ok": false, "error": "账号服务配置保存失败"}
 	}
 	replaceServerConnection(next)
+	adopted = true
 	if tunnel != nil {
 		tunnel.stop()
 	}
@@ -542,10 +593,10 @@ func (FrontendBridge) GetProjectSync(serverPath string) SyncInfo {
 		return observedProjectSync(serverPath)
 	}
 	if !workspaceMappingActiveLocked(mapping) {
-		return SyncInfo{Status: "disconnected", Detail: "当前账号未连接本地文件同步", ServerPath: serverPath}
+		return observedProjectSync(serverPath, SyncInfo{Status: "disconnected", Detail: "当前账号未连接本地文件同步"})
 	}
-	if apiConnection.workspaceRecoveryOnly {
-		return SyncInfo{Status: "blocked", Detail: "工作区正在恢复交还，请先完成恢复再同步", ServerPath: serverPath, BindingEpoch: mapping.BindingEpoch}
+	if apiConnection != nil && apiConnection.workspaceRecoveryOnly {
+		return observedProjectSync(serverPath, SyncInfo{Status: "blocked", Detail: "工作区正在恢复交还，请先完成恢复再同步"})
 	}
 	ensureSyncMonitor()
 	return observedProjectSync(serverPath)

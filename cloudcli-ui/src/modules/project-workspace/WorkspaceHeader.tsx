@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 
 import type { AppTab, Project, ProjectSession } from '@/shared/types';
 import { cn } from '@/shared/utils';
+import { isDesktop } from '@/shared/chisa';
 import MobileMenuButton from '@/modules/project-workspace/MobileMenuButton';
 import WorkspaceTabs from '@/modules/project-workspace/WorkspaceTabs';
 import WorkspaceTitle from '@/modules/project-workspace/WorkspaceTitle';
@@ -31,6 +32,7 @@ export default function WorkspaceHeader({
   onMenuClick,
 }: WorkspaceHeaderProps) {
   const { t } = useTranslation();
+  const compact = isDesktop() && !isMobile;
   const scrollRef = useRef<HTMLDivElement>(null);
   const [canScrollLeft, setCanScrollLeft] = useState(false);
   const [canScrollRight, setCanScrollRight] = useState(false);
@@ -93,8 +95,8 @@ export default function WorkspaceHeader({
 
   return (
     <header className="workspace-header desktop-drag pwa-header-safe flex-shrink-0 px-4 py-2 sm:px-6">
-      <div className="flex min-w-0 flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-3">
-        <div className="flex min-w-0 items-center gap-2 sm:max-w-[min(34%,24rem)] sm:flex-[1_1_18rem]">
+      <div className="flex min-w-0 flex-col gap-1.5 sm:flex-row sm:items-center sm:gap-4">
+        <div className="flex min-w-0 items-center gap-2 sm:flex-1">
           {isMobile && <MobileMenuButton onMenuClick={onMenuClick} />}
           <WorkspaceTitle
             activeTab={activeTab}
@@ -104,7 +106,17 @@ export default function WorkspaceHeader({
           />
         </div>
 
-        <div className="-mx-3 min-w-0 sm:mx-0 sm:flex-1">
+        {compact ? (
+          <WorkspaceTabs
+            activeTab={activeTab}
+            setActiveTab={setActiveTab}
+            shouldShowTasksTab={shouldShowTasksTab}
+            shouldShowBrowserTab={shouldShowBrowserTab}
+            compact
+            projectId={selectedProject?.projectId}
+            serverPath={selectedProject?.fullPath ?? selectedProject?.path}
+          />
+        ) : <div className="-mx-3 min-w-0 sm:mx-0 sm:flex-1">
           <div className="relative ml-auto w-fit max-w-full">
             {canScrollLeft && (
               <div className="pointer-events-none absolute inset-y-0 left-0 z-10 w-12 bg-gradient-to-r from-background via-background/90 to-transparent" />
@@ -113,7 +125,7 @@ export default function WorkspaceHeader({
               ref={scrollRef}
               onScroll={updateScrollState}
               className={cn(
-                'scrollbar-hide max-w-full scroll-smooth overflow-x-auto overscroll-x-contain px-3 [-webkit-overflow-scrolling:touch]',
+                'scrollbar-hide max-w-full scroll-smooth overflow-x-auto overscroll-x-contain rounded-lg bg-foreground/[0.025] p-1 [-webkit-overflow-scrolling:touch]',
                 hasOverflow ? 'sm:px-9' : 'sm:pl-3 sm:pr-0',
               )}
             >
@@ -149,7 +161,7 @@ export default function WorkspaceHeader({
               </button>
             )}
           </div>
-        </div>
+        </div>}
       </div>
     </header>
   );

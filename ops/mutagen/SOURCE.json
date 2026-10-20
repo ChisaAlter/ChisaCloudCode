@@ -1,0 +1,31 @@
+{
+  "version": "0.18.1-chisa.2",
+  "upstream": "https://github.com/mutagen-io/mutagen",
+  "upstreamTag": "v0.18.1",
+  "upstreamCommit": "a225ae50aee3d7ebb59139203cb84e8a6a3ff4bf",
+  "sourceModule": "github.com/mutagen-io/mutagen",
+  "moduleSum": "h1:uYR9CHuynFNO0zGFMypI2LseX9VkIYlgfWQeI/j4824=",
+  "goVersion": "1.27.1",
+  "patchSHA256": "4e2e5a8d815db28f68aca4eb3b410cddc824053c53a8f3787bfba251b0fe0b69",
+  "modifiedPaths": [
+    "cmd/mutagen-agent/stream_synchronization_linux.go",
+    "cmd/mutagen-agent/stream_synchronization_linux_test.go",
+    "cmd/mutagen-agent/stream_synchronization_other.go",
+    "cmd/mutagen-agent/synchronizer.go",
+    "cmd/mutagen/daemon/run.go",
+    "cmd/mutagen/sync/main.go",
+    "pkg/mutagen/version.go",
+    "pkg/synchronization/controller.go",
+    "pkg/synchronization/endpoint/local/endpoint.go",
+    "pkg/synchronization/endpoint/remote/client.go",
+    "pkg/synchronization/endpoint/remote/completion.go",
+    "pkg/synchronization/endpoint/remote/completion_protocol_test.go",
+    "pkg/synchronization/endpoint/remote/server.go",
+    "scripts/build.go",
+    "cmd/mutagen/sync/update_ignores.go",
+    "pkg/service/synchronization/ignore_configuration.go",
+    "pkg/service/synchronization/ignore_configuration_test.go",
+    "pkg/synchronization/update_ignores.go"
+  ],
+  "ssplEnhancements": false
+}

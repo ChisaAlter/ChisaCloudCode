@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,10 +17,10 @@ import (
 	"time"
 )
 
-const (
-	apiLocalPort = 18791
-	controlPort  = 18082
-)
+const apiLocalPort = 18791
+
+// Assigned by StartControlPlane before any workspace tunnel is started.
+var controlPort int
 
 type Tunnel struct {
 	mu                sync.Mutex
@@ -66,6 +65,14 @@ func sshConnectionArgs(cfg Config, keyPath string) []string {
 	}
 	return args
 }
+func (t *Tunnel) forwardArgs() []string {
+	apiHost, controlBind := "127.0.0.1", "127.0.0.1"
+	if t.Cfg.WorkspaceAccount != "" {
+		apiHost, controlBind = "host.docker.internal", "0.0.0.0"
+	}
+	return []string{"-N", "-L", fmt.Sprintf("127.0.0.1:%d:%s:%s", apiLocalPort, apiHost, workspaceAPIPort(t.Cfg)), "-R", fmt.Sprintf("%s:0:127.0.0.1:%d", controlBind, controlPort)}
+}
+
 func (t *Tunnel) start() error {
 	t.mu.Lock()
 	if t.stopped || t.Cfg.SSHHost == "" {
@@ -76,15 +83,7 @@ func (t *Tunnel) start() error {
 		t.mu.Unlock()
 		return t.PushToken(t.Cfg.Token)
 	}
-	port := "8791"
-	if u, err := url.Parse(t.Cfg.ServerURL); err == nil && u.Port() != "" {
-		port = u.Port()
-	}
-	apiHost, controlBind := "127.0.0.1", "127.0.0.1"
-	if t.Cfg.WorkspaceAccount != "" {
-		apiHost, controlBind = "host.docker.internal", "0.0.0.0"
-	}
-	args := append([]string{"-N", "-L", fmt.Sprintf("127.0.0.1:%d:%s:%s", apiLocalPort, apiHost, port), "-R", fmt.Sprintf("%s:0:127.0.0.1:%d", controlBind, controlPort)}, t.baseArgs()...)
+	args := append(t.forwardArgs(), t.baseArgs()...)
 	cmd := hideCommandWindow(exec.Command(sshExe(), args...))
 	pipe, err := cmd.StderrPipe()
 	if err != nil {
@@ -263,7 +262,7 @@ func (t *Tunnel) registerMappingContext(ctx context.Context, m *Mapping) error {
 	if m.Mode == "vps" {
 		protocol = 2
 	}
-	marker := map[string]any{"protocol": protocol, "readBatch": true, "port": port, "token": t.Cfg.Token, "bindingEpoch": m.BindingEpoch}
+	marker := map[string]any{"protocol": protocol, "readBatch": true, "localGitRead": true, "port": port, "token": t.Cfg.Token, "bindingEpoch": m.BindingEpoch}
 	if t.Cfg.WorkspaceAccount != "" {
 		marker["controlHost"] = t.Cfg.ControlHost
 	}

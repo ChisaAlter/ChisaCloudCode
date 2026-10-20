@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
-
-import { CLAUDE_PREDEFINED_MODELS, extractClaudeEventModel, ClaudeProviderModels } from '@/modules/providers/list/claude/claude-models.provider.js';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { mock } from 'node:test';
+import test, { mock } from 'node:test';
+
 import { sessionsDb } from '@/modules/database/index.js';
+import { CLAUDE_PREDEFINED_MODELS, extractClaudeEventModel, ClaudeProviderModels } from '@/modules/providers/list/claude/claude-models.provider.js';
+import { extractClaudeResolvedModel } from '@/shared/utils.js';
 
 const SESSION_ID = 'session-1';
 
@@ -26,6 +26,15 @@ test('fixed Opus versions have distinct IDs and automatic aliases remain availab
   assert.equal(options.find((item) => item.value === 'claude-opus-5')?.label, 'Opus 5');
   assert.equal(options.find((item) => item.value === 'claude-opus-4-8')?.label, 'Opus 4.8');
   assert.match(options.find((item) => item.value === 'opus[1m]')!.label, /auto/);
+});
+
+test('Claude curated catalog exposes reserved managed HiRoute selection', async () => {
+  const catalog = await new ClaudeProviderModels().getSupportedModels();
+  const options = catalog.OPTIONS.filter(option => option.value === 'hiroute');
+  assert.equal(options.length, 1);
+  assert.equal(options[0].label, 'HiRoute');
+  assert.match(options[0].description ?? '', /Claude subscription and saved model connections/);
+  assert.equal(catalog.DEFAULT, 'default');
 });
 
 test('observed versions exclude aliases, synthesized rows and subagent models', () => {
@@ -134,5 +143,3 @@ test('falls back to the message model when every content hit is a placeholder', 
     'claude-sonnet-5',
   );
 });
-
-import { extractClaudeResolvedModel } from '@/shared/utils.js';

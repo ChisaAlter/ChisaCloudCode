@@ -148,6 +148,105 @@ func TestAccountWorkspaceConcurrentSetupSharesEnrollment(t *testing.T) {
 	}
 }
 
+func TestAccountWorkspaceFolderOpenRetriesCompletedEnrollmentFailure(t *testing.T) {
+	var requests atomic.Int32
+	connection := accountWorkspaceFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"error":{"message":"fresh enrollment reached"}}`)
+	})
+	if err := waitAccountWorkspace(connection, false); err == nil || !strings.Contains(err.Error(), "HTTP 404") {
+		t.Fatalf("initial enrollment did not cache its 404: %v", err)
+	}
+	failed := connection.workspaceSetup
+	if err := waitAccountWorkspace(connection, false); err == nil || requests.Load() != 1 {
+		t.Fatalf("background waiter unexpectedly retried setup: requests=%d err=%v", requests.Load(), err)
+	}
+	result := prepareLocalProject(t.TempDir())
+	if result["ok"] != false || !strings.Contains(fmt.Sprint(result["error"]), "fresh enrollment reached") || requests.Load() != 2 {
+		t.Fatalf("explicit folder open reused stale enrollment failure: requests=%d result=%v", requests.Load(), result)
+	}
+	if connection.workspaceSetup == failed || len(store.mappings()) != 0 || tunnel != nil {
+		t.Fatal("folder retry failed to replace setup safely")
+	}
+}
+
+func TestAccountWorkspaceFolderOpenSharesInflightSetup(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	var requests atomic.Int32
+	connection := accountWorkspaceFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if requests.Add(1) == 1 {
+			close(started)
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"error":{"message":"shared enrollment failure"}}`)
+	})
+	background := make(chan error, 1)
+	go func() { background <- waitAccountWorkspace(connection, false) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background enrollment did not start")
+	}
+	pending := connection.workspaceSetup
+	opened := make(chan map[string]any, 1)
+	localPath := t.TempDir()
+	go func() { opened <- prepareLocalProject(localPath) }()
+	select {
+	case result := <-opened:
+		t.Fatalf("folder open did not wait for pending enrollment: %v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-background:
+		if err == nil || !strings.Contains(err.Error(), "shared enrollment failure") {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("background setup did not finish")
+	}
+	select {
+	case result := <-opened:
+		if result["ok"] != false || !strings.Contains(fmt.Sprint(result["error"]), "shared enrollment failure") {
+			t.Fatal(result)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("folder open did not finish with shared setup")
+	}
+	if requests.Load() != 1 || connection.workspaceSetup != pending {
+		t.Fatalf("folder open replaced in-flight setup: requests=%d", requests.Load())
+	}
+}
+
+func TestAccountWorkspaceFolderOpenReusesCompletedSuccess(t *testing.T) {
+	connection := accountWorkspaceFixture(t, func(http.ResponseWriter, *http.Request) {
+		t.Error("successful setup was unnecessarily enrolled again")
+	})
+	setup := &accountWorkspaceSetup{done: make(chan struct{})}
+	close(setup.done)
+	connection.workspaceSetup = setup
+	// No live tunnel is supplied: the open must reuse setup and then fail the
+	// connection check, without starting enrollment or touching remote files.
+	if result := prepareLocalProject(t.TempDir()); result["ok"] != false {
+		t.Fatalf("folder open unexpectedly succeeded without a tunnel: %v", result)
+	}
+	if connection.workspaceSetup != setup {
+		t.Fatal("folder open replaced completed successful setup")
+	}
+}
+
 func TestAccountWorkspaceAccountReplacementCancelsWaiter(t *testing.T) {
 	started := make(chan struct{})
 	connection := accountWorkspaceFixture(t, func(w http.ResponseWriter, r *http.Request) {
@@ -255,11 +354,20 @@ func TestAccountWorkspaceRPCPreservesCleanupErrorAndRefreshedToken(t *testing.T)
 	}
 }
 
+// This Windows fixture checks the server-confirmed state comparison. Use a real
+// Windows file lock in place of the Linux worker's flock; POSIX permissions are
+// exercised by the disposable Linux integration fixture.
+const accountWorkspaceLeaseTestBootstrap = `import os, sys, types, msvcrt
+def flock(guard, mode):
+    guard.seek(0)
+    msvcrt.locking(guard.fileno(), msvcrt.LK_LOCK, 1)
+sys.modules['fcntl'] = types.SimpleNamespace(LOCK_EX=2, flock=flock)
+os.fchmod = lambda *args: None
+exec(compile(sys.argv[1], 'embedded-lease.py', 'exec'), {'__name__': '__main__'})
+`
+
 func TestAccountWorkspaceLeaseRecoveryChecksServerState(t *testing.T) {
-	python := os.Getenv("CHISA_QA_PYTHON_PATH")
-	if python == "" {
-		python = "python3"
-	}
+	tools := syncSeedTools(t)
 	for _, changed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("changed=%t", changed), func(t *testing.T) {
 			root := filepath.Join(t.TempDir(), "project")
@@ -280,7 +388,8 @@ func TestAccountWorkspaceLeaseRecoveryChecksServerState(t *testing.T) {
 				t.Fatal(err)
 			}
 			request, _ := json.Marshal(map[string]any{"root": root, "op": "recover", "owner": "sync", "id": "new-sync", "epoch": "binding", "serverChecked": true, "checkedLease": checked})
-			cmd := exec.Command(python, "-c", leaseWorker)
+			cmd := exec.Command(tools.python, "-c", accountWorkspaceLeaseTestBootstrap, leaseWorker)
+			cmd.Env = tools.env
 			cmd.Stdin = bytes.NewReader(request)
 			out, err := cmd.CombinedOutput()
 			if err != nil {

@@ -10,6 +10,7 @@ import { FrontendBridge, getServerConnectionVersion, isDesktop, onWorkspaceConne
 import type { ChisaMapping, ChisaProjectStorage, ChisaState, ChisaSyncInfo } from '@/shared/types';
 import { getAuthSessionVersion } from '@/shared/authToken';
 import { useConnectionIdentity } from '@/shared/hooks/useConnectionIdentity';
+import { GitSyncRecovery } from '@/modules/workspace-sync-recovery';
 import { beginBackgroundOperation } from '@/shared/utils';
 
 const { getState } = FrontendBridge;
@@ -47,6 +48,8 @@ function ChisaSettingsContent() {
   const previewRefresh = useRef(0);
   const latestState = useRef(state);
   latestState.current = state;
+  // Failed native snapshots revoke recovery admission backed by cached state.
+  const [connectionError, setConnectionError] = useState(false);
   const available = isDesktop();
 
   const refresh = useCallback(async () => {
@@ -56,6 +59,7 @@ function ChisaSettingsContent() {
     try {
       const s = (await getState()) as ChisaState;
       if (!mounted.current || account !== getAuthSessionVersion() || connection !== getServerConnectionVersion()) return;
+      if (!s || !Array.isArray(s.mappings)) throw new Error('无法读取工作区状态');
       setState(current => {
         const sync = { ...s.sync };
         for (const [path, info] of Object.entries({ ...current?.sync, ...receivedSync.current })) {
@@ -63,8 +67,9 @@ function ChisaSettingsContent() {
         }
         return { ...s, sync };
       });
+      if (mounted.current) setConnectionError(false);
     } catch {
-      /* ignore */
+      if (mounted.current && account === getAuthSessionVersion() && connection === getServerConnectionVersion()) setConnectionError(true);
     }
   }, []);
 
@@ -130,6 +135,15 @@ function ChisaSettingsContent() {
       && state?.mappings.some(item => item.serverPath === serverPath && item.localPath === result?.localPath) ? result : undefined;
   };
 
+  useEffect(() => {
+    // A page opened during the startup handshake must recheck its connection
+    // before admitting recovery. Stop as soon as setup completes; idle settings
+    // never poll Git or repeat the optional storage inventory.
+    if (!available || connectionError || !state?.workspaceConnecting) return;
+    const timer = window.setTimeout(() => { void refresh(); }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [available, connectionError, refresh, state]);
+
   const removeMapping = useCallback(async (serverPath: string) => {
     const finish = beginBackgroundOperation('正在移除工作目录', '正在后台解除绑定并刷新项目状态。');
     try {
@@ -138,8 +152,8 @@ function ChisaSettingsContent() {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
     } finally {
-      await refresh();
       finish();
+      void refresh();
     }
   }, [refresh]);
 
@@ -188,8 +202,8 @@ function ChisaSettingsContent() {
       setMessage(error instanceof Error ? error.message : String(error));
     } finally {
       setSyncingProject(null);
-      await refresh();
       finish();
+      void refresh();
     }
   }, [refresh]);
 
@@ -247,6 +261,7 @@ function ChisaSettingsContent() {
                   {state.sync?.[m.serverPath]?.detail && <div className="mt-1 break-all text-xs text-amber-600">{state.sync?.[m.serverPath]?.detail}</div>}
                 </div>
                 <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+                <GitSyncRecovery info={state.sync?.[m.serverPath]?.serverPath === m.serverPath ? state.sync[m.serverPath] : null} unavailable={connectionError || !state.tunnel || state.workspaceConnecting || syncingProject !== null || switchingProject !== null} onRecovered={() => void refresh()} />
                 <button type="button" onClick={() => void synchronize(m.serverPath)} disabled={syncingProject !== null || Boolean(state.sync?.[m.serverPath]?.taskOwner) || ['syncing', 'migrating', 'reserved'].includes(state.sync?.[m.serverPath]?.status || '')} className="w-24 shrink-0 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50">
                   {syncingProject === m.serverPath ? '同步中…' : m.mode === 'vps' ? '同步' : '迁移到 VPS'}
                 </button>

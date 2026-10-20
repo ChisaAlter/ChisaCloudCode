@@ -7,8 +7,9 @@ import { api } from '@/shared/api';
 import { FrontendBridge } from '@/shared/chisa';
 import type { Project } from '@/shared/types';
 import { getBlockingOperations } from '@/shared/utils';
+import { BlockingOperationDialog } from '@/shared/ui/BlockingOperationDialog';
 
-const mocks = vi.hoisted(() => ({ refresh: vi.fn(), currentProject: vi.fn(), newSession: vi.fn(), openSettings: vi.fn() }));
+const mocks = vi.hoisted(() => ({ refresh: vi.fn(), currentProject: vi.fn(), newSession: vi.fn(), openSettings: vi.fn(), register: vi.fn() }));
 const openedProject: Project = { projectId: 'opened', displayName: 'ams-载货车', fullPath: '/work/ams' };
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
@@ -22,9 +23,13 @@ vi.mock('@/shared/context/SessionProtectionContext', () => ({ useBusySessionIdSe
 vi.mock('@/modules/task-master', () => ({
   useTaskMaster: () => ({ setCurrentProject: mocks.currentProject }), useTasksSettings: () => ({ tasksEnabled: false }),
 }));
-vi.mock('@/modules/command-palette', () => ({ usePaletteOps: () => ({ refreshProjects: mocks.refresh, openSettings: mocks.openSettings }) }));
+vi.mock('@/modules/command-palette', () => ({
+  usePaletteOps: () => ({ refreshProjects: mocks.refresh, openSettings: mocks.openSettings }),
+  usePaletteOpsRegister: mocks.register,
+}));
 vi.mock('@/shared/chisa', () => ({
   isDesktop: () => true, FrontendBridge: { selectLocalFolder: vi.fn() }, recordLocalSelection: vi.fn(),
+  subscribeWorkspaceSynchronization: () => () => {},
 }));
 vi.mock('@/modules/sidebar/hooks/useSidebarController', () => ({
   useSidebarController: () => {
@@ -49,10 +54,10 @@ beforeEach(() => {
 afterEach(cleanup);
 
 function showSidebar(projects: Project[] = []) {
-  render(<Sidebar projects={projects} selectedProject={null} selectedSession={null} attentionSessionIds={new Set()}
+  render(<><BlockingOperationDialog /><Sidebar projects={projects} selectedProject={null} selectedSession={null} attentionSessionIds={new Set()}
     onProjectSelect={vi.fn()} onSessionSelect={vi.fn()} onNewSession={mocks.newSession}
     isLoading={false} loadingProgress={null} onRefresh={mocks.refresh} onShowSettings={vi.fn()}
-    showSettings={false} settingsInitialTab="general" onCloseSettings={vi.fn()} isMobile={false} />);
+    showSettings={false} settingsInitialTab="general" onCloseSettings={vi.fn()} isMobile={false} /></>);
 }
 
 test('opening a new directory reveals projects and starts its blank draft', async () => {
@@ -65,6 +70,15 @@ test('opening a new directory reveals projects and starts its blank draft', asyn
   expect(mocks.refresh).toHaveBeenCalledTimes(1);
 });
 
+test('the welcome action uses the same native directory picker and project flow', async () => {
+  vi.spyOn(api, 'createProject').mockResolvedValue(Response.json({ project: openedProject }, { status: 201 }));
+  showSidebar();
+  act(() => mocks.register.mock.lastCall![0].createProject());
+  await waitFor(() => expect(mocks.newSession).toHaveBeenCalledWith(openedProject));
+  expect(FrontendBridge.selectLocalFolder).toHaveBeenCalledTimes(1);
+  expect(screen.getByTestId('view').textContent).toBe('projects:');
+});
+
 test('reopening a registered directory opens its draft without creating another project', async () => {
   const create = vi.spyOn(api, 'createProject');
   showSidebar([openedProject]);
@@ -75,18 +89,52 @@ test('reopening a registered directory opens its draft without creating another 
 });
 
 test.each([
-  { format: 'nested details', payload: { details: 'Legacy error details', error: { details: 'Directory /opt/project is outside the permitted workspace', message: 'Internal server error' } }, reason: 'Directory /opt/project is outside the permitted workspace' },
-  { format: 'legacy details', payload: { details: 'Directory unavailable', error: { message: 'Internal server error' } }, reason: 'Directory unavailable' },
-  { format: 'message', payload: { error: { message: 'Directory unavailable' } }, reason: 'Directory unavailable' },
-])('a failed project creation reports $format and leaves the current view intact', async ({ payload, reason }) => {
-  vi.spyOn(api, 'createProject').mockResolvedValue(Response.json(payload, { status: 403 }));
+  { error: { message: 'Directory unavailable', details: 'Workspace path is outside the configured root' } },
+  { error: 'Directory unavailable', details: 'Workspace path is outside the configured root' },
+])('a failed project creation replaces the busy dialog with the full API error: %j', async (failure) => {
+  let failCreation!: (response: Response) => void;
+  vi.spyOn(api, 'createProject').mockImplementation(() => new Promise(resolve => { failCreation = resolve; }));
   const alert = vi.spyOn(window, 'alert').mockImplementation(() => {});
   showSidebar();
   fireEvent.click(screen.getByRole('button', { name: 'Open directory' }));
-  await waitFor(() => expect(alert).toHaveBeenCalledWith(`打开本地目录失败：${reason}`));
+  await waitFor(() => expect(failCreation).toBeDefined());
+  expect(screen.getByRole('dialog', { name: '正在打开工作目录' })).toBeDefined();
+  await act(async () => failCreation(Response.json(failure, { status: 403 })));
+  await screen.findByRole('dialog', { name: '打开本地目录失败' });
+  expect(screen.getByText(/Directory unavailable/).textContent).toContain('Workspace path is outside the configured root');
+  expect(screen.queryByRole('dialog', { name: '正在打开工作目录' })).toBeNull();
+  expect(document.querySelector('[aria-busy="true"]')).toBeNull();
+  expect(getBlockingOperations()).toHaveLength(0);
+  expect(alert).not.toHaveBeenCalled();
   expect(mocks.newSession).not.toHaveBeenCalled();
   expect(mocks.refresh).not.toHaveBeenCalled();
   expect(screen.getByTestId('view').textContent).toBe('conversations:old conversation');
+  fireEvent.click(screen.getByRole('button', { name: '确定' }));
+  expect(screen.queryByRole('dialog')).toBeNull();
+});
+
+test('enrollment failure releases the busy dialog and permits retry after dismissing its error', async () => {
+  vi.mocked(FrontendBridge.selectLocalFolder).mockResolvedValueOnce({
+    ok: false, error: '自动文件同步授权失败（HTTP 404），请重新连接文件同步',
+  });
+  const create = vi.spyOn(api, 'createProject').mockResolvedValue(Response.json({ project: openedProject }, { status: 201 }));
+  const alert = vi.spyOn(window, 'alert').mockImplementation(() => {});
+  showSidebar();
+  fireEvent.click(screen.getByRole('button', { name: 'Open directory' }));
+  await screen.findByRole('dialog', { name: '打开本地目录失败' });
+  expect(screen.getByText(/HTTP 404/)).toBeDefined();
+  expect(screen.queryByRole('dialog', { name: '正在打开工作目录' })).toBeNull();
+  expect(document.querySelector('[aria-busy="true"]')).toBeNull();
+  expect(getBlockingOperations()).toHaveLength(0);
+  expect(alert).not.toHaveBeenCalled();
+  expect(create).not.toHaveBeenCalled();
+  expect(mocks.newSession).not.toHaveBeenCalled();
+  expect(screen.getByTestId('view').textContent).toBe('conversations:old conversation');
+  fireEvent.click(screen.getByRole('button', { name: '确定' }));
+  expect(screen.queryByRole('dialog')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Open directory' }));
+  await waitFor(() => expect(mocks.newSession).toHaveBeenCalledWith(openedProject));
+  expect(getBlockingOperations()).toHaveLength(0);
 });
 
 test('opening a directory stays blocked through project creation and list refresh', async () => {
@@ -98,6 +146,7 @@ test('opening a directory stays blocked through project creation and list refres
   fireEvent.click(screen.getByRole('button', { name: 'Open directory' }));
   await waitFor(() => expect(created).toBeDefined());
   expect(getBlockingOperations()).toHaveLength(1);
+  expect(screen.getByRole('dialog', { name: '正在打开工作目录' })).toBeDefined();
   created(Response.json({ project: openedProject }, { status: 201 }));
   await waitFor(() => expect(refreshed).toBeDefined());
   expect(getBlockingOperations()).toHaveLength(1);

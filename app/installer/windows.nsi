@@ -27,7 +27,8 @@ Var PreviousMutagenDirectory
 
 ; Request write access without writing, truncating, or deleting the existing file.
 ; Run every probe before creating directories or extracting any payload.
-Function RequireWritableFile
+!macro DefineFileGuards PREFIX ACTION
+Function ${PREFIX}RequireWritableFile
   IfFileExists "$CheckedPath" 0 writable
   System::Call 'kernel32::CreateFileW(w "$CheckedPath", i 0x40000000, i 7, p 0, i 3, i 0x80, p 0) p .r0'
   IntCmp $0 -1 blocked
@@ -36,14 +37,14 @@ Function RequireWritableFile
 blocked:
   SetErrorLevel 32
   IfSilent +2
-  MessageBox MB_ICONSTOP|MB_OK "安装尚未开始。请先关闭 ChisaCloudCode 及占用下列文件的程序，然后重新安装：$\r$\n$CheckedPath"
+  MessageBox MB_ICONSTOP|MB_OK "${ACTION}尚未开始。请先关闭 ChisaCloudCode 及占用下列文件的程序，然后重新${ACTION}：$\r$\n$CheckedPath"
   Quit
 writable:
 FunctionEnd
 
 ; Closing the app leaves its Mutagen daemon resident. Stop only this app's
 ; dedicated daemon, only when the installed engine is actually in use.
-Function StopResidentSync
+Function ${PREFIX}StopResidentSync
   IfFileExists "$INSTDIR\mutagen.exe" 0 stopped
   System::Call 'kernel32::CreateFileW(w "$INSTDIR\mutagen.exe", i 0x40000000, i 7, p 0, i 3, i 0x80, p 0) p .r0'
   IntCmp $0 -1 stop_daemon
@@ -73,10 +74,14 @@ still_running:
 sync_stop_failed:
   SetErrorLevel 32
   IfSilent +2
-  MessageBox MB_ICONSTOP|MB_OK "安装尚未开始。后台文件同步尚未退出，请稍后重新安装；若仍失败，请联系维护者。项目文件和同步记录均未删除。"
+  MessageBox MB_ICONSTOP|MB_OK "${ACTION}尚未开始。后台文件同步尚未退出，请稍后重新${ACTION}；若仍失败，请联系维护者。项目文件和同步记录均未删除。"
   Quit
 stopped:
 FunctionEnd
+!macroend
+
+!insertmacro DefineFileGuards "" "安装"
+!insertmacro DefineFileGuards "un." "卸载"
 
 Function .onInstFailed
   SetErrorLevel 1
@@ -124,10 +129,36 @@ Function CreateDesktopShortcut
 FunctionEnd
 
 Section "Uninstall"
-  Delete "$SMPROGRAMS\${PRODUCT_NAME}.lnk"
-  Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
+  StrCpy $CheckedPath "$INSTDIR\${PRODUCT_NAME}.exe"
+  Call un.RequireWritableFile
+  Call un.StopResidentSync
+  !include "${UNINSTALL_PREFLIGHT_INCLUDE}"
+  ClearErrors
   !include "${UNINSTALL_INCLUDE}"
+  ; Keep the registered retry entry until all installed payload files are gone.
+  ClearErrors
+  IfFileExists "$SMPROGRAMS\${PRODUCT_NAME}.lnk" 0 +3
+  Delete "$SMPROGRAMS\${PRODUCT_NAME}.lnk"
+  IfErrors uninstall_failed
+  IfFileExists "$DESKTOP\${PRODUCT_NAME}.lnk" 0 +3
+  Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
+  IfErrors uninstall_failed
+  ; The supported _?= entry runs in place; its own image remains for its caller
+  ; to remove after exit. A normal copied uninstaller can remove the original.
+  StrCmp "$EXEPATH" "$INSTDIR\Uninstall.exe" uninstall_payload_removed
   Delete "$INSTDIR\Uninstall.exe"
+  IfErrors uninstall_failed
+uninstall_payload_removed:
   RMDir "$INSTDIR"
+  ClearErrors
   DeleteRegKey HKCU "${UNINSTALL_KEY}"
+  IfErrors uninstall_failed
+  SetErrorLevel 0
+  Goto uninstalled
+uninstall_failed:
+  SetErrorLevel 1
+  IfSilent +2
+  MessageBox MB_ICONSTOP|MB_OK "卸载未完成。请关闭占用安装文件的程序并检查目录权限，然后从原卸载入口重试。项目文件和同步记录均未删除。"
+  Quit
+uninstalled:
 SectionEnd

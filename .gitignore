@@ -36,3 +36,14 @@
 /release/
 
 /app/build_identity_generated.go
+/cloudcli-ui/shared/build-identity.json
+/diagnostics/
+/qa-artifacts/
+/cloudcli-ui/qa/
+/app/scripts/share-claude-auth.sh
+/cloudcli-ui/database/
+**/.husky/_/
+**/.env.*
+!**/.env.example
+!**/.env.*.example
+!**/.env.sample

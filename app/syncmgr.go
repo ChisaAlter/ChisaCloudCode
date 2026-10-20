@@ -1,16 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,17 +20,18 @@ import (
 )
 
 type SyncInfo struct {
-	Status        string `json:"status"`
-	Detail        string `json:"detail,omitempty"`
-	CheckedAt     string `json:"checkedAt"`
-	LocalPath     string `json:"localPath,omitempty"`
-	ServerPath    string `json:"serverPath"`
-	BindingEpoch  string `json:"bindingEpoch"`
-	Sequence      uint64 `json:"sequence"`
-	EngineStatus  string `json:"engineStatus,omitempty"`
-	EmptySide     string `json:"emptySide,omitempty"`
-	TaskOwner     string `json:"taskOwner,omitempty"`
-	engineFailure bool
+	Status              string `json:"status"`
+	Detail              string `json:"detail,omitempty"`
+	CheckedAt           string `json:"checkedAt"`
+	LocalPath           string `json:"localPath,omitempty"`
+	ServerPath          string `json:"serverPath"`
+	BindingEpoch        string `json:"bindingEpoch"`
+	Sequence            uint64 `json:"sequence"`
+	EngineStatus        string `json:"engineStatus,omitempty"`
+	EmptySide           string `json:"emptySide,omitempty"`
+	TaskOwner           string `json:"taskOwner,omitempty"`
+	GitRecoveryRequired bool   `json:"gitRecoveryRequired,omitempty"`
+	engineFailure       bool
 }
 
 var syncStates sync.Map
@@ -109,8 +111,9 @@ func setSyncInfo(m *Mapping, status, detail string) {
 	storeSyncInfo(m, status, detail, false)
 }
 
-func storeSyncInfo(m *Mapping, status, detail string, engineFailure bool) {
-	syncStates.Store(m.ServerPath, SyncInfo{Status: status, Detail: detail, BindingEpoch: m.BindingEpoch, engineFailure: engineFailure})
+func storeSyncInfo(m *Mapping, status, detail string, engineFailure bool, gitRecovery ...bool) {
+	recovery := len(gitRecovery) > 0 && gitRecovery[0]
+	syncStates.Store(m.ServerPath, SyncInfo{Status: status, Detail: detail, BindingEpoch: m.BindingEpoch, engineFailure: engineFailure, GitRecoveryRequired: recovery})
 	if status == "syncing" || status == "migrating" {
 		syncActivities.Lock()
 		activity := syncActivities.items[m.ServerPath]
@@ -131,7 +134,7 @@ func (e *syncEngineError) Unwrap() error { return e.error }
 func setSyncFailure(m *Mapping, err error) {
 	var engineError *syncEngineError
 	interrupted := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-	storeSyncInfo(m, "blocked", err.Error(), !interrupted && errors.As(err, &engineError))
+	storeSyncInfo(m, "blocked", err.Error(), !interrupted && errors.As(err, &engineError), !interrupted && syncGitNeedsRecovery(err))
 }
 
 func syncOperationInfo(m *Mapping) SyncInfo {
@@ -155,6 +158,14 @@ func runMutagenTimeout(timeout time.Duration, args ...string) (string, error) {
 }
 
 func runMutagenContext(ctx context.Context, args ...string) (string, error) {
+	// Pausing only waits for the daemon to acknowledge that its loop stopped;
+	// it must not consume the file-transfer/Git synchronization budget.
+	pausing := len(args) > 1 && args[0] == "sync" && args[1] == "pause"
+	if pausing {
+		bounded, cancel := context.WithTimeout(ctx, workspaceSyncPauseTimeout)
+		defer cancel()
+		ctx = bounded
+	}
 	binary := mutagenExe()
 	if binary == "" {
 		return "", &syncEngineError{fmt.Errorf("Mutagen 未随应用分发")}
@@ -166,7 +177,20 @@ func runMutagenContext(ctx context.Context, args ...string) (string, error) {
 	cmd := hideCommandWindow(exec.CommandContext(ctx, binary, args...))
 	cmd.WaitDelay = time.Second
 	cmd.Env = append(os.Environ(), "MUTAGEN_DATA_DIRECTORY="+filepath.Join(dataDir(), "mutagen"), "MUTAGEN_SSH_PATH="+sshPath)
+	started := time.Now()
 	out, err := cmd.CombinedOutput()
+	if pausing {
+		outcome := "ok"
+		if err != nil {
+			outcome = "failed"
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			outcome = "timeout"
+		} else if errors.Is(ctx.Err(), context.Canceled) {
+			outcome = "canceled"
+		}
+		log.Printf("[sync-engine] operation=pause outcome=%s elapsed=%s", outcome, time.Since(started))
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			err = ctx.Err()
@@ -348,6 +372,34 @@ func syncSessionMatchesMapping(s syncSession, m *Mapping, cfg Config) bool {
 	return norm(s.Alpha.Path) == norm(m.LocalPath) && remote.Path == m.ServerPath && remote.Protocol == "ssh" && remote.Host == syncSSHAlias(cfg) && remote.User == "" && remote.Port == 0
 }
 
+type syncSessionIdentityKey struct{}
+type syncSessionIdentity struct{ identifier string }
+
+// A name is only a lookup key: another controller can recreate it during a
+// handoff. Every command and the final success check must keep the same ID.
+func pinProjectSyncSessionContext(ctx context.Context, m *Mapping, session syncSession) error {
+	if session.Identifier == "" || !syncSessionMatchesMapping(session, m, workspaceSyncConfig(ctx)) {
+		return fmt.Errorf("项目同步会话绑定不一致")
+	}
+	if pinned, _ := ctx.Value(syncSessionIdentityKey{}).(*syncSessionIdentity); pinned != nil {
+		if pinned.identifier != "" && pinned.identifier != session.Identifier {
+			return fmt.Errorf("同步期间项目会话已被替换，请重新同步")
+		}
+		pinned.identifier = session.Identifier
+	}
+	return nil
+}
+
+func validateProjectSyncSessionContext(ctx context.Context, m *Mapping, session syncSession) error {
+	if err := pinProjectSyncSessionContext(ctx, m, session); err != nil {
+		return err
+	}
+	if session.Mode != "two-way-safe" || !session.Ignore.VCS {
+		return fmt.Errorf("项目同步会话的同步模式或 Git 排除设置已改变，请修复会话后重新同步")
+	}
+	return nil
+}
+
 func syncWorkspaceOwner(serverPath string) string {
 	if reservation, reserved := cloudReservations.Load(serverPath); reserved {
 		if recovery, pending := cloudSyncRecovery.Load(serverPath); !pending || recovery != reservation {
@@ -378,6 +430,9 @@ func projectSyncInfo(m *Mapping, cfg Config, sessions []syncSession, queryErr er
 	operation := syncOperationInfo(m)
 	if operation.Status == "blocked" && !operation.engineFailure {
 		info.Status, info.Detail = operation.Status, operation.Detail
+		_, active := activeSyncOperations()[m.ServerPath]
+		info.GitRecoveryRequired = operation.GitRecoveryRequired && owner == "" && !active && queryErr == nil &&
+			m.SyncName != "" && len(matching) == 1 && syncSessionMatchesMapping(matching[0], m, cfg)
 		if len(matching) == 1 {
 			if _, pending := pendingProjectEmpty(m, matching[0]); pending {
 				info.EmptySide = "local"
@@ -501,11 +556,18 @@ func gitOutputContext(ctx context.Context, local string, args ...string) (string
 }
 
 func gitOutputContextEnv(ctx context.Context, local string, env []string, args ...string) (string, error) {
+	return gitOutputContextEnvInput(ctx, local, env, nil, args...)
+}
+
+func gitOutputContextEnvInput(ctx context.Context, local string, env []string, input []byte, args ...string) (string, error) {
 	if err := workspaceSyncCurrent(ctx); err != nil {
 		return "", err
 	}
 	cmd := hideCommandWindow(exec.CommandContext(ctx, "git", append([]string{"-C", local}, args...)...))
 	cmd.WaitDelay = time.Second
+	if input != nil {
+		cmd.Stdin = bytes.NewReader(input)
+	}
 	keyPath := store.keyPathOf()
 	if snapshot, _ := ctx.Value(workspaceSyncConnectionKey{}).(*workspaceSyncConnection); snapshot != nil {
 		keyPath = snapshot.keyPath
@@ -516,6 +578,9 @@ func gitOutputContextEnv(ctx context.Context, local string, env []string, args .
 		command = append(command, shellQuote(filepath.ToSlash(argument)))
 	}
 	cmd.Env = append(os.Environ(), "LC_ALL=C", "GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND="+strings.Join(command, " "))
+	if objects, _ := ctx.Value(syncGitPreviewObjectsKey{}).([]string); objects != nil {
+		cmd.Env = append(cmd.Env, objects...)
+	}
 	cmd.Env = append(cmd.Env, env...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -530,111 +595,39 @@ func gitOutputContextEnv(ctx context.Context, local string, env []string, args .
 	return strings.TrimSpace(string(out)), nil
 }
 
-// Generated directories stay excluded, with exact exceptions for tracked source/assets.
-func syncIgnoreConfiguration(m *Mapping) (string, error) {
-	return syncIgnoreConfigurationContext(context.Background(), m)
-}
-
-func syncIgnoreConfigurationContext(ctx context.Context, m *Mapping) (string, error) {
-	generated := map[string]bool{"dist": true, "build": true, "out": true, ".next": true, "coverage": true, ".cache": true, "cache": true, ".tmp": true, ".dev": true, ".nodetmp": true}
-	patterns := []string{"dist", "build", "out", ".next", "coverage", ".cache", "cache", ".tmp", ".dev", ".nodetmp"}
-	repository, err := localGitRepository(ctx, m.LocalPath)
-	if err != nil {
-		return "", err
-	}
-	tracked := ""
-	if repository {
-		tracked, err = gitOutputContext(ctx, m.LocalPath, "ls-files", "-z")
-		if err != nil {
-			return "", err
-		}
-	}
-	exceptions := map[string]bool{}
-	if repository {
-		for _, file := range strings.Split(tracked, "\x00") {
-			if file == "" {
-				continue
-			}
-			parts := strings.Split(filepath.ToSlash(file), "/")
-			ignored := false
-			for i, part := range parts {
-				if generated[part] {
-					ignored = true
-				}
-				if !ignored {
-					continue
-				}
-				item := "/" + strings.Join(parts[:i+1], "/")
-				escaped := strings.NewReplacer("\\", "\\\\", "*", "\\*", "?", "\\?", "[", "\\[", "]", "\\]").Replace(item)
-				exceptions["!"+escaped] = true
-				if i < len(parts)-1 {
-					exceptions[escaped+"/*"] = true
-				}
-			}
-		}
-	}
-	keys := make([]string, 0, len(exceptions))
-	for key := range exceptions {
-		keys = append(keys, key)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		a, b := strings.TrimPrefix(keys[i], "!"), strings.TrimPrefix(keys[j], "!")
-		da, db := strings.Count(a, "/"), strings.Count(b, "/")
-		if strings.HasSuffix(a, "/*") {
-			da--
-		}
-		if strings.HasSuffix(b, "/*") {
-			db--
-		}
-		if da != db {
-			return da < db
-		}
-		return a < b
-	})
-	patterns = append(patterns, keys...)
-	patterns = append(patterns, "node_modules", ".git", ".venv", "venv", "__pycache__", ".env", ".env.*", "!.env.example", "!.env.sample", ".chisa-bridge.json")
-	var config strings.Builder
-	config.WriteString("sync:\n  defaults:\n    ignore:\n      paths:\n")
-	for _, pattern := range patterns {
-		encoded, _ := json.Marshal(pattern)
-		config.WriteString("        - " + string(encoded) + "\n")
-	}
-	directory := filepath.Join(dataDir(), "sync-config")
-	if err := os.MkdirAll(directory, 0700); err != nil {
-		return "", err
-	}
-	target := filepath.Join(directory, m.BindingEpoch+".yml")
-	return target, os.WriteFile(target, []byte(config.String()), 0600)
-}
-
 func ensureSync(m *Mapping) error {
 	ctx, cancel := context.WithTimeout(context.Background(), workspaceSyncTimeout)
 	defer cancel()
 	return ensureSyncContext(ctx, m)
 }
 
-func ensureSyncContext(ctx context.Context, m *Mapping) error {
+// Freeze the session identity before preparing metadata evidence. Creating or
+// flushing the file session is deliberately deferred until after Git preflight.
+func ensureSyncNameContext(ctx context.Context, m *Mapping) error {
 	if err := workspaceSyncCurrent(ctx); err != nil {
 		return err
 	}
-	cfg := workspaceSyncConfig(ctx)
-	if m.ServerID != serverIdentity(cfg) {
+	if m.ServerID != serverIdentity(workspaceSyncConfig(ctx)) {
 		return fmt.Errorf("项目绑定属于其他服务器，请连接原服务器")
 	}
-	if m.SyncName == "" {
-		m.SyncName = "chisa-vps-" + m.BindingEpoch
-		serverConnectionMu.RLock()
-		snapshot, _ := ctx.Value(workspaceSyncConnectionKey{}).(*workspaceSyncConnection)
-		if ctx.Err() != nil || (snapshot != nil && !snapshot.currentLocked()) {
-			serverConnectionMu.RUnlock()
-			return fmt.Errorf("文件同步账号或连接已改变")
-		}
-		err := store.updateMapping(m)
-		serverConnectionMu.RUnlock()
-		if err != nil {
-			return err
-		}
+	if m.SyncName != "" {
+		return nil
 	}
+	m.SyncName = "chisa-vps-" + m.BindingEpoch
+	serverConnectionMu.RLock()
+	defer serverConnectionMu.RUnlock()
+	snapshot, _ := ctx.Value(workspaceSyncConnectionKey{}).(*workspaceSyncConnection)
+	if ctx.Err() != nil || (snapshot != nil && !snapshot.currentLocked()) {
+		return fmt.Errorf("文件同步账号或连接已改变")
+	}
+	return store.updateMapping(m)
+}
+
+func ensureSyncContext(ctx context.Context, m *Mapping) error {
+	if err := ensureSyncNameContext(ctx, m); err != nil {
+		return err
+	}
+	cfg := workspaceSyncConfig(ctx)
 	keyPath := store.keyPathOf()
 	if snapshot, _ := ctx.Value(workspaceSyncConnectionKey{}).(*workspaceSyncConnection); snapshot != nil {
 		keyPath = snapshot.keyPath
@@ -655,15 +648,16 @@ func ensureSyncContext(ctx context.Context, m *Mapping) error {
 		return err
 	}
 	if len(sessions) == 1 {
-		if !syncSessionMatchesMapping(sessions[0], m, cfg) {
-			return fmt.Errorf("同步会话绑定的服务器或目录不一致")
-		}
-		return nil
+		return validateProjectSyncSessionContext(ctx, m, sessions[0])
 	}
 	if len(sessions) > 1 {
 		return fmt.Errorf("存在重复同步会话")
 	}
-	config, err := syncIgnoreConfigurationContext(ctx, m)
+	if pinned, _ := ctx.Value(syncSessionIdentityKey{}).(*syncSessionIdentity); pinned != nil && pinned.identifier != "" {
+		return fmt.Errorf("同步期间项目会话已消失，请重新同步")
+	}
+	before, beforeErr := syncIgnoreEndpointSignatureContext(ctx, m)
+	config, _, _, err := guardedSyncIgnoreConfigurationContext(ctx, m, before, beforeErr)
 	if err != nil {
 		return err
 	}
@@ -677,42 +671,131 @@ func flushSync(m *Mapping, pause bool) error {
 	return flushSyncContext(ctx, m, pause)
 }
 
-// Call only after a successful flush+pause and Git reconciliation. The old
-// coverage has converged, so rebuilding the session does not forget pending
-// deletions. Newly tracked generated-directory paths still use two-way-safe.
-func refreshSyncIgnoreContext(ctx context.Context, m *Mapping) error {
-	configuration, err := syncIgnoreConfigurationContext(ctx, m)
-	if err != nil {
-		return err
+// Update the paused controller in place, before trying to flush old rules.
+// The engine preserves its archive and projects newly ignored paths out of the
+// baseline without interpreting them as deletions on either endpoint.
+//
+// Pausing is what makes a synchronization expensive: a paused session drops its
+// endpoint connections and the next flush has to rescan both sides from cold
+// (minutes on a large project). The policy is therefore computed first and the
+// engine is only paused when the pattern set actually changed.
+func refreshSyncIgnoreContext(ctx context.Context, m *Mapping) (bool, error) {
+	// Only evidence from both endpoints can skip inventory. A local-only stamp
+	// misses remote index, nested ignore, and effective configuration changes.
+	if err := workspaceSyncCurrent(ctx); err != nil {
+		return false, err
 	}
-	contents, err := os.ReadFile(configuration)
+	sessions, err := syncSessionsContext(ctx, m.SyncName)
 	if err != nil {
-		return err
+		return false, err
 	}
+	if len(sessions) == 0 {
+		return false, nil
+	}
+	if len(sessions) != 1 || !syncSessionMatchesMapping(sessions[0], m, workspaceSyncConfig(ctx)) {
+		return false, fmt.Errorf("更新文件过滤前发现项目会话绑定不一致")
+	}
+	session := sessions[0]
+	if err := validateProjectSyncSessionContext(ctx, m, session); err != nil {
+		return false, err
+	}
+	force, _ := ctx.Value(syncIgnoreForceKey{}).(bool)
+	before, beforeErr := syncIgnoreEndpointSignatureContext(ctx, m)
+	if !force && beforeErr == nil {
+		signature := syncIgnoreSessionSignature(before, session)
+		if stamp, err := os.ReadFile(syncIgnoreStampPath(m)); err == nil && strings.TrimSpace(string(stamp)) == signature {
+			return false, nil
+		}
+	}
+	configuration, contents, endpointSignature, err := guardedSyncIgnoreConfigurationContext(ctx, m, before, beforeErr)
+	if err != nil {
+		return false, err
+	}
+	remember := func() {
+		if endpointSignature == "" {
+			return
+		}
+		target := syncIgnoreStampPath(m)
+		if os.MkdirAll(filepath.Dir(target), 0700) != nil {
+			return
+		}
+		signature := syncIgnoreSessionSignature(endpointSignature, session)
+		if os.WriteFile(target+".tmp", []byte(signature), 0600) == nil {
+			_ = os.Rename(target+".tmp", target)
+		}
+	}
+	current, err := syncSessionsContext(ctx, m.SyncName)
+	if err != nil {
+		return false, err
+	}
+	if len(current) != 1 || current[0].Identifier != session.Identifier || !syncSessionMatchesMapping(current[0], m, workspaceSyncConfig(ctx)) || syncIgnoreSessionSignature("", current[0]) != syncIgnoreSessionSignature("", session) {
+		return false, fmt.Errorf("读取文件过滤期间同步会话已改变，请重新同步")
+	}
+	session = current[0]
 	var patterns []string
 	for _, line := range strings.Split(string(contents), "\n") {
 		if item, found := strings.CutPrefix(strings.TrimSpace(line), "- "); found {
 			var pattern string
 			if err = json.Unmarshal([]byte(item), &pattern); err != nil {
-				return err
+				return false, err
 			}
 			patterns = append(patterns, pattern)
 		}
 	}
+	if slices.Equal(patterns, session.Ignore.Paths) {
+		remember()
+		return false, nil
+	}
+	if !session.Paused {
+		if err := pauseSyncSessionContext(ctx, m, session.Identifier); err != nil {
+			return false, err
+		}
+	}
+	if _, err := runMutagenContext(ctx, "sync", "update-ignores", "--configuration-file", configuration, session.Identifier); err != nil {
+		return false, err
+	}
+	updated, err := syncSessionsContext(ctx, m.SyncName)
+	if err != nil {
+		return false, err
+	}
+	if len(updated) != 1 || updated[0].Identifier != session.Identifier || !slices.Equal(updated[0].Ignore.Paths, patterns) {
+		return false, fmt.Errorf("文件过滤更新后的项目会话或规则无法确认")
+	}
+	if err := validateProjectSyncSessionContext(ctx, m, updated[0]); err != nil {
+		return false, err
+	}
+	session = updated[0]
+	remember()
+	return true, nil
+}
+
+// ensureSyncWatchingContext resumes a paused session without disturbing one
+// that is already watching. Resuming an active session still re-dials both
+// endpoints, so it must not run on every synchronization.
+func ensureSyncWatchingContext(ctx context.Context, m *Mapping) error {
 	sessions, err := syncSessionsContext(ctx, m.SyncName)
 	if err != nil {
 		return err
 	}
-	if len(sessions) != 1 || !sessions[0].Paused || !syncSessionMatchesMapping(sessions[0], m, workspaceSyncConfig(ctx)) {
-		return fmt.Errorf("更新文件过滤前未确认原同步会话已暂停")
+	if len(sessions) != 1 {
+		return fmt.Errorf("无法确认唯一的项目同步会话")
 	}
-	if slices.Equal(patterns, sessions[0].Ignore.Paths) {
-		return nil
-	}
-	if _, err = runMutagenContext(ctx, "sync", "terminate", sessions[0].Identifier); err != nil {
+	session := sessions[0]
+	if err := validateProjectSyncSessionContext(ctx, m, session); err != nil {
 		return err
 	}
-	return flushSyncContext(ctx, m, true)
+	if session.Paused {
+		if _, err := runMutagenContext(ctx, "sync", "resume", session.Identifier); err != nil {
+			return err
+		}
+		// Resume reconnects endpoints asynchronously. Wait for its first confirmed
+		// cycle before reporting success; ordinary warm sessions skip this path.
+		return flushSyncContext(ctx, m, false)
+	}
+	if info := syncSessionInfo(session); info.Status != "ready" {
+		return &syncEngineError{fmt.Errorf("文件同步尚未就绪: %s", info.Detail)}
+	}
+	return nil
 }
 
 func flushSyncContext(ctx context.Context, m *Mapping, pause bool) error {
@@ -724,14 +807,23 @@ func flushSyncContext(ctx context.Context, m *Mapping, pause bool) error {
 	if err != nil {
 		return err
 	}
-	if len(before) == 1 && strings.HasPrefix(before[0].Status, "halted-") {
-		return &syncEngineError{fmt.Errorf("%s", syncSessionInfo(before[0]).Detail)}
+	if len(before) != 1 {
+		return &syncEngineError{fmt.Errorf("无法确认唯一的项目同步会话")}
 	}
-	if _, err := runMutagenContext(ctx, "sync", "resume", m.SyncName); err != nil {
+	session := before[0]
+	if err := validateProjectSyncSessionContext(ctx, m, session); err != nil {
 		return err
 	}
-	if _, err := runMutagenContext(ctx, "sync", "flush", m.SyncName); err != nil {
-		if failed, queryErr := syncSessionsContext(ctx, m.SyncName); queryErr == nil && len(failed) == 1 && strings.HasPrefix(failed[0].Status, "halted-") {
+	if strings.HasPrefix(session.Status, "halted-") {
+		return &syncEngineError{fmt.Errorf("%s", syncSessionInfo(session).Detail)}
+	}
+	if session.Paused {
+		if _, err := runMutagenContext(ctx, "sync", "resume", session.Identifier); err != nil {
+			return err
+		}
+	}
+	if _, err := runMutagenContext(ctx, "sync", "flush", session.Identifier); err != nil {
+		if failed, queryErr := syncSessionsContext(ctx, m.SyncName); queryErr == nil && len(failed) == 1 && failed[0].Identifier == session.Identifier && strings.HasPrefix(failed[0].Status, "halted-") {
 			return &syncEngineError{fmt.Errorf("%s", syncSessionInfo(failed[0]).Detail)}
 		}
 		return err
@@ -744,6 +836,15 @@ func flushSyncContext(ctx context.Context, m *Mapping, pause bool) error {
 		return &syncEngineError{fmt.Errorf("找不到项目同步会话")}
 	}
 	s := sessions[0]
+	if s.Identifier != session.Identifier {
+		return fmt.Errorf("同步期间项目会话已被替换，请重新同步")
+	}
+	if err := validateProjectSyncSessionContext(ctx, m, s); err != nil {
+		return err
+	}
+	if s.Paused || strings.HasPrefix(s.Status, "halted-") {
+		return &syncEngineError{fmt.Errorf("%s", syncSessionInfo(s).Detail)}
+	}
 	if len(s.Conflicts) > 0 || s.ExcludedConflicts > 0 {
 		return &syncEngineError{fmt.Errorf("两端存在同步冲突，请保留两端修改并解决后重新同步")}
 	}
@@ -762,7 +863,7 @@ func flushSyncContext(ctx context.Context, m *Mapping, pause bool) error {
 		return &syncEngineError{fmt.Errorf("同步尚未完成首轮传输")}
 	}
 	if pause {
-		if _, err := runMutagenContext(ctx, "sync", "pause", m.SyncName); err != nil {
+		if err := pauseSyncSessionContext(ctx, m, s.Identifier); err != nil {
 			return err
 		}
 		setSyncInfo(m, "reserved", "")

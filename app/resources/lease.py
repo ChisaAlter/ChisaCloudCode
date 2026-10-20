@@ -8,6 +8,9 @@ lock = Path(str(root) + '.chisa-lease')
 state_file = lock / 'state.json'
 op = q['op']
 
+class RecoveryStale(RuntimeError):
+    pass
+
 def state():
     if not lock.exists(): return None
     return json.loads(state_file.read_text())
@@ -57,6 +60,8 @@ def operate():
         result = {'ok': True, 'lease': current}
     elif op == 'recover':
         current = state()
+        if 'recoveryLease' in q and current != q['recoveryLease']:
+            raise RecoveryStale('Workspace reservation changed after Git recovery preview')
         if q.get('serverChecked') is True and current != q.get('checkedLease'):
             raise RuntimeError('Workspace reservation changed after server confirmation')
         if current and current['epoch'] != q['epoch']:
@@ -122,11 +127,18 @@ def operate():
     return result
 
 try:
-    # Keep this inode outside the directory that release/recover remove.
-    with Path(str(root) + '.chisa-lease.guard').open('a+b') as guard:
-        os.fchmod(guard.fileno(), 0o600)
-        fcntl.flock(guard, fcntl.LOCK_EX)
+    if op == 'read':
+        # state.json is atomically replaced. Metadata previews never create a
+        # lease directory/guard or mutate another task's ownership record.
         result = operate()
+    else:
+        # Keep this inode outside the directory that release/recover remove.
+        with Path(str(root) + '.chisa-lease.guard').open('a+b') as guard:
+            os.fchmod(guard.fileno(), 0o600)
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            result = operate()
+except RecoveryStale as error:
+    result = {'ok': False, 'error': str(error), 'code': 'GIT_RECOVERY_STALE'}
 except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
     result = {'ok': False, 'error': str(error)}
 print(json.dumps(result))

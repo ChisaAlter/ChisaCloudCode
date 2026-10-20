@@ -7,60 +7,91 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
-func TestPiHandoffChoosesObservedChangePathAndIsIdempotent(t *testing.T) {
-	for _, scenario := range []string{"unchanged", "partial-failed-shell-write", "observation-failed", "restarted-no-baseline", "stale-binding"} {
+func TestPiHandoffSynchronizesActiveWatcherOnceAndIsIdempotent(t *testing.T) {
+	for _, scenario := range []string{"unchanged", "legacy-baseline", "partial-failed-shell-write", "restarted-no-baseline", "release-pending", "stale-binding", "stale-local-path", "stale-sync-name", "stale-baseline-epoch", "stale-baseline-server-path"} {
 		t.Run(scenario, func(t *testing.T) {
-			m, _ := piWorkspaceFixture(t)
+			m, session := piWorkspaceFixture(t)
+			session.Paused = false
 			piWorkspaceWrite(t, m.LocalPath, "source.txt", "before")
 			s, writer := seedPi(m, "handoff-path")
 			t.Cleanup(func() { _ = writer.Close() })
 			s.Running, s.LeaseID = false, "exact-pi-lease"
 			s.LastResult = map[string]any{"status": "completed", "content": "model response"}
-			s.workspaceBaseline = piWorkspaceCapture(t, m)
+			s.workspaceBaseline = &piWorkspaceSnapshot{
+				localPath: m.LocalPath, serverPath: m.ServerPath, serverID: m.ServerID,
+				epoch: m.BindingEpoch, syncName: m.SyncName,
+			}
 			switch scenario {
+			case "legacy-baseline":
+				s.workspaceBaseline.session = *session
+				s.workspaceBaseline.session.Paused = true
+				s.workspaceBaseline.files = map[string]piWorkspaceFile{"source.txt": {size: 6}}
 			case "partial-failed-shell-write":
 				// No edit/write event exists. A failed PowerShell call can still
 				// leave a real synchronized file change that must be handed back.
 				piWorkspaceWrite(t, m.LocalPath, "source.txt", "partially written before exit 9")
 				piHandleEvent(s, s.process, map[string]any{"type": "tool_execution_end", "toolName": "powershell", "toolCallId": "partial", "isError": true})
-			case "observation-failed":
-				piWorkspaceSyncSessions = func(context.Context, string) ([]syncSession, error) { return nil, errors.New("snapshot unavailable") }
 			case "restarted-no-baseline":
 				s.workspaceBaseline = nil
+			case "release-pending":
+				s.HandoffPhase = piHandoffReleasePending
 			case "stale-binding":
 				m.BindingEpoch = "replacement-binding"
+			case "stale-local-path":
+				m.LocalPath = t.TempDir()
+			case "stale-sync-name":
+				m.SyncName = "replacement-sync-session"
+			case "stale-baseline-epoch":
+				s.workspaceBaseline.epoch = "another-binding"
+			case "stale-baseline-server-path":
+				s.workspaceBaseline.serverPath = "/srv/another-project"
+			}
+			observations := 0
+			piWorkspaceSyncSessions = func(context.Context, string) ([]syncSession, error) {
+				observations++
+				return []syncSession{*session}, nil
 			}
 			operations := []string{}
-			synchronizeProjectContext = func(_ context.Context, actual *Mapping, pause bool) error {
-				if actual.ServerPath != m.ServerPath || actual.BindingEpoch != m.BindingEpoch || pause {
-					t.Fatal("handback synchronized the wrong mapping")
+			synchronizeProjectContext = func(ctx context.Context, actual *Mapping, pause bool) error {
+				if actual == nil || *actual != *m || ctx.Value(syncLeaseContextKey{}) != "exact-pi-lease" || pause || session.Paused {
+					t.Fatal("handback lost the active watcher, mapping or exact Pi lease")
 				}
 				operations = append(operations, "sync")
 				return nil
 			}
-			piWorkspaceResumeSync = func(context.Context, string) error { operations = append(operations, "resume"); return nil }
+			piWorkspaceResumeSync = func(context.Context, string) error {
+				t.Fatal("handback resumed through the retired snapshot shortcut")
+				return nil
+			}
 			remoteLeaseContext = func(_ context.Context, actual *Mapping, op, owner, id string) (map[string]any, error) {
-				if actual.ServerPath != m.ServerPath || actual.BindingEpoch != m.BindingEpoch || owner != "pi" || id != "exact-pi-lease" {
-					t.Fatal("handback lost its exact Pi lease")
+				if actual == nil || *actual != *m || op != "release" || owner != "pi" || id != "exact-pi-lease" {
+					t.Fatal("handback lost its exact Pi lease or bypassed unified synchronization")
+				}
+				if durable := readPiRepairState(t, s.SessionID); durable.HandoffPhase != piHandoffReleasePending || durable.LeaseID != id {
+					t.Fatal("lease release preceded its durable recovery phase")
 				}
 				operations = append(operations, op)
-				return map[string]any{"ok": true, "lease": map[string]any{"owner": "pi", "id": id, "epoch": m.BindingEpoch}}, nil
+				return map[string]any{"ok": true}, nil
 			}
 			err := piReleaseWorkspace(s, s.runID)
-			if scenario == "stale-binding" {
-				if err == nil || len(operations) != 0 || s.Owner != "pi" || s.LeaseID == "" {
+			if observations != 0 || session.Paused {
+				t.Fatal("Pi handback observed the full-tree snapshot or paused the watcher")
+			}
+			if strings.HasPrefix(scenario, "stale-") {
+				if err == nil || len(operations) != 0 || s.Owner != "pi" || s.LeaseID == "" || s.LastResult["workspaceStatus"] != "failed" {
 					t.Fatal("stale binding was synchronized or released")
 				}
 				return
 			}
 			want := []string{"sync", "release"}
-			if scenario == "unchanged" {
-				want = []string{"confirm", "resume", "release"}
+			if scenario == "release-pending" {
+				want = []string{"release"}
 			}
-			if err != nil || !reflect.DeepEqual(operations, want) || s.Owner != "claude" || s.LeaseID != "" || s.LastResult["workspaceStatus"] != "released" {
+			if err != nil || !reflect.DeepEqual(operations, want) || s.Owner != "claude" || s.LeaseID != "" || s.HandoffPhase != "" || s.LastResult["workspaceStatus"] != "released" {
 				t.Fatalf("wrong handback path: operations=%v want=%v error=%v", operations, want, err)
 			}
 			before, _ := json.Marshal(s.LastResult)
@@ -69,8 +100,8 @@ func TestPiHandoffChoosesObservedChangePathAndIsIdempotent(t *testing.T) {
 				t.Fatal(err)
 			}
 			after, _ := json.Marshal(s.LastResult)
-			if string(before) != string(after) || cursor != s.Cursor || !reflect.DeepEqual(operations, want) {
-				t.Fatal("duplicate handback replayed sync/release or rewrote the result")
+			if string(before) != string(after) || cursor != s.Cursor || !reflect.DeepEqual(operations, want) || observations != 0 {
+				t.Fatal("duplicate handback replayed synchronization or rewrote the result")
 			}
 		})
 	}
@@ -121,7 +152,13 @@ func TestPiAbortRunningTaskKeepsStoppedResultAcrossFailedHandbackAndRecovery(t *
 func TestPiPreparedRequestRejectionAlwaysHandsBackOrRetainsRecovery(t *testing.T) {
 	for _, scenario := range []string{"reference-file-failure", "attachment-failure", "cancelled-after-preparation", "reference-failure-and-release-fails"} {
 		t.Run(scenario, func(t *testing.T) {
-			m, _ := piWorkspaceFixture(t)
+			m, session := piWorkspaceFixture(t)
+			session.Paused = false
+			observations := 0
+			piWorkspaceSyncSessions = func(context.Context, string) ([]syncSession, error) {
+				observations++
+				return []syncSession{*session}, nil
+			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			const sessionID = "rejected-after-prepare"
@@ -133,49 +170,57 @@ func TestPiPreparedRequestRejectionAlwaysHandsBackOrRetainsRecovery(t *testing.T
 					t.Fatal(err)
 				}
 			}
-			prepared, full, resumed, released := 0, 0, 0, 0
-			synchronizeProjectContext = func(_ context.Context, _ *Mapping, pause bool) error {
+			prepared, handbacks, released := 0, 0, 0
+			leaseID := ""
+			synchronizeProjectContext = func(syncCtx context.Context, actual *Mapping, pause bool) error {
+				if actual == nil || *actual != *m || leaseID == "" || syncCtx.Value(syncLeaseContextKey{}) != leaseID || session.Paused {
+					t.Fatal("prepared rejection lost the active watcher or exact lease")
+				}
 				if pause {
 					prepared++
 					if scenario == "cancelled-after-preparation" {
 						cancel()
 					}
 				} else {
-					full++
+					handbacks++
 				}
 				return nil
 			}
-			piWorkspaceResumeSync = func(context.Context, string) error { resumed++; return nil }
-			remoteLeaseContext = func(_ context.Context, _ *Mapping, op, owner, id string) (map[string]any, error) {
-				if op == "release" {
-					if owner != "pi" {
-						t.Fatal("prepared rejection dropped its lease without Pi handback")
+			piWorkspaceResumeSync = func(context.Context, string) error {
+				t.Fatal("prepared rejection used the retired snapshot shortcut")
+				return nil
+			}
+			remoteLeaseContext = func(_ context.Context, actual *Mapping, op, owner, id string) (map[string]any, error) {
+				if actual == nil || *actual != *m || owner != "pi" || id == "" {
+					t.Fatal("prepared rejection touched another project or lease")
+				}
+				switch op {
+				case "claim":
+					leaseID = id
+				case "release":
+					if id != leaseID || handbacks != 1 {
+						t.Fatal("prepared rejection dropped its lease without unified handback")
 					}
 					released++
 					if scenario == "reference-failure-and-release-fails" {
 						return nil, errors.New("exact release unconfirmed")
 					}
+				default:
+					t.Fatalf("prepared rejection used an unexpected lease operation: %s", op)
 				}
 				return map[string]any{"ok": true, "lease": map[string]any{"id": id, "epoch": m.BindingEpoch, "owner": "pi"}}, nil
 			}
 			view := piStartLockedContext(ctx, m, sessionID, "must not start a model", "Claude reference", attachments)
 			last, _ := view["lastResult"].(map[string]any)
-			if prepared != 1 || view["ok"] != false || view["running"] != false || view["runtimeActive"] != false || last["status"] != "error" || last["toolCalls"] != 0 || released != 1 {
-				t.Fatalf("rejected request did not use authoritative handback: %v prepare=%d resume=%d full=%d release=%d", view, prepared, resumed, full, released)
-			}
-			if scenario == "cancelled-after-preparation" {
-				if resumed != 0 || full != 1 {
-					t.Fatal("cancelled baseline observation did not keep full recovery")
-				}
-			} else if resumed != 1 || full != 0 {
-				t.Fatal("unchanged rejected request unnecessarily resynchronized")
+			if prepared != 1 || handbacks != 1 || observations != 0 || session.Paused || view["ok"] != false || view["running"] != false || view["runtimeActive"] != false || last["status"] != "error" || last["toolCalls"] != 0 || released != 1 {
+				t.Fatalf("rejected request did not use authoritative active handback: %v prepare=%d handback=%d observations=%d release=%d", view, prepared, handbacks, observations, released)
 			}
 			if scenario == "reference-failure-and-release-fails" {
 				if view["owner"] != "pi" || view["code"] != "PI_HANDOFF_FAILED" || last["workspaceStatus"] != "failed" || !piWorkspaceOwned(m.ServerPath) {
 					t.Fatal("unconfirmed prepared rejection lost its recovery reservation")
 				}
 			} else if view["owner"] != "claude" || last["workspaceStatus"] != "released" || piWorkspaceOwned(m.ServerPath) {
-				t.Fatal("rejected request left synchronization paused without visible ownership")
+				t.Fatal("rejected request retained its workspace reservation")
 			}
 		})
 	}

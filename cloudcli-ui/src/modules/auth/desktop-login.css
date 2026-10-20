@@ -1,0 +1,70 @@
+.desktop-login {
+  height: 100dvh;
+  overflow-y: auto;
+  background: hsl(var(--background));
+}
+
+.desktop-login-main {
+  display: flex;
+  min-height: 100%;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 24px 56px;
+}
+
+.desktop-login-content { width: 100%; max-width: 420px; }
+
+.desktop-login-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 26px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+}
+
+.desktop-login-mark {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border: 1px solid hsl(var(--primary) / 0.18);
+  border-radius: 10px;
+  background: hsl(var(--primary) / 0.08);
+  color: hsl(var(--primary));
+}
+
+.desktop-login-card {
+  padding: 30px;
+  border: 1px solid hsl(var(--border) / 0.9);
+  border-radius: 16px;
+  background: hsl(var(--card));
+  box-shadow: 0 4px 24px -12px hsl(var(--foreground) / 0.13);
+}
+
+.desktop-login-heading { margin-bottom: 26px; }
+.desktop-login-heading h1 { font-size: 22px; line-height: 1.4; font-weight: 600; letter-spacing: -0.035em; }
+.desktop-login-heading p { margin-top: 8px; color: hsl(var(--muted-foreground)); font-size: 13px; line-height: 1.6; }
+.desktop-login-footer { margin-top: 20px; text-align: center; color: hsl(var(--muted-foreground) / 0.8); font-size: 11px; line-height: 1.6; }
+
+.auth-input { min-height: 42px; font-size: 14px; }
+/* WebView2 supplies its own reveal control unless explicitly hidden. */
+.auth-input::-ms-reveal,
+.auth-input::-ms-clear { display: none; }
+
+.desktop-login .auth-submit { height: 42px; border-radius: 8px; font-size: 14px; box-shadow: none; }
+.desktop-login .auth-submit:hover { box-shadow: none; }
+.desktop-login .auth-server-section { margin-bottom: 24px; padding-bottom: 22px; border-bottom: 1px solid hsl(var(--border)); }
+
+@media (max-width: 480px) {
+  .desktop-login-main { padding: 24px 18px 32px; }
+  .desktop-login-card { padding: 24px 22px; }
+  .desktop-login-brand { margin-bottom: 22px; }
+}
+
+@media (max-height: 680px) {
+  .desktop-login-main { align-items: flex-start; padding-top: 20px; padding-bottom: 24px; }
+  .desktop-login-brand { margin-bottom: 16px; }
+}

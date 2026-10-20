@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import * as nativeFileSystem from 'node:fs/promises';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import os from 'node:os';
 import { createServer, request as httpRequest } from 'node:http';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -12,6 +16,126 @@ import express from 'express';
 import { createGitRouter } from '@/modules/git/git.routes.js';
 import { bridgeGitFileSystem } from '@/modules/workspace-bridge/index.js';
 import { WORKSPACES_ROOT } from '@/shared/index.js';
+
+test('commit preserves a partially staged file and commits the existing index only', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'git-partial-stage-'));
+  const execute = promisify(execFile);
+  const git = (...args: string[]) => execute('git', args, { cwd: root });
+  const commands: string[][] = [];
+  const unexpected = async () => { throw new Error('unexpected provider'); };
+  let server: ReturnType<typeof createServer> | undefined;
+  try {
+    await git('init', '-b', 'main');
+    await git('config', 'user.name', 'Test');
+    await git('config', 'user.email', 'test@example.invalid');
+    await writeFile(path.join(root, 'partial.txt'), 'base\n');
+    await writeFile(path.join(root, 'other.txt'), 'other base\n');
+    await git('add', '--', 'partial.txt', 'other.txt');
+    await git('commit', '-m', 'base');
+    await writeFile(path.join(root, 'partial.txt'), 'staged hunk\n');
+    await git('add', '--', 'partial.txt');
+    await writeFile(path.join(root, 'partial.txt'), 'staged hunk\nunstaged hunk\n');
+    await writeFile(path.join(root, 'other.txt'), 'other staged\n');
+    await git('add', '--', 'other.txt');
+    const app = express();
+    app.use(express.json());
+    app.use(createGitRouter({ fileSystem: nativeFileSystem as never, resolveProjectPathById: () => root,
+      spawnProcess: ((command: string, args: string[], options: Parameters<typeof spawn>[2]) => { commands.push(args); return spawn(command, args, options); }) as never,
+      queryClaude: unexpected, queryCursor: unexpected }));
+    server = app.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const response = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/commit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project: 'fixture', message: 'preserve staged content', files: ['partial.txt'] }) });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json() as { success: boolean }).success, true);
+    assert.equal((await git('show', 'HEAD:partial.txt')).stdout, 'staged hunk\n');
+    assert.equal((await git('show', 'HEAD:other.txt')).stdout, 'other staged\n');
+    assert.match((await git('diff', '--', 'partial.txt')).stdout, /\+unstaged hunk/);
+    assert.equal((await git('diff', '--cached')).stdout, '');
+    assert.equal(commands.some(args => args.includes('add')), false);
+  } finally {
+    if (server) { server.closeAllConnections(); await new Promise<void>(resolve => server!.close(() => resolve())); }
+    assert.equal(path.dirname(root), os.tmpdir());
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('status returns the exact branch name when a tag shadows it', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'git-shadowed-branch-'));
+  const execute = promisify(execFile);
+  const git = (...args: string[]) => execute('git', args, { cwd: root });
+  const unexpected = async () => { throw new Error('unexpected provider'); };
+  let server: ReturnType<typeof createServer> | undefined;
+  try {
+    await git('init', '-b', 'topic');
+    await git('config', 'user.name', 'Test');
+    await git('config', 'user.email', 'test@example.invalid');
+    await git('commit', '--allow-empty', '-m', 'base');
+    await git('tag', 'topic');
+    assert.equal((await git('symbolic-ref', '--short', 'HEAD')).stdout.trim(), 'heads/topic');
+    const app = express();
+    app.use(createGitRouter({ fileSystem: nativeFileSystem as never, resolveProjectPathById: () => root, spawnProcess: spawn as never, queryClaude: unexpected, queryCursor: unexpected }));
+    server = app.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const response = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/status?project=fixture`);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json() as { branch: string }).branch, 'topic');
+  } finally {
+    if (server) { server.closeAllConnections(); await new Promise<void>(resolve => server!.close(() => resolve())); }
+    assert.equal(path.dirname(root), os.tmpdir());
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('branch switching rejects unmerged entries and an unfinished merge without changing HEAD', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'git-switch-conflict-'));
+  const execute = promisify(execFile);
+  const git = (...args: string[]) => execute('git', args, { cwd: root });
+  const unexpected = async () => { throw new Error('unexpected provider'); };
+  let server: ReturnType<typeof createServer> | undefined;
+  try {
+    await git('init', '-b', 'main');
+    await git('config', 'user.name', 'Test');
+    await git('config', 'user.email', 'test@example.invalid');
+    await writeFile(path.join(root, 'conflict.txt'), 'base\n');
+    await git('add', '--', 'conflict.txt');
+    await git('commit', '-m', 'base');
+    await git('switch', '-c', 'topic');
+    await writeFile(path.join(root, 'conflict.txt'), 'topic\n');
+    await git('commit', '-am', 'topic');
+    await git('switch', 'main');
+    await writeFile(path.join(root, 'conflict.txt'), 'main\n');
+    await git('commit', '-am', 'main');
+    await assert.rejects(git('merge', 'topic'));
+    const originalHead = (await git('rev-parse', 'HEAD')).stdout;
+    const originalIndex = (await git('ls-files', '--stage')).stdout;
+    const app = express(); app.use(express.json());
+    app.use(createGitRouter({ fileSystem: nativeFileSystem as never, resolveProjectPathById: () => root, spawnProcess: spawn as never, queryClaude: unexpected, queryCursor: unexpected }));
+    server = app.listen(0, '127.0.0.1'); await once(server, 'listening');
+    const post = async (endpoint: string, branch: string) => {
+      const response = await fetch(`http://127.0.0.1:${(server!.address() as AddressInfo).port}${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project: 'fixture', branch }) });
+      return { status: response.status, body: await response.json() as { code: string } };
+    };
+    for (const [endpoint, branch] of [['/checkout', 'topic'], ['/create-branch', 'new-topic']]) {
+      const response = await post(endpoint, branch);
+      assert.equal(response.status, 409); assert.equal(response.body.code, 'GIT_OPERATION_IN_PROGRESS');
+    }
+    assert.equal((await git('rev-parse', 'HEAD')).stdout, originalHead);
+    assert.equal((await git('ls-files', '--stage')).stdout, originalIndex);
+    await writeFile(path.join(root, 'conflict.txt'), 'resolved\n');
+    await git('add', '--', 'conflict.txt');
+    assert.equal((await git('ls-files', '--unmerged')).stdout, '');
+    assert.equal((await post('/checkout', 'topic')).status, 409);
+    assert.equal((await git('branch', '--show-current')).stdout.trim(), 'main');
+    for (const branch of ['-f', '@{-1}', 'feature/../main', '.hidden', 'bad.lock']) {
+      const response = await post('/checkout', branch);
+      assert.equal(response.status, 400); assert.equal(response.body.code, 'GIT_INVALID_BRANCH');
+    }
+  } finally {
+    if (server) { server.closeAllConnections(); await new Promise<void>(resolve => server!.close(() => resolve())); }
+    assert.equal(path.dirname(root), os.tmpdir());
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test('git init does not run when repository validation fails for an execution error', async () => {
   const commands: string[][] = [];
@@ -170,7 +294,7 @@ test('initial commit preserves an authoritative workspace failure instead of tre
   await once(server, 'listening');
   try {
     const response = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/initial-commit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project: 'fixture' }) });
-    assert.equal(response.status, 500);
+    assert.equal(response.status, 503);
     assert.match((await response.json() as { error: string }).error, /workspace unavailable/);
     assert.equal(calls.filter(call => call.op === 'exec').length, 3);
     assert.equal(calls.some(call => (call.argv as string[] | undefined)?.includes('add')), false);

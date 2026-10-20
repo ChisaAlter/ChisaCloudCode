@@ -1,4 +1,7 @@
-param([string]$Makensis = "$env:LOCALAPPDATA/mygo/nsis-3.13/Bin/makensis.exe")
+param(
+    [string]$Makensis = "$env:LOCALAPPDATA/mygo/nsis-3.13/Bin/makensis.exe",
+    [string]$Node = 'node'
+)
 $ErrorActionPreference = 'Stop'
 $appRoot = Split-Path $PSScriptRoot -Parent
 $testRoot = Join-Path $appRoot ('build/installer-tests/' + [guid]::NewGuid().ToString('N'))
@@ -6,37 +9,25 @@ New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
 $fixtureId = 'com.chisa.installer-test.' + [guid]::NewGuid().ToString('N')
 $product = 'ChisaInstallerFixture-' + [guid]::NewGuid().ToString('N')
 $exeName = "$product.exe"
-$source = Join-Path $testRoot 'replacement.bin'
-[IO.File]::WriteAllText($source, 'replacement')
-$preflight = Join-Path $testRoot 'preflight.nsh'
-$payload = Join-Path $testRoot 'payload.nsh'
-$uninstall = Join-Path $testRoot 'uninstall.nsh'
-@'
-StrCpy $CheckedPath "$INSTDIR\${PRODUCT_NAME}.exe"
-Call RequireWritableFile
-StrCpy $CheckedPath "$INSTDIR\payload\resource.dat"
-Call RequireWritableFile
-'@ | Set-Content -LiteralPath $preflight -Encoding utf8
-@'
-SetOutPath "$INSTDIR"
-IfErrors install_failed
-File /oname=${PRODUCT_NAME}.exe "__SOURCE__"
-IfErrors install_failed
-SetOutPath "$INSTDIR\payload"
-IfErrors install_failed
-File /oname=resource.dat "__SOURCE__"
-IfErrors install_failed
-'@.Replace('__SOURCE__', $source) | Set-Content -LiteralPath $payload -Encoding utf8
-@'
-Delete "$INSTDIR\${PRODUCT_NAME}.exe"
-Delete "$INSTDIR\payload\resource.dat"
-RMDir "$INSTDIR\payload"
-'@ | Set-Content -LiteralPath $uninstall -Encoding utf8
-$installer = Join-Path $testRoot 'fixture-setup.exe'
-$arguments = @('/V2', '/INPUTCHARSET', 'UTF8', "/DPRODUCT_NAME=$product", "/DPRODUCT_ID=$fixtureId", '/DPRODUCT_VERSION=0.0.0',
-    "/DINSTALLER_OUTPUT=$installer", "/DINSTALLER_ICON=$appRoot/installer/icon.ico", "/DPREFLIGHT_INCLUDE=$preflight", "/DPAYLOAD_INCLUDE=$payload", "/DUNINSTALL_INCLUDE=$uninstall", "$appRoot/installer/windows.nsi")
-& $Makensis @arguments
-if ($LASTEXITCODE -ne 0) { throw "Fixture compilation failed: $LASTEXITCODE" }
+# Exercise the actual payload/include generator with a tiny fake application.
+# No native candidate or existing installed directory is used.
+$fixtureApp = Join-Path $testRoot 'fixture-app'
+foreach ($directory in @('scripts', 'installer', 'build/windows-amd64/payload')) {
+    New-Item -ItemType Directory -Path (Join-Path $fixtureApp $directory) -Force | Out-Null
+}
+Copy-Item -LiteralPath "$appRoot/scripts/build-installer.mjs" -Destination "$fixtureApp/scripts/build-installer.mjs"
+Copy-Item -LiteralPath "$appRoot/installer/windows.nsi" -Destination "$fixtureApp/installer/windows.nsi"
+Copy-Item -LiteralPath "$appRoot/installer/icon.ico" -Destination "$fixtureApp/installer/icon.ico"
+"export default { name: `"$product`", identifier: `"$fixtureId`", version: `"0.0.0`" };" | Set-Content -LiteralPath "$fixtureApp/mygo.config.ts" -Encoding utf8
+[IO.File]::WriteAllText("$fixtureApp/build/windows-amd64/$exeName", 'replacement')
+[IO.File]::WriteAllText("$fixtureApp/build/windows-amd64/payload/resource.dat", 'replacement')
+$previousMakensis = $env:MAKENSIS
+try {
+    $env:MAKENSIS = $Makensis
+    & $Node "$fixtureApp/scripts/build-installer.mjs"
+    if ($LASTEXITCODE -ne 0) { throw "Fixture compilation failed: $LASTEXITCODE" }
+} finally { $env:MAKENSIS = $previousMakensis }
+$installer = Join-Path $fixtureApp "build/windows-amd64/$product Setup 0.0.0.exe"
 
 foreach ($lockedRelative in @($exeName, 'payload/resource.dat', 'mutagen.exe')) {
     $destination = Join-Path $testRoot ([guid]::NewGuid().ToString('N'))
@@ -73,6 +64,7 @@ New-Item -ItemType Directory -Path $custom -Force | Out-Null
 $key = $registry.CreateSubKey($registryPath)
 $key.SetValue('InstallLocation', $custom)
 $key.Dispose()
+$resident = $null
 try {
     $locked = [IO.File]::Open("$custom/$exeName", [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
@@ -92,14 +84,105 @@ try {
     try { if ($key.GetValue('InstallLocation') -ne $destination) { throw 'Explicit /D did not override registry default' } } finally { $key.Dispose() }
     Write-Output 'PASS: explicit /D overrides the registered directory'
 
+    $locked = [IO.File]::Open("$destination/$exeName", [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $process = Start-Process -FilePath "$destination/Uninstall.exe" -ArgumentList "/S _?=$destination" -WindowStyle Hidden -Wait -PassThru
+        if ($process.ExitCode -ne 32) { throw "Busy application uninstall returned $($process.ExitCode), expected 32" }
+        $key = $registry.OpenSubKey($registryPath)
+        try { if (-not $key) { throw 'Busy uninstall removed its registration' } } finally { if ($key) { $key.Dispose() } }
+        if ([IO.File]::ReadAllText("$destination/$exeName") -ne 'replacement' -or
+            [IO.File]::ReadAllText("$destination/payload/resource.dat") -ne 'replacement') { throw 'Busy uninstall changed installed payload' }
+        Write-Output 'PASS: busy uninstall exits 32 before removing payload or registration'
+    } finally { $locked.Dispose() }
+
+    # A private fake daemon exercises the real stop/wait path without opening
+    # the user's Mutagen data directory or stopping a real synchronization task.
+    $helperSource = Join-Path $testRoot 'FakeDaemon.cs'
+    @'
+using System;
+using System.IO;
+using System.Threading;
+class FakeDaemon {
+    static int Main(string[] args) {
+        string executable = System.Reflection.Assembly.GetExecutingAssembly().Location;
+        if (args.Length == 2 && args[0] == "daemon" && args[1] == "stop") {
+            File.WriteAllText(executable + ".data", Environment.GetEnvironmentVariable("MUTAGEN_DATA_DIRECTORY") ?? "");
+            File.WriteAllText(executable + ".stop", "stop");
+            return 0;
+        }
+        File.WriteAllText(executable + ".ready", "ready");
+        for (int i = 0; i < 300; i++) {
+            if (File.Exists(executable + ".stop")) return 0;
+            Thread.Sleep(100);
+        }
+        return 3;
+    }
+}
+'@ | Set-Content -LiteralPath $helperSource -Encoding utf8
+    $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
+    & $compiler /nologo /target:exe "/out:$destination/mutagen.exe" $helperSource
+    if ($LASTEXITCODE -ne 0) { throw "Fake daemon compilation failed: $LASTEXITCODE" }
+    $resident = Start-Process -FilePath "$destination/mutagen.exe" -ArgumentList 'hold' -WindowStyle Hidden -PassThru
+    $waiting = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path -LiteralPath "$destination/mutagen.exe.ready") -and $waiting.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 50 }
+    if (-not (Test-Path -LiteralPath "$destination/mutagen.exe.ready")) {
+        if (-not $resident.HasExited) { $resident.Kill(); $resident.WaitForExit() }
+        throw 'Fake daemon did not become ready'
+    }
+
+    # The existing reader allows write access (preflight passes) but not deletion.
+    # This reaches the generated Delete error path without a timing race.
+    $locked = [IO.File]::Open("$destination/payload/resource.dat", [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try {
+        $process = Start-Process -FilePath "$destination/Uninstall.exe" -ArgumentList "/S _?=$destination" -WindowStyle Hidden -Wait -PassThru
+        if ($process.ExitCode -ne 1) { throw "Payload delete failure returned $($process.ExitCode), expected 1" }
+        $key = $registry.OpenSubKey($registryPath)
+        try { if (-not $key -or $key.GetValue('UninstallString') -notlike '*Uninstall.exe*') { throw 'Failed uninstall lost its registered retry entry' } } finally { if ($key) { $key.Dispose() } }
+        if (-not (Test-Path -LiteralPath "$destination/Uninstall.exe") -or
+            [IO.File]::ReadAllText("$destination/payload/resource.dat") -ne 'replacement') { throw 'Delete failure lost retry executable or locked payload' }
+        if (-not $resident.WaitForExit(5000) -or $resident.ExitCode -ne 0) { throw 'Uninstall did not stop its private resident daemon' }
+        $expectedDataDirectory = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'ChisaCloudCode/mutagen'
+        if ([IO.File]::ReadAllText("$destination/mutagen.exe.data") -ne $expectedDataDirectory) { throw 'Daemon stop used the wrong application-specific data directory' }
+        Write-Output 'PASS: uninstall stops only its private fake resident daemon and waits for its image to unlock'
+        Write-Output 'PASS: payload delete failure exits 1 and retains the original registered uninstall entry'
+    } finally {
+        $locked.Dispose()
+        if (-not $resident.HasExited) { $resident.Kill(); $resident.WaitForExit() }
+    }
+
     $process = Start-Process -FilePath "$destination/Uninstall.exe" -ArgumentList "/S _?=$destination" -WindowStyle Hidden -Wait -PassThru
     if ($process.ExitCode -ne 0) { throw "Fixture uninstall failed: $($process.ExitCode)" }
     if ((Test-Path -LiteralPath "$destination/$exeName") -or (Test-Path -LiteralPath "$destination/payload/resource.dat")) { throw 'Uninstall retained installed payload files' }
     if ([IO.File]::ReadAllText("$destination/user-project.txt") -ne 'keep root user data' -or
         [IO.File]::ReadAllText("$destination/payload/user-file.txt") -ne 'keep nested user data') { throw 'Uninstall removed user-owned files' }
     Write-Output 'PASS: uninstall removes known payload and preserves unknown root and nested files'
+
+    $normal = Join-Path $testRoot 'normal-copied-uninstaller'
+    $process = Start-Process -FilePath $installer -ArgumentList "/S /D=$normal" -WindowStyle Hidden -Wait -PassThru
+    if ($process.ExitCode -ne 0) { throw "Normal-path fixture install failed: $($process.ExitCode)" }
+    $process = Start-Process -FilePath "$normal/Uninstall.exe" -ArgumentList '/S' -WindowStyle Hidden -Wait -PassThru
+    if ($process.ExitCode -ne 0) { throw "Normal copied uninstaller launch failed: $($process.ExitCode)" }
+    $waiting.Restart()
+    do {
+        $key = $registry.OpenSubKey($registryPath)
+        $registered = $null -ne $key
+        if ($key) { $key.Dispose() }
+        $retainedPayload = (Test-Path -LiteralPath "$normal/$exeName") -or (Test-Path -LiteralPath "$normal/payload/resource.dat") -or (Test-Path -LiteralPath "$normal/Uninstall.exe")
+        if (-not $registered -and -not $retainedPayload) { break }
+        Start-Sleep -Milliseconds 50
+    } while ($waiting.ElapsedMilliseconds -lt 10000)
+    if ($registered -or $retainedPayload) { throw 'Normal copied uninstaller did not finish payload and registration cleanup' }
+    Write-Output 'PASS: normal /S copied-uninstaller path removes payload, original uninstaller and registration'
 } finally {
+    if ($resident) {
+        if (-not $resident.HasExited) { $resident.Kill(); $resident.WaitForExit() }
+        $resident.Dispose()
+    }
     $registry.DeleteSubKeyTree($registryPath, $false)
     $registry.Dispose()
+    foreach ($folder in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'))) {
+        $shortcut = Join-Path $folder "$product.lnk"
+        if (Test-Path -LiteralPath $shortcut) { Remove-Item -LiteralPath $shortcut -Force }
+    }
 }
 Write-Output "Fixture evidence: $testRoot"

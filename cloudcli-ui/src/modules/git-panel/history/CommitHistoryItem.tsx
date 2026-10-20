@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, GitBranch, Tag } from 'lucide-react';
+import { ChevronDown, ChevronRight, GitBranch, RefreshCw, Tag } from 'lucide-react';
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -43,6 +43,9 @@ type CommitHistoryItemProps = {
   commit: GitCommitSummary;
   isExpanded: boolean;
   diff?: string;
+  diffError?: string;
+  isDiffLoading: boolean;
+  onRetryDiff: () => void;
   isMobile: boolean;
   wrapText: boolean;
   graphRow?: CommitGraphRow;
@@ -54,6 +57,9 @@ export default function CommitHistoryItem({
   commit,
   isExpanded,
   diff,
+  diffError,
+  isDiffLoading,
+  onRetryDiff,
   isMobile,
   wrapText,
   graphRow,
@@ -106,7 +112,7 @@ export default function CommitHistoryItem({
         </div>
       </button>
 
-      {isExpanded && diff && (
+      {isExpanded && (
         <div className="bg-muted/50">
           <div className="max-h-[32rem] overflow-y-auto p-3">
             {/* Full hash */}
@@ -187,7 +193,20 @@ export default function CommitHistoryItem({
             )}
 
             {/* Diff viewer */}
-            <GitDiffViewer diff={diff} isMobile={isMobile} wrapText={wrapText} />
+            {isDiffLoading ? (
+              <div className="flex justify-center p-4" role="status" aria-label={t('common:status.loading')}>
+                <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground" />
+              </div>
+            ) : diffError ? (
+              <div className="space-y-2 text-sm" role="alert">
+                <p className="text-destructive">{diffError}</p>
+                <button onClick={onRetryDiff} className="rounded-md border border-border px-3 py-1 hover:bg-accent">
+                  {t('common:buttons.retry')}
+                </button>
+              </div>
+            ) : (
+              <GitDiffViewer diff={diff ?? null} isMobile={isMobile} wrapText={wrapText} />
+            )}
           </div>
         </div>
       )}

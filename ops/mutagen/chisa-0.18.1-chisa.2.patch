@@ -1,0 +1,1994 @@
+diff --git a/cmd/mutagen-agent/stream_synchronization_linux.go b/cmd/mutagen-agent/stream_synchronization_linux.go
+new file mode 100644
+index 0000000..136ed58
+--- /dev/null
++++ b/cmd/mutagen-agent/stream_synchronization_linux.go
+@@ -0,0 +1,76 @@
++//go:build linux
++
++package main
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"time"
++
++	"golang.org/x/sys/unix"
++)
++
++// synchronizationStdioStream owns pollable aliases of the agent's standard
++// streams. Unlike the generic stdioStream, Close must interrupt both protocol
++// halves so that ServeEndpoint can join them and shut down its local endpoint.
++// No other reader or writer may use standard input/output in synchronizer mode:
++// duplicated descriptors share O_NONBLOCK with the inherited descriptors.
++type synchronizationStdioStream struct {
++	input, output *os.File
++}
++
++func (s *synchronizationStdioStream) Read(buffer []byte) (int, error) {
++	return s.input.Read(buffer)
++}
++
++func (s *synchronizationStdioStream) Write(buffer []byte) (int, error) {
++	return s.output.Write(buffer)
++}
++
++func (s *synchronizationStdioStream) Close() error {
++	return errors.Join(s.input.Close(), s.output.Close())
++}
++
++// newSynchronizationStdioStream is specific to the Linux synchronization agent.
++// Make non-blocking descriptors before os.NewFile so Go registers them with its
++// runtime poller. Closing either File then wakes its pending I/O instead of
++// waiting for a blocking standard-stream syscall to return. No I/O deadline is
++// imposed; SetDeadline only verifies that registration succeeded.
++func newSynchronizationStdioStream() (io.ReadWriteCloser, error) {
++	open := func(original *os.File, name string) (*os.File, int, error) {
++		originalFD := original.Fd()
++		flags, err := unix.FcntlInt(originalFD, unix.F_GETFL, 0)
++		if err != nil {
++			return nil, 0, err
++		}
++		fd, err := unix.FcntlInt(originalFD, unix.F_DUPFD_CLOEXEC, 0)
++		if err != nil {
++			return nil, 0, err
++		}
++		if err = unix.SetNonblock(fd, true); err != nil {
++			unix.Close(fd)
++			return nil, 0, err
++		}
++		file := os.NewFile(uintptr(fd), name)
++		if err = file.SetDeadline(time.Time{}); err != nil {
++			file.Close()
++			unix.FcntlInt(originalFD, unix.F_SETFL, flags)
++			return nil, 0, fmt.Errorf("standard stream cannot support cancellable I/O: %w", err)
++		}
++		return file, flags, nil
++	}
++
++	input, inputFlags, err := open(os.Stdin, "synchronizer-input")
++	if err != nil {
++		return nil, fmt.Errorf("unable to initialize synchronization input: %w", err)
++	}
++	output, _, err := open(os.Stdout, "synchronizer-output")
++	if err != nil {
++		input.Close()
++		unix.FcntlInt(os.Stdin.Fd(), unix.F_SETFL, inputFlags)
++		return nil, fmt.Errorf("unable to initialize synchronization output: %w", err)
++	}
++	return &synchronizationStdioStream{input, output}, nil
++}
+diff --git a/cmd/mutagen-agent/stream_synchronization_linux_test.go b/cmd/mutagen-agent/stream_synchronization_linux_test.go
+new file mode 100644
+index 0000000..bafe396
+--- /dev/null
++++ b/cmd/mutagen-agent/stream_synchronization_linux_test.go
+@@ -0,0 +1,358 @@
++//go:build linux
++
++package main
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++
++	"golang.org/x/sys/unix"
++
++	"github.com/mutagen-io/mutagen/pkg/agent"
++	"github.com/mutagen-io/mutagen/pkg/encoding"
++	"github.com/mutagen-io/mutagen/pkg/mutagen"
++	"github.com/mutagen-io/mutagen/pkg/synchronization"
++	"github.com/mutagen-io/mutagen/pkg/synchronization/compression"
++	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
++	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/remote"
++	"github.com/mutagen-io/mutagen/pkg/synchronization/rsync"
++)
++
++// TestSynchronizationStdioHelperProcess runs the actual synchronizer entry point
++// when no standalone agent binary is supplied. It must never print test-runner
++// output on stdout, which carries the protocol.
++func TestSynchronizationStdioHelperProcess(t *testing.T) {
++	if os.Getenv("MUTAGEN_STDIO_TEST_CHILD") != "1" {
++		return
++	}
++	synchronizerConfiguration.logLevel = "error"
++	if err := synchronizerMain(nil, nil); err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++	os.Exit(0)
++}
++
++type synchronizationAgentProcess struct {
++	command      *exec.Cmd
++	input        *os.File
++	output       *os.File
++	fill         *os.File
++	fillFD       int
++	pipeCapacity int
++	root         string
++	stderr       bytes.Buffer
++	done         chan struct{}
++	waitErr      error
++	stopOnce     sync.Once
++}
++
++func startSynchronizationAgent(t *testing.T) *synchronizationAgentProcess {
++	t.Helper()
++	inputRead, inputWrite, err := os.Pipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	outputRead, outputWrite, err := os.Pipe()
++	if err != nil {
++		inputRead.Close()
++		inputWrite.Close()
++		t.Fatal(err)
++	}
++	// Save the descriptor before Start. Calling File.Fd afterward can restore
++	// blocking mode on the open-file description shared with the child.
++	fillFD := int(outputWrite.Fd())
++	capacity, err := unix.FcntlInt(uintptr(fillFD), unix.F_GETPIPE_SZ, 0)
++	if err != nil {
++		inputRead.Close()
++		inputWrite.Close()
++		outputRead.Close()
++		outputWrite.Close()
++		t.Fatal("unable to determine real stdout pipe capacity:", err)
++	}
++	var command *exec.Cmd
++	if binary := os.Getenv("MUTAGEN_TEST_AGENT_BINARY"); binary != "" {
++		command = exec.Command(binary, "synchronizer", "--log-level", "error")
++	} else {
++		binary, err := os.Executable()
++		if err != nil {
++			inputRead.Close()
++			inputWrite.Close()
++			outputRead.Close()
++			outputWrite.Close()
++			t.Fatal(err)
++		}
++		command = exec.Command(binary, "-test.run=^TestSynchronizationStdioHelperProcess$")
++	}
++	p := &synchronizationAgentProcess{
++		command: command, input: inputWrite, output: outputRead,
++		fill: outputWrite, fillFD: fillFD, pipeCapacity: capacity,
++		root: t.TempDir(), done: make(chan struct{}),
++	}
++	command.Stdin, command.Stdout, command.Stderr = inputRead, outputWrite, &p.stderr
++	command.Env = append(os.Environ(),
++		"MUTAGEN_STDIO_TEST_CHILD=1", "MUTAGEN_DATA_DIRECTORY="+t.TempDir())
++	if err := command.Start(); err != nil {
++		inputRead.Close()
++		p.input.Close()
++		p.output.Close()
++		p.fill.Close()
++		t.Fatal("unable to start synchronization agent:", err)
++	}
++	inputRead.Close()
++	go func() {
++		p.waitErr = command.Wait()
++		close(p.done)
++	}()
++	t.Cleanup(func() { p.stop(t) })
++	return p
++}
++
++func (p *synchronizationAgentProcess) Read(buffer []byte) (int, error) {
++	return p.output.Read(buffer)
++}
++
++func (p *synchronizationAgentProcess) Write(buffer []byte) (int, error) {
++	return p.input.Write(buffer)
++}
++
++func (p *synchronizationAgentProcess) Close() error {
++	return errors.Join(p.input.Close(), p.output.Close())
++}
++
++func (p *synchronizationAgentProcess) stop(t *testing.T) {
++	t.Helper()
++	p.stopOnce.Do(func() {
++		p.input.Close()
++		p.output.Close()
++		p.fill.Close()
++		select {
++		case <-p.done:
++		default:
++			p.command.Process.Kill()
++		}
++		select {
++		case <-p.done:
++		case <-time.After(3 * time.Second):
++			t.Error("synchronization agent did not stop after explicit cleanup")
++		}
++	})
++}
++
++func (p *synchronizationAgentProcess) exchange(t *testing.T, operation func() error) {
++	t.Helper()
++	result := make(chan error, 1)
++	go func() { result <- operation() }()
++	select {
++	case err := <-result:
++		if err != nil {
++			p.stop(t)
++			t.Fatalf("agent protocol exchange failed: %v; stderr: %s", err, p.stderr.String())
++		}
++	case <-time.After(3 * time.Second):
++		p.stop(t)
++		t.Fatal("agent protocol exchange stalled; stderr:", p.stderr.String())
++	}
++}
++
++func (p *synchronizationAgentProcess) expectFailureExit(t *testing.T, cause string) {
++	t.Helper()
++	select {
++	case <-p.done:
++	case <-time.After(3 * time.Second):
++		p.stop(t)
++		t.Fatal("agent remained stuck with the opposite stdio half open; stderr:", p.stderr.String())
++	}
++	var exitError *exec.ExitError
++	if !errors.As(p.waitErr, &exitError) {
++		t.Fatal("expected an ordinary error exit from the agent:", p.waitErr)
++	}
++	status, ok := exitError.Sys().(syscall.WaitStatus)
++	if !ok || status.Signaled() || exitError.ExitCode() != 1 {
++		t.Fatalf("agent did not return normally with its protocol error: %v; stderr: %s", p.waitErr, p.stderr.String())
++	}
++	if !strings.Contains(p.stderr.String(), cause) {
++		t.Fatalf("agent lost the initiating %q error: %s", cause, p.stderr.String())
++	}
++	// The test deliberately leaves stdin open: process exit cannot depend on
++	// the parent closing this writer to release a pending completion read.
++	if _, err := p.input.Stat(); err != nil {
++		t.Fatal("fixture closed stdin before agent termination:", err)
++	}
++}
++
++func initializeRawSynchronizationAgent(t *testing.T, p *synchronizationAgentProcess) *encoding.ProtobufEncoder {
++	t.Helper()
++	encoder := encoding.NewProtobufEncoder(p)
++	decoder := encoding.NewProtobufDecoder(bufio.NewReader(p))
++	p.exchange(t, func() error {
++		if err := agent.ClientHandshake(p); err != nil {
++			return err
++		}
++		if err := mutagen.ClientVersionHandshake(p); err != nil {
++			return err
++		}
++		if err := compression.ClientHandshake(p, compression.Algorithm_AlgorithmNone); err != nil {
++			return err
++		}
++		request := &remote.InitializeSynchronizationRequest{
++			Session: "stdio-protocol", Version: synchronization.DefaultVersion,
++			Root: p.root, Configuration: &synchronization.Configuration{
++				WatchMode:            synchronization.WatchMode_WatchModeNoWatch,
++				CompressionAlgorithm: compression.Algorithm_AlgorithmNone,
++			},
++		}
++		if err := encoder.Encode(request); err != nil {
++			return err
++		}
++		response := &remote.InitializeSynchronizationResponse{}
++		if err := decoder.Decode(response); err != nil {
++			return err
++		}
++		if response.Error != "" {
++			return errors.New(response.Error)
++		}
++		return nil
++	})
++	return encoder
++}
++
++func synchronizationStdioRequest(method string) *remote.EndpointRequest {
++	switch method {
++	case "Poll":
++		return &remote.EndpointRequest{Poll: &remote.PollRequest{}}
++	case "Scan":
++		return &remote.EndpointRequest{Scan: &remote.ScanRequest{
++			BaselineSnapshotSignature: rsync.NewEngine().BytesSignature(nil, 0), Full: true,
++		}}
++	default:
++		panic("unknown synchronization request")
++	}
++}
++
++func TestSynchronizationStdioMalformedCompletion(t *testing.T) {
++	p := startSynchronizationAgent(t)
++	encoder := initializeRawSynchronizationAgent(t, p)
++	// Initialization has consumed all stdout bytes. Fill the empty real pipe
++	// exactly once, without calling Fd after the child changed its shared
++	// open-file description to non-blocking mode.
++	n, err := unix.Write(p.fillFD, make([]byte, p.pipeCapacity))
++	if err != nil || n != p.pipeCapacity {
++		t.Fatalf("could not fill stdout pipe: wrote %d/%d bytes: %v", n, p.pipeCapacity, err)
++	}
++	p.exchange(t, func() error {
++		if err := encoder.Encode(synchronizationStdioRequest("Poll")); err != nil {
++			return err
++		}
++		// A length-one protobuf containing an invalid tag is a decoder error,
++		// not EOF. Keep stdin open and stdout completely full.
++		_, err := p.input.Write([]byte{1, 0xff})
++		return err
++	})
++	p.expectFailureExit(t, "unable to receive completion request")
++	t.Logf("real Poll agent aborted malformed completion with stdout blocked at %d bytes and stdin still open", p.pipeCapacity)
++}
++
++func TestSynchronizationStdioBrokenOutput(t *testing.T) {
++	p := startSynchronizationAgent(t)
++	encoder := initializeRawSynchronizationAgent(t, p)
++	if err := p.output.Close(); err != nil {
++		t.Fatal(err)
++	}
++	p.exchange(t, func() error { return encoder.Encode(synchronizationStdioRequest("Scan")) })
++	p.expectFailureExit(t, "unable to transmit response")
++	if !strings.Contains(p.stderr.String(), "broken pipe") {
++		t.Fatal("agent did not report the real stdout EPIPE:", p.stderr.String())
++	}
++	t.Log("real Scan agent returned EPIPE without SIGPIPE while stdin remained open")
++}
++
++func TestSynchronizationStdioHealthy(t *testing.T) {
++	for _, algorithm := range []compression.Algorithm{
++		compression.Algorithm_AlgorithmNone,
++		compression.Algorithm_AlgorithmDeflate,
++	} {
++		t.Run(algorithm.String(), func(t *testing.T) {
++			p := startSynchronizationAgent(t)
++			p.fill.Close()
++			var endpoint synchronization.Endpoint
++			p.exchange(t, func() error {
++				if err := agent.ClientHandshake(p); err != nil {
++					return err
++				}
++				if err := mutagen.ClientVersionHandshake(p); err != nil {
++					return err
++				}
++				var err error
++				endpoint, err = remote.NewEndpoint(nil, p, p.root, "stdio-healthy",
++					synchronization.DefaultVersion, &synchronization.Configuration{
++						WatchMode:            synchronization.WatchMode_WatchModeNoWatch,
++						CompressionAlgorithm: algorithm,
++					}, false)
++				return err
++			})
++			p.exchange(t, func() error {
++				ctx, cancel := context.WithCancel(context.Background())
++				cancel()
++				if err := endpoint.Poll(ctx); err != nil {
++					return err
++				}
++				if _, err, _ := endpoint.Scan(context.Background(), nil, true); err != nil {
++					return err
++				}
++				changes := []*core.Change{{Path: "ack-proof", New: &core.Entry{Kind: core.EntryKind_Directory}}}
++				results, problems, missing, err := endpoint.Transition(context.Background(), changes)
++				if err != nil || len(results) != 1 || len(problems) != 0 || missing {
++					return fmt.Errorf("directory transition failed: results=%v problems=%v missing=%v err=%v", results, problems, missing, err)
++				}
++				snapshot, err, _ := endpoint.Scan(context.Background(), nil, true)
++				if err != nil || snapshot == nil || snapshot.Content == nil || snapshot.Content.Contents["ack-proof"] == nil {
++					return fmt.Errorf("directory missing from subsequent Scan: %v", err)
++				}
++				return nil
++			})
++			if info, err := os.Stat(filepath.Join(p.root, "ack-proof")); err != nil || !info.IsDir() {
++				t.Fatal("real agent Transition did not create a directory:", err)
++			}
++			select {
++			case <-p.done:
++				t.Fatal("healthy cancellation or ACK terminated the agent:", p.stderr.String())
++			default:
++			}
++			p.exchange(t, endpoint.Shutdown)
++			// Shutdown intentionally closes stdin, so this exit assertion does
++			// not use expectFailureExit, which checks that stdin stayed open.
++			select {
++			case <-p.done:
++			case <-time.After(3 * time.Second):
++				p.stop(t)
++				t.Fatal("healthy agent did not exit after endpoint Shutdown")
++			}
++			var exitError *exec.ExitError
++			if !errors.As(p.waitErr, &exitError) {
++				t.Fatal("agent did not report ordinary protocol termination:", p.waitErr)
++			}
++			if status, ok := exitError.Sys().(syscall.WaitStatus); !ok || status.Signaled() || exitError.ExitCode() != 1 {
++				t.Fatalf("healthy Shutdown killed the agent instead of returning: %v; stderr: %s", p.waitErr, p.stderr.String())
++			}
++			if !strings.Contains(p.stderr.String(), "synchronization terminated") {
++				t.Fatal("missing ordinary synchronization termination:", p.stderr.String())
++			}
++			t.Log("real agent kept one connection for Poll cancel, Scan, directory Transition, Scan, then exited after Shutdown")
++		})
++	}
++}
++
++var _ io.ReadWriteCloser = (*synchronizationAgentProcess)(nil)
+diff --git a/cmd/mutagen-agent/stream_synchronization_other.go b/cmd/mutagen-agent/stream_synchronization_other.go
+new file mode 100644
+index 0000000..96c042a
+--- /dev/null
++++ b/cmd/mutagen-agent/stream_synchronization_other.go
+@@ -0,0 +1,15 @@
++//go:build !linux
++
++package main
++
++import (
++	"errors"
++	"io"
++)
++
++// This downstream runtime ships only a Linux synchronization agent. Reject
++// unsupported builds rather than offer the generic non-cancellable stdio stream
++// to the synchronization server. Forwarding keeps its upstream stream behavior.
++func newSynchronizationStdioStream() (io.ReadWriteCloser, error) {
++	return nil, errors.New("this synchronization agent build requires Linux")
++}
+diff --git a/cmd/mutagen-agent/synchronizer.go b/cmd/mutagen-agent/synchronizer.go
+index e20f749..8dd0aae 100644
+--- a/cmd/mutagen-agent/synchronizer.go
++++ b/cmd/mutagen-agent/synchronizer.go
+@@ -72,7 +72,11 @@ func synchronizerMain(_ *cobra.Command, _ []string) error {
+ 	go housekeepRegularly(ctx, logger.Sublogger("housekeeping"))
+ 
+ 	// Create a stream using standard input/output.
+-	stream := newStdioStream()
++	stream, err := newSynchronizationStdioStream()
++	if err != nil {
++		return err
++	}
++	defer stream.Close()
+ 
+ 	// Perform an agent handshake.
+ 	if err := agent.ServerHandshake(stream); err != nil {
+diff --git a/cmd/mutagen/daemon/run.go b/cmd/mutagen/daemon/run.go
+index 6917419..4235a88 100644
+--- a/cmd/mutagen/daemon/run.go
++++ b/cmd/mutagen/daemon/run.go
+@@ -88,6 +88,7 @@ func runMain(_ *cobra.Command, _ []string) error {
+ 	// Create and register the synchronization server.
+ 	synchronizationServer := synchronizationsvc.NewServer(synchronizationManager)
+ 	synchronizationsvc.RegisterSynchronizationServer(server, synchronizationServer)
++	synchronizationsvc.RegisterIgnoreConfigurationServer(server, synchronizationServer)
+ 
+ 	// Compute the path to the daemon IPC endpoint.
+ 	endpoint, err := daemon.EndpointPath()
+diff --git a/cmd/mutagen/sync/main.go b/cmd/mutagen/sync/main.go
+index 6564915..30b324a 100644
+--- a/cmd/mutagen/sync/main.go
++++ b/cmd/mutagen/sync/main.go
+@@ -50,6 +50,7 @@ func init() {
+ 		pauseCommand,
+ 		resumeCommand,
+ 		resetCommand,
++		updateIgnoresCommand,
+ 		terminateCommand,
+ 	)
+ }
+diff --git a/pkg/mutagen/version.go b/pkg/mutagen/version.go
+index 7922ffb..08294ab 100644
+--- a/pkg/mutagen/version.go
++++ b/pkg/mutagen/version.go
+@@ -19,7 +19,7 @@ const (
+ 	// VersionTag represents a tag to be appended to the Mutagen version string.
+ 	// It must not contain spaces. If empty, no tag is appended to the version
+ 	// string.
+-	VersionTag = ""
++	VersionTag = "chisa.2"
+ )
+ 
+ // DevelopmentModeEnabled indicates that development mode is active. This is
+diff --git a/pkg/synchronization/controller.go b/pkg/synchronization/controller.go
+index d0986c5..7a9d420 100644
+--- a/pkg/synchronization/controller.go
++++ b/pkg/synchronization/controller.go
+@@ -44,9 +44,9 @@ type controller struct {
+ 	// they store it in a separate variable before releasing the lock.
+ 	stateLock *state.TrackingLock
+ 	// session encodes the associated session metadata. It is considered static
+-	// and safe for concurrent access except for its Paused field, for which
+-	// stateLock should be held. It should be saved to disk any time it is
+-	// modified.
++	// and safe for concurrent access except for Paused and Configuration, for
++	// which stateLock should be held. Configuration changes also require the
++	// lifecycle lock and a paused, stopped controller. Save modifications.
+ 	session *Session
+ 	// mergedAlphaConfiguration is the alpha-specific configuration object
+ 	// (computed from the core configuration and alpha-specific overrides). It
+@@ -871,6 +871,12 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
+ 		return fmt.Errorf("invalid archive found on disk: %w", err)
+ 	}
+ 	ancestor := archive.Content
++	ignorer, err := c.session.Configuration.NewIgnorer(c.session.Version)
++	if err != nil {
++		return fmt.Errorf("unable to evaluate ancestor ignore coverage: %w", err)
++	}
++	ancestor = filterIgnoredAncestor("", ancestor, ignorer, false)
++	ancestorCoverageChanged := !archive.Content.Equal(ancestor, true)
+ 
+ 	// Compute the effective synchronization mode.
+ 	synchronizationMode := c.session.Configuration.SynchronizationMode
+@@ -1123,6 +1129,12 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
+ 				ancestor, αContent, βContent,
+ 			)
+ 		}
++		// Current entry kinds can differ from the archived kinds used by the
++		// initial ignore projection. An explicit untracked marker is not a
++		// deletion; preserve the other endpoint's copy instead of deleting it.
++		var untrackedCoverageChanged bool
++		ancestor, untrackedCoverageChanged = filterUntrackedAncestor(ancestor, αContent, βContent)
++		ancestorCoverageChanged = ancestorCoverageChanged || untrackedCoverageChanged
+ 
+ 		// Now that we've had a successful scan, clear the last error (if any),
+ 		// record scan statistics and problems (if any), and update the status
+@@ -1378,7 +1390,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
+ 		// ancestor if any changes are present.
+ 		ancestorChanges = append(ancestorChanges, αChanges...)
+ 		ancestorChanges = append(ancestorChanges, βChanges...)
+-		if len(ancestorChanges) > 0 {
++		if len(ancestorChanges) > 0 || ancestorCoverageChanged {
+ 			// Apply the changes to the ancestor.
+ 			if newAncestor, err := core.Apply(ancestor, ancestorChanges); err != nil {
+ 				return fmt.Errorf("unable to propagate changes to ancestor: %w", err)
+@@ -1405,6 +1417,7 @@ func (c *controller) synchronize(ctx context.Context, alpha, beta Endpoint) erro
+ 			if err := encoding.MarshalAndSaveProtobuf(c.archivePath, archive); err != nil {
+ 				return fmt.Errorf("unable to save ancestor: %w", err)
+ 			}
++			ancestorCoverageChanged = false
+ 		}
+ 
+ 		// Now check for transition errors.
+diff --git a/pkg/synchronization/endpoint/local/endpoint.go b/pkg/synchronization/endpoint/local/endpoint.go
+index 1bf3150..44bc4d1 100644
+--- a/pkg/synchronization/endpoint/local/endpoint.go
++++ b/pkg/synchronization/endpoint/local/endpoint.go
+@@ -21,8 +21,6 @@ import (
+ 	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
+ 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/fastpath"
+ 	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
+-	dockerignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/docker"
+-	mutagenignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/mutagen"
+ 	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/local/staging"
+ 	"github.com/mutagen-io/mutagen/pkg/synchronization/rsync"
+ 	"github.com/mutagen-io/mutagen/pkg/timeutil"
+@@ -275,40 +273,10 @@ func NewEndpoint(
+ 		symbolicLinkMode = version.DefaultSymbolicLinkMode()
+ 	}
+ 
+-	// Compute the effective ignore syntax.
+-	ignoreSyntax := configuration.IgnoreSyntax
+-	if ignoreSyntax.IsDefault() {
+-		ignoreSyntax = version.DefaultIgnoreSyntax()
+-	}
+-
+-	// Compute a combined ignore list and create the ignorer.
+-	var ignores []string
+-	ignores = append(ignores, configuration.DefaultIgnores...)
+-	ignores = append(ignores, configuration.Ignores...)
+-	var ignorer ignore.Ignorer
+-	if ignoreSyntax == ignore.Syntax_SyntaxMutagen {
+-		if i, err := mutagenignore.NewIgnorer(ignores); err != nil {
+-			return nil, fmt.Errorf("unable to create Mutagen-style ignorer: %w", err)
+-		} else {
+-			ignorer = i
+-		}
+-	} else if ignoreSyntax == ignore.Syntax_SyntaxDocker {
+-		if i, err := dockerignore.NewIgnorer(ignores); err != nil {
+-			return nil, fmt.Errorf("unable to create Docker-style ignorer: %w", err)
+-		} else {
+-			ignorer = i
+-		}
+-	} else {
+-		panic("unhandled ignore syntax")
+-	}
+-
+-	// Compute the effective VCS ignore mode and add VCS ignores if necessary.
+-	ignoreVCSMode := configuration.IgnoreVCSMode
+-	if ignoreVCSMode.IsDefault() {
+-		ignoreVCSMode = version.DefaultIgnoreVCSMode()
+-	}
+-	if ignoreVCSMode == ignore.IgnoreVCSMode_IgnoreVCSModeIgnore {
+-		ignorer = ignore.IgnoreVCS(ignorer)
++	// Use the same effective ignore semantics as ancestor coverage projection.
++	ignorer, err := configuration.NewIgnorer(version)
++	if err != nil {
++		return nil, fmt.Errorf("unable to create ignorer: %w", err)
+ 	}
+ 
+ 	// Track whether or not any non-default ownership or directory permissions
+diff --git a/pkg/synchronization/endpoint/remote/client.go b/pkg/synchronization/endpoint/remote/client.go
+index e588d8c..cde5e15 100644
+--- a/pkg/synchronization/endpoint/remote/client.go
++++ b/pkg/synchronization/endpoint/remote/client.go
+@@ -25,6 +25,8 @@ type endpointClient struct {
+ 	logger *logging.Logger
+ 	// closer close the compression resources and the control stream.
+ 	closer io.Closer
++	// aborter closes the raw transport without flushing compression buffers.
++	aborter io.Closer
+ 	// flusher flushes the outbound control stream.
+ 	flusher streampkg.Flusher
+ 	// encoder is the control stream encoder.
+@@ -79,12 +81,15 @@ func NewEndpoint(
+ 	// Create a mechanism to flush the outbound pipeline.
+ 	flusher := streampkg.NewMultiFlusher(outbound, compressor, compressedOutbound)
+ 
++	// Share a single transport closure between abort and normal shutdown.
++	aborter := newOnceCloser(stream)
++
+ 	// Create a closer for the control stream and compression resources.
+ 	closer := streampkg.NewMultiCloser(
+ 		streampkg.NewFlushCloser(outbound),
+ 		compressor,
+ 		streampkg.NewFlushCloser(compressedOutbound),
+-		stream,
++		aborter,
+ 		decompressor,
+ 	)
+ 
+@@ -130,6 +135,7 @@ func NewEndpoint(
+ 	return &endpointClient{
+ 		logger:  logger,
+ 		closer:  closer,
++		aborter: aborter,
+ 		flusher: flusher,
+ 		encoder: encoder,
+ 		decoder: decoder,
+@@ -184,29 +190,9 @@ func (c *endpointClient) Poll(ctx context.Context) error {
+ 		}
+ 	}()
+ 
+-	// Wait for both a completion request to be sent and a response to be
+-	// received. Both of these will occur, though their order is not known. If
+-	// the completion request is sent first, then we know that the polling
+-	// context has been cancelled and that a response is on its way. In this
+-	// case, we still cancel the subcontext we created as required by the
+-	// context package to avoid leaking resources. If the response comes first,
+-	// then we need to force sending of the completion request and wait for the
+-	// result of that operation.
+-	var completionSendErr, responseReceiveErr error
+-	select {
+-	case completionSendErr = <-completionSendErrors:
+-		cancel()
+-		responseReceiveErr = <-responseReceiveErrors
+-	case responseReceiveErr = <-responseReceiveErrors:
+-		cancel()
+-		completionSendErr = <-completionSendErrors
+-	}
+-
+-	// Check for transmission errors.
+-	if responseReceiveErr != nil {
+-		return responseReceiveErr
+-	} else if completionSendErr != nil {
+-		return completionSendErr
++	// Complete the exchange, aborting the transport on protocol failures.
++	if err := waitForCompletion(cancel, c.aborter, completionSendErrors, responseReceiveErrors); err != nil {
++		return err
+ 	}
+ 
+ 	// Check for remote errors.
+@@ -287,29 +273,9 @@ func (c *endpointClient) Scan(ctx context.Context, ancestor *core.Entry, full bo
+ 		}
+ 	}()
+ 
+-	// Wait for both a completion request to be sent and a response to be
+-	// received. Both of these will occur, though their order is not known. If
+-	// the completion request is sent first, then we know that the scanning
+-	// context has been cancelled and that a response is on its way. In this
+-	// case, we still cancel the subcontext we created as required by the
+-	// context package to avoid leaking resources. If the response comes first,
+-	// then we need to force sending of the completion request and wait for the
+-	// result of that operation.
+-	var completionSendErr, responseReceiveErr error
+-	select {
+-	case completionSendErr = <-completionSendErrors:
+-		cancel()
+-		responseReceiveErr = <-responseReceiveErrors
+-	case responseReceiveErr = <-responseReceiveErrors:
+-		cancel()
+-		completionSendErr = <-completionSendErrors
+-	}
+-
+-	// Check for transmission errors.
+-	if responseReceiveErr != nil {
+-		return nil, responseReceiveErr, false
+-	} else if completionSendErr != nil {
+-		return nil, completionSendErr, false
++	// Complete the exchange, aborting the transport on protocol failures.
++	if err := waitForCompletion(cancel, c.aborter, completionSendErrors, responseReceiveErrors); err != nil {
++		return nil, err, false
+ 	}
+ 
+ 	// Check for remote errors.
+@@ -500,29 +466,9 @@ func (c *endpointClient) Transition(ctx context.Context, transitions []*core.Cha
+ 		}
+ 	}()
+ 
+-	// Wait for both a completion request to be sent and a response to be
+-	// received. Both of these will occur, though their order is not known. If
+-	// the completion request is sent first, then we know that the transition
+-	// context has been cancelled and that a response is on its way. In this
+-	// case, we still cancel the subcontext we created as required by the
+-	// context package to avoid leaking resources. If the response comes first,
+-	// then we need to force sending of the completion request and wait for the
+-	// result of that operation.
+-	var completionSendErr, responseReceiveErr error
+-	select {
+-	case completionSendErr = <-completionSendErrors:
+-		cancel()
+-		responseReceiveErr = <-responseReceiveErrors
+-	case responseReceiveErr = <-responseReceiveErrors:
+-		cancel()
+-		completionSendErr = <-completionSendErrors
+-	}
+-
+-	// Check for transmission errors.
+-	if responseReceiveErr != nil {
+-		return nil, nil, false, responseReceiveErr
+-	} else if completionSendErr != nil {
+-		return nil, nil, false, completionSendErr
++	// Complete the exchange, aborting the transport on protocol failures.
++	if err := waitForCompletion(cancel, c.aborter, completionSendErrors, responseReceiveErrors); err != nil {
++		return nil, nil, false, err
+ 	}
+ 
+ 	// Check for remote errors.
+diff --git a/pkg/synchronization/endpoint/remote/completion.go b/pkg/synchronization/endpoint/remote/completion.go
+new file mode 100644
+index 0000000..3dbe8f1
+--- /dev/null
++++ b/pkg/synchronization/endpoint/remote/completion.go
+@@ -0,0 +1,54 @@
++package remote
++
++import (
++	"context"
++	"io"
++	"sync"
++)
++
++// onceCloser shares a single underlying closure between abort and shutdown.
++type onceCloser struct {
++	// close performs the underlying closure at most once and caches its result.
++	close func() error
++}
++
++// newOnceCloser wraps a closer so that it is only invoked once.
++func newOnceCloser(closer io.Closer) io.Closer {
++	return &onceCloser{close: sync.OnceValue(closer.Close)}
++}
++
++// Close implements io.Closer.Close.
++func (c *onceCloser) Close() error {
++	return c.close()
++}
++
++// waitForCompletion joins both sides of a completion exchange. A successful
++// first result still requires the other side's acknowledgement. A failed first
++// result aborts the raw transport before joining the remaining operation, since
++// a half-open transport cannot complete the exchange. The initiating failure is
++// preserved instead of the transport error induced by closure.
++func waitForCompletion(cancel context.CancelFunc, aborter io.Closer, first, second <-chan error) error {
++	var firstErr error
++	var remaining <-chan error
++	select {
++	case firstErr = <-first:
++		remaining = second
++	case firstErr = <-second:
++		remaining = first
++	}
++	cancel()
++
++	// Unblock the remaining operation if the exchange has already failed.
++	if firstErr != nil {
++		aborter.Close()
++		<-remaining
++		return firstErr
++	}
++
++	// Preserve the normal acknowledgement path when the first half succeeds.
++	if err := <-remaining; err != nil {
++		aborter.Close()
++		return err
++	}
++	return nil
++}
+diff --git a/pkg/synchronization/endpoint/remote/completion_protocol_test.go b/pkg/synchronization/endpoint/remote/completion_protocol_test.go
+new file mode 100644
+index 0000000..08a6ea4
+--- /dev/null
++++ b/pkg/synchronization/endpoint/remote/completion_protocol_test.go
+@@ -0,0 +1,340 @@
++package remote_test
++
++import (
++	"context"
++	"errors"
++	"net"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/mutagen-io/mutagen/pkg/synchronization"
++	"github.com/mutagen-io/mutagen/pkg/synchronization/compression"
++	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
++	"github.com/mutagen-io/mutagen/pkg/synchronization/endpoint/remote"
++)
++
++var errHalfFlow = errors.New("injected half-flow failure")
++
++// protocolFaultConnection preserves the stream contract: closing it unblocks
++// all pending reads and writes. Faults are armed only after real initialization.
++type protocolFaultConnection struct {
++	net.Conn
++	lock           sync.Mutex
++	mode           string
++	armed          bool
++	writes         int
++	requestRead    bool
++	requestWritten chan struct{}
++	requestOnce    sync.Once
++	fault          chan struct{}
++	faultOnce      sync.Once
++	closed         chan struct{}
++	closeOnce      sync.Once
++	closeCalls     atomic.Int32
++}
++
++func newProtocolFaultConnection(connection net.Conn) *protocolFaultConnection {
++	return &protocolFaultConnection{
++		Conn:           connection,
++		requestWritten: make(chan struct{}),
++		fault:          make(chan struct{}),
++		closed:         make(chan struct{}),
++	}
++}
++
++func (c *protocolFaultConnection) arm(mode string) {
++	c.lock.Lock()
++	c.mode, c.armed = mode, true
++	c.lock.Unlock()
++}
++
++func (c *protocolFaultConnection) Read(buffer []byte) (int, error) {
++	c.lock.Lock()
++	block := c.armed && (c.mode == "client" || (c.mode == "server-response" && c.requestRead))
++	fail := c.armed && (c.mode == "client-response" || (c.mode == "server" && c.requestRead))
++	c.lock.Unlock()
++	if fail {
++		c.faultOnce.Do(func() { close(c.fault) })
++		return 0, errHalfFlow
++	} else if block {
++		<-c.closed
++		return 0, net.ErrClosed
++	}
++
++	n, err := c.Conn.Read(buffer)
++	c.lock.Lock()
++	if c.armed && strings.HasPrefix(c.mode, "server") && n > 0 {
++		c.requestRead = true
++	}
++	c.lock.Unlock()
++	return n, err
++}
++
++func (c *protocolFaultConnection) Write(buffer []byte) (int, error) {
++	c.lock.Lock()
++	armed, mode := c.armed, c.mode
++	if armed {
++		c.writes++
++	}
++	writes := c.writes
++	c.lock.Unlock()
++	if armed && mode == "client" && writes >= 2 {
++		c.faultOnce.Do(func() { close(c.fault) })
++		return 0, errHalfFlow
++	} else if armed && mode == "client-response" && writes >= 2 {
++		<-c.closed
++		return 0, net.ErrClosed
++	} else if armed && mode == "server-response" {
++		c.faultOnce.Do(func() { close(c.fault) })
++		return 0, errHalfFlow
++	} else if armed && mode == "server" {
++		<-c.closed
++		return 0, net.ErrClosed
++	}
++
++	n, err := c.Conn.Write(buffer)
++	if armed && strings.HasPrefix(mode, "client") && writes == 1 && err == nil {
++		c.requestOnce.Do(func() { close(c.requestWritten) })
++	}
++	return n, err
++}
++
++// forceClose is the fixture's independent stop path, not a product Close call.
++func (c *protocolFaultConnection) forceClose() {
++	c.closeOnce.Do(func() {
++		close(c.closed)
++		c.Conn.Close()
++	})
++}
++
++func (c *protocolFaultConnection) Close() error {
++	c.closeCalls.Add(1)
++	c.forceClose()
++	return nil
++}
++
++type protocolPair struct {
++	endpoint     synchronization.Endpoint
++	client       *protocolFaultConnection
++	server       *protocolFaultConnection
++	root         string
++	serverDone   chan struct{}
++	serverErr    error
++	shutdownOnce sync.Once
++	shutdownErr  error
++}
++
++func newProtocolPair(t *testing.T, algorithm compression.Algorithm) *protocolPair {
++	t.Helper()
++	t.Setenv("MUTAGEN_DATA_DIRECTORY", t.TempDir())
++	client, server := net.Pipe()
++	pair := &protocolPair{
++		client:     newProtocolFaultConnection(client),
++		server:     newProtocolFaultConnection(server),
++		root:       t.TempDir(),
++		serverDone: make(chan struct{}),
++	}
++	go func() {
++		pair.serverErr = remote.ServeEndpoint(nil, pair.server)
++		close(pair.serverDone)
++	}()
++	var err error
++	pair.endpoint, err = remote.NewEndpoint(nil, pair.client, pair.root,
++		"completion-protocol", synchronization.DefaultVersion,
++		&synchronization.Configuration{
++			WatchMode:            synchronization.WatchMode_WatchModeNoWatch,
++			CompressionAlgorithm: algorithm,
++		}, false)
++	if err != nil {
++		pair.forceClose()
++		t.Fatal("unable to initialize real endpoint pair:", err)
++	}
++	t.Cleanup(func() {
++		pair.forceClose()
++		pair.shutdown()
++		awaitProtocolSignal(t, "server cleanup", pair.serverDone)
++	})
++	return pair
++}
++
++func (p *protocolPair) forceClose() {
++	p.client.forceClose()
++	p.server.forceClose()
++}
++
++func (p *protocolPair) shutdown() error {
++	p.shutdownOnce.Do(func() { p.shutdownErr = p.endpoint.Shutdown() })
++	return p.shutdownErr
++}
++
++func awaitProtocolSignal(t *testing.T, name string, signal <-chan struct{}) {
++	t.Helper()
++	select {
++	case <-signal:
++	case <-time.After(3 * time.Second):
++		t.Fatal(name, "did not complete")
++	}
++}
++
++func protocolOperation(endpoint synchronization.Endpoint, method string, ctx context.Context) error {
++	switch method {
++	case "Poll":
++		return endpoint.Poll(ctx)
++	case "Scan":
++		_, err, _ := endpoint.Scan(ctx, nil, true)
++		return err
++	case "Transition":
++		_, _, _, err := endpoint.Transition(ctx, nil)
++		return err
++	default:
++		panic("unknown protocol operation")
++	}
++}
++
++// testCompletionHalfFlow exercises a real client/server exchange rather than
++// the completion helper. The opposite I/O half remains open and blocked until
++// the product closes the raw transport. Fixture cleanup can independently stop
++// the original implementation when it gets stuck.
++func testCompletionHalfFlow(t *testing.T, algorithm compression.Algorithm, side, method, mode string) {
++	t.Helper()
++	pair := newProtocolPair(t, algorithm)
++	faulty := pair.client
++	if side == "server" {
++		faulty = pair.server
++	}
++	faulty.arm(mode)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	result := make(chan error, 1)
++	go func() { result <- protocolOperation(pair.endpoint, method, ctx) }()
++	if mode == "client" {
++		awaitProtocolSignal(t, "real request transmission", faulty.requestWritten)
++		cancel()
++	}
++	awaitProtocolSignal(t, "half-flow injection", faulty.fault)
++	started := time.Now()
++	var operationErr error
++	if side == "client" {
++		select {
++		case operationErr = <-result:
++		case <-time.After(time.Second):
++			pair.forceClose()
++			<-result
++			t.Error("client stuck after half-flow failure with opposite I/O half open")
++			return
++		}
++	} else {
++		select {
++		case <-pair.serverDone:
++			operationErr = pair.serverErr
++		case <-time.After(time.Second):
++			pair.forceClose()
++			awaitProtocolSignal(t, "forced server stop", pair.serverDone)
++			<-result
++			t.Error("server stuck after half-flow failure with opposite I/O half open")
++			return
++		}
++		select {
++		case <-result:
++		case <-time.After(3 * time.Second):
++			t.Fatal("client did not observe server abort")
++		}
++	}
++	if !errors.Is(operationErr, errHalfFlow) {
++		t.Error("original transport error was lost:", operationErr)
++	}
++	var stage string
++	if side == "client" {
++		stage = "unable to send completion request"
++		if mode == "client-response" {
++			stage = "unable to receive " + strings.ToLower(method) + " response"
++		}
++	} else {
++		stage = "unable to serve " + strings.ToLower(method) + " request: unable to receive completion request"
++		if mode == "server-response" {
++			stage = "unable to serve " + strings.ToLower(method) + " request: unable to transmit response"
++		}
++	}
++	if operationErr == nil || !strings.Contains(operationErr.Error(), stage) {
++		t.Errorf("fault did not reach the intended %s protocol stage: %v", stage, operationErr)
++	}
++	pair.shutdown()
++	awaitProtocolSignal(t, "server exit", pair.serverDone)
++	if calls := faulty.closeCalls.Load(); calls != 1 {
++		t.Errorf("raw transport Close called %d times, expected once", calls)
++	}
++	t.Logf("real %s %s exchange exited in %s; cause retained; raw Close once; %v", mode, method, time.Since(started), operationErr)
++}
++
++// TestCompletionProtocolHalfFlow covers the six client/server completion
++// methods and both orderings of transport failure.
++func TestCompletionProtocolHalfFlow(t *testing.T) {
++	for _, algorithm := range []compression.Algorithm{
++		compression.Algorithm_AlgorithmNone,
++		compression.Algorithm_AlgorithmDeflate,
++	} {
++		for _, side := range []string{"client", "server"} {
++			for _, method := range []string{"Poll", "Scan", "Transition"} {
++				t.Run(algorithm.String()+"/"+side+"/"+method, func(t *testing.T) {
++					testCompletionHalfFlow(t, algorithm, side, method, side)
++				})
++			}
++		}
++	}
++
++	// Also exercise response-side failures arriving before the completion side.
++	// The DEFLATE cases cover these alternate wait orderings on the real wire.
++	t.Run("AlgorithmDeflate/client-response/Poll", func(t *testing.T) {
++		testCompletionHalfFlow(t, compression.Algorithm_AlgorithmDeflate, "client", "Poll", "client-response")
++	})
++	t.Run("AlgorithmDeflate/server-response/Scan", func(t *testing.T) {
++		testCompletionHalfFlow(t, compression.Algorithm_AlgorithmDeflate, "server", "Scan", "server-response")
++	})
++}
++
++func TestCompletionProtocolHealthy(t *testing.T) {
++	for _, algorithm := range []compression.Algorithm{
++		compression.Algorithm_AlgorithmNone,
++		compression.Algorithm_AlgorithmDeflate,
++	} {
++		t.Run(algorithm.String(), func(t *testing.T) {
++			pair := newProtocolPair(t, algorithm)
++			ctx, cancel := context.WithCancel(context.Background())
++			cancel()
++			if err := pair.endpoint.Poll(ctx); err != nil {
++				t.Fatal("normal Poll cancellation failed:", err)
++			}
++			if _, err, _ := pair.endpoint.Scan(context.Background(), nil, true); err != nil {
++				t.Fatal("Scan after normal cancellation failed:", err)
++			}
++			changes := []*core.Change{{Path: "ack-proof", New: &core.Entry{Kind: core.EntryKind_Directory}}}
++			results, problems, missing, err := pair.endpoint.Transition(context.Background(), changes)
++			if err != nil || len(results) != 1 || len(problems) != 0 || missing {
++				t.Fatalf("real directory transition failed: results=%v problems=%v missing=%v err=%v", results, problems, missing, err)
++			}
++			if info, err := os.Stat(filepath.Join(pair.root, "ack-proof")); err != nil || !info.IsDir() {
++				t.Fatal("Transition did not create the directory:", err)
++			}
++			snapshot, err, _ := pair.endpoint.Scan(context.Background(), nil, true)
++			if err != nil || snapshot == nil || snapshot.Content == nil || snapshot.Content.Contents["ack-proof"] == nil {
++				t.Fatal("post-Transition Scan did not observe directory:", err)
++			}
++			if pair.client.closeCalls.Load() != 0 || pair.server.closeCalls.Load() != 0 {
++				t.Fatal("healthy ACK or normal cancellation aborted the transport")
++			}
++			if err := pair.shutdown(); err != nil {
++				t.Fatal("healthy shutdown failed:", err)
++			}
++			awaitProtocolSignal(t, "healthy server exit", pair.serverDone)
++			if pair.client.closeCalls.Load() != 1 || pair.server.closeCalls.Load() != 1 {
++				t.Fatal("healthy endpoint shutdown did not close each raw transport once")
++			}
++			t.Log("normal cancellation ACK, subsequent Scan/Transition/Scan, directory on disk/state, and shutdown succeeded on the same transport")
++		})
++	}
++}
+diff --git a/pkg/synchronization/endpoint/remote/server.go b/pkg/synchronization/endpoint/remote/server.go
+index a8f92a1..c4b3b86 100644
+--- a/pkg/synchronization/endpoint/remote/server.go
++++ b/pkg/synchronization/endpoint/remote/server.go
+@@ -25,6 +25,8 @@ import (
+ type endpointServer struct {
+ 	// endpoint is the underlying local endpoint.
+ 	endpoint synchronization.Endpoint
++	// aborter closes the raw transport without flushing compression buffers.
++	aborter io.Closer
+ 	// flusher flushes the outbound control stream.
+ 	flusher streampkg.Flusher
+ 	// encoder is the control stream encoder.
+@@ -61,13 +63,16 @@ func ServeEndpoint(logger *logging.Logger, stream io.ReadWriteCloser) error {
+ 	// Create a mechanism to flush the outbound pipeline.
+ 	flusher := streampkg.NewMultiFlusher(outbound, compressor, compressedOutbound)
+ 
++	// Share a single transport closure between abort and normal shutdown.
++	aborter := newOnceCloser(stream)
++
+ 	// Create a closer for the control stream and compression resources and
+ 	// defer its invocation.
+ 	closer := streampkg.NewMultiCloser(
+ 		streampkg.NewFlushCloser(outbound),
+ 		compressor,
+ 		streampkg.NewFlushCloser(compressedOutbound),
+-		stream,
++		aborter,
+ 		decompressor,
+ 	)
+ 	defer closer.Close()
+@@ -132,6 +137,7 @@ func ServeEndpoint(logger *logging.Logger, stream io.ReadWriteCloser) error {
+ 	// Create the server.
+ 	server := &endpointServer{
+ 		endpoint: endpoint,
++		aborter:  aborter,
+ 		flusher:  flusher,
+ 		encoder:  encoder,
+ 		decoder:  decoder,
+@@ -241,28 +247,9 @@ func (s *endpointServer) servePoll(request *PollRequest) error {
+ 		}
+ 	}()
+ 
+-	// Wait for both a completion request to be received and a response to be
+-	// sent. Both of these will occur, though their order is not known. If the
+-	// completion request is received first, then we cancel the subcontext to
+-	// preempt the scan and force transmission of a response. If the response is
+-	// sent first, then we know the completion request is on its way. In this
+-	// case, we still cancel the subcontext we created as required by the
+-	// context package to avoid leaking resources.
+-	var responseSendErr, completionReceiveErr error
+-	select {
+-	case completionReceiveErr = <-completionReceiveErrors:
+-		cancel()
+-		responseSendErr = <-responseSendErrors
+-	case responseSendErr = <-responseSendErrors:
+-		cancel()
+-		completionReceiveErr = <-completionReceiveErrors
+-	}
+-
+-	// Check for errors.
+-	if responseSendErr != nil {
+-		return responseSendErr
+-	} else if completionReceiveErr != nil {
+-		return completionReceiveErr
++	// Complete the exchange, aborting the transport on protocol failures.
++	if err := waitForCompletion(cancel, s.aborter, completionReceiveErrors, responseSendErrors); err != nil {
++		return err
+ 	}
+ 
+ 	// Success.
+@@ -331,28 +318,9 @@ func (s *endpointServer) serveScan(request *ScanRequest) error {
+ 		}
+ 	}()
+ 
+-	// Wait for both a completion request to be received and a response to be
+-	// sent. Both of these will occur, though their order is not known. If the
+-	// completion request is received first, then we cancel the subcontext to
+-	// preempt the scan and force transmission of a response. If the response is
+-	// sent first, then we know the completion request is on its way. In this
+-	// case, we still cancel the subcontext we created as required by the
+-	// context package to avoid leaking resources.
+-	var responseSendErr, completionReceiveErr error
+-	select {
+-	case completionReceiveErr = <-completionReceiveErrors:
+-		cancel()
+-		responseSendErr = <-responseSendErrors
+-	case responseSendErr = <-responseSendErrors:
+-		cancel()
+-		completionReceiveErr = <-completionReceiveErrors
+-	}
+-
+-	// Check for errors.
+-	if responseSendErr != nil {
+-		return responseSendErr
+-	} else if completionReceiveErr != nil {
+-		return completionReceiveErr
++	// Complete the exchange, aborting the transport on protocol failures.
++	if err := waitForCompletion(cancel, s.aborter, completionReceiveErrors, responseSendErrors); err != nil {
++		return err
+ 	}
+ 
+ 	// Success.
+@@ -483,28 +451,9 @@ func (s *endpointServer) serveTransition(request *TransitionRequest) error {
+ 		}
+ 	}()
+ 
+-	// Wait for both a completion request to be received and a response to be
+-	// sent. Both of these will occur, though their order is not known. If the
+-	// completion request is received first, then we cancel the subcontext to
+-	// preempt the transition and force transmission of a response. If the
+-	// response is sent first, then we know the completion request is on its
+-	// way. In this case, we still cancel the subcontext we created as required
+-	// by the context package to avoid leaking resources.
+-	var responseSendErr, completionReceiveErr error
+-	select {
+-	case completionReceiveErr = <-completionReceiveErrors:
+-		cancel()
+-		responseSendErr = <-responseSendErrors
+-	case responseSendErr = <-responseSendErrors:
+-		cancel()
+-		completionReceiveErr = <-completionReceiveErrors
+-	}
+-
+-	// Check for errors.
+-	if responseSendErr != nil {
+-		return responseSendErr
+-	} else if completionReceiveErr != nil {
+-		return completionReceiveErr
++	// Complete the exchange, aborting the transport on protocol failures.
++	if err := waitForCompletion(cancel, s.aborter, completionReceiveErrors, responseSendErrors); err != nil {
++		return err
+ 	}
+ 
+ 	// Success.
+diff --git a/scripts/build.go b/scripts/build.go
+index d025379..909bb6c 100644
+--- a/scripts/build.go
++++ b/scripts/build.go
+@@ -618,6 +618,10 @@ func build() error {
+ 	// Compute agent targets.
+ 	var agentTargets []Target
+ 	for _, target := range targets {
++		// ChisaCloudCode's managed workspace supports Linux amd64 agents.
++		if target.GOOS != "linux" || target.GOARCH != "amd64" {
++			continue
++		}
+ 		if mode == "local" && target.IsCrossTarget() {
+ 			continue
+ 		} else if (mode == "slim" || mode == "release-slim") && !target.IncludeAgentInSlimBuildModes() {
+diff --git a/cmd/mutagen/sync/update_ignores.go b/cmd/mutagen/sync/update_ignores.go
+new file mode 100644
+index 0000000..6ef0a18
+--- /dev/null
++++ b/cmd/mutagen/sync/update_ignores.go
+@@ -0,0 +1,58 @@
++package sync
++
++import (
++	"fmt"
++
++	"github.com/spf13/cobra"
++	"google.golang.org/protobuf/types/known/emptypb"
++
++	"github.com/mutagen-io/mutagen/cmd/mutagen/daemon"
++	"github.com/mutagen-io/mutagen/pkg/grpcutil"
++	"github.com/mutagen-io/mutagen/pkg/identifier"
++	synchronizationsvc "github.com/mutagen-io/mutagen/pkg/service/synchronization"
++	"github.com/mutagen-io/mutagen/pkg/synchronization"
++)
++
++func updateIgnoresMain(command *cobra.Command, arguments []string) error {
++	if !identifier.IsValid(arguments[0]) {
++		return fmt.Errorf("an exact session identifier is required")
++	}
++	configuration, err := loadAndValidateGlobalSynchronizationConfiguration(updateIgnoresConfiguration.configurationFile)
++	if err != nil {
++		return fmt.Errorf("unable to load ignore configuration: %w", err)
++	}
++	connection, err := daemon.Connect(true, true)
++	if err != nil {
++		return fmt.Errorf("unable to connect to daemon: %w", err)
++	}
++	defer connection.Close()
++	request := &synchronization.Session{
++		Identifier:    arguments[0],
++		Configuration: synchronization.IgnoreConfiguration(configuration),
++	}
++	if err := connection.Invoke(command.Context(), synchronizationsvc.IgnoreConfigurationUpdateMethod, request, &emptypb.Empty{}); err != nil {
++		return grpcutil.PeelAwayRPCErrorLayer(err)
++	}
++	return nil
++}
++
++var updateIgnoresCommand = &cobra.Command{
++	Use:          "update-ignores --configuration-file <yaml> <identifier>",
++	Short:        "Replace ignore rules for one paused session without resetting history",
++	Args:         cobra.ExactArgs(1),
++	RunE:         updateIgnoresMain,
++	SilenceUsage: true,
++}
++
++var updateIgnoresConfiguration struct {
++	help              bool
++	configurationFile string
++}
++
++func init() {
++	flags := updateIgnoresCommand.Flags()
++	flags.SortFlags = false
++	flags.BoolVarP(&updateIgnoresConfiguration.help, "help", "h", false, "Show help information")
++	flags.StringVar(&updateIgnoresConfiguration.configurationFile, "configuration-file", "", "Configuration file supplying the replacement sync.defaults.ignore settings")
++	updateIgnoresCommand.MarkFlagRequired("configuration-file")
++}
+diff --git a/pkg/service/synchronization/ignore_configuration.go b/pkg/service/synchronization/ignore_configuration.go
+new file mode 100644
+index 0000000..56fb245
+--- /dev/null
++++ b/pkg/service/synchronization/ignore_configuration.go
+@@ -0,0 +1,52 @@
++package synchronization
++
++import (
++	"context"
++
++	"google.golang.org/grpc"
++	"google.golang.org/protobuf/types/known/emptypb"
++
++	"github.com/mutagen-io/mutagen/pkg/synchronization"
++)
++
++// IgnoreConfigurationUpdateMethod is the fork's additive daemon-only RPC.
++// Its request uses Session's existing wire type; only Identifier and
++// Configuration are consumed. The manager rejects non-ignore settings.
++const IgnoreConfigurationUpdateMethod = "/synchronization.IgnoreConfiguration/Update"
++
++type ignoreConfigurationServer interface {
++	UpdateIgnores(context.Context, *synchronization.Session) (*emptypb.Empty, error)
++}
++
++// UpdateIgnores updates a stopped session without changing its archive.
++func (s *Server) UpdateIgnores(ctx context.Context, request *synchronization.Session) (*emptypb.Empty, error) {
++	if err := s.manager.UpdateIgnores(ctx, request.Identifier, request.Configuration); err != nil {
++		return nil, err
++	}
++	return &emptypb.Empty{}, nil
++}
++
++// RegisterIgnoreConfigurationServer registers the additive fork service without
++// changing or regenerating the upstream Synchronization protobuf bindings.
++func RegisterIgnoreConfigurationServer(registrar grpc.ServiceRegistrar, server *Server) {
++	registrar.RegisterService(&grpc.ServiceDesc{
++		ServiceName: "synchronization.IgnoreConfiguration",
++		HandlerType: (*ignoreConfigurationServer)(nil),
++		Methods: []grpc.MethodDesc{{
++			MethodName: "Update",
++			Handler: func(srv interface{}, ctx context.Context, decode func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
++				request := new(synchronization.Session)
++				if err := decode(request); err != nil {
++					return nil, err
++				}
++				handler := func(ctx context.Context, request interface{}) (interface{}, error) {
++					return srv.(ignoreConfigurationServer).UpdateIgnores(ctx, request.(*synchronization.Session))
++				}
++				if interceptor == nil {
++					return handler(ctx, request)
++				}
++				return interceptor(ctx, request, &grpc.UnaryServerInfo{Server: srv, FullMethod: IgnoreConfigurationUpdateMethod}, handler)
++			},
++		}},
++	}, server)
++}
+diff --git a/pkg/service/synchronization/ignore_configuration_test.go b/pkg/service/synchronization/ignore_configuration_test.go
+new file mode 100644
+index 0000000..21611ae
+--- /dev/null
++++ b/pkg/service/synchronization/ignore_configuration_test.go
+@@ -0,0 +1,325 @@
++package synchronization
++
++import (
++	"bytes"
++	"context"
++	"net"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/test/bufconn"
++	"google.golang.org/protobuf/types/known/emptypb"
++
++	"github.com/mutagen-io/mutagen/pkg/encoding"
++	"github.com/mutagen-io/mutagen/pkg/filesystem"
++	"github.com/mutagen-io/mutagen/pkg/identifier"
++	"github.com/mutagen-io/mutagen/pkg/selection"
++	syncpkg "github.com/mutagen-io/mutagen/pkg/synchronization"
++	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
++	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
++	_ "github.com/mutagen-io/mutagen/pkg/synchronization/protocols/local"
++	"github.com/mutagen-io/mutagen/pkg/url"
++)
++
++type ignoreUpdateHarness struct {
++	t                     *testing.T
++	data, alpha, beta, id string
++	manager               *syncpkg.Manager
++	connection            *grpc.ClientConn
++	server                *grpc.Server
++}
++
++func newIgnoreUpdateHarness(t *testing.T, configuration *syncpkg.Configuration, files map[string]string) *ignoreUpdateHarness {
++	t.Helper()
++	root := t.TempDir()
++	h := &ignoreUpdateHarness{t: t, data: filepath.Join(root, "data"), alpha: filepath.Join(root, "alpha"), beta: filepath.Join(root, "beta")}
++	t.Setenv("MUTAGEN_DATA_DIRECTORY", h.data)
++	for _, directory := range []string{h.alpha, h.beta} {
++		if err := os.MkdirAll(directory, 0700); err != nil {
++			t.Fatal(err)
++		}
++		for name, content := range files {
++			path := filepath.Join(directory, name)
++			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
++				t.Fatal(err)
++			}
++			if err := os.WriteFile(path, []byte(content), 0600); err != nil {
++				t.Fatal(err)
++			}
++		}
++	}
++	var err error
++	h.manager, err = syncpkg.NewManager(nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { h.closeRPC(); h.manager.Shutdown() })
++	configuration.WatchMode = syncpkg.WatchMode_WatchModeNoWatch
++	configuration.ScanMode = syncpkg.ScanMode_ScanModeFull
++	alpha, err := url.Parse(h.alpha, url.Kind_Synchronization, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	beta, err := url.Parse(h.beta, url.Kind_Synchronization, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	h.id, err = h.manager.Create(context.Background(), alpha, beta, configuration, &syncpkg.Configuration{}, &syncpkg.Configuration{}, "ignore-update-test", nil, true, "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	h.cycle()
++	h.startRPC()
++	return h
++}
++
++func (h *ignoreUpdateHarness) selected() *selection.Selection {
++	return &selection.Selection{Specifications: []string{h.id}}
++}
++
++func (h *ignoreUpdateHarness) cycle() {
++	h.t.Helper()
++	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++	defer cancel()
++	if err := h.manager.Resume(ctx, h.selected(), ""); err != nil {
++		h.t.Fatal(err)
++	}
++	// Resume starts the controller asynchronously. Wait on its state tracker,
++	// not elapsed time, before submitting a flush to the synchronization loop.
++	var index uint64
++	for {
++		nextIndex, states, err := h.manager.List(ctx, h.selected(), index)
++		if err != nil {
++			h.t.Fatal(err)
++		}
++		index = nextIndex
++		if states[0].LastError != "" {
++			h.t.Fatal(states[0].LastError)
++		}
++		if states[0].Status >= syncpkg.Status_Watching {
++			break
++		}
++	}
++	if err := h.manager.Flush(ctx, h.selected(), "", false); err != nil {
++		h.t.Fatal(err)
++	}
++	if err := h.manager.Pause(ctx, h.selected(), ""); err != nil {
++		h.t.Fatal(err)
++	}
++}
++
++func (h *ignoreUpdateHarness) startRPC() {
++	h.t.Helper()
++	listener := bufconn.Listen(1024 * 1024)
++	h.server = grpc.NewServer()
++	service := NewServer(h.manager)
++	RegisterSynchronizationServer(h.server, service)
++	RegisterIgnoreConfigurationServer(h.server, service)
++	go h.server.Serve(listener)
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	connection, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithInsecure(), grpc.WithBlock())
++	if err != nil {
++		h.t.Fatal(err)
++	}
++	h.connection = connection
++	h.t.Cleanup(func() { listener.Close() })
++}
++
++func (h *ignoreUpdateHarness) closeRPC() {
++	if h.connection != nil {
++		h.connection.Close()
++		h.connection = nil
++	}
++	if h.server != nil {
++		h.server.Stop()
++		h.server = nil
++	}
++}
++
++func (h *ignoreUpdateHarness) update(ctx context.Context, id string, configuration *syncpkg.Configuration) error {
++	return h.connection.Invoke(ctx, IgnoreConfigurationUpdateMethod, &syncpkg.Session{Identifier: id, Configuration: configuration}, &emptypb.Empty{})
++}
++
++func (h *ignoreUpdateHarness) stored(directory string) []byte {
++	h.t.Helper()
++	data, err := os.ReadFile(filepath.Join(h.data, directory, h.id))
++	if err != nil {
++		h.t.Fatal(err)
++	}
++	return data
++}
++
++func (h *ignoreUpdateHarness) session() *syncpkg.Session {
++	h.t.Helper()
++	_, states, err := h.manager.List(context.Background(), h.selected(), 0)
++	if err != nil {
++		h.t.Fatal(err)
++	}
++	if len(states) != 1 || states[0].Session.Identifier != h.id {
++		h.t.Fatalf("unexpected session selection: %v", states)
++	}
++	return states[0].Session
++}
++
++func (h *ignoreUpdateHarness) requireContent(root, name, want string) {
++	h.t.Helper()
++	content, err := os.ReadFile(filepath.Join(root, name))
++	if err != nil || string(content) != want {
++		h.t.Fatalf("%s: content=%q, error=%v", filepath.Join(root, name), content, err)
++	}
++}
++
++func (h *ignoreUpdateHarness) requireAbsent(root, name string) {
++	h.t.Helper()
++	if _, err := os.Lstat(filepath.Join(root, name)); !os.IsNotExist(err) {
++		h.t.Fatalf("%s should be absent: %v", filepath.Join(root, name), err)
++	}
++}
++
++func TestIgnoreUpdateRejectsWithoutMutation(t *testing.T) {
++	h := newIgnoreUpdateHarness(t, &syncpkg.Configuration{}, map[string]string{"keep.txt": "keep"})
++	session, archive := h.stored(filesystem.MutagenSynchronizationSessionsDirectoryName), h.stored(filesystem.MutagenSynchronizationArchivesDirectoryName)
++	missing, err := identifier.New(identifier.PrefixSynchronization)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, test := range []struct {
++		name, id      string
++		configuration *syncpkg.Configuration
++	}{
++		{"name", "ignore-update-test", &syncpkg.Configuration{Ignores: []string{"cache"}}},
++		{"prefix", h.id[:12], &syncpkg.Configuration{Ignores: []string{"cache"}}},
++		{"missing", missing, &syncpkg.Configuration{Ignores: []string{"cache"}}},
++		{"invalid-pattern", h.id, &syncpkg.Configuration{Ignores: []string{"["}}},
++		{"other-setting", h.id, &syncpkg.Configuration{WatchPollingInterval: 1}},
++		{"missing-config", h.id, nil},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			if err := h.update(context.Background(), test.id, test.configuration); err == nil {
++				t.Fatal("invalid request accepted")
++			}
++			if !bytes.Equal(session, h.stored(filesystem.MutagenSynchronizationSessionsDirectoryName)) || !bytes.Equal(archive, h.stored(filesystem.MutagenSynchronizationArchivesDirectoryName)) {
++				t.Fatal("rejected request changed persistent session or archive")
++			}
++		})
++	}
++	if err := h.manager.Resume(context.Background(), h.selected(), ""); err != nil {
++		t.Fatal(err)
++	}
++	running := h.stored(filesystem.MutagenSynchronizationSessionsDirectoryName)
++	if err := h.update(context.Background(), h.id, &syncpkg.Configuration{Ignores: []string{"keep.txt"}}); err == nil {
++		t.Fatal("running session accepted update")
++	}
++	if !bytes.Equal(running, h.stored(filesystem.MutagenSynchronizationSessionsDirectoryName)) || !bytes.Equal(archive, h.stored(filesystem.MutagenSynchronizationArchivesDirectoryName)) {
++		t.Fatal("running rejection changed persistent state")
++	}
++}
++
++func TestIgnoreUpdatePreservesArchiveAndRestarts(t *testing.T) {
++	h := newIgnoreUpdateHarness(t, &syncpkg.Configuration{IgnoreSyntax: ignore.Syntax_SyntaxDocker, IgnoreVCSMode: ignore.IgnoreVCSMode_IgnoreVCSModeIgnore, Ignores: []string{"old"}}, map[string]string{"keep.txt": "keep"})
++	archive := h.stored(filesystem.MutagenSynchronizationArchivesDirectoryName)
++	if err := h.update(context.Background(), h.id, &syncpkg.Configuration{Ignores: []string{"new"}}); err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(archive, h.stored(filesystem.MutagenSynchronizationArchivesDirectoryName)) {
++		t.Fatal("update modified archive")
++	}
++	session := h.session()
++	if !session.Paused || session.Configuration.IgnoreSyntax != ignore.Syntax_SyntaxDocker || session.Configuration.IgnoreVCSMode != ignore.IgnoreVCSMode_IgnoreVCSModeIgnore || len(session.Configuration.Ignores) != 1 || session.Configuration.Ignores[0] != "new" {
++		t.Fatalf("paths-only update changed session semantics: %v", session)
++	}
++	h.closeRPC()
++	h.manager.Shutdown()
++	var err error
++	h.manager, err = syncpkg.NewManager(nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	h.startRPC()
++	if session := h.session(); !session.Paused || session.Configuration.Ignores[0] != "new" {
++		t.Fatalf("restart lost paused configuration: %v", session)
++	}
++	if !bytes.Equal(archive, h.stored(filesystem.MutagenSynchronizationArchivesDirectoryName)) {
++		t.Fatal("restart modified archive")
++	}
++	stored := h.stored(filesystem.MutagenSynchronizationSessionsDirectoryName)
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if err := h.update(ctx, h.id, &syncpkg.Configuration{Ignores: []string{"cancelled"}}); err == nil {
++		t.Fatal("cancelled RPC succeeded")
++	}
++	if err := h.manager.UpdateIgnores(ctx, h.id, &syncpkg.Configuration{Ignores: []string{"cancelled"}}); err == nil {
++		t.Fatal("cancelled manager operation succeeded")
++	}
++	if !bytes.Equal(stored, h.stored(filesystem.MutagenSynchronizationSessionsDirectoryName)) || !bytes.Equal(archive, h.stored(filesystem.MutagenSynchronizationArchivesDirectoryName)) {
++		t.Fatal("cancelled update changed persistent state")
++	}
++	if err := h.update(context.Background(), h.id, &syncpkg.Configuration{}); err != nil {
++		t.Fatal(err)
++	}
++	if len(h.session().Configuration.Ignores) != 0 {
++		t.Fatal("empty path update did not clear old paths")
++	}
++}
++
++func TestIgnoreUpdateKeepsCoveredPendingDeletion(t *testing.T) {
++	h := newIgnoreUpdateHarness(t, &syncpkg.Configuration{}, map[string]string{"keep.txt": "keep", "delete.txt": "remove", "cache.txt": "generated"})
++	if err := os.Remove(filepath.Join(h.alpha, "delete.txt")); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Remove(filepath.Join(h.alpha, "cache.txt")); err != nil {
++		t.Fatal(err)
++	}
++	if err := h.update(context.Background(), h.id, &syncpkg.Configuration{Ignores: []string{"cache.txt"}}); err != nil {
++		t.Fatal(err)
++	}
++	h.cycle()
++	h.requireAbsent(h.beta, "delete.txt")
++	h.requireAbsent(h.alpha, "cache.txt")
++	h.requireContent(h.beta, "cache.txt", "generated")
++	h.requireContent(h.alpha, "keep.txt", "keep")
++	h.requireContent(h.beta, "keep.txt", "keep")
++}
++
++func TestIgnoreUpdateFileBecomesIgnoredDirectory(t *testing.T) {
++	h := newIgnoreUpdateHarness(t, &syncpkg.Configuration{}, map[string]string{"keep.txt": "keep", "cache": "preserve"})
++	if err := os.Remove(filepath.Join(h.alpha, "cache")); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Mkdir(filepath.Join(h.alpha, "cache"), 0700); err != nil {
++		t.Fatal(err)
++	}
++	if err := h.update(context.Background(), h.id, &syncpkg.Configuration{Ignores: []string{"cache/"}}); err != nil {
++		t.Fatal(err)
++	}
++	h.cycle()
++	h.requireContent(h.beta, "cache", "preserve")
++	if info, err := os.Stat(filepath.Join(h.alpha, "cache")); err != nil || !info.IsDir() {
++		t.Fatalf("ignored directory changed: %v", err)
++	}
++}
++
++func TestIgnoreUpdatePersistsProjectionWithoutOtherChanges(t *testing.T) {
++	h := newIgnoreUpdateHarness(t, &syncpkg.Configuration{}, map[string]string{"keep.txt": "keep", "cache.txt": "preserve"})
++	before := h.stored(filesystem.MutagenSynchronizationArchivesDirectoryName)
++	if err := h.update(context.Background(), h.id, &syncpkg.Configuration{Ignores: []string{"cache.txt"}}); err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(before, h.stored(filesystem.MutagenSynchronizationArchivesDirectoryName)) {
++		t.Fatal("configuration update rewrote archive")
++	}
++	h.cycle()
++	archive := &core.Archive{}
++	if err := encoding.LoadAndUnmarshalProtobuf(filepath.Join(h.data, filesystem.MutagenSynchronizationArchivesDirectoryName, h.id), archive); err != nil {
++		t.Fatal(err)
++	}
++	if archive.Content.GetContents()["cache.txt"] != nil || archive.Content.GetContents()["keep.txt"] == nil {
++		t.Fatalf("coverage projection not saved: %v", archive)
++	}
++	h.requireContent(h.alpha, "cache.txt", "preserve")
++	h.requireContent(h.beta, "cache.txt", "preserve")
++}
+diff --git a/pkg/synchronization/update_ignores.go b/pkg/synchronization/update_ignores.go
+new file mode 100644
+index 0000000..721fb4c
+--- /dev/null
++++ b/pkg/synchronization/update_ignores.go
+@@ -0,0 +1,203 @@
++package synchronization
++
++import (
++	"context"
++	"errors"
++	"fmt"
++
++	"google.golang.org/protobuf/proto"
++
++	"github.com/mutagen-io/mutagen/pkg/encoding"
++	"github.com/mutagen-io/mutagen/pkg/identifier"
++	"github.com/mutagen-io/mutagen/pkg/synchronization/core"
++	"github.com/mutagen-io/mutagen/pkg/synchronization/core/fastpath"
++	"github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore"
++	dockerignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/docker"
++	mutagenignore "github.com/mutagen-io/mutagen/pkg/synchronization/core/ignore/mutagen"
++)
++
++// IgnoreConfiguration extracts replacement ignore paths and optional syntax/VCS
++// overrides. An empty path list clears existing ignores instead of merging them.
++func IgnoreConfiguration(configuration *Configuration) *Configuration {
++	if configuration == nil {
++		return nil
++	}
++	return &Configuration{
++		IgnoreSyntax:   configuration.IgnoreSyntax,
++		DefaultIgnores: append([]string(nil), configuration.DefaultIgnores...),
++		Ignores:        append([]string(nil), configuration.Ignores...),
++		IgnoreVCSMode:  configuration.IgnoreVCSMode,
++	}
++}
++
++// NewIgnorer builds the same effective ignorer for endpoints and ancestors.
++func (c *Configuration) NewIgnorer(version Version) (ignore.Ignorer, error) {
++	syntax := c.IgnoreSyntax
++	if syntax.IsDefault() {
++		syntax = version.DefaultIgnoreSyntax()
++	}
++	patterns := append(append([]string(nil), c.DefaultIgnores...), c.Ignores...)
++	var ignorer ignore.Ignorer
++	var err error
++	switch syntax {
++	case ignore.Syntax_SyntaxMutagen:
++		ignorer, err = mutagenignore.NewIgnorer(patterns)
++	case ignore.Syntax_SyntaxDocker:
++		ignorer, err = dockerignore.NewIgnorer(patterns)
++	default:
++		return nil, errors.New("unknown or unsupported ignore syntax")
++	}
++	if err != nil {
++		return nil, err
++	}
++	vcsMode := c.IgnoreVCSMode
++	if vcsMode.IsDefault() {
++		vcsMode = version.DefaultIgnoreVCSMode()
++	}
++	if vcsMode == ignore.IgnoreVCSMode_IgnoreVCSModeIgnore {
++		ignorer = ignore.IgnoreVCS(ignorer)
++	} else if vcsMode != ignore.IgnoreVCSMode_IgnoreVCSModePropagate {
++		return nil, errors.New("unknown or unsupported VCS ignore mode")
++	}
++	return ignorer, nil
++}
++
++// filterIgnoredAncestor projects the common ancestor onto the current coverage.
++// It never changes the archive on disk. Retained leaves (including the baseline
++// for deletions not yet propagated) are preserved exactly. Ignored ancestors
++// cannot become deletion instructions when the next snapshots omit them.
++func filterIgnoredAncestor(path string, entry *core.Entry, ignorer ignore.Ignorer, mask bool) *core.Entry {
++	if entry == nil {
++		return nil
++	}
++	directory := entry.Kind == core.EntryKind_Directory
++	if path != "" {
++		status, continueTraversal := ignorer.Ignore(path, directory)
++		switch status {
++		case ignore.IgnoreStatusNominal:
++			if mask && !continueTraversal {
++				return nil
++			}
++		case ignore.IgnoreStatusIgnored:
++			if !continueTraversal {
++				return nil
++			}
++			mask = true
++		case ignore.IgnoreStatusUnignored:
++			mask = false
++		}
++	}
++	if !directory {
++		return entry
++	}
++	result := entry.Copy(core.EntryCopyBehaviorSlim)
++	result.Contents = make(map[string]*core.Entry, len(entry.Contents))
++	for name, child := range entry.Contents {
++		if filtered := filterIgnoredAncestor(fastpath.Joinable(path)+name, child, ignorer, mask); filtered != nil {
++			result.Contents[name] = filtered
++		}
++	}
++	// An ignored directory is retained only as a parent of unignored content.
++	// The sync root itself is never subject to ignore matching.
++	if mask && len(result.Contents) == 0 {
++		return nil
++	}
++	return result
++}
++
++// filterUntrackedAncestor handles coverage changes whose current filesystem
++// kind differs from the archived kind (for example a file replaced by an
++// ignored directory). Either endpoint's explicit untracked marker takes that
++// path outside shared coverage. Absence alone does not: an absent tracked path
++// must retain its ancestor so its pending deletion can still propagate.
++func filterUntrackedAncestor(entry, alpha, beta *core.Entry) (*core.Entry, bool) {
++	if entry == nil {
++		return nil, false
++	}
++	if alpha != nil && alpha.Kind == core.EntryKind_Untracked || beta != nil && beta.Kind == core.EntryKind_Untracked {
++		return nil, true
++	}
++	if entry.Kind != core.EntryKind_Directory {
++		return entry, false
++	}
++	var result *core.Entry
++	alphaContents, betaContents := alpha.GetContents(), beta.GetContents()
++	for name, child := range entry.Contents {
++		filtered, changed := filterUntrackedAncestor(child, alphaContents[name], betaContents[name])
++		if !changed {
++			continue
++		}
++		if result == nil {
++			result = entry.Copy(core.EntryCopyBehaviorShallow)
++		}
++		if filtered == nil {
++			delete(result.Contents, name)
++		} else {
++			result.Contents[name] = filtered
++		}
++	}
++	if result != nil {
++		return result, true
++	}
++	return entry, false
++}
++
++// UpdateIgnores replaces ignore rules for one exact, paused session identifier.
++// It neither resets the archive nor connects or resumes either endpoint.
++func (m *Manager) UpdateIgnores(ctx context.Context, id string, configuration *Configuration) error {
++	if !identifier.IsValid(id) {
++		return errors.New("invalid exact session identifier")
++	}
++	if err := configuration.EnsureValid(false); err != nil {
++		return fmt.Errorf("invalid ignore configuration: %w", err)
++	}
++	if !proto.Equal(configuration, IgnoreConfiguration(configuration)) {
++		return errors.New("only ignore settings may be updated")
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	m.sessionsLock.Lock()
++	c, ok := m.sessions[id]
++	m.sessionsLock.UnlockWithoutNotify()
++	if !ok {
++		return errors.New("exact session identifier not found")
++	}
++	c.lifecycleLock.Lock()
++	defer c.lifecycleLock.Unlock()
++	if c.disabled {
++		return errors.New("controller disabled")
++	}
++	c.stateLock.Lock()
++	defer c.stateLock.Unlock()
++	if !c.session.Paused || c.cancel != nil {
++		return errors.New("session must be paused and stopped before updating ignores")
++	}
++	// Save the complete new session atomically before publishing its settings.
++	// The archive stays untouched, so interruption can never pair a new archive
++	// with old rules or discard pending deletions in still-covered content.
++	next := proto.Clone(c.session).(*Session)
++	next.Configuration.DefaultIgnores = append([]string(nil), configuration.DefaultIgnores...)
++	next.Configuration.Ignores = append([]string(nil), configuration.Ignores...)
++	// Omitted enum settings retain the session's existing semantics. In
++	// particular, a paths-only update must not undo create's --ignore-vcs.
++	if !configuration.IgnoreSyntax.IsDefault() {
++		next.Configuration.IgnoreSyntax = configuration.IgnoreSyntax
++	}
++	if !configuration.IgnoreVCSMode.IsDefault() {
++		next.Configuration.IgnoreVCSMode = configuration.IgnoreVCSMode
++	}
++	if _, err := next.Configuration.NewIgnorer(c.session.Version); err != nil {
++		return fmt.Errorf("invalid ignore rules: %w", err)
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if err := encoding.MarshalAndSaveProtobuf(c.sessionPath, next); err != nil {
++		return fmt.Errorf("unable to persist ignore configuration: %w", err)
++	}
++	c.session.Configuration = next.Configuration
++	c.mergedAlphaConfiguration = MergeConfigurations(next.Configuration, c.session.ConfigurationAlpha)
++	c.mergedBetaConfiguration = MergeConfigurations(next.Configuration, c.session.ConfigurationBeta)
++	return nil
++}

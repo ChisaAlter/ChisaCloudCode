@@ -32,7 +32,7 @@ function createSocket() {
   const socket = new EventEmitter() as EventEmitter & { readyState: number; frames: Array<Record<string, unknown>>; send(data: string): void };
   socket.readyState = 1;
   socket.frames = [];
-  socket.send = data => socket.frames.push(JSON.parse(data) as Record<string, unknown>);
+  socket.send = data => { const frame = JSON.parse(data) as Record<string, unknown>; if (frame.kind !== "chat_run_status") socket.frames.push(frame); };
   return socket;
 }
 

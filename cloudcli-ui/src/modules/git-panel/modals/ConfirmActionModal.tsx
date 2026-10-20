@@ -50,6 +50,8 @@ const CONFIRMATION_ICON_CONTAINER_CLASSES: Record<ConfirmActionType, string> = {
 
 type ConfirmActionModalProps = {
   action: ConfirmationRequest | null;
+  isPending?: boolean;
+  error?: string | null;
   onCancel: () => void;
   onConfirm: (useAlternateConfirmation: boolean) => void;
 };
@@ -75,30 +77,33 @@ function renderConfirmActionIcon(actionType: ConfirmationRequest['type']) {
 }
 
 /** Rendered by GitPanel to confirm destructive or remote git actions before they run. */
-export default function ConfirmActionModal({ action, onCancel, onConfirm }: ConfirmActionModalProps) {
+export default function ConfirmActionModal({ action, isPending = false, error, onCancel, onConfirm }: ConfirmActionModalProps) {
   const { t } = useTranslation();
-  const [useAlternateConfirmation, setUseAlternateConfirmation] = useState(false);
+  // Retain the force-delete choice for retries of this request, then reset for a new confirmation.
+  const [alternateSelection, setAlternateSelection] = useState<{ action: ConfirmationRequest; selected: boolean } | null>(null);
+  const useAlternateConfirmation = alternateSelection?.action === action && Boolean(alternateSelection?.selected);
   const titleId = action ? `confirmation-title-${action.type}` : undefined;
 
   const handleCancel = () => {
-    setUseAlternateConfirmation(false);
+    if (isPending) return;
+    setAlternateSelection(null);
     onCancel();
   };
 
   const handleConfirm = () => {
+    if (isPending) return;
     const shouldUseAlternateConfirmation = useAlternateConfirmation && Boolean(action?.alternateConfirmation);
-    setUseAlternateConfirmation(false);
     onConfirm(shouldUseAlternateConfirmation);
   };
 
   useEffect(() => {
-    if (!action) {
+    if (!action || isPending) {
       return;
     }
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        setUseAlternateConfirmation(false);
+        setAlternateSelection(null);
         onCancel();
       }
     };
@@ -107,7 +112,7 @@ export default function ConfirmActionModal({ action, onCancel, onConfirm }: Conf
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [action, onCancel]);
+  }, [action, isPending, onCancel]);
 
   if (!action) {
     return null;
@@ -125,6 +130,7 @@ export default function ConfirmActionModal({ action, onCancel, onConfirm }: Conf
         className="relative flex max-h-[calc(100dvh-2rem)] w-full max-w-md flex-col overflow-hidden rounded-xl border border-border bg-card shadow-2xl"
         role="dialog"
         aria-modal="true"
+        aria-busy={isPending}
         aria-labelledby={titleId}
       >
         <div className="flex shrink-0 items-center px-6 pt-6">
@@ -150,7 +156,8 @@ export default function ConfirmActionModal({ action, onCancel, onConfirm }: Conf
             <input
               type="checkbox"
               checked={useAlternateConfirmation}
-              onChange={(event) => setUseAlternateConfirmation(event.target.checked)}
+              disabled={isPending}
+              onChange={(event) => setAlternateSelection({ action, selected: event.target.checked })}
               className="mt-0.5 h-4 w-4 shrink-0 accent-destructive"
             />
             <span className="min-w-0">
@@ -165,15 +172,19 @@ export default function ConfirmActionModal({ action, onCancel, onConfirm }: Conf
           </label>
         )}
 
+        {error && <p role="alert" className="mb-4 px-6 text-sm text-destructive">{error}</p>}
+
         <div className="flex shrink-0 justify-end space-x-3 px-6 pb-6">
           <button
             onClick={handleCancel}
+            disabled={isPending}
             className="rounded-lg px-4 py-2 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             {t('git:confirm.cancel')}
           </button>
           <button
             onClick={handleConfirm}
+            disabled={isPending}
             className={`flex items-center space-x-2 rounded-lg px-4 py-2 text-sm text-white transition-colors ${CONFIRMATION_BUTTON_CLASSES[action.type]}`}
           >
             {renderConfirmActionIcon(action.type)}

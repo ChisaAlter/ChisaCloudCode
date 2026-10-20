@@ -1,3 +1,4 @@
+import { FolderGit2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { LLMProviderLogo } from '@/shared/ui';
@@ -15,6 +16,10 @@ type WorkspaceTitleProps = {
 function getTabTitle(activeTab: AppTab, shouldShowTasksTab: boolean, t: (key: string) => string, pluginDisplayName?: string) {
   if (activeTab.startsWith('plugin:') && pluginDisplayName) {
     return pluginDisplayName;
+  }
+
+  if (activeTab === 'shell') {
+    return t('tabs.shell');
   }
 
   if (activeTab === 'files') {
@@ -54,12 +59,14 @@ export default function WorkspaceTitle({
   const showChatNewSession = activeTab === 'chat' && !selectedSession;
 
   return (
-    <div className="scrollbar-hide flex min-w-0 flex-1 items-center gap-2 overflow-x-auto">
-      {showSessionIcon && (
-        <div className="flex h-5 w-5 flex-shrink-0 items-center justify-center">
+    <div className="workspace-title scrollbar-hide flex min-w-0 flex-1 items-center gap-2.5 overflow-x-auto">
+      <div className="workspace-title-icon flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-lg bg-foreground/[0.07] text-foreground/75">
+        {showSessionIcon ? (
           <LLMProviderLogo provider={selectedSession?.__provider} className="h-4 w-4" />
-        </div>
-      )}
+        ) : (
+          <FolderGit2 className="h-4 w-4" />
+        )}
+      </div>
 
       <div className="min-w-0 flex-1">
         {activeTab === 'chat' && selectedSession ? (
