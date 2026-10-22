@@ -15,7 +15,20 @@ import (
 
 // syncIgnorePolicyVersion invalidates every cached policy when the rule
 // generation changes.
-const syncIgnorePolicyVersion = "2"
+const syncIgnorePolicyVersion = "3"
+
+// Reserved, versioned live-engine capability marker. The native transport must
+// require workspaceSyncEngineVersion before creating or resuming this policy.
+const syncDynamicGitPolicyMarker = "/.chisa-sync-policy/git-v1"
+
+func syncSessionHasDynamicGitPolicy(session syncSession) bool {
+	for _, pattern := range session.Ignore.Paths {
+		if pattern == syncDynamicGitPolicyMarker {
+			return true
+		}
+	}
+	return false
+}
 
 // syncIgnoreForceKey marks a synchronization that must recompute the policy even
 // when nothing that feeds it changed (the manual "Sync now" action).
@@ -104,12 +117,21 @@ func syncIgnoreConfigurationContext(ctx context.Context, m *Mapping) (string, er
 	return writeSyncIgnoreConfiguration(m, local)
 }
 
-// Both endpoints contribute effective Git ignores (including info/exclude and
-// nested ignore files). Exact tracked exceptions from either index win. Query
-// through the existing lease-bound sync worker, never an unowned SSH command.
+// Live sessions use stable configuration. Engine .3 performs joint Git policy
+// admission before every scan and transfer; native metadata polling must never
+// replace that admission with delayed literal paths or reconnect hot endpoints.
 var projectSyncIgnoreConfigurationContext = projectSyncIgnoreConfiguration
 
 func projectSyncIgnoreConfiguration(ctx context.Context, m *Mapping) (string, error) {
+	if err := workspaceSyncCurrent(ctx); err != nil {
+		return "", err
+	}
+	return writeSyncIgnorePatterns(m, m.BindingEpoch+".yml", append(syncFixedIgnorePatterns(), syncDynamicGitPolicyMarker))
+}
+
+// Explicit offline/destructive inspection needs a freshly generated snapshot,
+// including both indexes. This is not the live engine's admission policy.
+func projectSyncIgnoreSnapshotConfiguration(ctx context.Context, m *Mapping) (string, error) {
 	local, err := localSyncGitInventory(ctx, m)
 	if err != nil {
 		return "", err
@@ -123,7 +145,7 @@ func projectSyncIgnoreConfiguration(ctx context.Context, m *Mapping) (string, er
 	if err := json.Unmarshal([]byte(out), &remote); err != nil {
 		return "", fmt.Errorf("VPS 项目忽略规则响应无效: %w", err)
 	}
-	return writeSyncIgnoreConfiguration(m, local, remote)
+	return writeExactSyncIgnoreConfiguration(m, local, remote)
 }
 
 func literalSyncIgnorePath(value string) (string, error) {
@@ -146,6 +168,17 @@ func literalSyncIgnorePath(value string) (string, error) {
 const syncIgnoreTrackedChildLimit = 4
 
 func writeSyncIgnoreConfiguration(m *Mapping, inventories ...syncGitInventory) (string, error) {
+	return writeSnapshotSyncIgnoreConfiguration(m, false, inventories...)
+}
+
+// Destructive confirmation must retain every ignored ancestor, even when it
+// contains many force-tracked files. Runtime matcher size is no longer a reason
+// to broaden this explicit snapshot's coverage.
+func writeExactSyncIgnoreConfiguration(m *Mapping, inventories ...syncGitInventory) (string, error) {
+	return writeSnapshotSyncIgnoreConfiguration(m, true, inventories...)
+}
+
+func writeSnapshotSyncIgnoreConfiguration(m *Mapping, exact bool, inventories ...syncGitInventory) (string, error) {
 	// Root-anchored: an unanchored name matches at every depth, which drags whole
 	// tracked trees into the exception list.
 	patterns := []string{"/dist", "/build", "/out", "/.next", "/coverage", "/.cache", "/cache", "/.tmp", "/.dev", "/.nodetmp"}
@@ -175,7 +208,7 @@ func writeSyncIgnoreConfiguration(m *Mapping, inventories ...syncGitInventory) (
 		}
 	}
 	for prefix := range ignored {
-		if trackedPrefixes[prefix] > syncIgnoreTrackedChildLimit {
+		if !exact && trackedPrefixes[prefix] > syncIgnoreTrackedChildLimit {
 			delete(ignored, prefix)
 		}
 	}
@@ -220,7 +253,39 @@ func writeSyncIgnoreConfiguration(m *Mapping, inventories ...syncGitInventory) (
 	patterns = append(patterns, keys...)
 	// These existing security/runtime exclusions remain unconditional. This
 	// policy must not make tracked credentials or node_modules newly public.
-	patterns = append(patterns, "node_modules", ".git", ".venv", "venv", "__pycache__", ".env", ".env.*", "!.env.example", "!.env.sample", ".chisa-bridge.json")
+	patterns = append(patterns, "node_modules", ".git", ".venv", "venv", "__pycache__", ".env", ".env.*", "!.env.example", "!.env.sample", ".chisa-bridge.json", ".chisa-session.json", ".chisa-lease", ".chisa-worktrees")
+	return writeSyncIgnorePatterns(m, m.BindingEpoch+".snapshot.yml", patterns)
+}
+
+func syncFixedIgnorePatterns() []string {
+	return []string{"/dist", "/build", "/out", "/.next", "/coverage", "/.cache", "/cache", "/.tmp", "/.dev", "/.nodetmp", "node_modules", ".git", ".venv", "venv", "__pycache__", ".env", ".env.*", "!.env.example", "!.env.sample", ".chisa-bridge.json", ".chisa-session.json", ".chisa-lease", ".chisa-worktrees"}
+}
+
+func projectSyncIgnoreSnapshotPatterns(ctx context.Context, m *Mapping) ([]string, error) {
+	configuration, err := projectSyncIgnoreSnapshotConfiguration(ctx, m)
+	if err != nil {
+		return nil, err
+	}
+	contents, err := os.ReadFile(configuration)
+	if err != nil {
+		return nil, err
+	}
+	var patterns []string
+	for _, line := range strings.Split(string(contents), "\n") {
+		if item, found := strings.CutPrefix(strings.TrimSpace(line), "- "); found {
+			var pattern string
+			if err := json.Unmarshal([]byte(item), &pattern); err != nil {
+				return nil, err
+			}
+			if pattern != syncDynamicGitPolicyMarker {
+				patterns = append(patterns, pattern)
+			}
+		}
+	}
+	return patterns, nil
+}
+
+func writeSyncIgnorePatterns(m *Mapping, filename string, patterns []string) (string, error) {
 	var config strings.Builder
 	config.WriteString("sync:\n  defaults:\n    ignore:\n      paths:\n")
 	for _, pattern := range patterns {
@@ -231,6 +296,6 @@ func writeSyncIgnoreConfiguration(m *Mapping, inventories ...syncGitInventory) (
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return "", err
 	}
-	target := filepath.Join(directory, m.BindingEpoch+".yml")
+	target := filepath.Join(directory, filename)
 	return target, os.WriteFile(target, []byte(config.String()), 0600)
 }

@@ -1,7 +1,10 @@
 import fsSync from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import Database from 'better-sqlite3';
 
+import { resolveProviderHome } from '@/modules/providers/services/provider-state.service.js';
 import { parseFilesInputTag, parseImagesInputTag } from '@/shared/image-attachments.js';
 import type { IProviderSessions } from '@/shared/interfaces.js';
 import type { AnyRecord, FetchHistoryOptions, FetchHistoryResult, NormalizedMessage } from '@/shared/types.js';
@@ -36,8 +39,7 @@ type OpenCodeTokenTotals = {
   cacheWriteTokens: number;
 };
 
-const openOpenCodeDatabase = (): Database.Database | null => {
-  const dbPath = getOpenCodeDatabasePath();
+const openOpenCodeDatabase = (dbPath = getOpenCodeDatabasePath()): Database.Database | null => {
   if (!fsSync.existsSync(dbPath)) {
     return null;
   }
@@ -312,7 +314,8 @@ export class OpenCodeSessionsProvider implements IProviderSessions {
     // OpenCode's shared sqlite database keys messages by the provider-native
     // session id, not the app-facing id this method is addressed with.
     const providerSessionId = options.providerSessionId ?? sessionId;
-    const db = openOpenCodeDatabase();
+    const home = options.providerProfilePath ? resolveProviderHome('opencode', sessionId, options.providerProfilePath) : os.homedir();
+    const db = openOpenCodeDatabase(path.join(home, '.local', 'share', 'opencode', 'opencode.db'));
     if (!db) {
       return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };
     }

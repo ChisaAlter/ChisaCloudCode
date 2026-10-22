@@ -8,6 +8,7 @@ import Database from 'better-sqlite3';
 import { sessionsDb } from '@/modules/database/index.js';
 import type { AnyRecord } from '@/shared/types.js';
 import { AppError, getOpenCodeDatabasePath } from '@/shared/utils.js';
+import { resolveProviderHome } from '@/modules/providers/services/provider-state.service.js';
 
 type SessionRow = NonNullable<ReturnType<typeof sessionsDb.getSessionById>>;
 
@@ -394,7 +395,7 @@ export function createProviderTokenUsageService(
       }
 
       if (session.provider === 'opencode') {
-        const databasePath = dependencies.getOpenCodeDatabasePath();
+        const databasePath = session.provider_profile_path ? path.join(resolveProviderHome('opencode', sessionId, session.provider_profile_path), '.local', 'share', 'opencode', 'opencode.db') : dependencies.getOpenCodeDatabasePath();
         if (!dependencies.fileExists(databasePath)) {
           throw new AppError('OpenCode database was not found.', {
             code: 'OPENCODE_DATABASE_NOT_FOUND',

@@ -1,7 +1,8 @@
 import { access, readdir } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 
+import { sessionsDb } from '@/modules/database/index.js';
+import { resolveProviderHome } from '@/modules/providers/services/provider-state.service.js';
 import type { IProviderModels } from '@/shared/interfaces.js';
 import type {
   ProviderCurrentActiveModel,
@@ -41,19 +42,21 @@ export const CURSOR_PREDEFINED_MODELS: ProviderModelsDefinition = {
   DEFAULT: 'auto',
 };
 
-const CURSOR_CHATS_ROOT = path.join(os.homedir(), '.cursor', 'chats');
+
 
 const resolveCursorSessionStorePath = async (sessionId: string): Promise<string | null> => {
-  const safeSessionId = sanitizeLeafDirectoryName(sessionId, 'cursor session id');
+  const row = sessionsDb.getSessionById(sessionId) ?? sessionsDb.getSessionByProviderSessionId(sessionId);
+  const safeSessionId = sanitizeLeafDirectoryName(row?.provider_session_id ?? sessionId, 'cursor session id');
+  const chatsRoot = path.join(resolveProviderHome('cursor', sessionId), '.cursor', 'chats');
 
   try {
-    const workspaceEntries = await readdir(CURSOR_CHATS_ROOT, { withFileTypes: true });
+    const workspaceEntries = await readdir(chatsRoot, { withFileTypes: true });
     for (const workspaceEntry of workspaceEntries) {
       if (!workspaceEntry.isDirectory()) {
         continue;
       }
 
-      const storeDbPath = path.join(CURSOR_CHATS_ROOT, workspaceEntry.name, safeSessionId, 'store.db');
+      const storeDbPath = path.join(chatsRoot, workspaceEntry.name, safeSessionId, 'store.db');
       try {
         await access(storeDbPath);
         return storeDbPath;

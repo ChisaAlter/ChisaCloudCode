@@ -4,6 +4,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 
 import { sessionsDb } from '@/modules/database/index.js';
+import { registeredProviderProfiles, profileForArtifact } from '@/modules/providers/services/provider-state.service.js';
 import type { IProviderSessionSynchronizer } from '@/shared/interfaces.js';
 import {
   getOpenCodeDatabasePath,
@@ -39,7 +40,9 @@ export class OpenCodeSessionSynchronizer implements IProviderSessionSynchronizer
    */
   async synchronize(since?: Date): Promise<number> {
     const result = this.synchronizeRows(since);
-    return result.processed;
+    let managed = 0;
+    for (const { home } of registeredProviderProfiles('opencode')) managed += this.synchronizeRows(since, undefined, path.join(home, '.local', 'share', 'opencode', 'opencode.db')).processed;
+    return result.processed + managed;
   }
 
   /**
@@ -50,12 +53,11 @@ export class OpenCodeSessionSynchronizer implements IProviderSessionSynchronizer
       return null;
     }
 
-    const result = this.synchronizeRows(undefined, 1);
+    const result = this.synchronizeRows(undefined, 1, filePath);
     return result.firstSessionId;
   }
 
-  private synchronizeRows(since?: Date, limit?: number): SynchronizeRowsResult {
-    const dbPath = getOpenCodeDatabasePath();
+  private synchronizeRows(since?: Date, limit?: number, dbPath = getOpenCodeDatabasePath()): SynchronizeRowsResult {
     if (!fsSync.existsSync(dbPath)) {
       return { processed: 0, firstSessionId: null };
     }
@@ -85,6 +87,8 @@ export class OpenCodeSessionSynchronizer implements IProviderSessionSynchronizer
       let firstSessionId: string | null = null;
       for (const row of rows) {
         const indexedSessionId = this.upsertSession(db, row);
+        const profile = profileForArtifact('opencode', dbPath);
+        if (profile && indexedSessionId) sessionsDb.setProviderProfilePath(indexedSessionId, profile);
         if (!indexedSessionId) {
           continue;
         }

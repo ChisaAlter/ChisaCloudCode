@@ -28,12 +28,14 @@ import type {
  * execution context is supplied by the application service at call time.
  */
 export interface IProviderRuntime {
+  /** Resolves after all owned processes and tools stop; terminal protocol output alone is insufficient. */
   run(
     command: string,
     options: AnyRecord,
     writer: ProviderRuntimeWriter,
     context: ProviderRuntimeContext,
   ): Promise<unknown>;
+  /** Confirms teardown before resolving; the dispatcher additionally waits for workspace handback. */
   abort(sessionId: string): boolean | Promise<boolean>;
   permissions?: ProviderRuntimePermissionGateway;
 }

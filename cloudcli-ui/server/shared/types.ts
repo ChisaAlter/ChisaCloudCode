@@ -481,8 +481,52 @@ export type ProviderRuntimeContext = {
   getProviderModels(): Promise<ProviderModelsDefinition>;
   normalizeMessage(raw: unknown, sessionId: string | null): NormalizedMessage[];
   isProviderInstalled(): Promise<boolean>;
+  /** Server-owned launcher installed only after workspace admission; never supplied by a chat option. */
+  runProcess?: ProviderProcessRunner;
 };
 
+// ---------------------------
+//----------------- PROVIDER PROCESS OWNERSHIP ------------
+/**
+ * One private provider worker job. The supervisor sends this only over its
+ * inherited IPC channel or container stdin frame, never through CLI arguments
+ * or a model prompt. CLI
+ * workers own their command tree; Codex workers keep the SDK's thread/attachment
+ * protocol while making its otherwise hidden child tree observable to teardown.
+ * Optional executable/env values are trusted composition overrides, never chat
+ * input; focused tests supply fake SDK processes without invoking a model.
+ */
+export type ProviderProcessJob =
+  | { kind: 'cli'; command: string; args: string[]; cwd: string; env?: Record<string, string> }
+  | { kind: 'codex'; providerSessionId: string | null; threadOptions: AnyRecord; input: string | Array<{ type: 'text'; text: string } | { type: 'local_image'; path: string }>; executable?: string; env?: Record<string, string> };
+
+/**
+ * Private worker-to-supervisor messages. `done` confirms the provider stream
+ * ended, but does not release a workspace: the supervisor must still terminate
+ * and confirm the worker's complete process tree before resolving its run.
+ */
+export type ProviderProcessEvent =
+  | { kind: 'stdout' | 'stderr'; text: string }
+  | { kind: 'event'; event: AnyRecord }
+  | { kind: 'done'; code: number | null; error?: { name: string; message: string } };
+
+/**
+ * Provider SDK/CLI process execution capability passed only by trusted server
+ * composition. Resolves after every owned process/container is stopped; stream
+ * callbacks preserve native output/event ordering. Cancellation is propagated
+ * only after teardown is confirmed, and teardown failures remain explicit.
+ */
+export type ProviderProcessRunner = (
+  job: ProviderProcessJob,
+  handlers: {
+    stdout?(text: string): void;
+    stderr?(text: string): void;
+    event?(event: AnyRecord): void;
+  },
+  signal?: AbortSignal,
+) => Promise<{ code: number | null; error?: { name: string; message: string } }>;
+
+// ---------------------------
 export type ProviderRunFunction = (
   command: string,
   options: AnyRecord,
@@ -506,6 +550,8 @@ export type FetchHistoryOptions = {
   limit?: number | null;
   offset?: number;
   providerSessionId?: string;
+  /** Server-owned durable provider HOME selected from the app session, never client input. */
+  providerProfilePath?: string | null;
 };
 
 /**

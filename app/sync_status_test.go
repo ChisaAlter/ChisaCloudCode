@@ -97,10 +97,11 @@ func TestSyncStatusCacheAndBinding(t *testing.T) {
 	cfg := Config{ServerURL: "http://sync.test:8791", SSHHost: "sync.test", SSHUser: "root"}
 	m := &Mapping{LocalPath: t.TempDir(), ServerPath: "/srv/sync-status-unit-" + randHex(8), SyncName: "unit-sync", BindingEpoch: "current", ServerID: serverIdentity(cfg), Mode: "vps"}
 	session := syncSession{
-		Name: m.SyncName, Status: "watching", SuccessfulCycles: 1,
+		Name: m.SyncName, Mode: "two-way-safe", Status: "watching", SuccessfulCycles: 1,
 		Alpha: syncEndpoint{Path: m.LocalPath, Connected: true, Scanned: true},
 		Beta:  syncEndpoint{Protocol: "ssh", Host: syncSSHAlias(cfg), Path: m.ServerPath, Connected: true, Scanned: true},
 	}
+	session.Ignore.VCS, session.Ignore.Paths = true, []string{syncDynamicGitPolicyMarker}
 	checkedAt := "2026-10-06T04:00:00Z"
 	t.Cleanup(func() {
 		syncStates.Delete(m.ServerPath)
@@ -152,6 +153,15 @@ func TestSyncStatusCacheAndBinding(t *testing.T) {
 	wrongEndpoint := session
 	wrongEndpoint.Beta.Path += "-other"
 	check(read(wrongEndpoint), "unavailable")
+	unsafeMode := session
+	unsafeMode.Mode = "one-way-replica"
+	check(read(unsafeMode), "blocked")
+	unsafeGit := session
+	unsafeGit.Ignore.VCS = false
+	check(read(unsafeGit), "blocked")
+	legacyPolicy := session
+	legacyPolicy.Ignore.Paths = nil
+	check(read(legacyPolicy), "needs-sync")
 	wrongServer := cfg
 	wrongServer.SSHHost = "other.test"
 	check(projectSyncInfo(m, wrongServer, []syncSession{session}, nil, checkedAt, ""), "unavailable")

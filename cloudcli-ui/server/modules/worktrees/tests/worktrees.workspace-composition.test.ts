@@ -120,7 +120,7 @@ async function withRepository(
       await rm(leaseDirectory, { recursive: true });
     }
     response.writeHead(200, { 'Content-Type': 'application/json' });
-    response.end(JSON.stringify({ ok: true }));
+    response.end(JSON.stringify({ ok: true, ...(body.op === 'sync_end' ? { releasedRunId: body.runId, bindingEpoch: request.headers['x-binding-epoch'] } : {}) }));
   });
   bridge.listen(0, '127.0.0.1');
   await once(bridge, 'listening');
@@ -179,7 +179,6 @@ test('HTTP create from a linked project protects the main binding for its full c
     assert.deepEqual(calls, [
       { op: 'sync_begin', root: main },
       { op: 'sync_end', root: main, changed: true },
-      { op: 'sync_released', root: main },
     ]);
     assert.equal(await exists(main + '.chisa-lease'), false);
   });
@@ -214,7 +213,6 @@ test('create admits the selected linked binding for the complete transaction whe
     assert.deepEqual(calls, [
       { op: 'sync_begin', root: linked },
       { op: 'sync_end', root: linked, changed: true },
-      { op: 'sync_released', root: linked },
     ]);
     assert.equal(await exists(linked + '.chisa-lease'), false);
     assert.equal(await exists(main + '.chisa-lease'), false);
@@ -231,7 +229,7 @@ test('create registration compensation stays inside one admitted transaction', a
     assert.equal((await response.json() as { message: string }).message, 'fixture registration failed');
     assert.equal(await git(main, 'branch', '--list', 'rollback'), '');
     assert.equal(await exists(path.join(path.dirname(main), 'main-worktrees', 'rollback')), false);
-    assert.deepEqual(calls.map(call => call.op), ['sync_begin', 'sync_end', 'sync_released']);
+    assert.deepEqual(calls.map(call => call.op), ['sync_begin', 'sync_end']);
   });
 });
 
@@ -289,7 +287,6 @@ test('merge without removal holds both bindings for one transaction and preserve
       ...orderedRoots.map(root => ({ op: 'sync_begin', root })),
       ...[...orderedRoots].reverse().flatMap(root => [
         { op: 'sync_end', root, changed: true },
-        { op: 'sync_released', root },
       ]),
     ]);
   });
@@ -325,7 +322,6 @@ for (const route of ['merge', 'remove']) {
         ...orderedRoots.map(root => ({ op: 'sync_begin', root })),
         ...[...orderedRoots].reverse().flatMap(root => [
           { op: 'sync_end', root, changed: true },
-          { op: 'sync_released', root },
         ]),
       ]);
     });
@@ -347,7 +343,6 @@ test('merge with removal retains the ordinary source path when only the main wor
     assert.deepEqual(calls, [
       { op: 'sync_begin', root: main },
       { op: 'sync_end', root: main, changed: true },
-      { op: 'sync_released', root: main },
     ]);
   });
 });
@@ -363,7 +358,6 @@ test('standalone removal retains the ordinary source path when only the main wor
     assert.deepEqual(calls, [
       { op: 'sync_begin', root: main },
       { op: 'sync_end', root: main, changed: true },
-      { op: 'sync_released', root: main },
     ]);
   });
 });

@@ -63,7 +63,33 @@ var syncGitMentionedOID = regexp.MustCompile(`\b(?:[a-f0-9]{64}|[a-f0-9]{40})\b`
 func readGitIndexState(ctx context.Context, m *Mapping, env []string) (string, error) {
 	preview, _ := ctx.Value(syncGitPreviewKey{}).(bool)
 	listingArgs := []string{"ls-files", "--stage", "-z"}
-	if preview {
+	isolateIndex := preview
+	if !preview {
+		var index string
+		readOnly := false
+		for _, setting := range env {
+			if path, ok := strings.CutPrefix(setting, "GIT_INDEX_FILE="); ok {
+				index = path
+			}
+			readOnly = readOnly || setting == "GIT_OPTIONAL_LOCKS=0"
+		}
+		// Native observations copy the index beside its original. Only split
+		// bases need a private Git directory; ordinary reads keep their effective
+		// repository configuration and avoid extra Git discovery processes.
+		if readOnly && index != "" {
+			entries, err := os.ReadDir(filepath.Dir(index))
+			if err != nil {
+				return "", err
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), "sharedindex.") {
+					isolateIndex = true
+					break
+				}
+			}
+		}
+	}
+	if isolateIndex {
 		var discard func()
 		var err error
 		env, discard, err = syncGitPreviewIndexEnvironment(ctx, m, env)
@@ -71,6 +97,8 @@ func readGitIndexState(ctx context.Context, m *Mapping, env []string) (string, e
 			return "", err
 		}
 		defer discard()
+	}
+	if preview {
 		// Expanding a sparse index can write cache trees through alternates.
 		// Directory entries are stage zero and need no expansion to find conflicts.
 		listingArgs = append(listingArgs, "--sparse")

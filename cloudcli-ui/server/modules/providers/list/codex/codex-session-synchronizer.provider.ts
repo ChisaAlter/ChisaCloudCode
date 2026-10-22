@@ -3,6 +3,7 @@ import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 
 import { sessionsDb } from '@/modules/database/index.js';
+import { registeredProviderProfiles, profileForArtifact, managedProviderHome } from '@/modules/providers/services/provider-state.service.js';
 import {
   buildLookupMap,
   extractFirstValidJsonlData,
@@ -23,7 +24,7 @@ type ParsedSession = {
  */
 export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
   private readonly provider = 'codex' as const;
-  private readonly codexHome = path.join(os.homedir(), '.codex');
+  constructor(private readonly codexHome = path.join(os.homedir(), '.codex')) {}
 
   /**
    * Scans ~/.codex/sessions and upserts discovered sessions into DB.
@@ -53,7 +54,7 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
       }
 
       const timestamps = await readFileTimestamps(filePath);
-      sessionsDb.createSession(
+      const indexedId = sessionsDb.createSession(
         parsed.sessionId,
         this.provider,
         parsed.projectPath,
@@ -62,9 +63,12 @@ export class CodexSessionSynchronizer implements IProviderSessionSynchronizer {
         timestamps.updatedAt,
         filePath
       );
+      const profile = profileForArtifact('codex', filePath);
+      if (profile === managedProviderHome('codex', indexedId)) sessionsDb.setProviderProfilePath(indexedId, profile);
       processed += 1;
     }
 
+    if (this.codexHome === path.join(os.homedir(), '.codex')) for (const { home } of registeredProviderProfiles('codex')) processed += await new CodexSessionSynchronizer(path.join(home, '.codex')).synchronize(since);
     return processed;
   }
 

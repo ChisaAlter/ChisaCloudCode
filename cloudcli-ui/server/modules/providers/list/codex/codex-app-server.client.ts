@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
-import { stat } from 'node:fs/promises';
+import { lstat, realpath, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import readline from 'node:readline';
+import nodePath from 'node:path';
 
 import { AppError } from '@/shared/utils.js';
 
@@ -72,10 +73,11 @@ function resolveCodexLauncher(): string {
  */
 async function withAppServer<T>(
   run: (call: (method: string, params: unknown) => Promise<unknown>) => Promise<T>,
+  profileHome?: string,
 ): Promise<T> {
   const launcher = resolveCodexLauncher();
   const child = spawn(process.execPath, [launcher, 'app-server'], {
-    env: process.env,
+    env: profileHome ? { ...process.env, HOME: profileHome, CODEX_HOME: nodePath.join(profileHome, '.codex') } : process.env,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
@@ -208,6 +210,8 @@ export const codexAppServer = {
     threadId: string;
     lastTurnId?: string;
     cwd: string;
+    /** Server-validated app-session HOME for managed threads; omitted for native CLI threads. */
+    profileHome?: string;
   }): Promise<CodexThreadFork> {
     return withAppServer(async (call) => {
       const result = await call('thread/fork', {
@@ -230,6 +234,11 @@ export const codexAppServer = {
       // there is a session that can never be opened.
       try {
         await stat(path);
+        if (input.profileHome) {
+          const root = nodePath.join(input.profileHome, '.codex', 'sessions');
+          const stats = await lstat(path);
+          if (!stats.isFile() || stats.isSymbolicLink() || await realpath(path) !== nodePath.resolve(path) || !nodePath.resolve(path).startsWith(root + nodePath.sep)) throw new Error('The managed fork transcript must stay in its registered profile.');
+        }
       } catch {
         throw new AppError('Codex reported a fork but wrote no transcript for it.', {
           code: 'FORK_FAILED',
@@ -238,6 +247,6 @@ export const codexAppServer = {
       }
 
       return { threadId, path };
-    });
+    }, input.profileHome);
   },
 };

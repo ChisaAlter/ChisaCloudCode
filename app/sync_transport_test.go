@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -75,10 +76,72 @@ func TestMutagenTransportAlreadyCurrentDoesNotRestartActiveTask(t *testing.T) {
 	}
 }
 
+// These daemon tests can select an explicit tagged test artifact while keeping
+// the daemon, copied executable, data and SSH resources entirely task-private.
+// Ordinary source runs retain their usual bundled-resource selection.
+func isolateMutagenTransportRuntime(t *testing.T) {
+	t.Helper()
+	source := os.Getenv("CHISA_SYNC_TEST_MUTAGEN_PATH")
+	if source == "" {
+		return
+	}
+	if !filepath.IsAbs(source) {
+		t.Fatal("CHISA_SYNC_TEST_MUTAGEN_PATH must name an explicit absolute tagged engine")
+	}
+	sshSource, err := mutagenSSHPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	private := t.TempDir()
+	resources := filepath.Join(private, "app", "resources")
+	sshDestination := filepath.Join(resources, "windows-amd64", "sync-ssh")
+	if err := os.MkdirAll(sshDestination, 0700); err != nil {
+		t.Fatal(err)
+	}
+	copyResource := func(source, target string) {
+		input, err := os.Open(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer input.Close()
+		info, err := input.Stat()
+		if err != nil || !info.Mode().IsRegular() {
+			t.Fatal("explicit test resource must be a regular file", err)
+		}
+		output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0700)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, copyErr := io.Copy(output, input)
+		closeErr := output.Close()
+		if copyErr != nil || closeErr != nil {
+			t.Fatal(copyErr, closeErr)
+		}
+	}
+	engine := filepath.Join(resources, "mutagen.exe")
+	copyResource(source, engine)
+	for _, name := range []string{"ssh.exe", "scp.exe"} {
+		copyResource(filepath.Join(sshSource, name), filepath.Join(sshDestination, name))
+	}
+	t.Chdir(filepath.Dir(resources))
+	selected, err := filepath.Abs(mutagenExe())
+	if err != nil || selected != engine {
+		t.Fatal("daemon test did not select its private tagged artifact", selected, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	version, err := runMutagenContext(ctx, "version")
+	if err != nil || strings.TrimSpace(version) != workspaceSyncEngineVersion {
+		t.Fatal("explicit daemon test artifact is not the required tagged engine", err)
+	}
+	t.Logf("isolated exact tagged engine artifact=%s version=%s", source, strings.TrimSpace(version))
+}
+
 func TestMutagenTransportFreshAndStaleDaemonReady(t *testing.T) {
 	for _, state := range []string{"fresh", "empty-directory", "stale-lock-and-socket"} {
 		t.Run(state, func(t *testing.T) {
 			connection := accountWorkspaceFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("transport startup used HTTP") })
+			isolateMutagenTransportRuntime(t)
 			daemonDirectory := filepath.Join(dataDir(), "mutagen", "daemon")
 			if state != "fresh" {
 				if err := os.MkdirAll(daemonDirectory, 0700); err != nil {
@@ -163,6 +226,7 @@ func TestMutagenTransportRejectsUntaggedRuntime(t *testing.T) {
 
 func TestMutagenTransportLockFailureDoesNotRecordReadiness(t *testing.T) {
 	connection := accountWorkspaceFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("transport check used HTTP") })
+	isolateMutagenTransportRuntime(t)
 	if err := os.MkdirAll(filepath.Join(dataDir(), "mutagen", "daemon", "daemon.lock"), 0700); err != nil {
 		t.Fatal(err)
 	}

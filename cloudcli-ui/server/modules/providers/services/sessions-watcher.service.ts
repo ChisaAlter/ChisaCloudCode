@@ -5,6 +5,7 @@ import { promises as fsPromises } from 'node:fs';
 import chokidar, { type FSWatcher } from 'chokidar';
 
 import { sessionSynchronizerService } from '@/modules/providers/services/session-synchronizer.service.js';
+import { onManagedProviderProfile, registeredProviderProfiles } from '@/modules/providers/services/provider-state.service.js';
 import { broadcastSessionUpsertedBatch } from '@/modules/websocket/index.js';
 import type { LLMProvider } from '@/shared/types.js';
 
@@ -204,9 +205,24 @@ export async function initializeSessionsWatcher(): Promise<void> {
     failures: initialSync.failures,
   });
 
-  for (const { provider, rootPath } of PROVIDER_WATCH_PATHS) {
+  const paths = [...PROVIDER_WATCH_PATHS, ...registeredProviderProfiles().map(({ provider, home }) => ({ provider, rootPath: managedWatchPath(provider, home) }))];
+  for (const { provider, rootPath } of paths) await addWatch(provider, rootPath);
+  stopProfileListener = onManagedProviderProfile((provider, home) => { void addWatch(provider, managedWatchPath(provider, home)); });
+}
+
+let stopProfileListener: (() => void) | undefined;
+const watchedRoots = new Set<string>();
+function managedWatchPath(provider: LLMProvider, home: string) {
+  return provider === 'codex' ? path.join(home, '.codex', 'sessions') : provider === 'cursor' ? path.join(home, '.cursor', 'projects') : path.join(home, '.local', 'share', 'opencode');
+}
+async function addWatch(provider: LLMProvider, rootPath: string) {
+    if (watchedRoots.has(rootPath)) return;
+    watchedRoots.add(rootPath);
     try {
-      await fsPromises.mkdir(rootPath, { recursive: true });
+      // Managed stores are created/chowned by the admitted profile initializer;
+      // watching a not-yet-created path must not manufacture root-owned children.
+      const managed = registeredProviderProfiles().some(({ home }) => rootPath.startsWith(home + path.sep));
+      if (!managed) await fsPromises.mkdir(rootPath, { recursive: true });
 
       const watcher = chokidar.watch(rootPath, {
         ignored: WATCHER_IGNORED_PATTERNS,
@@ -239,13 +255,13 @@ export async function initializeSessionsWatcher(): Promise<void> {
         error: message,
       });
     }
-  }
 }
 
 /**
  * Stops all active provider session watchers.
  */
 export async function closeSessionsWatcher(): Promise<void> {
+  stopProfileListener?.(); stopProfileListener = undefined; watchedRoots.clear();
   clearPendingWatcherFlushTimer();
 
   await Promise.all(

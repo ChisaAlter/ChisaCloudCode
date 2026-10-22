@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -37,7 +38,10 @@ func pendingProjectEmpty(m *Mapping, session syncSession) (syncSession, bool) {
 	}
 	pending := value.(pendingEmptyConfirmation)
 	valid := pending.epoch == m.BindingEpoch && session.Paused && session.Identifier == pending.session.Identifier
-	if valid && errors.Is(localSyncRootEmpty(m, pending.session), errLocalSyncRootNotEmpty) {
+	// Dynamic live configuration contains only a capability marker, not current
+	// Git exclusions. Recheck its local emptiness with both endpoints' fresh
+	// snapshot inside clearConfirmedProject, after acquiring the exact lease.
+	if valid && !syncSessionHasDynamicGitPolicy(pending.session) && errors.Is(localSyncRootEmpty(m, pending.session), errLocalSyncRootNotEmpty) {
 		pendingEmptyConfirmations.Delete(m.ServerPath)
 		valid = false
 	}
@@ -100,9 +104,13 @@ func projectEmptySession(ctx context.Context, m *Mapping) (syncSession, error) {
 	} else if session.Mode != "two-way-safe" || session.Status != "halted-on-root-emptied" || !emptySyncEndpoint(session.Alpha) || emptySyncEndpoint(session.Beta) {
 		return syncSession{}, fmt.Errorf("当前项目不再处于本地清空保护状态，请刷新后重新确认")
 	}
-	if err := localSyncRootEmpty(m, session); err != nil {
-		return syncSession{}, err
+	if !syncSessionHasDynamicGitPolicy(session) {
+		if err := localSyncRootEmpty(m, session); err != nil {
+			return syncSession{}, err
+		}
 	}
+	// The authoritative local-content guard for a dynamic session runs under
+	// the exact lease, using fresh Git exclusions, before any remote move.
 	return session, nil
 }
 
@@ -157,6 +165,11 @@ type syncEmptyResult struct {
 	Error      string `json:"error,omitempty"`
 }
 
+// A live policy marker is deliberately not a static ignore snapshot. Destructive
+// confirmation obtains both endpoints' current policy under the paused session
+// and exact lease, and proves it unchanged again before requesting quarantine.
+var confirmedEmptyIgnorePatterns = projectSyncIgnoreSnapshotPatterns
+
 func clearConfirmedProject(ctx context.Context, m *Mapping, session syncSession) (syncEmptyResult, error) {
 	notStarted := syncEmptyResult{ClearState: "not-started"}
 	current, err := syncSessionsContext(ctx, m.SyncName)
@@ -165,6 +178,14 @@ func clearConfirmedProject(ctx context.Context, m *Mapping, session syncSession)
 	}
 	if len(current) != 1 || !current[0].Paused || current[0].Identifier != session.Identifier || !syncSessionMatchesMapping(current[0], m, workspaceSyncConfig(ctx)) {
 		return notStarted, fmt.Errorf("清空确认后同步会话已改变")
+	}
+	dynamicPolicy := syncSessionHasDynamicGitPolicy(session)
+	if dynamicPolicy {
+		patterns, err := confirmedEmptyIgnorePatterns(ctx, m)
+		if err != nil {
+			return notStarted, fmt.Errorf("无法确认清空时的最新过滤规则，未移动文件: %w", err)
+		}
+		session.Ignore.Paths = patterns
 	}
 	if err := localSyncRootEmpty(m, session); err != nil {
 		return notStarted, err
@@ -211,12 +232,26 @@ func clearConfirmedProject(ctx context.Context, m *Mapping, session syncSession)
 		}
 		entries = append(entries, selected...)
 	}
+	if dynamicPolicy {
+		patterns, err := confirmedEmptyIgnorePatterns(ctx, m)
+		if err != nil || !slices.Equal(patterns, session.Ignore.Paths) {
+			return notStarted, fmt.Errorf("清空准备期间文件过滤规则已改变或无法确认，未移动文件")
+		}
+	}
 	if err := localSyncRootEmpty(m, session); err != nil {
 		return notStarted, err
 	}
 	id, _ := ctx.Value(syncLeaseContextKey{}).(string)
+	request := map[string]any{"op": "move", "id": id, "epoch": m.BindingEpoch, "entries": entries, "directories": directoryContents}
+	if dynamicPolicy {
+		local, err := localSyncGitInventory(ctx, m)
+		if err != nil {
+			return notStarted, fmt.Errorf("清空前无法确认本地跟踪例外，未移动文件: %w", err)
+		}
+		request["gitPolicy"], request["tracked"] = true, local.Tracked
+	}
 	moved := syncEmptyResult{ClearState: "unknown"}
-	if err := callWorker(map[string]any{"op": "move", "id": id, "epoch": m.BindingEpoch, "entries": entries, "directories": directoryContents}, &moved); err != nil {
+	if err := callWorker(request, &moved); err != nil {
 		return syncEmptyResult{ClearState: "unknown"}, fmt.Errorf("清空结果未确认；请检查 VPS 原目录和备份目录后再操作: %w", err)
 	}
 	switch moved.ClearState {

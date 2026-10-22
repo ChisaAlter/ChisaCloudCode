@@ -198,7 +198,10 @@ func gitIndexGuard(ctx context.Context, m *Mapping) (string, *locking.Locker, er
 		guard.Close()
 		return "", nil, err
 	}
-	if err = removeOwnedIndexLock(index); err != nil {
+	if err = removeOwnedIndexLock(index); err == nil {
+		err = recoverLocalGitHeadLock(ctx, m)
+	}
+	if err != nil {
 		guard.Close()
 		return "", nil, err
 	}
@@ -576,6 +579,9 @@ func syncGitStateContext(ctx context.Context, m *Mapping) error {
 	if err != nil {
 		return err
 	}
+	if err = preflightSyncGitState(ctx, m, local, remote, desired); err != nil {
+		return err
+	}
 	if err = applyPreparedGitState(ctx, m, r, local, remote, desired); err != nil {
 		return err
 	}
@@ -607,32 +613,11 @@ func applyPreparedGitState(ctx context.Context, m *Mapping, r *syncGitCheckpoint
 	if local == remote && local == desired {
 		return nil
 	}
-	cfg := workspaceSyncConfig(ctx)
-	url := cfg.SSHUser + "@" + cfg.SSHHost + ":" + m.ServerPath
+	// Preflight has already provisioned immutable snapshot objects on the
+	// receiving endpoint, before its branch ancestry checks. No user's ref,
+	// index or worktree was moved by that transfer. Save Pending before the
+	// first mutable metadata operation and retain exact endpoint CAS below.
 	var err error
-	// Transfer an ordinary recovery commit that retains every stage/operation
-	// object. Unresolved indexes use a synthetic tree, never a conflicted tree.
-	// Neither user's branch receives this commit.
-	ref := "refs/chisa/transfer/" + randHex(16)
-	if desired == remote {
-		if _, err = remoteGitSnapshot(ctx, m, desired, ref); err != nil {
-			return err
-		}
-		if _, err = gitOutputContext(ctx, m.LocalPath, "fetch", "--no-tags", "--upload-pack=setpriv --reuid=1000 --regid=1000 --clear-groups env HOME=/nonexistent git -c core.hooksPath=/dev/null -c core.fsmonitor=false upload-pack", url, ref); err != nil {
-			return err
-		}
-	} else {
-		if _, err = localGitSnapshot(ctx, m, desired, ref); err != nil {
-			return err
-		}
-		receive, e := syncRemoteJobCommand(ctx, m, "receive-pack", "")
-		if e != nil {
-			return e
-		}
-		if _, err = gitOutputContext(ctx, m.LocalPath, "push", "--receive-pack="+receive, url, ref+":"+ref); err != nil {
-			return err
-		}
-	}
 	if r.Pending == nil {
 		r.Pending = &syncGitPending{Local: local, Remote: remote, Desired: desired}
 	}

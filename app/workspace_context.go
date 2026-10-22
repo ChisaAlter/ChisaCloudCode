@@ -26,7 +26,7 @@ func workspaceSynchronizationTimeout(m *Mapping) time.Duration {
 // keeps the engine watching, so this bound only applies to rule migrations and
 // explicit stops.
 const workspaceSyncPauseTimeout = 10 * time.Second
-const workspaceSyncEngineVersion = "0.18.1-chisa.2"
+const workspaceSyncEngineVersion = "0.18.1-chisa.3"
 const serverRequestTimeout = 2000 * time.Second
 const workspaceDeadlineHeader = "X-Chisa-Deadline-Ms"
 

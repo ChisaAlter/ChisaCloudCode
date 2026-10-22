@@ -400,6 +400,19 @@ func validateProjectSyncSessionContext(ctx context.Context, m *Mapping, session 
 	return nil
 }
 
+// Structural validation also admits a paused legacy session so its exact policy
+// can be migrated. File transfer and readiness additionally require the live
+// Git-policy capability; an old literal snapshot can never authorize resume.
+func validateLiveProjectSyncSessionContext(ctx context.Context, m *Mapping, session syncSession) error {
+	if err := validateProjectSyncSessionContext(ctx, m, session); err != nil {
+		return err
+	}
+	if !syncSessionHasDynamicGitPolicy(session) {
+		return fmt.Errorf("项目同步过滤策略需要升级，请立即同步以安全更新规则")
+	}
+	return nil
+}
+
 func syncWorkspaceOwner(serverPath string) string {
 	if reservation, reserved := cloudReservations.Load(serverPath); reserved {
 		if recovery, pending := cloudSyncRecovery.Load(serverPath); !pending || recovery != reservation {
@@ -467,6 +480,11 @@ func projectSyncInfo(m *Mapping, cfg Config, sessions []syncSession, queryErr er
 	}
 	live := syncSessionInfo(session)
 	info.Status, info.Detail = live.Status, live.Detail
+	if session.Mode != "two-way-safe" || !session.Ignore.VCS {
+		info.Status, info.Detail = "blocked", "同步会话的同步模式或 Git 排除设置已改变，请修复会话后重新同步"
+	} else if !syncSessionHasDynamicGitPolicy(session) {
+		info.Status, info.Detail = "needs-sync", "同步过滤策略需要升级，请立即同步以安全更新规则"
+	}
 	info.EmptySide = live.EmptySide
 	if _, pending := pendingProjectEmpty(m, session); pending {
 		info.Status, info.EmptySide = "blocked", "local"
@@ -648,7 +666,7 @@ func ensureSyncContext(ctx context.Context, m *Mapping) error {
 		return err
 	}
 	if len(sessions) == 1 {
-		return validateProjectSyncSessionContext(ctx, m, sessions[0])
+		return validateLiveProjectSyncSessionContext(ctx, m, sessions[0])
 	}
 	if len(sessions) > 1 {
 		return fmt.Errorf("存在重复同步会话")
@@ -656,8 +674,10 @@ func ensureSyncContext(ctx context.Context, m *Mapping) error {
 	if pinned, _ := ctx.Value(syncSessionIdentityKey{}).(*syncSessionIdentity); pinned != nil && pinned.identifier != "" {
 		return fmt.Errorf("同步期间项目会话已消失，请重新同步")
 	}
-	before, beforeErr := syncIgnoreEndpointSignatureContext(ctx, m)
-	config, _, _, err := guardedSyncIgnoreConfigurationContext(ctx, m, before, beforeErr)
+	// The versioned engine negotiates and validates both endpoints' Git policy
+	// before its first scan. The live configuration is stable; native snapshots
+	// belong only to explicit offline/destructive inspection.
+	config, err := projectSyncIgnoreConfigurationContext(ctx, m)
 	if err != nil {
 		return err
 	}
@@ -675,13 +695,13 @@ func flushSync(m *Mapping, pause bool) error {
 // The engine preserves its archive and projects newly ignored paths out of the
 // baseline without interpreting them as deletions on either endpoint.
 //
-// Pausing is what makes a synchronization expensive: a paused session drops its
-// endpoint connections and the next flush has to rescan both sides from cold
-// (minutes on a large project). The policy is therefore computed first and the
-// engine is only paused when the pattern set actually changed.
+// Pausing drops endpoint connections and makes the next flush cold. A negotiated
+// live policy updates itself inside each engine cycle, so only legacy sessions
+// need a one-time exact-session pause/configuration migration here.
 func refreshSyncIgnoreContext(ctx context.Context, m *Mapping) (bool, error) {
-	// Only evidence from both endpoints can skip inventory. A local-only stamp
-	// misses remote index, nested ignore, and effective configuration changes.
+	// Validate the exact session before trusting its negotiated live capability.
+	// The engine owns policy evidence for both endpoints; native only migrates
+	// legacy configuration while preserving its archive and exact identifier.
 	if err := workspaceSyncCurrent(ctx); err != nil {
 		return false, err
 	}
@@ -699,30 +719,22 @@ func refreshSyncIgnoreContext(ctx context.Context, m *Mapping) (bool, error) {
 	if err := validateProjectSyncSessionContext(ctx, m, session); err != nil {
 		return false, err
 	}
-	force, _ := ctx.Value(syncIgnoreForceKey{}).(bool)
-	before, beforeErr := syncIgnoreEndpointSignatureContext(ctx, m)
-	if !force && beforeErr == nil {
-		signature := syncIgnoreSessionSignature(before, session)
-		if stamp, err := os.ReadFile(syncIgnoreStampPath(m)); err == nil && strings.TrimSpace(string(stamp)) == signature {
-			return false, nil
-		}
+	if syncSessionHasDynamicGitPolicy(session) {
+		// The capability is enforced on both endpoints by engine .3 before
+		// every scan and transfer. Never repeat native tree discovery, literal
+		// inventories or endpoint reconnection for ordinary index/rule changes.
+		return false, nil
 	}
-	configuration, contents, endpointSignature, err := guardedSyncIgnoreConfigurationContext(ctx, m, before, beforeErr)
+	// A legacy session is paused by engine .3 before it can connect. Migrate
+	// only that pinned session to stable live policy; no old literal inventory
+	// can authorize transfer or override the engine's fresh joint decisions.
+	configuration, err := projectSyncIgnoreConfigurationContext(ctx, m)
 	if err != nil {
 		return false, err
 	}
-	remember := func() {
-		if endpointSignature == "" {
-			return
-		}
-		target := syncIgnoreStampPath(m)
-		if os.MkdirAll(filepath.Dir(target), 0700) != nil {
-			return
-		}
-		signature := syncIgnoreSessionSignature(endpointSignature, session)
-		if os.WriteFile(target+".tmp", []byte(signature), 0600) == nil {
-			_ = os.Rename(target+".tmp", target)
-		}
+	contents, err := os.ReadFile(configuration)
+	if err != nil {
+		return false, err
 	}
 	current, err := syncSessionsContext(ctx, m.SyncName)
 	if err != nil {
@@ -742,8 +754,12 @@ func refreshSyncIgnoreContext(ctx context.Context, m *Mapping) (bool, error) {
 			patterns = append(patterns, pattern)
 		}
 	}
+	policy := session
+	policy.Ignore.Paths = patterns
+	if !syncSessionHasDynamicGitPolicy(policy) {
+		return false, fmt.Errorf("新的文件过滤配置缺少实时 Git 策略，未启动传输")
+	}
 	if slices.Equal(patterns, session.Ignore.Paths) {
-		remember()
 		return false, nil
 	}
 	if !session.Paused {
@@ -761,11 +777,9 @@ func refreshSyncIgnoreContext(ctx context.Context, m *Mapping) (bool, error) {
 	if len(updated) != 1 || updated[0].Identifier != session.Identifier || !slices.Equal(updated[0].Ignore.Paths, patterns) {
 		return false, fmt.Errorf("文件过滤更新后的项目会话或规则无法确认")
 	}
-	if err := validateProjectSyncSessionContext(ctx, m, updated[0]); err != nil {
+	if err := validateLiveProjectSyncSessionContext(ctx, m, updated[0]); err != nil {
 		return false, err
 	}
-	session = updated[0]
-	remember()
 	return true, nil
 }
 
@@ -781,7 +795,7 @@ func ensureSyncWatchingContext(ctx context.Context, m *Mapping) error {
 		return fmt.Errorf("无法确认唯一的项目同步会话")
 	}
 	session := sessions[0]
-	if err := validateProjectSyncSessionContext(ctx, m, session); err != nil {
+	if err := validateLiveProjectSyncSessionContext(ctx, m, session); err != nil {
 		return err
 	}
 	if session.Paused {
@@ -792,10 +806,57 @@ func ensureSyncWatchingContext(ctx context.Context, m *Mapping) error {
 		// cycle before reporting success; ordinary warm sessions skip this path.
 		return flushSyncContext(ctx, m, false)
 	}
-	if info := syncSessionInfo(session); info.Status != "ready" {
-		return &syncEngineError{fmt.Errorf("文件同步尚未就绪: %s", info.Detail)}
+	// A fresh edit can start another healthy cycle after our explicit flush.
+	// Observe that cycle to completion instead of treating its busy frame as a
+	// failure and disconnecting the otherwise healthy endpoints. The exact
+	// session, mode and endpoint identity remain pinned on every observation.
+	return waitSyncWatchingContext(ctx, m, session, func() ([]syncSession, error) {
+		return syncSessionsContext(ctx, m.SyncName)
+	})
+}
+
+func waitSyncWatchingContext(ctx context.Context, m *Mapping, session syncSession, observe func() ([]syncSession, error)) error {
+	identifier := session.Identifier
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := workspaceSyncCurrent(ctx); err != nil {
+			return err
+		}
+		if session.Identifier != identifier {
+			return fmt.Errorf("同步期间项目会话已被替换，请重新同步")
+		}
+		if err := validateLiveProjectSyncSessionContext(ctx, m, session); err != nil {
+			return err
+		}
+		info := syncSessionInfo(session)
+		if info.Status == "ready" {
+			return nil
+		}
+		// Only a previously initialized, connected and error-free session can
+		// wait. Conflicts, halted roots, external pauses and unsafe configuration
+		// still return immediately without borrowing or releasing ownership.
+		transient := info.Status == "checking" || info.Status == "syncing"
+		if !transient || session.Paused || !session.Alpha.Connected || !session.Beta.Connected || session.SuccessfulCycles == 0 {
+			return &syncEngineError{fmt.Errorf("文件同步尚未就绪: %s", info.Detail)}
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		sessions, err := observe()
+		if err != nil {
+			return err
+		}
+		if len(sessions) != 1 {
+			return fmt.Errorf("等待文件同步期间无法确认唯一的项目会话")
+		}
+		session = sessions[0]
 	}
-	return nil
 }
 
 func flushSyncContext(ctx context.Context, m *Mapping, pause bool) error {
@@ -851,16 +912,14 @@ func flushSyncContext(ctx context.Context, m *Mapping, pause bool) error {
 	if s.LastError != "" {
 		return &syncEngineError{fmt.Errorf("同步错误: %s", s.LastError)}
 	}
-	for _, e := range []syncEndpoint{s.Alpha, s.Beta} {
-		if !e.Connected || !e.Scanned {
-			return &syncEngineError{fmt.Errorf("同步端点尚未完成连接和扫描")}
-		}
-		if len(e.ScanProblems)+len(e.TransitionProblems) > 0 || e.ExcludedScanProblems+e.ExcludedTransitionProblems > 0 {
-			return &syncEngineError{fmt.Errorf("%s", syncProblemDetail(s))}
-		}
-	}
-	if s.SuccessfulCycles == 0 {
-		return &syncEngineError{fmt.Errorf("同步尚未完成首轮传输")}
+	// The completed flush and this query are separate daemon requests. A
+	// subsequent edit can already be scanning, including Scanned=false, when
+	// the flush result arrives. Use the same exact-session convergence guard as
+	// final handoff; do not turn that normal follow-up cycle into a pause.
+	if err := waitSyncWatchingContext(ctx, m, s, func() ([]syncSession, error) {
+		return syncSessionsContext(ctx, m.SyncName)
+	}); err != nil {
+		return err
 	}
 	if pause {
 		if err := pauseSyncSessionContext(ctx, m, s.Identifier); err != nil {

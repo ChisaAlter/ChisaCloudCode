@@ -84,26 +84,30 @@ func TestSyncGitRecoveryOuterSessionPinSurvivesInnerPipeline(t *testing.T) {
 	original := fixture.session()
 	fixture.setSessions(original)
 	var outerPin *syncSessionIdentity
-	pauseCalls := 0
-	pauseProjectSync = func(ctx context.Context, mapping *Mapping) error {
-		pauseCalls++
+	prepareCalls, pauseCalls := 0, 0
+	prepareProjectSyncSession = func(ctx context.Context, mapping *Mapping) error {
+		prepareCalls++
 		pinned, _ := ctx.Value(syncSessionIdentityKey{}).(*syncSessionIdentity)
 		if pinned == nil || outerPin != nil && pinned != outerPin {
-			return errors.New("pause lost the outer session identity")
+			return errors.New("admission lost the outer session identity")
 		}
 		outerPin = pinned
-		if err := pauseProjectSyncContext(ctx, mapping); err != nil {
+		if err := prepareProjectSyncSessionContext(ctx, mapping); err != nil {
 			return err
 		}
 		if pinned.identifier != original.Identifier {
-			return errors.New("outer pause did not pin its exact session")
+			return errors.New("outer admission did not pin its exact session")
 		}
-		// Recreate the same valid name/binding immediately after the outer pause.
+		// Recreate the same valid name/binding immediately after admission.
 		// The inner pipeline must not treat it as a fresh first observation.
 		replacement := original
-		replacement.Identifier = "replacement-after-outer-pause"
+		replacement.Identifier = "replacement-after-outer-admission"
 		fixture.setSessions(replacement)
 		return nil
+	}
+	pauseProjectSync = func(ctx context.Context, mapping *Mapping) error {
+		pauseCalls++
+		return pauseProjectSyncContext(ctx, mapping)
 	}
 	claims, confirms, releases := 0, 0, 0
 	claimedID := ""
@@ -114,7 +118,7 @@ func TestSyncGitRecoveryOuterSessionPinSurvivesInnerPipeline(t *testing.T) {
 			claims++
 			claimedID = id
 			if outerPin == nil || outerPin.identifier != original.Identifier || ctx.Value(syncSessionIdentityKey{}) != outerPin {
-				return nil, errors.New("lease claim lost the paused session identity")
+				return nil, errors.New("lease claim lost the admitted session identity")
 			}
 			lease = map[string]any{"owner": owner, "id": id, "epoch": mapping.BindingEpoch}
 		case "confirm":
@@ -142,8 +146,8 @@ func TestSyncGitRecoveryOuterSessionPinSurvivesInnerPipeline(t *testing.T) {
 	if result["ok"] != false || !strings.Contains(message, "会话已被替换") {
 		t.Errorf("inner pipeline did not reject the recreated session: %v", result)
 	}
-	if claims != 1 || confirms != 1 || releases != 0 || pauseCalls != 2 {
-		t.Errorf("unexpected handoff after session replacement: claims=%d confirms=%d releases=%d pauseChecks=%d", claims, confirms, releases, pauseCalls)
+	if claims != 1 || confirms != 1 || releases != 0 || prepareCalls != 1 || pauseCalls != 1 {
+		t.Errorf("unexpected handoff after session replacement: claims=%d confirms=%d releases=%d admissionChecks=%d pauseChecks=%d", claims, confirms, releases, prepareCalls, pauseCalls)
 	}
 	if outerPin == nil || outerPin.identifier != original.Identifier {
 		t.Errorf("outer session identity was lost: %+v", outerPin)
@@ -162,8 +166,8 @@ func TestSyncGitRecoveryOuterSessionPinSurvivesInnerPipeline(t *testing.T) {
 		}
 		t.Errorf("replacement reached an engine mutation: %q", args)
 	}
-	if pauses != 1 {
-		t.Errorf("outer pause did not target exactly the original session once: %d", pauses)
+	if pauses != 0 {
+		t.Errorf("read-only admission or rejected cleanup mutated a replaced session: %d", pauses)
 	}
 	pending, ok := pendingSyncReleases.Load(m.ServerPath)
 	if !ok {

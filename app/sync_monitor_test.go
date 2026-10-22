@@ -32,11 +32,13 @@ func isolateSyncObserver(t *testing.T) (*Mapping, syncSession, *syncMonitorProce
 		delete(syncActivities.items, m.ServerPath)
 		syncActivities.Unlock()
 	})
-	return m, syncSession{
-		Name: m.SyncName, Status: "watching", SuccessfulCycles: 1,
+	session := syncSession{
+		Name: m.SyncName, Mode: "two-way-safe", Status: "watching", SuccessfulCycles: 1,
 		Alpha: syncEndpoint{Path: m.LocalPath, Connected: true, Scanned: true},
 		Beta:  syncEndpoint{Protocol: "ssh", Host: syncSSHAlias(cfg), Path: m.ServerPath, Connected: true, Scanned: true},
-	}, process
+	}
+	session.Ignore.VCS, session.Ignore.Paths = true, []string{syncDynamicGitPolicyMarker}
+	return m, session, process
 }
 
 func TestSyncMonitorVersionsAndOperations(t *testing.T) {

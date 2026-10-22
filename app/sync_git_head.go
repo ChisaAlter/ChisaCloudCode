@@ -13,6 +13,10 @@ import (
 // callers do not supply this context value.
 type syncGitHeadBeforeLockKey struct{}
 
+// Child-process crash regressions stop only at completed real filesystem/CAS
+// boundaries. Production callers never supply this context value.
+type syncGitHeadLockStageKey struct{}
+
 // applyLocalGitHead installs only HEAD and the desired branch tip. The caller
 // retains index/operation locking, target/worktree validation, recovery refs,
 // and the pending journal. old is the exact target tip from localGitTarget
@@ -49,12 +53,9 @@ func applyLocalGitHead(ctx context.Context, m *Mapping, before, desired syncGitS
 			return fmt.Errorf("Git HEAD 目标不是提交")
 		}
 	}
-	head, err := gitOutputContext(ctx, m.LocalPath, "rev-parse", "--git-path", "HEAD")
+	head, err := localGitHeadPath(ctx, m)
 	if err != nil {
 		return err
-	}
-	if !filepath.IsAbs(head) {
-		head = filepath.Join(m.LocalPath, head)
 	}
 	observed, err := os.ReadFile(head)
 	if err != nil {
@@ -67,28 +68,11 @@ func applyLocalGitHead(ctx context.Context, m *Mapping, before, desired syncGitS
 		hook()
 	}
 
-	// symref-update's `ref` expectation checks the raw symbolic target, even
-	// when another branch resolves to the same OID. Git locks both refs before
-	// committing. Do not fall back on a failed CAS or a foreign lock.
-	//
-	// Git's files backend also creates a HEAD reflog update for an update of
-	// the checked-out branch. Including that branch and HEAD in one transaction
-	// is rejected as a duplicate update, so that case uses the locked path.
-	if before.Branch != "" && desired.Branch != "" && before.Branch != desired.Branch {
-		transaction := "start\x00symref-update HEAD\x00" + desired.Branch + "\x00ref\x00" + before.Branch +
-			"\x00update " + desired.Branch + "\x00" + desired.Head + "\x00" + old + "\x00prepare\x00commit\x00"
-		_, err = gitOutputContextEnvInput(ctx, m.LocalPath, nil, []byte(transaction),
-			"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "update-ref", "--no-deref", "--stdin", "-z")
-		if err == nil {
-			return nil
-		}
-		// Symref transactions were added in Git 2.48. Detect the command, not
-		// a parsed version string (vendors can backport it). A parser rejection
-		// precedes prepare/commit and cannot have modified either reference.
-		if !strings.Contains(err.Error(), "unknown command: symref-update") {
-			return err
-		}
-	}
+	// Own every HEAD write through the same durable lock protocol, including
+	// branch switches on Git versions supporting symref-update. Letting Git
+	// create HEAD.lock inside a transaction would leave no exact ownership proof
+	// if the process were killed. The pending journal resumes the branch-CAS /
+	// HEAD-publication prefix; raw HEAD identity is rechecked under our lock.
 	return applyLocalGitHeadLocked(ctx, m, before, desired, old, head, observed)
 }
 
@@ -113,24 +97,29 @@ func syncGitHeadMatches(raw []byte, state syncGitState) bool {
 }
 
 func applyLocalGitHeadLocked(ctx context.Context, m *Mapping, before, desired syncGitState, old, head string, observed []byte) error {
-	lock, err := os.OpenFile(head+".lock", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	guard, err := syncGitHeadGuard(head)
 	if err != nil {
-		return err // In particular, never remove another process's HEAD.lock.
+		return err
+	}
+	defer guard.Close()
+	// Publish the proof before the lock: a kill at either boundary is safely
+	// recoverable. Never create HEAD.lock and then try to establish ownership.
+	lock, err := os.OpenFile(head+".chisa-owned", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
 	}
 	owned, err := lock.Stat()
 	if err != nil {
 		lock.Close()
 		return err
 	}
-	defer func() {
-		lock.Close()
-		// Identity is checked even during error cleanup: a replacement lock
-		// at the same path belongs to its new owner.
-		current, statErr := os.Lstat(lock.Name())
-		if statErr == nil && os.SameFile(owned, current) {
-			os.Remove(lock.Name())
-		}
-	}()
+	defer func() { lock.Close(); removeGitHeadLockOwner(head, owned) }()
+	if err = os.Link(lock.Name(), head+".lock"); err != nil {
+		return err // In particular, never remove another process's HEAD.lock.
+	}
+	if hook, _ := ctx.Value(syncGitHeadLockStageKey{}).(func(string)); hook != nil {
+		hook("locked")
+	}
 	current, err := os.ReadFile(head)
 	if err != nil {
 		return err
@@ -159,7 +148,10 @@ func applyLocalGitHeadLocked(ctx context.Context, m *Mapping, before, desired sy
 		return err
 	}
 
-	if desired.Branch != "" {
+	if err = func() error {
+		if desired.Branch == "" {
+			return nil
+		}
 		// A normal update-ref of a checked-out branch tries to acquire
 		// HEAD.lock for its reflog, even with --no-deref. A private detached
 		// Git dir shares the same objects/refs through commondir, allowing
@@ -182,10 +174,14 @@ func applyLocalGitHeadLocked(ctx context.Context, m *Mapping, before, desired sy
 		if err = os.WriteFile(filepath.Join(private, "commondir"), []byte(filepath.ToSlash(common)+"\n"), 0600); err != nil {
 			return err
 		}
-		if _, err = gitOutputContext(ctx, m.LocalPath, "--git-dir="+private,
-			"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "update-ref", "--no-deref", desired.Branch, desired.Head, old); err != nil {
-			return err
-		}
+		_, err = gitOutputContext(ctx, m.LocalPath, "--git-dir="+private,
+			"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "update-ref", "--no-deref", desired.Branch, desired.Head, old)
+		return err
+	}(); err != nil {
+		return err
+	}
+	if hook, _ := ctx.Value(syncGitHeadLockStageKey{}).(func(string)); hook != nil {
+		hook("cas")
 	}
 	// No cancellable operation remains between branch CAS and replacing HEAD.
 	// On failure the existing recovery ref and pending journal still describe
@@ -193,12 +189,18 @@ func applyLocalGitHeadLocked(ctx context.Context, m *Mapping, before, desired sy
 	if err = lock.Close(); err != nil {
 		return err
 	}
-	currentLock, err := os.Lstat(lock.Name())
+	currentLock, err := os.Lstat(head + ".lock")
 	if err != nil {
 		return err
 	}
-	if !os.SameFile(owned, currentLock) {
+	if !currentLock.Mode().IsRegular() || !os.SameFile(owned, currentLock) {
 		return fmt.Errorf("Git HEAD 锁所有者发生改变，未覆盖")
 	}
-	return os.Rename(lock.Name(), head)
+	if err = os.Rename(head+".lock", head); err != nil {
+		return err
+	}
+	if hook, _ := ctx.Value(syncGitHeadLockStageKey{}).(func(string)); hook != nil {
+		hook("published")
+	}
+	return nil
 }

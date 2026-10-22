@@ -118,7 +118,7 @@ func newSyncPolicyGuardFixture(t *testing.T) *syncPolicyGuardFixture {
 	fixture := &syncPolicyGuardFixture{
 		t: t, mapping: m, statePath: filepath.Join(root, "sessions.json"),
 		configuration: filepath.Join(root, "ignore.yml"), remoteToken: "stable-remote-policy",
-		patterns: []string{"node_modules", ".git"},
+		patterns: []string{"node_modules", ".git", syncDynamicGitPolicyMarker},
 	}
 	fixture.logPath = privateConnectionTool(t, "[]")
 	t.Setenv("CHISA_CONNECTION_TEST_TOOL", "policy-guard")
@@ -215,38 +215,53 @@ func (fixture *syncPolicyGuardFixture) requireNoStamp() {
 	}
 }
 
-func TestSyncIgnoreCacheRevalidatesRecreatedSession(t *testing.T) {
+func TestSyncDynamicPolicyMigrationGuardsResumeUntilAcknowledged(t *testing.T) {
+	fixture := newSyncPolicyGuardFixture(t)
+	legacy := fixture.session()
+	legacy.Paused = true
+	legacy.Ignore.Paths = []string{"node_modules", ".git"}
+	fixture.setSessions(legacy)
+	if err := ensureSyncWatchingContext(context.Background(), fixture.mapping); err == nil {
+		t.Fatal("legacy literal policy resumed without dynamic admission")
+	}
+	fixture.requireQueriesOnly()
+	if changed, err := refreshSyncIgnoreContext(context.Background(), fixture.mapping); err != nil || !changed {
+		t.Fatalf("policy migration failed: changed=%t err=%v", changed, err)
+	}
+	if err := ensureSyncWatchingContext(context.Background(), fixture.mapping); err != nil {
+		t.Fatalf("acknowledged dynamic policy could not resume: %v", err)
+	}
+}
+
+func TestSyncIgnoreDynamicEngineRevalidatesIdentityWithoutInventories(t *testing.T) {
 	fixture := newSyncPolicyGuardFixture(t)
 	session := fixture.session()
 	fixture.setSessions(session)
-	if changed, err := refreshSyncIgnoreContext(context.Background(), fixture.mapping); err != nil || changed || fixture.inventories != 1 {
-		t.Fatalf("initial policy validation: changed=%t inventories=%d err=%v", changed, fixture.inventories, err)
-	}
-	session.Identifier = "policy-guard-recreated"
-	fixture.setSessions(session)
-	if changed, err := refreshSyncIgnoreContext(context.Background(), fixture.mapping); err != nil || changed || fixture.inventories != 2 {
-		t.Fatalf("same-name replacement reused previous session evidence: changed=%t inventories=%d err=%v", changed, fixture.inventories, err)
-	}
-	if changed, err := refreshSyncIgnoreContext(context.Background(), fixture.mapping); err != nil || changed || fixture.inventories != 2 {
-		t.Fatalf("validated replacement did not stay warm: changed=%t inventories=%d err=%v", changed, fixture.inventories, err)
+	for pass := 0; pass < 3; pass++ {
+		if changed, err := refreshSyncIgnoreContext(context.Background(), fixture.mapping); err != nil || changed || fixture.inventories != 0 {
+			t.Fatalf("dynamic engine policy did native inventory: changed=%t inventories=%d err=%v", changed, fixture.inventories, err)
+		}
+		session.Identifier = fmt.Sprintf("policy-guard-recreated-%d", pass)
+		fixture.setSessions(session)
 	}
 	fixture.requireQueriesOnly()
 }
 
-func TestSyncIgnoreCacheRepairsExternallyChangedRules(t *testing.T) {
+func TestSyncIgnoreDynamicEngineIgnoresLegacyLiteralsAndMigratesRemovedMarker(t *testing.T) {
 	fixture := newSyncPolicyGuardFixture(t)
 	session := fixture.session()
-	fixture.setSessions(session)
-	if _, err := refreshSyncIgnoreContext(context.Background(), fixture.mapping); err != nil {
-		t.Fatal(err)
-	}
 	session.Ignore.Paths = append(session.Ignore.Paths, "tracked-source.txt")
 	fixture.setSessions(session)
-	if changed, err := refreshSyncIgnoreContext(context.Background(), fixture.mapping); err != nil || !changed || fixture.inventories != 2 {
-		t.Fatalf("external rules bypassed inventory/migration: changed=%t inventories=%d err=%v", changed, fixture.inventories, err)
+	if changed, err := refreshSyncIgnoreContext(context.Background(), fixture.mapping); err != nil || changed || fixture.inventories != 0 {
+		t.Fatalf("legacy literals disturbed authoritative engine policy: changed=%t inventories=%d err=%v", changed, fixture.inventories, err)
 	}
-	if changed, err := refreshSyncIgnoreContext(context.Background(), fixture.mapping); err != nil || changed || fixture.inventories != 2 {
-		t.Fatalf("migration did not remember the corrected live rules: changed=%t inventories=%d err=%v", changed, fixture.inventories, err)
+	session.Ignore.Paths = []string{"node_modules", ".git", "tracked-source.txt"}
+	fixture.setSessions(session)
+	if changed, err := refreshSyncIgnoreContext(context.Background(), fixture.mapping); err != nil || !changed || fixture.inventories != 1 {
+		t.Fatalf("removed capability bypassed migration: changed=%t inventories=%d err=%v", changed, fixture.inventories, err)
+	}
+	if changed, err := refreshSyncIgnoreContext(context.Background(), fixture.mapping); err != nil || changed || fixture.inventories != 1 {
+		t.Fatalf("migrated policy did not stay warm: changed=%t inventories=%d err=%v", changed, fixture.inventories, err)
 	}
 	counts := map[string]int{}
 	for _, args := range fixture.calls() {
@@ -281,7 +296,7 @@ func TestSyncIgnoreCacheRejectsExternalModeOrVCSTamper(t *testing.T) {
 			if err := flushSyncContext(context.Background(), fixture.mapping, false); err == nil {
 				t.Fatal("unsafe live session was allowed to flush")
 			}
-			if fixture.inventories != 1 {
+			if fixture.inventories != 0 {
 				t.Fatalf("invalid session should fail before policy inventory: %d", fixture.inventories)
 			}
 			fixture.requireQueriesOnly()
@@ -306,12 +321,8 @@ func TestSyncIgnoreGuardRejectsEndpointChangeDuringInventory(t *testing.T) {
 						invalidateSyncIgnoreObservation(fixture.mapping)
 					}
 				}
-				var err error
-				if operation == "first-create" {
-					err = ensureSyncContext(context.Background(), fixture.mapping)
-				} else {
-					_, err = refreshSyncIgnoreContext(context.Background(), fixture.mapping)
-				}
+				before, beforeErr := syncIgnoreEndpointSignatureContext(context.Background(), fixture.mapping)
+				_, _, _, err := guardedSyncIgnoreConfigurationContext(context.Background(), fixture.mapping, before, beforeErr)
 				if err == nil || !strings.Contains(err.Error(), "读取期间发生改变") || fixture.inventories != 1 {
 					t.Fatalf("endpoint drift reached engine: inventories=%d err=%v", fixture.inventories, err)
 				}
@@ -337,12 +348,8 @@ func TestSyncIgnoreGuardRejectsUnsupportedInventoryMismatch(t *testing.T) {
 					fixture.patterns = append(fixture.patterns, "newly-ignored")
 				}
 			}
-			var err error
-			if operation == "first-create" {
-				err = ensureSyncContext(context.Background(), fixture.mapping)
-			} else {
-				_, err = refreshSyncIgnoreContext(context.Background(), fixture.mapping)
-			}
+			before, beforeErr := syncIgnoreEndpointSignatureContext(context.Background(), fixture.mapping)
+			_, _, _, err := guardedSyncIgnoreConfigurationContext(context.Background(), fixture.mapping, before, beforeErr)
 			if err == nil || !strings.Contains(err.Error(), "持续变化") || fixture.inventories != 2 {
 				t.Fatalf("unsupported observation accepted inconsistent inventories: inventories=%d err=%v", fixture.inventories, err)
 			}
@@ -357,6 +364,7 @@ func TestSyncIgnoreGuardRejectsSessionChangeDuringInventory(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			fixture := newSyncPolicyGuardFixture(t)
 			session := fixture.session()
+			session.Ignore.Paths = []string{"legacy-policy"}
 			fixture.setSessions(session)
 			fixture.onInventory = func(int) {
 				if kind == "replacement" {

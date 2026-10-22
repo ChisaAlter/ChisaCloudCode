@@ -142,14 +142,14 @@ func TestWorkspaceFolderOpenImportBudget(t *testing.T) {
 				connection.ctx, cancelParent = context.WithCancel(connection.ctx)
 			}
 			defer cancelParent()
-			previousPause := pauseProjectSync
+			previousPrepare := prepareProjectSyncSession
 			t.Cleanup(func() {
-				pauseProjectSync = previousPause
+				prepareProjectSyncSession = previousPrepare
 				syncStates.Delete(m.ServerPath)
 			})
 			stopped := errors.New("budget observed before remote writes")
 			observed := false
-			pauseProjectSync = func(ctx context.Context, _ *Mapping) error {
+			prepareProjectSyncSession = func(ctx context.Context, _ *Mapping) error {
 				observed = true
 				deadline, ok := ctx.Deadline()
 				remaining := time.Until(deadline)
@@ -180,10 +180,11 @@ func TestWorkspaceManualReleaseAndExactRecovery(t *testing.T) {
 	isolateWorkspaceSyncTransport(t)
 	m.ServerID = serverIdentity(store.config())
 	m.SyncName = "manual-unit"
-	previousPause := pauseProjectSync
+	previousPause, previousPrepare := pauseProjectSync, prepareProjectSyncSession
 	pauseProjectSync = func(context.Context, *Mapping) error { return nil }
+	prepareProjectSyncSession = func(context.Context, *Mapping) error { return nil }
 	t.Cleanup(func() {
-		pauseProjectSync = previousPause
+		pauseProjectSync, prepareProjectSyncSession = previousPause, previousPrepare
 		pendingSyncReleases.Delete(m.ServerPath)
 		syncStates.Delete(m.ServerPath)
 	})
@@ -307,8 +308,13 @@ func TestWorkspaceSyncReleasedReservation(t *testing.T) {
 		if response["ok"] != true {
 			t.Fatalf("%s failed: %v", op, response)
 		}
-		if info := observedProjectSync(m.ServerPath); info.Status != "reserved" || info.TaskOwner != "claude" {
-			t.Fatalf("%s exposed ready before the server released its lease: %+v", op, info)
+		info := observedProjectSync(m.ServerPath)
+		if op == "sync_begin" {
+			if info.Status != "reserved" || info.TaskOwner != "claude" {
+				t.Fatalf("%s exposed ready before the server released its lease: %+v", op, info)
+			}
+		} else if response["releasedRunId"] != id || response["bindingEpoch"] != m.BindingEpoch || info.Status != "ready" || info.TaskOwner != "" {
+			t.Fatalf("atomic release did not immediately return readiness and its exact receipt: %v %+v", response, info)
 		}
 	}
 	if synchronized != 2 || releases != 1 || lease != nil {
@@ -317,22 +323,17 @@ func TestWorkspaceSyncReleasedReservation(t *testing.T) {
 	notify := func() map[string]any {
 		return workspaceRPCContext(context.Background(), m, map[string]any{"op": "sync_released", "runId": id})
 	}
-	reserved := observedProjectSync(m.ServerPath)
-	if value, ok := cloudReservations.Load(m.ServerPath); !ok || value != id || reserved.Status != "reserved" {
-		t.Fatal("atomic release removed the readiness reservation before notification")
-	}
-	if response := notify(); response["ok"] != true {
-		t.Fatalf("confirmed matching release failed: %v", response)
-	}
 	ready := observedProjectSync(m.ServerPath)
-	if _, ok := cloudReservations.Load(m.ServerPath); ok || ready.Status != "ready" || ready.TaskOwner != "" || ready.Sequence <= reserved.Sequence {
-		t.Fatalf("confirmed release did not advance to send readiness: %+v", ready)
+	if _, ok := cloudReservations.Load(m.ServerPath); ok || ready.Status != "ready" {
+		t.Fatal("atomic release left readiness waiting for an optional notification")
 	}
-	if response := notify(); response["ok"] != true {
-		t.Fatalf("duplicate release confirmation was not idempotent: %v", response)
-	}
-	if duplicate := observedProjectSync(m.ServerPath); duplicate.Status != "ready" || duplicate.Sequence != ready.Sequence {
-		t.Fatal("duplicate confirmation created another readiness transition")
+	for range 2 {
+		if response := notify(); response["ok"] != true {
+			t.Fatalf("optional release confirmation was not idempotent: %v", response)
+		}
+		if duplicate := observedProjectSync(m.ServerPath); duplicate.Status != "ready" || duplicate.Sequence != ready.Sequence {
+			t.Fatal("optional notification created another readiness transition")
+		}
 	}
 	for _, tc := range []struct {
 		name     string

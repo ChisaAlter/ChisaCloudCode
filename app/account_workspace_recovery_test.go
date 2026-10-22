@@ -114,7 +114,7 @@ func TestAccountWorkspaceNormalSetupAttemptsDurableHandback(t *testing.T) {
 	if err := setupAccountWorkspace(connection); err != nil {
 		t.Fatal("a project recovery error disabled the normal account transport", err)
 	}
-	if want := []string{"read", "pause", "recover", "synchronize", "read", "release"}; !reflect.DeepEqual(events, want) {
+	if want := []string{"read", "recover", "synchronize", "read", "release"}; !reflect.DeepEqual(events, want) {
 		t.Fatal("normal enrollment did not enter exact-owner durable recovery", events)
 	}
 	if state := syncOperationInfo(m); state.Status != "blocked" || !strings.Contains(state.Detail, "controlled file failure") {
@@ -267,7 +267,7 @@ func TestAccountWorkspaceStaleJournalCannotClearConcurrentManualRecovery(t *test
 	if err != nil || record == nil || record.ID != manualID || record.ID == "old-release-reply-lost" {
 		t.Fatal("stale startup observation cleared a newer same-epoch journal", record, err)
 	}
-	if lease["id"] != manualID || pauses.Load() != 1 {
-		t.Fatal("automatic cleanup paused or replaced manual recovery", lease, pauses.Load())
+	if lease["id"] != manualID || pauses.Load() != 0 {
+		t.Fatal("stale cleanup paused the warm session or replaced manual recovery", lease, pauses.Load())
 	}
 }

@@ -1,5 +1,5 @@
 """Replace portable Git metadata under the index lock; never checkout files."""
-import base64, fcntl, json, os, pathlib, re, subprocess, sys, tempfile
+import base64, contextlib, fcntl, json, os, pathlib, re, stat, subprocess, sys, tempfile
 
 q = json.load(sys.stdin)
 root = pathlib.Path(q['root'])
@@ -138,13 +138,13 @@ def rebase_owns_target(state, branch, old):
     return bool(name) and name == branch and original == old
 
 
-def target_tip(before, branch, head):
+def target_tip(before, branch, head, ancestry=True):
     for worktree in git('worktree', 'list', '--porcelain', '-z').split('\0\0'):
         fields = dict(field.split(' ', 1) for field in worktree.split('\0') if ' ' in field)
         if fields.get('branch') == branch and pathlib.Path(fields['worktree']).resolve() != root.resolve():
             raise RuntimeError('Target Git branch is checked out in another worktree; preserved its history')
     old = git('rev-parse', '--verify', '--quiet', branch, missing=True)
-    if old and branch != before['branch'] and old != head and not rebase_owns_target(before, branch, old) and not is_ancestor(old, head):
+    if ancestry and old and branch != before['branch'] and old != head and not rebase_owns_target(before, branch, old) and not is_ancestor(old, head):
         raise RuntimeError('Target Git branch has independent commits; preserved its history')
     return old
 
@@ -220,6 +220,44 @@ def head_matches(raw, state):
     return value == expected
 
 
+def head_path():
+    head = pathlib.Path(git('rev-parse', '--git-path', 'HEAD'))
+    return head if head.is_absolute() else root / head
+
+
+def remove_owned_head_lock(head, expected=None):
+    marker, lock = pathlib.Path(str(head) + '.chisa-owned'), pathlib.Path(str(head) + '.lock')
+    try:
+        owned = marker.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(owned.st_mode): raise RuntimeError('Unsafe Git HEAD ownership marker; preserved')
+    if expected is not None and not os.path.samestat(expected, owned): raise RuntimeError('Git HEAD ownership marker replaced; preserved')
+    try:
+        current = lock.lstat()
+    except FileNotFoundError:
+        current = None
+    if current is not None and stat.S_ISREG(current.st_mode) and os.path.samestat(owned, current): lock.unlink()
+    if not os.path.samestat(owned, marker.lstat()): raise RuntimeError('Git HEAD ownership marker changed; preserved')
+    # After publication the marker may be a hard link to HEAD. Unlink it only;
+    # opening/truncating it during recovery would corrupt the installed HEAD.
+    marker.unlink()
+
+
+@contextlib.contextmanager
+def head_guard(head):
+    with pathlib.Path(str(head) + '.chisa-guard').open('a+b') as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        remove_owned_head_lock(head)
+        yield
+
+
+def recover_head_lock():
+    head = head_path()
+    with head_guard(head):
+        if os.path.lexists(str(head) + '.lock'): raise RuntimeError('Git HEAD is being written; retry after the operation completes')
+
+
 def apply_head(before, desired, old):
     validate_head_states(before, desired)
     old = old or '0' * len(desired['head'])
@@ -227,56 +265,45 @@ def apply_head(before, desired, old):
         raise RuntimeError('Invalid Git target branch expectation')
     if not desired['branch'] and git('cat-file', '-t', desired['head']) != 'commit':
         raise RuntimeError('Git HEAD target is not a commit')
-    head = pathlib.Path(git('rev-parse', '--git-path', 'HEAD'))
-    if not head.is_absolute(): head = root / head
+    head = head_path()
     observed = head.read_bytes()
     if not head_matches(observed, before): raise RuntimeError('Git HEAD changed during synchronization; preserved new edits')
-    # A ref expectation checks raw symbolic identity, not merely its OID.
-    # The checked-out-branch case cannot include both HEAD and its referent:
-    # Git's automatic HEAD reflog update would duplicate HEAD in the transaction.
-    if before['branch'] and desired['branch'] and before['branch'] != desired['branch']:
-        transaction = ('start\0symref-update HEAD\0' + desired['branch'] + '\0ref\0' + before['branch'] +
-                       '\0update ' + desired['branch'] + '\0' + desired['head'] + '\0' + old + '\0prepare\0commit\0')
+    # All writes use one durable protocol, including symbolic branch switches.
+    # A Git-created transaction lock could not be proven ours after SIGKILL.
+    head_lock, marker = pathlib.Path(str(head) + '.lock'), pathlib.Path(str(head) + '.chisa-owned')
+    with head_guard(head):
+        output = marker.open('xb')
+        owned_head = os.fstat(output.fileno())
         try:
-            git('update-ref', '--no-deref', '--stdin', '-z', data=transaction.encode('utf-8'))
-            return
-        except RuntimeError as error:
-            # Git 2.48 added symref-update. Only an unsupported command permits
-            # fallback; a real failed CAS or another writer's lock must fail.
-            if 'unknown command: symref-update' not in str(error): raise
-    head_lock = pathlib.Path(str(head) + '.lock')
-    output = head_lock.open('xb')  # Never take ownership of a foreign lock.
-    owned_head = os.fstat(output.fileno())
-    try:
-        current = head.read_bytes()
-        if current != observed or not head_matches(current, before):
-            raise RuntimeError('Git HEAD changed during synchronization; preserved new edits')
-        if git('rev-parse', '--verify', 'HEAD^{commit}') != before['head']:
-            raise RuntimeError('Git HEAD commit changed during synchronization; preserved new edits')
-        value = 'ref: ' + desired['branch'] if desired['branch'] else desired['head']
-        output.write((value + '\n').encode('utf-8'))
-        output.flush()
-        os.fsync(output.fileno())
-        if desired['branch']:
-            # Updating the checked-out branch normally reacquires HEAD.lock.
-            # A private detached Git dir shares the actual common refs/objects
-            # and lets update-ref do its exact OID CAS under our real HEAD lock.
-            common = pathlib.Path(git('rev-parse', '--git-common-dir'))
-            if not common.is_absolute(): common = root / common
-            with tempfile.TemporaryDirectory(prefix='chisa-head-', dir=head.parent) as directory:
-                private = pathlib.Path(directory)
-                (private / 'HEAD').write_bytes((before['head'] + '\n').encode('ascii'))
-                (private / 'commondir').write_bytes((common.resolve().as_posix() + '\n').encode('utf-8'))
-                git('--git-dir=' + str(private), 'update-ref', '--no-deref', desired['branch'], desired['head'], old)
-        output.close()
-        if not os.path.samestat(owned_head, head_lock.lstat()): raise RuntimeError('Git HEAD lock owner changed; preserved lock')
-        os.replace(head_lock, head)
-    finally:
-        output.close()
-        try:
-            if os.path.samestat(owned_head, head_lock.lstat()): head_lock.unlink()
-        except FileNotFoundError:
-            pass
+            os.link(marker, head_lock)  # Never take ownership of a foreign lock.
+            current = head.read_bytes()
+            if current != observed or not head_matches(current, before):
+                raise RuntimeError('Git HEAD changed during synchronization; preserved new edits')
+            if git('rev-parse', '--verify', 'HEAD^{commit}') != before['head']:
+                raise RuntimeError('Git HEAD commit changed during synchronization; preserved new edits')
+            value = 'ref: ' + desired['branch'] if desired['branch'] else desired['head']
+            output.write((value + '\n').encode('utf-8'))
+            output.flush()
+            os.fsync(output.fileno())
+            if desired['branch']:
+                # Updating the checked-out branch normally reacquires HEAD.lock.
+                # A private detached Git dir shares the actual common refs/objects
+                # and lets update-ref do its exact OID CAS under our real HEAD lock.
+                common = pathlib.Path(git('rev-parse', '--git-common-dir'))
+                if not common.is_absolute(): common = root / common
+                with tempfile.TemporaryDirectory(prefix='chisa-head-', dir=head.parent) as directory:
+                    private = pathlib.Path(directory)
+                    (private / 'HEAD').write_bytes((before['head'] + '\n').encode('ascii'))
+                    (private / 'commondir').write_bytes((common.resolve().as_posix() + '\n').encode('utf-8'))
+                    git('--git-dir=' + str(private), 'update-ref', '--no-deref', desired['branch'], desired['head'], old)
+            output.close()
+            current_lock = head_lock.lstat()
+            if not stat.S_ISREG(current_lock.st_mode) or not os.path.samestat(owned_head, current_lock):
+                raise RuntimeError('Git HEAD lock owner changed; preserved lock')
+            os.replace(head_lock, head)
+        finally:
+            output.close()
+            remove_owned_head_lock(head, owned_head)
 
 
 def snapshot(state, ref):
@@ -318,16 +345,21 @@ if q.get('op') == 'snapshot':
     print(snapshot(q['state'], q['backup']))
     sys.exit(0)
 
-if q.get('op') == 'preflight':
+if q.get('op') in ('preflight', 'preview-targets'):
     before, desired = normalize(before), normalize(desired)
     validate_head_states(before, desired)
     index_entries(desired['index'])
     decode_operations(before['operations'])
     decode_operations(desired['operations'])
-    if desired['branch']: target_tip(before, desired['branch'], desired['head'])
+    targets = []
+    if desired['branch']: targets.append((desired['branch'], desired['head']))
     rebase_branch, rebase_head = rebase_original(desired)
-    if rebase_branch: target_tip(before, rebase_branch, rebase_head)
-    print('{}')
+    if rebase_branch: targets.append((rebase_branch, rebase_head))
+    tips = {branch: target_tip(before, branch, head, ancestry=q.get('op') != 'preview-targets') for branch, head in targets}
+    # A lease-free preview cannot populate this repository's object database.
+    # Return exact tips after worktree checks; its caller fetches these immutable
+    # OIDs into a disposable local database and performs the same ancestry test.
+    print(json.dumps(tips if q.get('op') == 'preview-targets' else {}))
     sys.exit(0)
 
 index = pathlib.Path(git('rev-parse', '--git-path', 'index'))
@@ -402,6 +434,7 @@ def remove_owned_lock():
 with pathlib.Path(str(index) + '.chisa-guard').open('a+b') as guard:
     fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
     remove_owned_lock()
+    recover_head_lock()
     try:
         with owned.open('xb') as output:
             os.link(owned, lock)
