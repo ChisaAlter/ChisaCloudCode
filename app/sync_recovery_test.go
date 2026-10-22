@@ -17,13 +17,14 @@ func isolateSyncRecovery(t *testing.T) *Mapping {
 	t.Helper()
 	m := isolatePi(t)
 	m.SyncName = "recovery-session"
-	previousTunnel, previousPause := tunnel, pauseProjectSync
+	previousTunnel, previousPause, previousPrepare := tunnel, pauseProjectSync, prepareProjectSyncSession
 	// Only admission readiness is simulated; each test supplies the lease/daemon observations.
 	tunnel = newTunnel(store.config(), store.keyPathOf(), func() {})
 	tunnel.proc, tunnel.bridgeReady, tunnel.bridgePort = &exec.Cmd{}, true, 1
 	pauseProjectSync = func(context.Context, *Mapping) error { return nil }
+	prepareProjectSyncSession = func(context.Context, *Mapping) error { return nil }
 	t.Cleanup(func() {
-		tunnel, pauseProjectSync = previousTunnel, previousPause
+		tunnel, pauseProjectSync, prepareProjectSyncSession = previousTunnel, previousPause, previousPrepare
 		pendingSyncReleases.Delete(m.ServerPath)
 		syncStopUnconfirmed.Delete(m.ServerPath)
 		syncStates.Delete(m.ServerPath)

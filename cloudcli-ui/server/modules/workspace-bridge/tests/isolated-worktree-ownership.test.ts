@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { createServer } from 'node:http';
 import { chown, lchown, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -23,6 +24,27 @@ const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), 'chisa-isolated-owner-'
 process.env.WORKSPACES_ROOT = fixtureRoot;
 const { workspaceQuery } = await import('@/modules/workspace-bridge/index.js');
 const linuxRoot = process.platform === 'linux' && process.getuid?.() === 0;
+
+async function bindFixture(root: string) {
+  const server = createServer((incoming, outgoing) => {
+    void (async () => {
+      const chunks: Buffer[] = []; for await (const chunk of incoming) chunks.push(Buffer.from(chunk));
+      const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      const reply: Record<string, unknown> = { ok: true };
+      if (request.op === 'sync_begin' && request.snapshot) Object.assign(reply, { snapshotPinned: true, bindingEpoch: 'fixture' });
+      if (request.op === 'sync_end') {
+        const directory = root + '.chisa-lease'; const lease = JSON.parse(await readFile(path.join(directory, 'state.json'), 'utf8'));
+        assert.equal(lease.id, request.runId); assert.equal(lease.epoch, 'fixture'); assert.equal(lease.owner, 'sync-needed'); assert.ok(!lease.cleanupPending?.length);
+        await rm(directory, { recursive: true }); Object.assign(reply, { releasedRunId: request.runId, bindingEpoch: 'fixture' });
+      }
+      outgoing.end(JSON.stringify(reply));
+    })().catch(error => { outgoing.statusCode = 500; outgoing.end(JSON.stringify({ error: String(error) })); });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  await writeFile(path.join(root, '.chisa-bridge.json'), JSON.stringify({ protocol: 2, port: address.port, token: 'fixture', bindingEpoch: 'fixture' }));
+  return async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); };
+}
 
 type CommandResult = { code: number | null; stdout: string; stderr: string };
 function command(executable: string, args: string[], cwd: string, asWorkspaceUser = false): Promise<CommandResult> {
@@ -65,7 +87,7 @@ test('root API creates a uid1000 isolated worktree with dirty snapshot and writa
   await writeFile(path.join(root, 'tracked.txt'), 'dirty working tree\n');
   await mkdir(path.join(root, 'private'), { mode: 0o700 });
   await writeFile(path.join(root, 'private', 'untracked.txt'), 'untracked snapshot\n', { mode: 0o600 });
-  await writeFile(path.join(root, '.chisa-bridge.json'), JSON.stringify({ protocol: 2, port: 19081, token: 'fixture', bindingEpoch: 'fixture' }));
+  const closeBridge = await bindFixture(root);
   await ownedTree(root);
   const sourceIndex = await readFile(path.join(root, '.git', 'index'));
   const sourceHead = await git(['rev-parse', 'HEAD'], root, true);
@@ -87,7 +109,7 @@ test('root API creates a uid1000 isolated worktree with dirty snapshot and writa
     assert.equal((await stat(path.join(root, '.git'))).uid, 1000);
     const worker = await command(process.execPath, ['-e', `const fs=require('node:fs');const marker=JSON.parse(fs.readFileSync('.chisa-bridge.json'));const metadata=JSON.parse(fs.readFileSync('.chisa-session.json'));if(marker.execution!=='isolated-worktree'||metadata.sessionId!=='${sessionId}')throw Error('invalid metadata');if(fs.readFileSync('tracked.txt','utf8')!=='dirty working tree\\n')throw Error('missing dirty snapshot');if(fs.readFileSync('private/untracked.txt','utf8')!=='untracked snapshot\\n')throw Error('missing untracked snapshot');fs.appendFileSync('tracked.txt','worker edit\\n');fs.appendFileSync('private/untracked.txt','worker edit\\n');fs.writeFileSync('worker-created.txt','isolated');`], worktree, true);
     assert.equal(worker.code, 0, worker.stderr);
-    assert.equal((await git(['branch', '--show-current'], worktree, true)).trim(), `chisa/session/${path.basename(worktree)}`);
+    assert.equal((await git(['branch', '--show-current'], worktree, true)).trim(), `chisa/session-private/${path.basename(worktree)}/work`);
     await git(['status', '--porcelain=v1'], worktree, true);
     assert.deepEqual(await readFile(path.join(root, '.git', 'index')), sourceIndex);
     assert.equal(await git(['rev-parse', 'HEAD'], root, true), sourceHead);
@@ -99,6 +121,7 @@ test('root API creates a uid1000 isolated worktree with dirty snapshot and writa
     await query.next();
     await git(['worktree', 'remove', '--force', worktree], root, true);
     await rm(parent, { recursive: true, force: true });
+    await closeBridge();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -107,14 +130,14 @@ test('isolated Git inspection failures do not silently run in the shared source'
   const root = await mkdtemp(path.join(fixtureRoot, 'broken-'));
   await git(['init', '-b', 'main'], root);
   await writeFile(path.join(root, '.git', 'config'), '[broken\n');
-  await writeFile(path.join(root, '.chisa-bridge.json'), JSON.stringify({ protocol: 2, port: 19081, token: 'fixture', bindingEpoch: 'fixture' }));
+  const closeBridge = await bindFixture(root);
   selectedCwd = undefined;
   const query = workspaceQuery({ prompt: 'fixture', options: { cwd: root, chisaSessionId: 'broken-session' } as never });
   try {
     await assert.rejects(query.next(), { code: 'WORKSPACE_WORKTREE_CREATE_FAILED' });
     assert.equal(selectedCwd, undefined);
     await assert.rejects(stat(root + '.chisa-lease'), { code: 'ENOENT' });
-  } finally { await query.return?.(); await rm(root, { recursive: true, force: true }); }
+  } finally { await query.return?.(); await closeBridge(); await rm(root, { recursive: true, force: true }); }
 });
 
 test.after(async () => { await rm(fixtureRoot, { recursive: true, force: true }); });

@@ -105,6 +105,51 @@ func TestSyncIgnoreRuntimeKeepsTrackedSources(t *testing.T) {
 // thousands of tracked files. Enumerating a re-include exception per tracked
 // descendant is what made a cold scan take minutes, so the generated rule set has
 // to stay bounded no matter how large the repository is.
+func TestSyncExactSnapshotKeepsIgnoredSiblingsWithManyTrackedChildren(t *testing.T) {
+	m := isolatePi(t)
+	var tracked []string
+	for index := 0; index < syncIgnoreTrackedChildLimit+3; index++ {
+		tracked = append(tracked, fmt.Sprintf("runtime/keep%d.txt", index))
+	}
+	configuration, err := writeExactSyncIgnoreConfiguration(m, syncGitInventory{Tracked: tracked, Ignored: []string{"runtime/"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := syncSession{}
+	for _, line := range strings.Split(string(contents), "\n") {
+		if item, found := strings.CutPrefix(strings.TrimSpace(line), "- "); found {
+			var pattern string
+			if err := json.Unmarshal([]byte(item), &pattern); err != nil {
+				t.Fatal(err)
+			}
+			session.Ignore.Paths = append(session.Ignore.Paths, pattern)
+		}
+	}
+	if syncSessionHasDynamicGitPolicy(session) {
+		t.Fatal("destructive snapshot carries live-engine marker")
+	}
+	entries := []syncEmptyEntry{{Path: "runtime", Directory: true, Mode: 0040755}, {Path: "runtime/ignored.txt", Mode: 0100644}}
+	for _, name := range tracked {
+		entries = append(entries, syncEmptyEntry{Path: name, Mode: 0100644})
+	}
+	selected, err := syncEmptyPlan(entries, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range selected {
+		if entry.Path == "runtime/ignored.txt" {
+			t.Fatal("exact snapshot broadened ignored prefix to untracked sibling")
+		}
+	}
+	if len(selected) != len(tracked)+1 {
+		t.Fatalf("tracked snapshot entries=%d want=%d", len(selected), len(tracked)+1)
+	}
+}
+
 func TestSyncIgnoreRuleCountStaysBounded(t *testing.T) {
 	m := isolatePi(t)
 	var ignored []string

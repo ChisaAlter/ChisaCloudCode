@@ -50,7 +50,9 @@ func workspaceContainerArgs(root string) []string {
 		"--pids-limit=256", "--memory=2g", "--hostname=workspace", "--workdir=/workspace", "--read-only",
 		"--tmpfs=/tmp:rw,size=512m", "--tmpfs=/home/chisa:rw,size=512m",
 		"--volume", root + ":/workspace:rw", "--env=HOME=/home/chisa", "--env=TZ=UTC",
-		"--mount", "type=bind,src=" + root + "/.chisa-bridge.json,dst=/workspace/.chisa-bridge.json,readonly",
+		// Commands must not read the native capability token. The host retains
+		// the real marker; the unprivileged container sees an empty masked file.
+		"--mount", "type=bind,src=/dev/null,dst=/workspace/.chisa-bridge.json,readonly",
 	}
 }
 

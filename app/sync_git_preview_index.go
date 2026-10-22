@@ -9,9 +9,9 @@ import (
 )
 
 // A copied split index still resolves sharedindex files relative to GIT_DIR,
-// and Git freshens those files even with optional locks disabled. Only index
-// commands use this minimal disposable repository; HEAD/refs/operations are
-// observed separately in the original repository.
+// and Git freshens those files even with optional locks disabled. Native and
+// preview observations use this minimal disposable repository for index commands;
+// HEAD/refs/operations are observed separately in the original repository.
 func syncGitPreviewIndexEnvironment(ctx context.Context, m *Mapping, env []string) ([]string, func(), error) {
 	format, err := gitOutputContext(ctx, m.LocalPath, "rev-parse", "--show-object-format")
 	if err != nil {
@@ -77,5 +77,38 @@ func syncGitPreviewIndexEnvironment(ctx context.Context, m *Mapping, env []strin
 		}
 	}
 	isolated := append(append([]string{}, env...), "GIT_DIR="+private, "GIT_COMMON_DIR="+private, "GIT_WORK_TREE="+m.LocalPath, "GIT_NO_LAZY_FETCH=1")
+	if preview, _ := ctx.Value(syncGitPreviewKey{}).(bool); !preview {
+		// Native write-tree must keep its portable tree in the real object
+		// database for the later apply. Only the split-index base is disposable.
+		objects, err := gitOutputContext(ctx, m.LocalPath, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+		if err != nil {
+			return fail(err)
+		}
+		isolated = append(isolated, "GIT_OBJECT_DIRECTORY="+objects)
+		// Partial clones may intentionally omit skip-worktree blobs. Keep Git's
+		// promisor recognition without granting this read any remote endpoint.
+		promisor, configErr := gitOutputContext(ctx, m.LocalPath, "config", "--type=bool", "--get-regexp", `^remote\..*\.promisor$`)
+		if configErr != nil && gitExitCode(configErr) != 1 {
+			return fail(configErr)
+		}
+		partial := false
+		for _, line := range strings.Split(promisor, "\n") {
+			fields := strings.Fields(line)
+			partial = partial || len(fields) == 2 && fields[1] == "true"
+		}
+		if !partial {
+			filter, filterErr := gitOutputContext(ctx, m.LocalPath, "config", "--get-regexp", `^(remote\..*\.partialclonefilter|extensions\.partialclone)$`)
+			if filterErr != nil && gitExitCode(filterErr) != 1 {
+				return fail(filterErr)
+			}
+			partial = strings.TrimSpace(filter) != ""
+		}
+		if partial {
+			config += "[remote \"chisa-observation\"]\npromisor = true\n"
+			if err := os.WriteFile(filepath.Join(private, "config"), []byte(config), 0600); err != nil {
+				return fail(err)
+			}
+		}
+	}
 	return isolated, discard, nil
 }

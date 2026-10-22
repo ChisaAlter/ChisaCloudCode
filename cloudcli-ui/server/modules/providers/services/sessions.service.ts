@@ -465,6 +465,7 @@ export const sessionsService = {
         offset: 0,
         projectPath,
         providerSessionId,
+        providerProfilePath: session.provider_profile_path,
       }),
     });
 
@@ -486,6 +487,7 @@ export const sessionsService = {
         offset: requestedOffset,
         projectPath,
         providerSessionId,
+        providerProfilePath: session.provider_profile_path,
       });
     }
 

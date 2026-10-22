@@ -60,22 +60,8 @@ func executeRemoteLeaseContext(parent context.Context, m *Mapping, op, owner, id
 		request["serverChecked"] = true
 		request["checkedLease"] = checked["lease"]
 	}
-	q, _ := json.Marshal(request)
-	if err := workspaceSyncCurrent(ctx); err != nil {
-		return nil, err
-	}
-	cmd := hideCommandWindow(exec.CommandContext(ctx, sshExe(), append(transport.baseArgs(), "python3 -c "+shellQuote(leaseWorker))...))
-	cmd.WaitDelay = time.Second
-	cmd.Stdin = bytes.NewReader(q)
-	out, err := cmd.Output()
+	result, err := executePersistentRemoteLease(ctx, m, request)
 	if err != nil {
-		if ctx.Err() != nil {
-			err = ctx.Err()
-		}
-		return nil, err
-	}
-	var result map[string]any
-	if err = json.Unmarshal(out, &result); err != nil {
 		return nil, err
 	}
 	if err := workspaceSyncCurrent(ctx); err != nil {
@@ -323,6 +309,7 @@ func serverGitConfigurationContext(ctx context.Context, m *Mapping) string {
 var synchronizeProject = syncProjectContents
 var synchronizeProjectContext = syncProjectContentsContext
 var pauseProjectSync = pauseProjectSyncContext
+var prepareProjectSyncSession = prepareProjectSyncSessionContext
 
 type syncPauseError struct{ error }
 
@@ -372,6 +359,28 @@ func pauseProjectSyncContext(ctx context.Context, m *Mapping) error {
 		return err
 	}
 	return pauseSyncSessionContext(ctx, m, sessions[0].Identifier)
+}
+
+// Ordinary manual synchronization pins and validates the existing session
+// without disconnecting its endpoints. Recovery paths still pause explicitly.
+func prepareProjectSyncSessionContext(ctx context.Context, m *Mapping) error {
+	if err := confirmProjectSyncStop(ctx, m); err != nil {
+		return err
+	}
+	if m.SyncName == "" {
+		return nil
+	}
+	sessions, err := syncSessionsContext(ctx, m.SyncName)
+	if err != nil {
+		return err
+	}
+	if len(sessions) == 0 {
+		return nil
+	}
+	if len(sessions) != 1 {
+		return fmt.Errorf("同步前无法确认唯一的项目会话")
+	}
+	return validateProjectSyncSessionContext(ctx, m, sessions[0])
 }
 
 func syncProjectContents(m *Mapping, pause bool) error {
@@ -592,8 +601,8 @@ func syncProjectWithEmptyConfirmationContext(parent context.Context, serverPath,
 		return map[string]any{"ok": false, "error": err.Error()}
 	}
 	defer cancel()
-	// Keep the same daemon identity across admission, pause and the inner file
-	// pipeline. A recreated name must never become a new first observation.
+	// Keep the same daemon identity across admission, recovery and the inner
+	// file pipeline. A recreated name must never become a new first observation.
 	if pinned, _ := ctx.Value(syncSessionIdentityKey{}).(*syncSessionIdentity); pinned == nil {
 		ctx = context.WithValue(ctx, syncSessionIdentityKey{}, &syncSessionIdentity{})
 	}
@@ -688,11 +697,17 @@ func syncProjectWithEmptyConfirmationContext(parent context.Context, serverPath,
 		}
 	}
 	id := randHex(16)
+	_, recoveringHandback := cloudSyncRecovery.Load(serverPath)
+	consent, _ := ctx.Value(syncGitRecoveryKey{}).(*syncGitRecoveryConsent)
 	if emptySession != nil {
 		pendingEmptyConfirmations.Store(m.ServerPath, pendingEmptyConfirmation{epoch: m.BindingEpoch, session: *emptySession})
 		err = pauseSyncSessionContext(ctx, m, emptySession.Identifier)
-	} else {
+	} else if recoveringHandback || consent != nil {
+		// A failed handback or an explicit Git source selection retains its
+		// stop barrier; ordinary synchronization keeps a healthy session warm.
 		err = pauseProjectSync(ctx, m)
+	} else {
+		err = prepareProjectSyncSession(ctx, m)
 	}
 	if err != nil {
 		setSyncFailure(m, err)
@@ -894,6 +909,9 @@ func synchronizationRPCContext(ctx context.Context, m *Mapping, q map[string]any
 		}()
 	}
 	ctx = syncLeaseContext(ctx, id)
+	if pinned, _ := ctx.Value(syncSessionIdentityKey{}).(*syncSessionIdentity); pinned == nil {
+		ctx = context.WithValue(ctx, syncSessionIdentityKey{}, &syncSessionIdentity{})
+	}
 	if pending, ok := lease["cleanupPending"].([]any); ok && len(pending) > 0 {
 		setSyncInfo(m, "blocked", "工作区运行容器清理尚未确认，请立即同步恢复")
 		return map[string]any{"error": "工作区运行容器清理尚未确认", "code": "WORKSPACE_CLEANUP_FAILED"}
@@ -914,6 +932,37 @@ func synchronizationRPCContext(ctx context.Context, m *Mapping, q map[string]any
 		return map[string]any{"error": err.Error(), "code": code}
 	}
 	result = map[string]any{"ok": true}
+	if op == "sync_begin" && q["snapshot"] == true {
+		// A new isolated worktree copies the shared replica. Its exact source
+		// lease excludes server writers, and this explicit acknowledgement also
+		// stops background file transfer before the server reads that snapshot.
+		// Ordinary handoffs never request this short-lived snapshot fence.
+		if err := pauseProjectSync(ctx, m); err != nil {
+			setSyncFailure(m, err)
+			return map[string]any{"error": err.Error(), "code": "SYNC_PAUSE_UNCONFIRMED"}
+		}
+		stopped, err := syncSessionsContext(ctx, m.SyncName)
+		if err != nil || len(stopped) != 1 || !stopped[0].Paused {
+			if err == nil {
+				err = fmt.Errorf("隔离副本的文件同步停止状态尚未确认")
+			}
+			setSyncFailure(m, err)
+			return map[string]any{"error": err.Error(), "code": "SYNC_PAUSE_UNCONFIRMED"}
+		}
+		if err := validateProjectSyncSessionContext(ctx, m, stopped[0]); err != nil {
+			setSyncFailure(m, err)
+			return map[string]any{"error": err.Error(), "code": "SYNC_BLOCKED"}
+		}
+		confirmation, err := remoteLeaseContext(ctx, m, "confirm", "claude", id)
+		if err != nil {
+			return map[string]any{"error": err.Error(), "code": "WORKSPACE_BUSY"}
+		}
+		currentLease, _ := confirmation["lease"].(map[string]any)
+		if currentLease["id"] != id || currentLease["epoch"] != m.BindingEpoch || currentLease["owner"] != "claude" {
+			return map[string]any{"error": "隔离副本的项目接管状态已改变", "code": "WORKSPACE_BUSY"}
+		}
+		result["snapshotPinned"], result["bindingEpoch"] = true, m.BindingEpoch
+	}
 	if op == "sync_begin" && q["readOnly"] == true {
 		upstream, observationError := readLocalGitRemoteStatus(ctx, m)
 		if observationError != nil {
@@ -936,6 +985,16 @@ func synchronizationRPCContext(ctx context.Context, m *Mapping, q map[string]any
 			setSyncInfo(m, "blocked", "工作区同步已结束，但原子释放尚未确认；请同步恢复: "+err.Error())
 			return map[string]any{"error": err.Error(), "code": "WORKSPACE_CLEANUP_FAILED"}
 		}
+		// A legitimate next owner can claim immediately after atomic release,
+		// before this HTTP reply arrives. This exact receipt proves only this
+		// handback; the server must never remove or fail that later reservation.
+		result["releasedRunId"], result["bindingEpoch"] = id, m.BindingEpoch
+		cloudReservations.CompareAndDelete(m.ServerPath, id)
+		cloudSyncRecovery.CompareAndDelete(m.ServerPath, id)
+		if preparation, ok := readOnlySyncPreparations.Load(m.ServerPath); ok && preparation.(readOnlySyncPreparation).leaseID == id {
+			readOnlySyncPreparations.CompareAndDelete(m.ServerPath, preparation)
+		}
+		publishProjectSync(m)
 	}
 	return result
 }

@@ -15,12 +15,14 @@ process.env.WORKSPACES_ROOT = fixture;
 type FakeChild = EventEmitter & { stdout: PassThrough; stderr: PassThrough; stdin: PassThrough; kill(): void };
 let commands: string[][] = [];
 let onRun: ((child: FakeChild, args: string[]) => void) | undefined;
+let onCleanup: ((child: FakeChild, args: string[]) => void) | undefined;
 let cleanupFails = false;
 const finish = (child: FakeChild, code = 0, output = '') => queueMicrotask(() => {
   if (output) child.stdout.write(output);
   child.emit('close', code);
 });
 mock.module('node:child_process', { namedExports: {
+  ...childProcess,
   ...childProcess,
   spawn: (_command: string, args: string[]) => {
     commands.push(args);
@@ -31,6 +33,7 @@ mock.module('node:child_process', { namedExports: {
       if (onRun) onRun(child, args);
       else finish(child, 0, JSON.stringify({ ok: true, stdout: 'completed', exitCode: 0 }));
     });
+    else if (onCleanup) queueMicrotask(() => onCleanup!(child, args));
     else finish(child, cleanupFails ? 1 : 0);
     return child as unknown as ReturnType<typeof realSpawn>;
   },
@@ -52,6 +55,7 @@ const saveLease = async (root: string, lease: Lease) => {
 async function withWorkspace(run: (root: string) => Promise<void>) {
   commands = [];
   onRun = undefined;
+  onCleanup = undefined;
   cleanupFails = false;
   const root = await mkdtemp(path.join(fixture, 'project-'));
   await writeFile(path.join(root, '.chisa-bridge.json'), JSON.stringify({ protocol: 2, port: 18082, token: 'fixture', bindingEpoch: epoch }));
@@ -184,6 +188,50 @@ test('another preview and worker cannot borrow an idle preview startup reservati
     assert.equal(commands.length, 0);
     await preview.finish(true);
     assert.equal(existsSync(leasePath(root)), false);
+  });
+});
+
+test('Docker auto-removal presence is retried while the exact lease remains held until verified absence', async () => {
+  await withWorkspace(async root => {
+    let container = ''; let queries = 0; let removals = 0;
+    onRun = (child, args) => { container = args[args.indexOf('--name') + 1]!; finish(child, 0, JSON.stringify({ ok: true })); };
+    onCleanup = (child, args) => {
+      assert.deepEqual(readLease(root).cleanupPending, [container]);
+      if (args[0] === 'rm') { assert.equal(args[2], container); removals++; finish(child, 1); }
+      else {
+        assert.equal(args[0], 'ps'); assert.ok(args.includes(`name=^/${container}$`));
+        queries++; finish(child, 0, queries === 1 ? container + '\n' : '');
+      }
+    };
+    await executeSyncTransportWorker(root, epoch, { op: 'write' });
+    assert.equal(removals, 2); assert.equal(queries, 2);
+    assert.equal(existsSync(leasePath(root)), false);
+  });
+});
+
+test('a container that remains present exhausts cleanup budget and retains its exact barrier', { timeout: 15_000 }, async () => {
+  await withWorkspace(async root => {
+    let container = ''; let queries = 0;
+    onRun = (child, args) => { container = args[args.indexOf('--name') + 1]!; finish(child, 0, JSON.stringify({ ok: true })); };
+    onCleanup = (child, args) => {
+      if (args[0] === 'rm') finish(child, 1);
+      else { queries++; finish(child, 0, container + '\n'); }
+    };
+    const start = Date.now();
+    await assert.rejects(executeSyncTransportWorker(root, epoch, { op: 'write' }), { code: 'WORKSPACE_CLEANUP_FAILED' });
+    assert.ok(Date.now() - start < 12_000); assert.ok(queries > 1);
+    assert.deepEqual(readLease(root).cleanupPending, [container]);
+    assert.equal(readLease(root).owner, 'sync-needed');
+  });
+});
+
+for (const query of [{ code: 1, output: '' }, { code: 0, output: 'unexpected-container\n' }]) test(`unconfirmed daemon query never retries cleanup: ${query.code}/${query.output.trim()}`, async () => {
+  await withWorkspace(async root => {
+    onCleanup = (child, args) => finish(child, args[0] === 'rm' ? 1 : query.code, args[0] === 'rm' ? '' : query.output);
+    await assert.rejects(executeSyncTransportWorker(root, epoch, { op: 'write' }), { code: 'WORKSPACE_CLEANUP_FAILED' });
+    assert.equal(commands.filter(args => args[0] === 'rm').length, 1);
+    assert.equal(commands.filter(args => args[0] === 'ps').length, 1);
+    assert.equal(readLease(root).cleanupPending?.length, 1);
   });
 });
 

@@ -267,6 +267,8 @@ class Metadata:
         for number, directory in enumerate(roots):
             if lstat(os.path.join(directory, 'index.lock')) is not None:
                 raise ObservationError('Git index.lock is present; full safe reader required')
+            if any(lstat(os.path.join(directory, name + '.chisa-owned')) is not None for name in ('index', 'HEAD')):
+                raise ObservationError('Git owned lock requires guarded recovery')
             before = lstat(directory)
             with os.scandir(directory) as iterator:
                 names = sorted(entry.name for entry in iterator)
@@ -346,6 +348,8 @@ class Metadata:
         for directory in roots:
             if lstat(os.path.join(directory, 'index.lock')) is not None:
                 raise ObservationError('Git index.lock is present; full safe reader required')
+            if any(lstat(os.path.join(directory, name + '.chisa-owned')) is not None for name in ('index', 'HEAD')):
+                raise ObservationError('Git owned lock requires guarded recovery')
         return self.result(True, (gitdir, git_identity, common, common_identity))
 
     def result(self, repository, layout):

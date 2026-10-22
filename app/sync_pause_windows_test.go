@@ -64,7 +64,7 @@ func TestWorkspacePauseTimeoutRetainsBarrierWithoutRepeatedCleanup(t *testing.T)
 	previousIgnoreConfig := projectSyncIgnoreConfigurationContext
 	projectSyncIgnoreConfigurationContext = func(context.Context, *Mapping) (string, error) {
 		path := filepath.Join(t.TempDir(), "ignore.yml")
-		return path, os.WriteFile(path, []byte("sync:\n  defaults:\n    ignore:\n      paths:\n        - \"node_modules\"\n"), 0600)
+		return path, os.WriteFile(path, []byte("sync:\n  defaults:\n    ignore:\n      paths:\n        - \"node_modules\"\n        - \""+syncDynamicGitPolicyMarker+"\"\n"), 0600)
 	}
 	t.Cleanup(func() { projectSyncIgnoreConfigurationContext = previousIgnoreConfig })
 	synchronizeProjectContext = syncProjectContentsContext
@@ -135,7 +135,7 @@ func TestUnchangedIgnorePolicyKeepsSyncEngineWarm(t *testing.T) {
 	t.Cleanup(func() { observeSyncIgnoreRemoteMetadata = previousObservation })
 	session := syncSession{Name: m.SyncName, Identifier: "private-test-session", Mode: "two-way-safe", Status: "watching", SuccessfulCycles: 1}
 	session.Ignore.VCS = true
-	session.Ignore.Paths = []string{"node_modules", ".git"}
+	session.Ignore.Paths = []string{"node_modules", ".git", syncDynamicGitPolicyMarker}
 	session.Alpha = syncEndpoint{Path: m.LocalPath, Connected: true, Scanned: true}
 	session.Beta = syncEndpoint{Protocol: "ssh", Host: syncSSHAlias(store.config()), Path: m.ServerPath, Connected: true, Scanned: true}
 	encoded, err := json.Marshal([]syncSession{session})
@@ -181,8 +181,8 @@ func TestUnchangedIgnorePolicyKeepsSyncEngineWarm(t *testing.T) {
 		t.Fatal(err)
 	}
 	validationCalls := strings.Split(strings.TrimSpace(string(after[before:])), "\n")
-	if inventories != 1 || len(after) <= before {
-		t.Fatalf("cached policy skipped live validation or repeated inventory: inventories=%d calls=%s", inventories, string(after[before:]))
+	if inventories != 0 || len(after) <= before {
+		t.Fatalf("live policy skipped session validation or repeated native inventory: inventories=%d calls=%s", inventories, string(after[before:]))
 	}
 	for _, line := range validationCalls {
 		var args []string
@@ -190,18 +190,18 @@ func TestUnchangedIgnorePolicyKeepsSyncEngineWarm(t *testing.T) {
 			t.Fatalf("cached policy should only validate the live session: %q (%v)", line, err)
 		}
 	}
-	// Only the remote half changes; it must invalidate the local stamp without
-	// pausing the engine when the resulting pattern set remains equal.
+	// Endpoint policy is evaluated by the negotiated engine on every cycle.
+	// Native metadata observer restarts or lost hints cannot trigger inventories
+	// or disconnect a healthy session; they no longer authorize live filtering.
 	remoteToken = "changed-remote-policy"
 	changed, err = refreshSyncIgnoreContext(context.Background(), m)
-	if err != nil || changed || inventories != 2 {
-		t.Fatalf("remote policy was not rechecked: changed=%t inventories=%d err=%v", changed, inventories, err)
+	if err != nil || changed || inventories != 0 {
+		t.Fatalf("remote policy hints disturbed the live engine: changed=%t inventories=%d err=%v", changed, inventories, err)
 	}
 	remoteToken = ""
 	for pass := 0; pass < 2; pass++ {
-		beforeInventory := inventories
-		if changed, err = refreshSyncIgnoreContext(context.Background(), m); err != nil || changed || inventories != beforeInventory+2 {
-			t.Fatalf("untrusted remote evidence reused stamp: inventories=%d err=%v", inventories, err)
+		if changed, err = refreshSyncIgnoreContext(context.Background(), m); err != nil || changed || inventories != 0 {
+			t.Fatalf("lost observer proof triggered native live filtering: inventories=%d err=%v", inventories, err)
 		}
 	}
 	raw, err = os.ReadFile(calls)

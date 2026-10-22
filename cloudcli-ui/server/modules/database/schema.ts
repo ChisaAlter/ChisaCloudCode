@@ -134,7 +134,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     provider_session_id TEXT,
     custom_name TEXT,
     project_path TEXT,
+    -- App-created/forked sessions retain source project identity even when a
+    -- provider transcript records a different isolated execution directory.
+    project_path_owned INTEGER NOT NULL DEFAULT 0,
     jsonl_path TEXT,
+    -- Server-owned dedicated provider HOME for sandboxed app sessions. Never
+    -- accept this path from transport input or use it as a deletable transcript.
+    provider_profile_path TEXT,
     -- Model and reasoning effort this session runs with. Written when the user
     -- changes either selection and on every send, so reopening a session
     -- restores its exact runtime configuration instead of provider defaults.

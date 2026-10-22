@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -230,6 +231,7 @@ func readSyncGitMetadataFile(name string, capture bool, limit int64) (syncGitMet
 
 var syncGitUnsupportedConfig = regexp.MustCompile(`(?im)^\s*\[\s*include(?:if)?(?:\s|\.|\])|(?:refstorage|excludesfile)\s*=`)
 var syncGitUnsupportedReference = regexp.MustCompile(`[\x00-\x20\x7f~^:?*\[\\]`)
+var errSyncGitInheritedRepository = errors.New("项目继承了父目录 Git 仓库")
 
 func localSyncMetadataFingerprint(m *Mapping) (string, bool, error) {
 	digest := sha256.New()
@@ -381,12 +383,15 @@ func localSyncMetadataFingerprint(m *Mapping) (string, bool, error) {
 		// Certify absence at this exact root, including inherited/bare repositories.
 		// No source-file contents or worktree inventory are read.
 		for directory := filepath.Clean(m.LocalPath); ; directory = filepath.Dir(directory) {
-			record, err := addFile(filepath.Join(directory, ".git"), false)
+			_, exists, err := syncGitMetadataPathStamp(filepath.Join(directory, ".git"))
 			if err != nil {
 				return "", false, err
 			}
-			if record.exists {
-				return "", false, fmt.Errorf("项目继承了父目录 Git 仓库")
+			if exists {
+				return "", false, errSyncGitInheritedRepository
+			}
+			if _, err := addFile(filepath.Join(directory, ".git"), false); err != nil {
+				return "", false, err
 			}
 			// Git also discovers a bare repository in any ancestor. Certify at
 			// least one bare marker absent through final validation at each level.
@@ -497,6 +502,15 @@ func localSyncMetadataFingerprint(m *Mapping) (string, bool, error) {
 	for _, name := range []string{filepath.Join(gitdir, "index"), filepath.Join(gitdir, "HEAD"), filepath.Join(common, "packed-refs")} {
 		if err := checkLock(name); err != nil {
 			return "", true, err
+		}
+	}
+	for _, name := range []string{"index", "HEAD"} {
+		if record, err := addFile(filepath.Join(gitdir, name+".chisa-owned"), false); err != nil {
+			return "", true, err
+		} else if record.exists {
+			// Even a marker-only crash after rename must pass the guarded reader
+			// before a no-op or warm cache can claim a completed transition.
+			return "", true, fmt.Errorf("Git 自有锁需要安全恢复: %s", name)
 		}
 	}
 	head := filepath.Join(gitdir, "HEAD")
@@ -647,6 +661,52 @@ func localSyncMetadataFingerprint(m *Mapping) (string, bool, error) {
 	return hex.EncodeToString(digest.Sum(nil)), true, nil
 }
 
+// A selected directory may inherit a valid repository without owning its Git
+// state. The general fingerprint deliberately declines that discovery; preflight
+// can still certify file-only mode after Git confirms the selected root is not
+// the repository root. Never use this fallback for an existing .git marker.
+func localSyncPreflightFingerprint(ctx context.Context, m *Mapping) (string, bool, error) {
+	fingerprint, repository, observationErr := localSyncMetadataFingerprint(m)
+	if repository || !errors.Is(observationErr, errSyncGitInheritedRepository) {
+		return fingerprint, repository, observationErr
+	}
+	before, exists, err := syncGitMetadataPathStamp(m.LocalPath)
+	if err != nil {
+		return "", false, err
+	}
+	if !exists || !before.mode.IsDir() {
+		return "", false, observationErr
+	}
+	marker := filepath.Join(m.LocalPath, ".git")
+	if _, err := os.Lstat(marker); !os.IsNotExist(err) {
+		if err != nil {
+			return "", false, err
+		}
+		return "", true, observationErr
+	}
+	owned, err := localGitRepository(ctx, m.LocalPath)
+	if err != nil {
+		return "", false, err
+	}
+	if owned {
+		return "", true, observationErr
+	}
+	if _, err := os.Lstat(marker); !os.IsNotExist(err) {
+		return "", true, fmt.Errorf("Git 项目根目录标记在观察时改变")
+	}
+	after, exists, err := syncGitMetadataPathStamp(m.LocalPath)
+	if err != nil {
+		return "", false, err
+	}
+	if !exists || !after.mode.IsDir() || before.volume != after.volume || before.high != after.high || before.low != after.low {
+		return "", false, fmt.Errorf("Git 工作区目录在观察时改变")
+	}
+	// Parent refs/index are outside the selected project. Only root identity and
+	// its own marker absence belong to this proof; ordinary file edits are safe.
+	digest := sha256.Sum256([]byte(fmt.Sprintf("file-only:%s\x00%d:%d:%d", filepath.Clean(m.LocalPath), after.volume, after.high, after.low)))
+	return hex.EncodeToString(digest[:]), false, nil
+}
+
 var observeSyncGitRemoteMetadata = observeRemoteSyncMetadata
 
 // An observer failure invalidates repository cache evidence. A metadata-only
@@ -689,7 +749,7 @@ type syncGitPlan struct {
 
 func prepareGitSyncContext(ctx context.Context, m *Mapping) (*syncGitPlan, error) {
 	key := syncGitObservationKey(ctx, m)
-	localFP, repository, localErr := localSyncMetadataFingerprint(m)
+	localFP, repository, localErr := localSyncPreflightFingerprint(ctx, m)
 	remote, err := observeGitMetadataOrFallback(ctx, m)
 	if err != nil {
 		return nil, err
@@ -706,7 +766,7 @@ func prepareGitSyncContext(ctx context.Context, m *Mapping) (*syncGitPlan, error
 		if err := syncGitContext(ctx, m); err != nil {
 			return nil, err
 		}
-		localFP, repository, localErr = localSyncMetadataFingerprint(m)
+		localFP, repository, localErr = localSyncPreflightFingerprint(ctx, m)
 		remote, err = observeGitMetadataOrFallback(ctx, m)
 		if err != nil {
 			return nil, err
@@ -769,7 +829,49 @@ func fetchSyncGitHead(ctx context.Context, m *Mapping, local, remote syncGitStat
 	return err
 }
 
+// Test fixtures replace only the transport with real local fetch/push between
+// independent object databases. Selection, preflight and apply remain production.
+var provisionSyncGitObjects = transferSyncGitObjects
+var runSyncGitPreflightWorker = syncGitMetadataRemoteScript
+
+func transferSyncGitObjects(ctx context.Context, m *Mapping, local, remote, desired syncGitState) error {
+	if local == desired && remote == desired {
+		return nil
+	}
+	cfg := workspaceSyncConfig(ctx)
+	url := cfg.SSHUser + "@" + cfg.SSHHost + ":" + m.ServerPath
+	// The synthetic commit retains HEAD's full history plus index/operation
+	// objects. Publishing only under a unique private namespace cannot move a
+	// user's branch, HEAD, index or worktree. Receiver target CAS is still later.
+	ref := "refs/chisa/transfer/" + randHex(16)
+	if desired == remote {
+		if _, err := remoteGitSnapshot(ctx, m, desired, ref); err != nil {
+			return err
+		}
+		_, err := gitOutputContext(ctx, m.LocalPath, "fetch", "--no-tags", "--no-write-fetch-head", "--no-auto-maintenance",
+			"--upload-pack=setpriv --reuid=1000 --regid=1000 --clear-groups env HOME=/nonexistent git -c core.hooksPath=/dev/null -c core.fsmonitor=false upload-pack", url, ref)
+		return err
+	}
+	if _, err := localGitSnapshot(ctx, m, desired, ref); err != nil {
+		return err
+	}
+	receive, err := syncRemoteJobCommand(ctx, m, "receive-pack", "")
+	if err != nil {
+		return err
+	}
+	_, err = gitOutputContext(ctx, m.LocalPath, "push", "--receive-pack="+receive, url, ref+":"+ref)
+	return err
+}
+
 func preflightSyncGitState(ctx context.Context, m *Mapping, local, remote, desired syncGitState) error {
+	preview, _ := ctx.Value(syncGitPreviewKey{}).(bool)
+	if !preview {
+		// Ancestry needs the desired HEAD (and rebase parents) in the receiver's
+		// object database. Transfer immutable objects before any target checks.
+		if err := provisionSyncGitObjects(ctx, m, local, remote, desired); err != nil {
+			return err
+		}
+	}
 	if local != desired {
 		if _, err := localGitTarget(ctx, m, local, desired); err != nil {
 			return err
@@ -785,8 +887,65 @@ func preflightSyncGitState(ctx context.Context, m *Mapping, local, remote, desir
 		}
 	}
 	if remote != desired {
-		request, _ := json.Marshal(map[string]any{"root": m.ServerPath, "op": "preflight", "before": remote, "desired": desired})
-		if _, err := syncGitMetadataRemoteScript(ctx, m, "setpriv --reuid=1000 --regid=1000 --clear-groups env HOME=/nonexistent python3 -c "+shellQuote(syncGitApplyWorker), bytes.NewReader(request)); err != nil {
+		op := "preflight"
+		if preview {
+			op = "preview-targets"
+		}
+		request, _ := json.Marshal(map[string]any{"root": m.ServerPath, "op": op, "before": remote, "desired": desired})
+		out, err := runSyncGitPreflightWorker(ctx, m, "setpriv --reuid=1000 --regid=1000 --clear-groups env HOME=/nonexistent python3 -c "+shellQuote(syncGitApplyWorker), bytes.NewReader(request))
+		if err != nil {
+			return err
+		}
+		if preview {
+			return preflightSyncGitPreviewTargets(ctx, m, remote, desired, out)
+		}
+	}
+	return nil
+}
+
+func preflightSyncGitPreviewTargets(ctx context.Context, m *Mapping, before, desired syncGitState, output string) error {
+	var tips map[string]string
+	if err := json.Unmarshal([]byte(output), &tips); err != nil {
+		return err
+	}
+	ctx, discard, err := syncGitPreviewObjectsContext(ctx, m)
+	if err != nil {
+		return err
+	}
+	defer discard()
+	targets := []syncGitState{}
+	if desired.Branch != "" {
+		targets = append(targets, desired)
+	}
+	branch, head, err := gitRebaseOriginal(desired)
+	if err != nil {
+		return err
+	}
+	if branch != "" {
+		targets = append(targets, syncGitState{Branch: branch, Head: head})
+	}
+	for _, target := range targets {
+		old, present := tips[target.Branch]
+		if !present || (old != "" && !syncGitHeadOID(old)) {
+			return fmt.Errorf("无法确认接收端 Git 目标分支")
+		}
+		if old == "" || target.Branch == before.Branch || old == target.Head || gitRebaseOwnsTarget(before, target.Branch, old) {
+			continue
+		}
+		if _, err := gitOutputContext(ctx, m.LocalPath, "cat-file", "-e", old+"^{commit}"); err != nil {
+			cfg := workspaceSyncConfig(ctx)
+			url := cfg.SSHUser + "@" + cfg.SSHHost + ":" + m.ServerPath
+			// Fetch only the observed immutable tip; never resolve a possibly
+			// changed branch name into a different ancestry expectation.
+			if _, err = gitOutputContext(ctx, m.LocalPath, "fetch", "--no-tags", "--no-write-fetch-head", "--no-auto-maintenance",
+				"--upload-pack=setpriv --reuid=1000 --regid=1000 --clear-groups env HOME=/nonexistent git -c core.hooksPath=/dev/null -c core.fsmonitor=false upload-pack", url, old); err != nil {
+				return err
+			}
+		}
+		if _, err := gitOutputContext(ctx, m.LocalPath, "merge-base", "--is-ancestor", old, target.Head); err != nil {
+			if gitExitCode(err) == 1 {
+				return fmt.Errorf("目标 Git 分支包含独立提交，已保留其历史，请先处理分支冲突")
+			}
 			return err
 		}
 	}
@@ -865,7 +1024,7 @@ func (p *syncGitPlan) verify(ctx context.Context, m *Mapping) error {
 	if p.mapping != *m || p.key != syncGitObservationKey(ctx, m) {
 		return fmt.Errorf("同步期间项目绑定或连接已改变")
 	}
-	local, repository, err := localSyncMetadataFingerprint(m)
+	local, repository, err := localSyncPreflightFingerprint(ctx, m)
 	remote, remoteErr := observeGitMetadataOrFallback(ctx, m)
 	if remoteErr != nil {
 		return remoteErr

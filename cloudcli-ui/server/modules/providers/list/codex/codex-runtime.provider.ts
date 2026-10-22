@@ -28,6 +28,8 @@ import {
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 import type { AnyRecord, ProviderRuntimeContext, ProviderRuntimeWriter } from '@/shared/index.js';
 
+import { codexWorkspaceRuntime } from './codex-workspace-runtime.provider.js';
+
 type ActiveCodexSession = {
   status: 'running' | 'stopping' | 'completed';
   abortController: AbortController;
@@ -582,8 +584,12 @@ async function abortCodexSession(sessionId: string) {
 
 /** Used by the providers module's CodexProvider to run and abort SDK turns. */
 export const codexRuntime = {
-  run: queryCodex,
-  abort: abortCodexSession,
+  run: (command: string, options: AnyRecord, writer: ProviderRuntimeWriter, context: ProviderRuntimeContext) => context.runProcess
+    ? codexWorkspaceRuntime.run(command, options, writer, context)
+    : queryCodex(command, options, writer, context),
+  async abort(sessionId: string) {
+    return await codexWorkspaceRuntime.abort(sessionId) || await abortCodexSession(sessionId);
+  },
 };
 
 /**

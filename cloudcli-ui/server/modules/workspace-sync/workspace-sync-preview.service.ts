@@ -68,9 +68,9 @@ export function createWorkspaceSyncPreviewService() {
         '--user=1000:1000', '--cap-drop=ALL', '--security-opt=no-new-privileges',
         '--pids-limit=256', '--memory=2g', '--hostname=workspace', '--read-only',
         '--tmpfs=/tmp:rw,size=512m', '--tmpfs=/home/chisa:rw,size=512m', '--volume', root + ':/workspace:rw',
-        '--mount', 'type=bind,src=' + path.join(root, '.chisa-bridge.json') + ',dst=/workspace/.chisa-bridge.json,readonly',
+        '--mount', 'type=bind,src=/dev/null,dst=/workspace/.chisa-bridge.json,readonly',
         '--env=HOME=/home/chisa', '--env=TZ=UTC', '--workdir', cwd,
-          'localhost/chisa-workspace:2', 'bash', '-c', command], 30_000, signal);
+          'localhost/chisa-workspace:3', 'bash', '-c', command], 30_000, signal);
         signal?.throwIfAborted();
         const remoteHost = (await run(['inspect', '--format', '{{(index .NetworkSettings.Networks "' + network + '").IPAddress}}', id], 15_000, signal)).trim();
         if (isIP(remoteHost) !== 4) throw new Error('Invalid preview address');

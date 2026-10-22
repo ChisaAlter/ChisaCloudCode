@@ -1,5 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+
 import crossSpawn from 'cross-spawn';
 
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
@@ -13,6 +14,8 @@ import {
   terminateProviderProcess,
 } from '@/shared/index.js';
 import type { AnyRecord, ProviderRuntimeContext, ProviderRuntimeWriter } from '@/shared/index.js';
+
+import { cursorWorkspaceRuntime } from './cursor-workspace-runtime.provider.js';
 
 type CursorRun = {
   key: string;
@@ -345,6 +348,10 @@ async function abortCursorSession(sessionId: string): Promise<boolean> {
 
 /** Used by CursorProvider to execute and cancel one app-session run. */
 export const cursorRuntime = {
-  run: spawnCursor,
-  abort: abortCursorSession,
+  run: (command: string, options: AnyRecord, writer: ProviderRuntimeWriter, context: ProviderRuntimeContext) => context.runProcess
+    ? cursorWorkspaceRuntime.run(command, options, writer, context)
+    : spawnCursor(command, options, writer, context),
+  async abort(sessionId: string) {
+    return await cursorWorkspaceRuntime.abort(sessionId) || await abortCursorSession(sessionId);
+  },
 };

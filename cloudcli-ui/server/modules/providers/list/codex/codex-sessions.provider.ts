@@ -5,6 +5,7 @@ import readline from 'node:readline';
 
 import { sessionsDb } from '@/modules/database/index.js';
 import { codexAppServer } from '@/modules/providers/list/codex/codex-app-server.client.js';
+import { resolveProviderHome } from '@/modules/providers/services/provider-state.service.js';
 import { parseFilesInputTag, toImageAttachments } from '@/shared/image-attachments.js';
 import type { IProviderSessions } from '@/shared/interfaces.js';
 import { prepareTranscriptMessages } from '@/shared/message-unification.js';
@@ -1857,6 +1858,7 @@ export class CodexSessionsProvider implements IProviderSessions {
       threadId: supersededThreadId,
       lastTurnId: keepThroughId,
       cwd: session.project_path ?? '',
+      ...(session.provider_profile_path ? { profileHome: resolveProviderHome('codex', sessionId, session.provider_profile_path) } : {}),
     });
 
     sessionsDb.markProviderSessionSuperseded({

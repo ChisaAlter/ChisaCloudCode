@@ -17,6 +17,8 @@ import {
 import type { AnyRecord, ProviderRuntimeContext, ProviderRuntimeWriter } from '@/shared/index.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 
+import { opencodeWorkspaceRuntime } from './opencode-workspace-runtime.provider.js';
+
 // cross-spawn resolves .cmd shims/PATHEXT on Windows and delegates to
 // child_process.spawn everywhere else.
 const spawnFunction = crossSpawn;
@@ -398,6 +400,10 @@ async function abortOpenCodeSession(sessionId: string): Promise<boolean> {
 
 /** Consumed by OpenCodeProvider to run and cancel one CLI lifecycle per session. */
 export const opencodeRuntime = {
-  run: spawnOpenCode,
-  abort: abortOpenCodeSession,
+  run: (command: string, options: AnyRecord, writer: ProviderRuntimeWriter, context: ProviderRuntimeContext) => context.runProcess
+    ? opencodeWorkspaceRuntime.run(command, options, writer, context)
+    : spawnOpenCode(command, options, writer, context),
+  async abort(sessionId: string) {
+    return await opencodeWorkspaceRuntime.abort(sessionId) || await abortOpenCodeSession(sessionId);
+  },
 };

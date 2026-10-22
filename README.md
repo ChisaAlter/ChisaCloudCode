@@ -25,7 +25,7 @@
 
 需要 Windows、Node.js 24、Go 1.27.1，以及 [MyGo](https://github.com/egoist/mygo) 的 Windows 构建依赖。
 
-先从 Releases 下载 [`runtime-dependencies.json`](runtime-dependencies.json) 对应的定制 Mutagen **0.18.1-chisa.2** 并核对校验值，将 `mutagen.exe` 和 `mutagen-agents.tar.gz` 放到仓库根目录；也可按[同步引擎构建说明](ops/mutagen/README.md)从公开补丁重建。该运行时提供应用需要的忽略规则更新能力，不能用上游原版替代。
+当前源码要求尚未发布的定制 Mutagen **0.18.1-chisa.3**。先按[同步引擎源码与构建说明](ops/mutagen/README.md)重放经校验的补丁，构建 Windows CLI 和 Linux agent，再将 `mutagen.exe` 与 `mutagen-agents.tar.gz` 放到仓库根目录。根目录 [`runtime-dependencies.json`](runtime-dependencies.json) 保留已发布 `.2` 文件的历史校验值，不适用于本分支新构建的 `.3`；新构建会产生独立校验清单。当前源码不能配用 `.2` 或上游原版，本 PR 不发布安装包。
 
 ```powershell
 npm ci --prefix cloudcli-ui
