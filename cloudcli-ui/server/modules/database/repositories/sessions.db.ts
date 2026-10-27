@@ -9,6 +9,7 @@ type SessionRow = {
   provider_session_id: string | null;
   project_path: string | null;
   jsonl_path: string | null;
+  provider_profile_path: string | null;
   custom_name: string | null;
   /** Model this session runs with; NULL until the app records one for it. */
   model: string | null;
@@ -29,7 +30,7 @@ type RecentSessionsPage = {
 };
 
 const SESSION_ROW_COLUMNS =
-  'session_id, provider, provider_session_id, project_path, jsonl_path, custom_name, model, effort, forked_from_session_id, workspace_mode, isArchived, created_at, updated_at';
+  'session_id, provider, provider_session_id, project_path, jsonl_path, provider_profile_path, custom_name, model, effort, forked_from_session_id, workspace_mode, isArchived, created_at, updated_at';
 
 const SQLITE_UTC_TIMESTAMP_REGEX = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 
@@ -80,8 +81,9 @@ export const sessionsDb = {
    * `provider_session_id` so a session that was first created by the app
    * (with an app-allocated `session_id`) is updated in place once its
    * transcript shows up on disk, instead of producing a duplicate row. An
-   * app-created row keeps its existing name; synchronizer names only update
-   * rows that were themselves created by indexing provider storage.
+   * app-created row keeps its original project and existing name: transcript
+   * cwd describes execution, not project ownership. Synchronizers may update
+   * project/name only for rows originally discovered in provider storage.
    */
   createSession(
     providerSessionId: string,
@@ -97,33 +99,44 @@ export const sessionsDb = {
     const updatedAtValue = normalizeTimestamp(updatedAt);
     const normalizedProjectPath = normalizeProjectPathForProvider(provider, projectPath);
 
-    // First, ensure the project path is recorded in the projects table,
-    // since it's a foreign key in the sessions table.
-    projectsDb.createProjectPath(normalizedProjectPath);
-
     const existing = db
       .prepare(
-        `SELECT session_id FROM sessions
-         WHERE provider_session_id = ? AND provider = ?
+        `SELECT session_id, provider_session_id, project_path_owned FROM sessions
+         WHERE provider = ? AND (provider_session_id = ? OR session_id = ?)
+         ORDER BY CASE WHEN provider_session_id = ? THEN 0 ELSE 1 END
          LIMIT 1`
       )
-      .get(providerSessionId, provider) as { session_id: string } | undefined;
+      .get(provider, providerSessionId, providerSessionId, providerSessionId) as
+        | { session_id: string; provider_session_id: string | null; project_path_owned: number }
+        | undefined;
+
+    // A transcript records its execution cwd, which may be an isolated worktree.
+    // The app owns its original project identity even before the provider id is
+    // assigned. Do not register the worktree as another sidebar project either.
+    const appOwned = Boolean(existing && (existing.project_path_owned || existing.session_id !== existing.provider_session_id));
+    if (!appOwned) projectsDb.createProjectPath(normalizedProjectPath);
 
     if (existing) {
       db.prepare(
         `UPDATE sessions SET
            provider = ?,
+           provider_session_id = COALESCE(provider_session_id, ?),
+           project_path_owned = CASE WHEN project_path_owned = 1 OR provider_session_id IS NULL OR session_id <> provider_session_id THEN 1 ELSE 0 END,
            updated_at = COALESCE(?, CURRENT_TIMESTAMP),
-           project_path = ?,
+           project_path = CASE
+             WHEN project_path_owned = 1 OR session_id <> provider_session_id OR provider_session_id IS NULL THEN project_path
+             ELSE ?
+           END,
            jsonl_path = ?,
            isArchived = CASE WHEN ? IS NULL OR julianday(?) > julianday(updated_at) THEN 0 ELSE isArchived END,
            custom_name = CASE
-             WHEN session_id <> provider_session_id AND custom_name IS NOT NULL THEN custom_name
+             WHEN (project_path_owned = 1 OR provider_session_id IS NULL OR session_id <> provider_session_id) AND custom_name IS NOT NULL THEN custom_name
              ELSE COALESCE(?, custom_name)
            END
          WHERE session_id = ?`
       ).run(
         provider,
+        providerSessionId,
         updatedAtValue,
         normalizedProjectPath,
         jsonlPath ?? null,
@@ -169,6 +182,16 @@ export const sessionsDb = {
     return providerSessionId;
   },
 
+  /** Provider runtime and native artifact indexers persist the managed private profile separately from deletable transcript paths. */
+  setProviderProfilePath(sessionId: string, profilePath: string): void {
+    getConnection().prepare('UPDATE sessions SET provider_profile_path = ? WHERE session_id = ?').run(profilePath, sessionId);
+  },
+
+  /** Provider watcher/indexer composition lists durable private profile registrations without scanning arbitrary cache directories. */
+  listProviderProfiles(provider?: string): Array<{ session_id: string; provider: string; provider_profile_path: string }> {
+    return getConnection().prepare(`SELECT session_id, provider, provider_profile_path FROM sessions WHERE provider_profile_path IS NOT NULL AND provider IN ('codex','cursor','opencode')${provider ? ' AND provider = ?' : ''}`).all(...(provider ? [provider] : [])) as Array<{ session_id: string; provider: string; provider_profile_path: string }>;
+  },
+
   /**
    * Inserts one app-allocated session row before any provider run happens.
    *
@@ -191,8 +214,8 @@ export const sessionsDb = {
     projectsDb.createProjectPath(normalizedProjectPath);
 
     db.prepare(
-      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, workspace_mode, isArchived, created_at, updated_at)
-       VALUES (?, ?, NULL, ?, ?, NULL, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, project_path_owned, jsonl_path, workspace_mode, isArchived, created_at, updated_at)
+       VALUES (?, ?, NULL, ?, ?, 1, NULL, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
     ).run(sessionId, provider, customName ?? null, normalizedProjectPath, workspaceMode);
 
     return sessionId;
@@ -230,8 +253,8 @@ export const sessionsDb = {
       db.prepare('DELETE FROM sessions WHERE session_id = ? AND session_id <> ?')
         .run(input.providerSessionId, input.sessionId);
       db.prepare(
-        `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, jsonl_path, model, effort, forked_from_session_id, workspace_mode, isArchived, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+        `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, project_path_owned, jsonl_path, model, effort, forked_from_session_id, workspace_mode, isArchived, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
       ).run(
         input.sessionId,
         input.provider,

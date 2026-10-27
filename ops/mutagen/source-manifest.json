@@ -1,0 +1,209 @@
+{
+  "upstream": "github.com/mutagen-io/mutagen@v0.18.1",
+  "version": "0.18.1-chisa.3",
+  "marker": "/.chisa-sync-policy/git-v1",
+  "capability": "chisa-git-policy-v1",
+  "files": [
+    {
+      "path": "cmd/mutagen-agent/stream_synchronization_linux.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "4806011792e7e568adb2a67b10bc87c7b9a7cde339b9ec69f16f2ec5313b1d2c"
+    },
+    {
+      "path": "cmd/mutagen-agent/stream_synchronization_linux_test.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "1441181404de22690198b2b5ace18ca2d337f508921d6c169283171856682e9d"
+    },
+    {
+      "path": "cmd/mutagen-agent/stream_synchronization_other.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "f1fd00492588413e8257864a976fce45613054085d58122498043e4317f0bb76"
+    },
+    {
+      "path": "cmd/mutagen-agent/synchronizer.go",
+      "beforeSha256LF": "3a6095568a9acf0339f69093f50b64a184c05e5a7a7b034eb2c3cd183be2f71f",
+      "afterSha256LF": "4cde3129c2546bc355ea43fd22753ee497d1eda49995fc91a6f1d0093b72a263"
+    },
+    {
+      "path": "cmd/mutagen/daemon/run.go",
+      "beforeSha256LF": "0eed0981d7b4dd3565f9b2496b0618119b7fc1a533e4ab034b48a66cb1cad3e0",
+      "afterSha256LF": "9efbd1ee15f768a6728746ac46434338d7e1b285d930ebe0cdbe053041f24591"
+    },
+    {
+      "path": "cmd/mutagen/sync/main.go",
+      "beforeSha256LF": "b221a7d186ad836ab85e49a5afec623cea224b8655ad0d5d94654738cc1aa826",
+      "afterSha256LF": "a87aa52765b7e4767026bec3b9e0921efd4da80e8aaf3b25b70d20a6f927268d"
+    },
+    {
+      "path": "cmd/mutagen/sync/update_ignores.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "259df797d91dd343666c8d337b5f34b78de3e4c027b6ea40403018f882a4b0ee"
+    },
+    {
+      "path": "pkg/filesystem/watching/watch_recursive_linux_inotify.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "b795a237ca003d0a71fe82cb061bc51761990854cae6e86e15579b5405aca22f"
+    },
+    {
+      "path": "pkg/filesystem/watching/watch_recursive_linux_inotify_test.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "dcc844e2fc44112e6a0f2be46617c7e24367f55f0a2c7db03b38c4796197b6a4"
+    },
+    {
+      "path": "pkg/filesystem/watching/watch_recursive_unsupported.go",
+      "beforeSha256LF": "d5bbb3e3a3cc80b4cc64bc4a7dd6b5bfa286e4015297b27a20b70ec3b66e6ec2",
+      "afterSha256LF": "80eadad19007f69425fb95255680f62553b6a7b6fa8a3963d889d2a34f706d59"
+    },
+    {
+      "path": "pkg/mutagen/version.go",
+      "beforeSha256LF": "c50ec60dba76ab610b26bd14cff8fe907c5a3705b8889000ed6fa94280198cc8",
+      "afterSha256LF": "ebcfbd072e756a28f77e670fb8094860889f0a6e7aa26443f91af28720ed37d9"
+    },
+    {
+      "path": "pkg/service/synchronization/ignore_configuration.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "814fd97dd516f3036ff63f02ea28e18b458f9efc6335409ee012dd444c8351d6"
+    },
+    {
+      "path": "pkg/synchronization/controller.go",
+      "beforeSha256LF": "427825e7dd5295cd2e3abb0d50ae021bad77dba1a63d133efcf26f73476a4aee",
+      "afterSha256LF": "23688276a1bf48e7da4f07bcf8d2dfe49603591dab890c20347fa9491b625f99"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/local/endpoint.go",
+      "beforeSha256LF": "a87c30f7cca7519a605d7152ce7dd9bdd1be8bf9db31baccf84d76c4e83ee1cf",
+      "afterSha256LF": "a3b34863873fb600f36bc087e3e460e749ab429eb8d1c8052cc46db8d4b5d028"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/local/git_policy.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "1c9c7659499613d0dca3873973471f938c5714066d62dfbf81d337f7a08c4991"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/local/git_policy_fallback_test.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "f863b5ba2c00cf8c242a8d94390bece38d1888ae40efc26ddd85b720492b3bfe"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/local/git_policy_test.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "91313601c86520eab38c72210d7c6d7dc64876378d740ffe1024ceecad6c63ff"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/local/git_policy_witness.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "f4d67362df9b789a52c69b2a7f722d1fe58fa9af5314fd7f28bcd109eda815df"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/local/git_policy_witness_test.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "c87af726d976c05bc437f33456f228cf89895dc56f097184aaa607bcf39f8703"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/remote/client.go",
+      "beforeSha256LF": "e6d2b33c0fe19db1bfb0b15a2c033ef9a47d8636002583017669fb5eead6245f",
+      "afterSha256LF": "23cc4e2781e944897938e133ad37d4c0f715c1def398735f8ac7b99b2f2f3b15"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/remote/completion.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "a0e1eb411893baee824fb180591a7c6f3940a2ccfb232d9667ce46c4a41f87cb"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/remote/completion_protocol_test.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "8a58b9173348b5e684ad1b57c3a912fe534aa5d2d1023f90598ba8e15d65b3a0"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/remote/git_policy.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "72b8c3092bc83ad4a9235d1edef4c5e8f7706cafd060bd613e0fbe2993b9b403"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/remote/git_policy_test.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "cee3666f07e58273f99d2e827159eac10cc42f6506859e0de7ab5e23c86fffc9"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/remote/protocol.go",
+      "beforeSha256LF": "233cef4a1b44189bbdc4dc779235d6a3a78db29d27c2d091b664bf4d4cf0ecb9",
+      "afterSha256LF": "5d988846259db8415ab5dd4f6437c44a4058fa9c40679d6f50aad1e47f11a301"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/remote/protocol.pb.go",
+      "beforeSha256LF": "8b363232cd1d66b65c466659b40262c870dc70fe19b07d7aea1f753356470f91",
+      "afterSha256LF": "3d5c02d9231eaa4b61b9a7e620001aad660353624c274ba3dfe0cd96b949e399"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/remote/protocol.proto",
+      "beforeSha256LF": "a9acea2a796cc2118ebb4cdac4bf63ee73e373a9f17f0fc0f9d429a05017ee5b",
+      "afterSha256LF": "b75af7ed8c57c882bc7921dc540985704ae4af02aad5faf63fa8c1ad4f3e47cc"
+    },
+    {
+      "path": "pkg/synchronization/endpoint/remote/server.go",
+      "beforeSha256LF": "b303ade9c9656eef1c645bf040c807274e106755c7f6b49f6fe068fc7e91c173",
+      "afterSha256LF": "22545ac9a3dc38cac03e3fce58a74fda94dd3c3aa95451f071747aaf29aefa6f"
+    },
+    {
+      "path": "pkg/synchronization/git_policy.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "50db0c0f95df3fd0a92e572aa2cf9d2164ce2fa3fb90309d9dbaaf79459afcc3"
+    },
+    {
+      "path": "pkg/synchronization/git_policy.pb.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "bf926be23d8690fbe5dc865f51ef8054d5c107ac98dbf43e9368d399c50e0ebd"
+    },
+    {
+      "path": "pkg/synchronization/git_policy.proto",
+      "beforeSha256LF": null,
+      "afterSha256LF": "9a7cb9adaccb6ec06a18b76d9d4c0700fb9150a9887250473099f1ee2ef2b636"
+    },
+    {
+      "path": "pkg/synchronization/git_policy_cache_test.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "7ea3dabdbb077668406a1c15188ee82dfd72cf054f72e91f0441252df2960243"
+    },
+    {
+      "path": "pkg/synchronization/git_policy_idle_test.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "39f1a685526f6f3ca540380d43ecbd3b48d945bc5febd52ace42e06b5ca4219c"
+    },
+    {
+      "path": "pkg/synchronization/git_policy_integration_test.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "191ac8e7aac1768fe6df4e9e2543797e0a40ca21c083d40de486c66f7bbd786e"
+    },
+    {
+      "path": "pkg/synchronization/git_policy_migration_test.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "7e5e6ece4282724ebb7763902f90f1994fec939e1c357e32fdd8d7f77a8260d3"
+    },
+    {
+      "path": "pkg/synchronization/git_policy_retry_test.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "07161fa87c7649827eff09da84bb52594e827f64a284bc3e2ec9d35cc2321993"
+    },
+    {
+      "path": "pkg/synchronization/git_policy_tree_cache.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "86d9b3f8ebeeb5225cb6fdf8b753b53ae8b4870fc548a4fac0fca384ac5bdd6b"
+    },
+    {
+      "path": "pkg/synchronization/git_policy_tree_cache_test.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "0311e7cf614287c43110b22314bca4057711fc5b888413ec2f298e1b71756bed"
+    },
+    {
+      "path": "pkg/synchronization/rsync/transmit.go",
+      "beforeSha256LF": "8f0463601a91b6045eb078413d2ed09a9b979e15e3e0310f6d21cbb02d654ed1",
+      "afterSha256LF": "e597ee1be5dbd8850b0d5ec25ae0f4b33cf5a8d4bff5f26ac3f257021bf93c5a"
+    },
+    {
+      "path": "pkg/synchronization/update_ignores.go",
+      "beforeSha256LF": null,
+      "afterSha256LF": "af8238a39c48d20b134801326f2e64f846d6bedf4fd1df38fe0aaa4649186139"
+    }
+  ],
+  "patchSha256": "ae78c79c2557ab884a1cb59fc2210a3d719b8c9ae118e7e164588b3ff648c09f"
+}

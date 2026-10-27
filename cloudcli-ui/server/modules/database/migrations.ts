@@ -296,6 +296,7 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
     ? 'jsonl_path'
     : 'NULL';
 
+  const providerProfilePathExpression = columnNames.includes('provider_profile_path') ? 'provider_profile_path' : 'NULL';
   const modelExpression = columnNames.includes('model') ? 'model' : 'NULL';
   const effortExpression = columnNames.includes('effort') ? 'effort' : 'NULL';
   const forkedFromSessionIdExpression = columnNames.includes('forked_from_session_id')
@@ -304,6 +305,12 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
   const workspaceModeExpression = columnNames.includes('workspace_mode')
     ? "CASE WHEN workspace_mode = 'shared' THEN 'shared' ELSE 'isolated' END"
     : "'isolated'";
+
+  const projectPathOwnedExpression = columnNames.includes('project_path_owned')
+    ? 'COALESCE(project_path_owned, 0)'
+    : columnNames.includes('provider_session_id')
+      ? `CASE WHEN provider_session_id IS NULL OR session_id <> provider_session_id OR ${forkedFromSessionIdExpression} IS NOT NULL THEN 1 ELSE 0 END`
+      : '0';
 
   const isArchivedExpression = columnNames.includes('isArchived')
     ? 'COALESCE(isArchived, 0)'
@@ -328,7 +335,9 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
         provider_session_id TEXT,
         custom_name TEXT,
         project_path TEXT,
+        project_path_owned INTEGER NOT NULL DEFAULT 0,
         jsonl_path TEXT,
+        provider_profile_path TEXT,
         model TEXT,
         effort TEXT,
         forked_from_session_id TEXT,
@@ -350,7 +359,9 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
           ${providerSessionIdExpression} AS provider_session_id,
           ${customNameExpression} AS custom_name,
           ${projectPathExpression} AS project_path,
+          ${projectPathOwnedExpression} AS project_path_owned,
           ${jsonlPathExpression} AS jsonl_path,
+          ${providerProfilePathExpression} AS provider_profile_path,
           ${modelExpression} AS model,
           ${effortExpression} AS effort,
           ${forkedFromSessionIdExpression} AS forked_from_session_id,
@@ -369,7 +380,9 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
           provider_session_id,
           custom_name,
           project_path,
+          project_path_owned,
           jsonl_path,
+          provider_profile_path,
           model,
           effort,
           forked_from_session_id,
@@ -389,7 +402,9 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
         provider_session_id,
         custom_name,
         project_path,
+        project_path_owned,
         jsonl_path,
+        provider_profile_path,
         model,
         effort,
         forked_from_session_id,
@@ -404,7 +419,9 @@ const rebuildSessionsTableWithProjectSchema = (db: Database): void => {
         provider_session_id,
         custom_name,
         project_path,
+        project_path_owned,
         jsonl_path,
+        provider_profile_path,
         model,
         effort,
         forked_from_session_id,
@@ -507,6 +524,21 @@ const addSessionWorkspaceModeColumn = (db: Database): void => {
   db.exec("UPDATE sessions SET workspace_mode = 'isolated' WHERE workspace_mode IS NULL OR workspace_mode NOT IN ('isolated', 'shared')");
 };
 
+/**
+ * Persists app ownership independently of provider-id equality. Only provable
+ * existing app rows are backfilled; external/ambiguous equal-id rows keep the
+ * historical transcript-driven project behavior. Run before mapping NULL ids.
+ */
+const addSessionProjectOwnershipColumn = (db: Database): void => {
+  const columnNames = getTableInfo(db, 'sessions').map((column) => column.name);
+  addColumnToTableIfNotExists(db, 'sessions', columnNames, 'project_path_owned', 'INTEGER NOT NULL DEFAULT 0');
+  addColumnToTableIfNotExists(db, 'sessions', columnNames, 'provider_profile_path', 'TEXT');
+  if (!columnNames.includes('provider_session_id')) return;
+  const forked = columnNames.includes('forked_from_session_id') ? 'OR forked_from_session_id IS NOT NULL' : '';
+  db.exec(`UPDATE sessions SET project_path_owned = 1
+    WHERE provider_session_id IS NULL OR session_id <> provider_session_id ${forked}`);
+};
+
 const ensureProjectsForSessionPaths = (db: Database): void => {
   if (!tableExists(db, 'sessions')) {
     return;
@@ -571,6 +603,7 @@ export const runMigrations = (db: Database) => {
     migrateLegacyWorkspaceTableIntoProjects(db);
     rebuildSessionsTableWithProjectSchema(db);
     migrateLegacySessionNames(db);
+    addSessionProjectOwnershipColumn(db);
     addProviderSessionIdMapping(db);
     addSessionModelColumn(db);
     addSessionEffortColumn(db);
