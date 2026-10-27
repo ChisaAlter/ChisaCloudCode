@@ -14,9 +14,11 @@ async function withIsolatedDatabase(runTest: () => void | Promise<void>): Promis
 
   closeConnection();
   process.env.DATABASE_PATH = path.join(tempDirectory, 'auth.db');
-  await initializeDatabase();
 
   try {
+    // Keep fixture contents independent of any host legacy database.
+    await writeFile(process.env.DATABASE_PATH, '');
+    await initializeDatabase();
     await runTest();
   } finally {
     closeConnection();
@@ -132,7 +134,15 @@ test('recent sessions map project metadata and preserve database pagination', { 
     projectsDb.updateCustomProjectName('/tmp/recent-project', 'Recent Project');
 
     const project = projectsDb.getProjectPath('/tmp/recent-project');
-    const page = sessionsService.listRecentSessions(1, 0);
+    const page = sessionsService.listRecentSessions(1, 0, undefined, ['older-session']);
+    const pinnedConversation = {
+      sessionId: 'older-session',
+      provider: 'claude',
+      projectId: project?.project_id ?? null,
+      projectDisplayName: 'Recent Project',
+      sessionTitle: 'Older conversation',
+      lastActivity: '2026-08-01T09:00:00.000Z',
+    };
 
     assert.deepEqual(page, {
       conversations: [{
@@ -143,6 +153,7 @@ test('recent sessions map project metadata and preserve database pagination', { 
         sessionTitle: 'Newer conversation',
         lastActivity: '2026-08-01T11:00:00.000Z',
       }],
+      pinned: [pinnedConversation],
       total: 2,
       hasMore: true,
     });

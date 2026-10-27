@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
 
-import type { Project,CodeEditorDiffInfo,CodeEditorFile } from '@/shared/types';
+import type { Project, CodeEditorDiffInfo, CodeEditorFile, WorkspaceDescriptor } from '@/shared/types';
 
 type UseEditorSidebarOptions = {
   projects?: Project[];
@@ -24,13 +24,14 @@ export const useEditorSidebar = ({
   const resizeHandleRef = useRef<HTMLDivElement | null>(null);
 
   const handleFileOpen = useCallback(
-    (filePath: string, diffInfo: CodeEditorDiffInfo | null = null) => {
+    (filePath: string, diffInfo: CodeEditorDiffInfo | null = null, workspace?: WorkspaceDescriptor | null) => {
+      if (workspace === null || (workspace && !workspace.capabilities.read)) return;
       const normalizedPath = filePath.replace(/\\/g, '/');
       const fileName = normalizedPath.split('/').pop() || filePath;
       // Absolute transcript references can belong to another registered project
       // (e.g. /tmp/frames). Keep server path guards and use the most specific owner.
       const isAbsolute = normalizedPath.startsWith('/') || /^[A-Za-z]:\//.test(normalizedPath);
-      const owner = isAbsolute ? projects?.filter(project => {
+      const owner = isAbsolute && workspace === undefined ? projects?.filter(project => {
         const root = (project.fullPath || project.path || '').replace(/\\/g, '/').replace(/\/+$/, '');
         return root && normalizedPath.startsWith(`${root}/`);
       }).sort((a, b) => (b.fullPath || b.path || '').length - (a.fullPath || a.path || '').length)[0] : undefined;
@@ -40,7 +41,8 @@ export const useEditorSidebar = ({
         path: filePath,
         // DB projectId is forwarded to the editor so it can read/save files
         // via `/api/file-tree/projects/:projectId/file` endpoints.
-        projectId: owner?.projectId ?? selectedProject?.projectId,
+        projectId: workspace?.projectId ?? owner?.projectId ?? selectedProject?.projectId,
+        ...(workspace === undefined ? {} : { workspace }),
         diffInfo,
       });
     },

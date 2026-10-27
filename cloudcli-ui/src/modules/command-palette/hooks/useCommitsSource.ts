@@ -1,4 +1,4 @@
-import { api } from '@/shared/api';
+import { useWorkspaceApi, useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
 import { useApiSource } from '@/modules/command-palette/hooks/useApiSource';
 
 export type CommitResult = {
@@ -16,9 +16,11 @@ type CommitsResponse = {
 };
 
 export function useCommitsSource(projectId: string | undefined, enabled: boolean) {
+  const api = useWorkspaceApi();
+  const workspace = useWorkspaceScope();
   return useApiSource<CommitResult, CommitsResponse>({
-    enabled: enabled && !!projectId,
-    deps: [projectId],
+    enabled: enabled && !!projectId && workspace !== null && workspace?.capabilities.git !== false,
+    deps: [projectId, api],
     fetcher: (signal) => api.git.commits(projectId!, { limit: COMMIT_RESULT_LIMIT }, { signal }),
     parse: (data) => {
       if (!data.commits) return [];

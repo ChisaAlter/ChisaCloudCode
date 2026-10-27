@@ -1,19 +1,17 @@
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { claudeConnectionsDb } from '@/modules/database/index.js';
+import { claudeAccountsService } from '@/modules/providers/services/claude-accounts.service.js';
 import { createHiRouteHost } from '@/modules/providers/services/hiroute-host.service.js';
-import type { ClaudeModelConnectionSecret, HiRouteConnection } from '@/shared/types.js';
+import type { ClaudeAccountLaunchSnapshot, ClaudeModelConnectionSecret, HiRouteConnection } from '@/shared/types.js';
 import { AppError, requireConnectionUserId } from '@/shared/utils.js';
 
 type Host = Awaited<ReturnType<typeof createHiRouteHost>>;
 type Json = Record<string, any>;
 type Subscription = { accessToken: string; expiresAt: number; scopes?: string[]; subscriptionType?: string };
 const pending = new Map<number, Promise<unknown>>();
-const leases = new Map<number, { count: number; hosts: Map<string, Host> }>();
+const leases = new Map<number, { count: number; hosts: Map<string, Host>; accountReleases: Array<() => void> }>();
 
 async function serialized<T>(userId: number, work: () => Promise<T>): Promise<T> {
   const previous = pending.get(userId) ?? Promise.resolve();
@@ -31,25 +29,14 @@ function digest(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
-async function readSubscription(): Promise<Subscription | null> {
-  const directory = process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR !== undefined
-    ? process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR || path.join(os.homedir(), '.claude')
-    : process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
-  let oauth: Json = {};
-  try {
-    oauth = JSON.parse(await readFile(path.join(directory, '.credentials.json'), 'utf8')).claudeAiOauth ?? {};
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw failure('HiRoute 无法读取 Claude 登录状态，请检查当前登录配置。');
-  }
-  const accessToken = process.env.CLAUDE_CODE_OAUTH_TOKEN || oauth?.accessToken;
-  if (!accessToken || /[\x00-\x20\x7f]/.test(accessToken)) return null;
-  // Native Claude retains refresh ownership. Only its current access credential crosses the bridge.
-  if (!process.env.CLAUDE_CODE_OAUTH_TOKEN && (!Number.isFinite(oauth?.expiresAt) || oauth.expiresAt <= Date.now())) return null;
-  return {
-    accessToken, expiresAt: process.env.CLAUDE_CODE_OAUTH_TOKEN ? Date.now() + 60 * 60 * 1000 : oauth.expiresAt,
-    ...(Array.isArray(oauth?.scopes) ? { scopes: oauth.scopes } : {}),
-    ...(typeof oauth?.subscriptionType === 'string' ? { subscriptionType: oauth.subscriptionType } : {}),
-  };
+async function readSubscription(userId: number, snapshot: ClaudeAccountLaunchSnapshot | null): Promise<Subscription | null> {
+  // Use the same per-user selection as ordinary Claude launches and the usage panel.
+  const subscription = snapshot ? await claudeAccountsService.readSubscription(userId, snapshot) : null;
+  if (!subscription || /[\x00-\x20\x7f]/.test(subscription.accessToken)
+    || (subscription.expiresAt !== null && subscription.expiresAt <= Date.now())) return null;
+  // Claude alone refreshes credentials; the gateway receives only the current access token.
+  return { accessToken: subscription.accessToken, expiresAt: subscription.expiresAt ?? Date.now() + 60 * 60 * 1000,
+    ...(subscription.subscriptionType ? { subscriptionType: subscription.subscriptionType } : {}) };
 }
 
 async function finish(host: Host, result: Json): Promise<void> {
@@ -192,13 +179,30 @@ async function connect(host: Host, plan: Json): Promise<HiRouteConnection> {
 
 async function prepare(userId: number, signal?: AbortSignal): Promise<HiRouteConnection> {
   signal?.throwIfAborted();
+  let snapshot: ClaudeAccountLaunchSnapshot | null = null;
+  try { snapshot = claudeAccountsService.captureLaunch(userId); }
+  catch (error) {
+    // An unavailable subscription must not block explicitly saved HiRoute API sources.
+    if (!['CLAUDE_ACCOUNT_SIGN_IN_REQUIRED', 'CLAUDE_ACCOUNT_IN_USE'].includes((error as AppError).code ?? '') || !claudeConnectionsDb.list(userId).length) throw error;
+  }
+  let retained = false;
+  try {
+    const result = await prepareWithSnapshot(userId, snapshot, signal);
+    // The host may retain this source while other requests are using its gateway.
+    if (snapshot) leases.get(userId)!.accountReleases.push(snapshot.release);
+    retained = true;
+    return result;
+  } finally { if (!retained) snapshot?.release(); }
+}
+
+async function prepareWithSnapshot(userId: number, snapshot: ClaudeAccountLaunchSnapshot | null, signal?: AbortSignal): Promise<HiRouteConnection> {
   const connections = claudeConnectionsDb.list(userId);
-  const subscription = await readSubscription();
+  const subscription = await readSubscription(userId, snapshot);
   if (!connections.length && !subscription) throw failure('HiRoute 需要可用的 Claude 登录或已保存的第三方模型连接。请先登录或添加连接。');
   // Credential material is hashed, never included in process arguments or diagnostic output.
   const generation = digest({ connections, subscription: subscription ? { accessToken: subscription.accessToken } : null });
   const host = await createHiRouteHost(userId, generation, {}, signal);
-  const lease = leases.get(userId) ?? { count: 0, hosts: new Map<string, Host>() };
+  const lease = leases.get(userId) ?? { count: 0, hosts: new Map<string, Host>(), accountReleases: [] };
   lease.hosts.set(generation, host);
   leases.set(userId, lease);
   try {
@@ -244,6 +248,7 @@ export async function releaseManagedHiRoute(userId: unknown): Promise<void> {
     if (lease.count > 0) return;
     leases.delete(id);
     for (const host of lease.hosts.values()) await host.dispose().catch(() => undefined);
+    for (const release of lease.accountReleases) release();
   });
 }
 

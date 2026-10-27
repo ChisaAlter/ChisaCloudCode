@@ -3054,7 +3054,7 @@ var Duration = class _Duration {
    * Returns a string representation of this Duration appropriate for the REPL.
    * @return {string}
    */
-  [/* @__PURE__ */ Symbol.for("nodejs.util.inspect.custom")]() {
+  [Symbol.for("nodejs.util.inspect.custom")]() {
     if (this.isValid) {
       return `Duration { values: ${JSON.stringify(this.values)} }`;
     } else {
@@ -3828,7 +3828,7 @@ var Interval = class _Interval {
    * Returns a string representation of this Interval appropriate for the REPL.
    * @return {string}
    */
-  [/* @__PURE__ */ Symbol.for("nodejs.util.inspect.custom")]() {
+  [Symbol.for("nodejs.util.inspect.custom")]() {
     if (this.isValid) {
       return `Interval { start: ${this.s.toISO()}, end: ${this.e.toISO()} }`;
     } else {
@@ -6187,7 +6187,7 @@ var DateTime = class _DateTime {
    * Returns a string representation of this DateTime appropriate for the REPL.
    * @return {string}
    */
-  [/* @__PURE__ */ Symbol.for("nodejs.util.inspect.custom")]() {
+  [Symbol.for("nodejs.util.inspect.custom")]() {
     if (this.isValid) {
       return `DateTime { ts: ${this.toISO()}, zone: ${this.zone.name}, locale: ${this.locale} }`;
     } else {

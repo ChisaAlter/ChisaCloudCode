@@ -47,10 +47,7 @@ func TestStartupListenersChooseAvailableLoopbackPorts(t *testing.T) {
 	if err := StartAPIProxy(); err != nil {
 		t.Fatal(err)
 	}
-	if err := StartControlPlane("127.0.0.1:0"); err != nil {
-		t.Fatal(err)
-	}
-	for _, port := range []int{apiProxyPort, controlPort} {
+	for _, port := range []int{apiProxyPort} {
 		if port == 0 || port == 18792 || port == 18082 {
 			t.Fatalf("listener did not choose an independent port: %d", port)
 		}

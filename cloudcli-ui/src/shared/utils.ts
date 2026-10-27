@@ -1,7 +1,7 @@
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
-import type { ComponentBuildIdentity, BlockingOperation, Project, ProjectSession } from '@/shared/types';
+import type { BlockingOperation, Project, ProjectSession } from '@/shared/types';
 
 //----------------- BLOCKING OPERATIONS ------------
 
@@ -274,16 +274,3 @@ export const getPageTitle = (
   const displayName = selectedProject?.displayName?.trim();
   return displayName ? `${displayName} - ${DEFAULT_PAGE_TITLE}` : DEFAULT_PAGE_TITLE;
 };
-
-//----------------- COMPONENT BUILD IDENTITY ------------
-
-/** About and diagnostics allow only version metadata; unexpected response content is discarded. */
-export function safeBuildIdentity(value: unknown): ComponentBuildIdentity {
-  const data = value && typeof value === 'object' ? value as Record<string, unknown> : {};
-  return {
-    version: typeof data.version === 'string' && /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(data.version) ? data.version : null,
-    commit: typeof data.commit === 'string' && /^[a-f0-9]{40}$/i.test(data.commit) ? data.commit : null,
-    dirty: typeof data.dirty === 'boolean' ? data.dirty : null,
-    builtAt: typeof data.builtAt === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(data.builtAt) ? data.builtAt : null,
-  };
-}

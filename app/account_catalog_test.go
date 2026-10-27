@@ -28,9 +28,8 @@ func TestAccountCheckKeepsConcurrentPluginQuery(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("APPDATA", t.TempDir())
-			previousStore, previousConnection, previousTunnel, previousDefaults := store, apiConnection, tunnel, serviceConfiguration
+			previousStore, previousConnection, previousDefaults := store, apiConnection, serviceConfiguration
 			store = &Store{path: filepath.Join(t.TempDir(), "state.json")}
-			tunnel = nil
 			started, release := make(chan struct{}), make(chan struct{})
 			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
@@ -59,7 +58,7 @@ func TestAccountCheckKeepsConcurrentPluginQuery(t *testing.T) {
 					apiConnection.cancel()
 				}
 				upstream.Close()
-				store, apiConnection, tunnel, serviceConfiguration = previousStore, previousConnection, previousTunnel, previousDefaults
+				store, apiConnection, serviceConfiguration = previousStore, previousConnection, previousDefaults
 			})
 			if err := initializeServerConnection(); err != nil {
 				t.Fatal(err)

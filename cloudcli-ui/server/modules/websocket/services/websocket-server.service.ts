@@ -1,4 +1,5 @@
-import type { Server as HttpServer } from 'node:http';
+import type { IncomingMessage, Server as HttpServer } from 'node:http';
+import type { Duplex } from 'node:stream';
 
 import { WebSocket, WebSocketServer, type VerifyClientCallbackSync } from 'ws';
 
@@ -7,13 +8,14 @@ import { verifyWebSocketClient } from '@/modules/websocket/services/websocket-au
 import { handlePluginWsProxy } from '@/modules/websocket/services/plugin-websocket-proxy.service.js';
 import { handleShellConnection } from '@/modules/websocket/services/shell-websocket.service.js';
 import { handleDesktopNotificationsConnection } from '@/modules/notifications/index.js';
-import type { AuthenticatedWebSocketRequest } from '@/shared/types.js';
+import type { AuthenticatedWebSocketRequest } from '@/shared/index.js';
 
 type WebSocketServerDependencies = {
   verifyClient: Parameters<typeof verifyWebSocketClient>[1];
   chat: Parameters<typeof handleChatConnection>[2];
   shell: Parameters<typeof handleShellConnection>[1];
   getPluginPort: Parameters<typeof handlePluginWsProxy>[2];
+  handlePreviewUpgrade?: (request: IncomingMessage, socket: Duplex, head: Buffer) => boolean;
 };
 
 /**
@@ -85,11 +87,30 @@ export function createWebSocketServer(
   dependencies: WebSocketServerDependencies
 ): WebSocketServer {
   const wss = new WebSocketServer({
-    server,
+    noServer: true,
     verifyClient: ((
       info: Parameters<VerifyClientCallbackSync<AuthenticatedWebSocketRequest>>[0]
     ) => verifyWebSocketClient(info, dependencies.verifyClient)),
   });
+
+  // One upgrade listener owns dispatch. Preview capability URLs authenticate
+  // in their proxy; all remaining routes still pass verifyWebSocketClient.
+  const onUpgrade = (request: IncomingMessage, socket: Duplex, head: Buffer) => {
+    const route = async () => {
+      if (request.url?.startsWith('/api/workspace-runtime/preview/')) {
+        const handlePreview = dependencies.handlePreviewUpgrade
+          ?? (await import('@/modules/workspace-runtime/index.js')).handleWorkspaceRuntimePreviewUpgrade;
+        if (handlePreview(request, socket, head)) return;
+      }
+      wss.handleUpgrade(request, socket, head, ws => wss.emit('connection', ws, request));
+    };
+    void route().catch(error => {
+      console.error('[ERROR] WebSocket upgrade failed:', error);
+      socket.destroy();
+    });
+  };
+  server.on('upgrade', onUpgrade);
+  wss.once('close', () => server.off('upgrade', onUpgrade));
 
   wss.on('connection', (ws, request) => {
     attachWebSocketHeartbeat(ws);
@@ -99,7 +120,7 @@ export function createWebSocketServer(
     const pathname = new URL(url, 'http://localhost').pathname;
 
     if (pathname === '/shell') {
-      handleShellConnection(ws, dependencies.shell);
+      handleShellConnection(ws, dependencies.shell, incomingRequest);
       return;
     }
 

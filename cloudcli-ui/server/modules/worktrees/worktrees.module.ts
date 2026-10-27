@@ -1,7 +1,9 @@
-import { access } from 'node:fs/promises';
+import { access, lstat } from 'node:fs/promises';
+import path from 'node:path';
 
 import { projectsDb } from '@/modules/database/index.js';
-import { isWorkspaceBindingRoot, withWorkspaceMutation } from '@/modules/workspace-bridge/index.js';
+import { withWorkspaceWriteOperation } from '@/modules/workspace-bridge/index.js';
+import { resolveSelectedWorkspace, workspaceSelectionScope } from '@/modules/workspaces/index.js';
 import {
   createProject,
   deleteOrArchiveProject,
@@ -11,16 +13,18 @@ import type {
   WorktreeFileSystem,
   WorktreeProjectGateway,
   WorktreeServices,
-} from '@/shared/types.js';
-import { AppError } from '@/shared/utils.js';
+} from '@/shared/index.js';
+import { AppError } from '@/shared/index.js';
 import { createWorktree } from '@/modules/worktrees/services/worktree-create.service.js';
 import { createAndOpenWorktree } from '@/modules/worktrees/services/worktree-create-and-open.service.js';
-import { listWorktreePorcelainEntries, runGitCommand } from '@/modules/worktrees/services/worktree-git.service.js';
 import { listWorktrees } from '@/modules/worktrees/services/worktree-list.service.js';
 import { mergeWorktree } from '@/modules/worktrees/services/worktree-merge.service.js';
 import { openWorktreeAsProject } from '@/modules/worktrees/services/worktree-open.service.js';
 import { removeWorktree } from '@/modules/worktrees/services/worktree-remove.service.js';
 import { createWorktreesRouter } from '@/modules/worktrees/worktrees.routes.js';
+
+import { listWorktreePorcelainEntries, runGitCommand } from './services/worktree-git.service.js';
+import { createWorktreeManagementServices } from './services/worktree-management.service.js';
 
 /**
  * Real filesystem adapter used only by Worktrees production composition.
@@ -54,38 +58,33 @@ const worktreeProjects: WorktreeProjectGateway = {
   archiveProject: (projectId) => deleteOrArchiveProject(projectId, false),
 };
 
-const remove: WorktreeServices['remove'] = (input) => removeWorktree(input, {
+async function withRepositoryWrite<T>(projectPath: string, operation: () => Promise<T>): Promise<T> {
+  const entries = await listWorktreePorcelainEntries(projectPath, runGitCommand);
+  const repositoryRoot = entries[0]?.path;
+  if (!repositoryRoot) throw new AppError('The main worktree could not be resolved', { code: 'WORKTREE_LIST_EMPTY', statusCode: 409 });
+  // A retained project can be selected in the sidebar while merge writes the
+  // main worktree. Reserve that actual destination, then the selected root.
+  return withWorkspaceWriteOperation(repositoryRoot, () => withWorkspaceWriteOperation(projectPath, async () => {
+    const current = await listWorktreePorcelainEntries(projectPath, runGitCommand);
+    if (current[0]?.path !== repositoryRoot) throw new AppError('The worktree repository changed before admission', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
+    return operation();
+  }));
+}
+
+const remove: WorktreeServices['remove'] = (input) => withRepositoryWrite(input.projectPath, () => withWorkspaceWriteOperation(input.worktreePath, () => removeWorktree(input, {
   runGit: runGitCommand,
   projects: worktreeProjects,
-});
+})));
 
-const create: WorktreeServices['create'] = (input) => createWorktree(input, {
+const create: WorktreeServices['create'] = (input) => withRepositoryWrite(input.projectPath, () => createWorktree(input, {
   runGit: runGitCommand,
   fileSystem: worktreeFileSystem,
-});
+}));
 
 const open: WorktreeServices['open'] = (input) => openWorktreeAsProject(input, {
   runGit: runGitCommand,
   projects: worktreeProjects,
 });
-
-// Git metadata belongs to the main worktree even when the selected project is
-// a linked worktree. A merge/removal must also reserve its source directory.
-async function mutateWorktree<T>(input: { projectPath: string; worktreePath?: string }, operation: () => Promise<T>, removesSource = false): Promise<T> {
-  const entries = await listWorktreePorcelainEntries(input.projectPath, runGitCommand);
-  const roots = [entries[0].path, input.projectPath, ...(input.worktreePath ? [input.worktreePath] : [])];
-  return withWorkspaceMutation(roots, () => {
-    // Removing an independently synchronized root would destroy its capability
-    // before handback. Unbind it explicitly; ordinary linked worktrees keep the
-    // existing removal path, and a merge without removal remains available.
-    if (removesSource && input.worktreePath && isWorkspaceBindingRoot(input.worktreePath)) {
-      throw new AppError('此 worktree 仍有独立工作区绑定，请先解除绑定再删除；也可以仅合并并保留 worktree。', {
-        code: 'WORKTREE_BINDING_ACTIVE', statusCode: 409,
-      });
-    }
-    return operation();
-  });
-}
 
 /**
  * Production Worktrees application-service surface.
@@ -95,32 +94,32 @@ async function mutateWorktree<T>(input: { projectPath: string; worktreePath?: st
  */
 const worktreeServices: WorktreeServices = {
   resolveProjectPath(projectId) {
-    const projectPath = worktreeProjects.getProjectPathById(projectId);
-    if (!projectPath) {
-      throw new AppError(`Unable to resolve project path for "${projectId}"`, {
-        code: 'PROJECT_NOT_FOUND',
-        statusCode: 404,
+    const descriptor = resolveSelectedWorkspace(projectId);
+    if (descriptor.sourceMode === 'ssh') throw new AppError('SSH 本地项目暂不支持会话 worktree 管理。', { code: 'SSH_WORKSPACE_UNSUPPORTED', statusCode: 409 });
+    if (descriptor.kind !== 'cloudReplica') {
+      throw new AppError('Worktree management requires the project replica; integrate session changes through the workspace API', {
+        code: 'WORKSPACE_REPLICA_REQUIRED',
+        statusCode: 409,
       });
     }
-
-    return projectPath;
+    return descriptor.rootPath;
   },
   list: (input) => listWorktrees(input, {
     runGit: runGitCommand,
     getProjectByPath: worktreeProjects.getProjectByPath,
   }),
-  create: (input) => mutateWorktree(input, () => create(input)),
-  createAndOpen: (input) => mutateWorktree(input, () => createAndOpenWorktree(input, {
+  create,
+  createAndOpen: (input) => createAndOpenWorktree(input, {
     createWorktree: create,
     openWorktree: open,
     removeWorktree: remove,
-  })),
+  }),
   open,
-  merge: (input) => mutateWorktree(input, () => mergeWorktree(input, {
+  merge: (input) => withRepositoryWrite(input.projectPath, () => withWorkspaceWriteOperation(input.worktreePath, () => mergeWorktree(input, {
     runGit: runGitCommand,
     removeWorktree: remove,
-  }), Boolean(input.removeAfterMerge)),
-  remove: (input) => mutateWorktree(input, () => remove(input), true),
+  }))),
+  remove,
 };
 
 /**
@@ -129,4 +128,14 @@ const worktreeServices: WorktreeServices = {
  * It is assembled here so other modules consume only the Worktrees barrel and
  * cannot depend on route or service implementation files.
  */
-export const worktreesRoutes = createWorktreesRouter(worktreeServices);
+export const worktreesRoutes = createWorktreesRouter(createWorktreeManagementServices(worktreeServices, async rootPath => {
+  try {
+    // Presence is sufficient, including damaged metadata and dangling symlinks:
+    // an ordinary worktree route cannot authorize recovery of a private root.
+    await lstat(path.join(rootPath, '.chisa-session.json'));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}), workspaceSelectionScope);

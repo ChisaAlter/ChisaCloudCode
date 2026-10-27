@@ -23,7 +23,7 @@ BrandingText " "
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_ID}"
 
 Var CheckedPath
-Var PreviousMutagenDirectory
+
 
 ; Request write access without writing, truncating, or deleting the existing file.
 ; Run every probe before creating directories or extracting any payload.
@@ -42,42 +42,6 @@ blocked:
 writable:
 FunctionEnd
 
-; Closing the app leaves its Mutagen daemon resident. Stop only this app's
-; dedicated daemon, only when the installed engine is actually in use.
-Function ${PREFIX}StopResidentSync
-  IfFileExists "$INSTDIR\mutagen.exe" 0 stopped
-  System::Call 'kernel32::CreateFileW(w "$INSTDIR\mutagen.exe", i 0x40000000, i 7, p 0, i 3, i 0x80, p 0) p .r0'
-  IntCmp $0 -1 stop_daemon
-  System::Call 'kernel32::CloseHandle(p r0)'
-  Return
-stop_daemon:
-  ReadEnvStr $PreviousMutagenDirectory "MUTAGEN_DATA_DIRECTORY"
-  System::Call 'kernel32::SetEnvironmentVariableW(w "MUTAGEN_DATA_DIRECTORY", w "$APPDATA\ChisaCloudCode\mutagen")'
-  nsExec::ExecToStack /TIMEOUT=15000 '"$INSTDIR\mutagen.exe" daemon stop'
-  Pop $0
-  Pop $1
-  System::Call 'kernel32::SetEnvironmentVariableW(w "MUTAGEN_DATA_DIRECTORY", w "$PreviousMutagenDirectory")'
-  StrCmp $0 "0" wait_for_exit sync_stop_failed
-wait_for_exit:
-  ; The daemon may acknowledge termination before Windows releases its image.
-  StrCpy $2 50
-check_exit:
-  System::Call 'kernel32::CreateFileW(w "$INSTDIR\mutagen.exe", i 0x40000000, i 7, p 0, i 3, i 0x80, p 0) p .r0'
-  IntCmp $0 -1 still_running
-  System::Call 'kernel32::CloseHandle(p r0)'
-  Return
-still_running:
-  IntOp $2 $2 - 1
-  IntCmp $2 0 sync_stop_failed
-  Sleep 100
-  Goto check_exit
-sync_stop_failed:
-  SetErrorLevel 32
-  IfSilent +2
-  MessageBox MB_ICONSTOP|MB_OK "${ACTION}尚未开始。后台文件同步尚未退出，请稍后重新${ACTION}；若仍失败，请联系维护者。项目文件和同步记录均未删除。"
-  Quit
-stopped:
-FunctionEnd
 !macroend
 
 !insertmacro DefineFileGuards "" "安装"
@@ -88,10 +52,10 @@ Function .onInstFailed
 FunctionEnd
 
 Section
-  ; Refuse an open application before stopping any background work.
+  ; Refuse an open application before modifying installed payload.
   StrCpy $CheckedPath "$INSTDIR\${PRODUCT_NAME}.exe"
   Call RequireWritableFile
-  Call StopResidentSync
+
   !include "${PREFLIGHT_INCLUDE}"
   StrCpy $CheckedPath "$INSTDIR\Uninstall.exe"
   Call RequireWritableFile
@@ -131,7 +95,7 @@ FunctionEnd
 Section "Uninstall"
   StrCpy $CheckedPath "$INSTDIR\${PRODUCT_NAME}.exe"
   Call un.RequireWritableFile
-  Call un.StopResidentSync
+
   !include "${UNINSTALL_PREFLIGHT_INCLUDE}"
   ClearErrors
   !include "${UNINSTALL_INCLUDE}"

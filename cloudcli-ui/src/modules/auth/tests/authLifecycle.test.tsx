@@ -35,7 +35,7 @@ beforeEach(() => {
   requests.user.mockImplementation(() => Promise.resolve(json({ user: { id: 1, username: 'demo-user' } })));
   requests.onboardingStatus.mockImplementation(() => Promise.resolve(json({ hasCompletedOnboarding: true })));
 });
-afterEach(() => cleanup());
+afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 test('JWT rotation retains the workspace and unsaved input while its account check waits', async () => {
   await mount();
@@ -73,6 +73,31 @@ test('logout rejects a late profile save and a late auth check without reviving 
   assert.equal(auth.isLoading, false);
   assert.equal(localStorage.getItem('auth-token'), null);
   assert.ok(screen.getByText('signed out'));
+});
+
+test('offline startup retains the stored session and online automatically restores it', async () => {
+  requests.user.mockRejectedValueOnce(new TypeError('offline'));
+  render(<AuthProvider><AccountProbe /><ProtectedRoute><WorkspaceProbe /></ProtectedRoute></AuthProvider>);
+  await waitFor(() => assert.equal(auth.isLoading, false));
+  assert.equal(auth.user, null);
+  assert.equal(auth.token, 'initial.payload.signature');
+  assert.ok(auth.error?.includes('保留登录状态'));
+  await act(async () => { window.dispatchEvent(new Event('online')); });
+  await waitFor(() => assert.equal(auth.user?.id, 1));
+  assert.ok(screen.getByLabelText('workspace buffer'));
+  assert.equal(requests.login.mock.calls.length, 0);
+});
+
+test('logout invalidates scheduled connectivity retries and late responses', async () => {
+  requests.user.mockResolvedValueOnce(new Response('offline', { status: 503 }));
+  render(<AuthProvider><AccountProbe /><ProtectedRoute><WorkspaceProbe /></ProtectedRoute></AuthProvider>);
+  await waitFor(() => assert.equal(auth.isLoading, false));
+  act(() => auth.logout());
+  const count = requests.user.mock.calls.length;
+  await act(async () => { window.dispatchEvent(new Event('online')); window.dispatchEvent(new Event('focus')); });
+  assert.equal(requests.user.mock.calls.length, count);
+  assert.equal(auth.user, null);
+  assert.equal(auth.token, null);
 });
 
 test('an initial 502 preserves the stored session and manual account refresh can recover it', async () => {

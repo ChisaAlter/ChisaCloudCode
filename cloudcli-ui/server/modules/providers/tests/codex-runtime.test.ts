@@ -1,58 +1,69 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { Codex } from '@openai/codex-sdk';
-import type { Thread, ThreadOptions } from '@openai/codex-sdk';
-
-import { codexRuntime } from '@/modules/providers/list/codex/codex-runtime.provider.js';
-import type { ProviderRuntimeContext } from '@/shared/index.js';
+import { createCodexRuntime } from '@/modules/providers/list/codex/codex-runtime.provider.js';
+import type { ProviderProcessJob, ProviderRuntimeContext } from '@/shared/index.js';
 
 for (const resumed of [false, true]) {
-  for (const permissionMode of [undefined, 'default', 'unknown', 'acceptEdits', 'bypassPermissions']) {
-    test(`Codex ${resumed ? 'resumes' : 'starts'} with supported permissions (${permissionMode ?? 'omitted'})`, async (t) => {
-      let capturedOptions: ThreadOptions | undefined;
-      let capturedPrompt: unknown;
-      const messages: unknown[] = [];
-      const thread = {
-        id: 'native-thread',
-        async runStreamed(prompt: unknown) {
-          capturedPrompt = prompt;
-          return { events: (async function* () {
-            yield { type: 'thread.started', thread_id: 'native-thread' };
-          })() };
-        },
-      } as unknown as Thread;
-
-      const start = t.mock.method(Codex.prototype, 'startThread', (options?: ThreadOptions) => {
-        capturedOptions = options;
-        return thread;
-      });
-      const resume = t.mock.method(Codex.prototype, 'resumeThread', (id: string, options?: ThreadOptions) => {
-        assert.equal(id, 'native-thread');
-        capturedOptions = options;
-        return thread;
+  for (const permissionMode of [undefined, 'default', 'unknown', 'acceptEdits', 'bypassPermissions', 'plan']) {
+    test(`Codex ${resumed ? 'resumes' : 'starts'} with supported permissions (${permissionMode ?? 'omitted'})`, async () => {
+      let job: ProviderProcessJob | undefined;
+      const messages: any[] = [];
+      const runtime = createCodexRuntime(async (input, handlers) => {
+        job = input;
+        handlers.event?.({ type: 'thread.started', thread_id: 'native-thread' });
+        handlers.event?.({ type: 'turn.completed', usage: { input_tokens: 4, output_tokens: 2 } });
+        assert.equal(messages.some((message) => message.kind === 'complete'), false, 'stream completion must not finish a live process');
+        return { code: 0 };
       });
       const context: ProviderRuntimeContext = {
         resolveProviderSessionId: () => resumed ? 'native-thread' : null,
         resolveResumeModel: async () => 'test-model',
         getProviderModels: async () => ({ OPTIONS: [], DEFAULT: 'test-model' }),
-        normalizeMessage: () => [],
+        normalizeMessage: (event: any) => event.type === 'turn_complete' ? [{ kind: 'complete' } as any] : [],
         isProviderInstalled: async () => true,
       };
-
-      await codexRuntime.run('hey there', {
-        sessionId: resumed ? 'app-session' : undefined,
-        permissionMode,
-        cwd: process.cwd(),
-      }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, context);
-
-      assert.equal(start.mock.callCount(), resumed ? 0 : 1);
-      assert.equal(resume.mock.callCount(), resumed ? 1 : 0);
-      assert.equal(capturedPrompt, 'hey there');
-      assert.equal(capturedOptions?.sandboxMode, permissionMode === 'bypassPermissions' ? 'danger-full-access' : 'workspace-write');
-      assert.equal(capturedOptions?.approvalPolicy, permissionMode === 'acceptEdits' || permissionMode === 'bypassPermissions' ? 'never' : 'on-request');
-      assert.ok(messages.some((message: any) => message.kind === 'complete' && message.exitCode === 0));
-      assert.ok(!messages.some((message: any) => message.kind === 'error'));
+      await runtime.run('hey there', { sessionId: `app-${resumed}-${permissionMode}`, permissionMode, cwd: process.cwd() }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, context);
+      assert.equal(job?.kind, 'codex');
+      if (job?.kind !== 'codex') throw new Error('missing Codex job');
+      assert.equal(job.providerSessionId, resumed ? 'native-thread' : null);
+      assert.equal(job.input, 'hey there');
+      assert.equal(job.threadOptions.sandboxMode, permissionMode === 'plan' ? 'read-only' : permissionMode === 'bypassPermissions' ? 'danger-full-access' : 'workspace-write');
+      assert.equal(job.threadOptions.approvalPolicy, ['acceptEdits', 'bypassPermissions', 'plan'].includes(permissionMode || '') ? 'never' : 'on-request');
+      assert.equal(messages.filter((message) => message.kind === 'complete').length, 1);
+      assert.equal(messages.find((message) => message.kind === 'complete')?.exitCode, 0);
     });
   }
 }
+
+test('Codex abort waits for process teardown and propagates an unconfirmed teardown', async () => {
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  let finish!: () => void;
+  const teardown = new Promise<void>((resolve) => { finish = resolve; });
+  const runtime = createCodexRuntime(async (_job, _handlers, signal) => {
+    entered();
+    await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
+    await teardown;
+    throw Object.assign(new Error('tool still alive'), { processTeardownError: true });
+  });
+  const context: ProviderRuntimeContext = {
+    resolveProviderSessionId: () => null,
+    resolveResumeModel: async () => 'model',
+    getProviderModels: async () => ({ OPTIONS: [], DEFAULT: 'model' }),
+    normalizeMessage: () => [], isProviderInstalled: async () => true,
+  };
+  const messages: unknown[] = [];
+  const running = runtime.run('fixture', { sessionId: 'abort-test' }, { isWebSocketWriter: true, send: (message) => messages.push(message) }, context);
+  void running.catch(() => {});
+  await started;
+  let aborted = false;
+  const aborting = runtime.abort('abort-test').finally(() => { aborted = true; });
+  void aborting.catch(() => {});
+  await Promise.resolve();
+  assert.equal(aborted, false);
+  finish();
+  await assert.rejects(running, /tool still alive/);
+  await assert.rejects(aborting, /tool still alive/);
+  assert.deepEqual(messages, []);
+});

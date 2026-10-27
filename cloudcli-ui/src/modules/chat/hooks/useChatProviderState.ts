@@ -8,6 +8,7 @@ import type { PendingPermissionRequest, PermissionMode,
   CustomProviderModelInput,
   ProviderModelActions,
   ProviderModelOption,
+  ProjectDefaultSettings,
   ServerEvent,
   ProviderModelsDefinition } from '@/shared/types';
 import { DEFAULT_EFFORT_VALUE } from '@/shared/constants';
@@ -122,21 +123,24 @@ type SessionProviderSelection = {
   model: string | null;
   resolvedModel?: string | null;
   effort: string | null;
-  status: 'loading' | 'ready' | 'error';
-  error?: string;
 };
 
 const getSessionSelectionKey = (provider: LLMProvider, sessionId: string): string => (
   `${provider}:${sessionId}`
 );
 
-export function useChatProviderState({ selectedSession, selectedProject: _selectedProject, subscribe }: UseChatProviderStateArgs) {
+export function useChatProviderState({ selectedSession, selectedProject, subscribe }: UseChatProviderStateArgs) {
+  const sshProject = selectedProject?.sourceMode === 'ssh';
   const [permissionMode, setPermissionMode] = useState<PermissionMode>('default');
   const [pendingPermissionRequests, setPendingPermissionRequests] = useState<PendingPermissionRequest[]>([]);
   // The provider the composer sends under. Held here rather than read from
   // storage per render because switching it has to reset the model menu, the
   // permission mode and the session in one commit.
-  const [provider, setProvider] = useState<LLMProvider>(readSelectedProvider);
+  const [preferredProvider, setPreferredProvider] = useState<LLMProvider>(readSelectedProvider);
+  const provider: LLMProvider = sshProject ? 'claude' : preferredProvider;
+  const setProvider = useCallback((next: LLMProvider) => {
+    if (!sshProject || next === 'claude') setPreferredProvider(next);
+  }, [sshProject]);
   // Every provider's chosen model, not just the active one: switching provider
   // must restore the model that provider was last used with, and the catalogue
   // that validates them arrives asynchronously per provider.
@@ -153,6 +157,19 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
       return acc;
     }, {});
   });
+  // Explicit defaults the selected project applies to a brand-new session.
+  // They are read here rather than copied into the account-level provider
+  // model/effort stores, so switching projects cannot leak one project's
+  // defaults into another.
+  const [projectDefaults, setProjectDefaults] = useState<ProjectDefaultSettings | null>(null);
+  // A choice made in the composer for the current unsaved session outranks the
+  // project default until that session is created or the project changes.
+  const [newSessionModelOverride, setNewSessionModelOverride] = useState<string | null>(null);
+  const [newSessionEffortOverride, setNewSessionEffortOverride] = useState<string | null>(null);
+  const appliedProjectProviderRef = useRef<string | null>(null);
+  // Once the user chooses a permission mode for this new session, a project
+  // default that resolves later must not overwrite that choice.
+  const permissionModeTouchedRef = useRef(false);
 
   /**
    * Backend-owned capability matrix keyed by provider. Drives the permission
@@ -168,22 +185,15 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
   const [providerModelCatalog, setProviderModelCatalog] = useState<
     Partial<Record<LLMProvider, ProviderModelsDefinition>>
   >({});
-  // One slow provider must not keep the active provider's model menu loading.
-  const [modelCatalogLoading, setModelCatalogLoading] = useState<Partial<Record<LLMProvider, boolean>>>({});
-  // Failed reads retain the previous catalog and expose a retry in the same menu.
-  const [modelCatalogErrors, setModelCatalogErrors] = useState<Partial<Record<LLMProvider, boolean>>>({});
+  const [providerModelsLoading, setProviderModelsLoading] = useState(true);
 
-  const providerModelsRequestIdRef = useRef<Partial<Record<LLMProvider, number>>>({});
-  const modelCatalogControllersRef = useRef<Partial<Record<LLMProvider, AbortController>>>({});
+  const providerModelsRequestIdRef = useRef(0);
   const sessionSelectionLoadRequestIdRef = useRef(0);
   const liveResolvedModelRef = useRef<{ key: string; model: string } | null>(null);
   const sessionModelMutationIdRef = useRef(0);
   const sessionEffortMutationIdRef = useRef(0);
-  const providerModelsRef = useRef(providerModels);
-  providerModelsRef.current = providerModels;
 
   const setStoredProviderModel = useCallback((targetProvider: LLMProvider, model: string) => {
-    providerModelsRef.current = { ...providerModelsRef.current, [targetProvider]: model };
     setProviderModels((previous) => (
       previous[targetProvider] === model
         ? previous
@@ -201,47 +211,52 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     localStorage.setItem(`${targetProvider}-effort`, effort);
   }, []);
 
-  const loadProviderModels = useCallback(async (targetProvider: LLMProvider) => {
-    const requestId = (providerModelsRequestIdRef.current[targetProvider] ?? 0) + 1;
-    providerModelsRequestIdRef.current[targetProvider] = requestId;
-    modelCatalogControllersRef.current[targetProvider]?.abort();
-    const controller = new AbortController();
-    modelCatalogControllersRef.current[targetProvider] = controller;
-    setModelCatalogLoading((current) => ({ ...current, [targetProvider]: true }));
-    setModelCatalogErrors((current) => ({ ...current, [targetProvider]: false }));
-    // Catalog reads must not wait for the native bridge's multi-minute workspace timeout.
-    const timeout = setTimeout(() => controller.abort(), 15_000);
+  const loadProviderModels = useCallback(async () => {
+    const requestId = providerModelsRequestIdRef.current + 1;
+    providerModelsRequestIdRef.current = requestId;
+    setProviderModelsLoading(true);
 
     try {
-      const response = await api.providers.models(targetProvider, { signal: controller.signal });
-      const body = (await response.json()) as ProviderModelsApiResponse;
-      if (!response.ok || !body.success || !body.data?.models) throw new Error('Unable to load model catalog');
-      if (providerModelsRequestIdRef.current[targetProvider] !== requestId) return;
-      setProviderModelCatalog((current) => ({ ...current, [targetProvider]: body.data!.models! }));
+      const results = await Promise.all(
+        PROVIDERS.map(async (p) => {
+          const response = await api.providers.models(p);
+          const body = (await response.json()) as ProviderModelsApiResponse;
+          if (!body.success || !body.data?.models) {
+            return null;
+          }
+
+          return body.data.models;
+        }),
+      );
+
+      if (providerModelsRequestIdRef.current !== requestId) {
+        return;
+      }
+
+      const nextCatalog: Partial<Record<LLMProvider, ProviderModelsDefinition>> = {};
+
+      PROVIDERS.forEach((p, i) => {
+        const entry = results[i];
+        if (!entry) {
+          return;
+        }
+
+        nextCatalog[p] = entry;
+      });
+
+      setProviderModelCatalog(nextCatalog);
     } catch (error) {
-      if (providerModelsRequestIdRef.current[targetProvider] !== requestId) return;
-      setModelCatalogErrors((current) => ({ ...current, [targetProvider]: true }));
-      console.error(`Error loading ${targetProvider} models:`, error);
+      console.error('Error loading provider models:', error);
     } finally {
-      clearTimeout(timeout);
-      if (providerModelsRequestIdRef.current[targetProvider] === requestId) {
-        setModelCatalogLoading((current) => ({ ...current, [targetProvider]: false }));
-        delete modelCatalogControllersRef.current[targetProvider];
+      if (providerModelsRequestIdRef.current === requestId) {
+        setProviderModelsLoading(false);
       }
     }
   }, []);
 
   useEffect(() => {
-    PROVIDERS.forEach((targetProvider) => { void loadProviderModels(targetProvider); });
-    return () => {
-      for (const targetProvider of PROVIDERS) {
-        providerModelsRequestIdRef.current[targetProvider] = (providerModelsRequestIdRef.current[targetProvider] ?? 0) + 1;
-        modelCatalogControllersRef.current[targetProvider]?.abort();
-      }
-    };
+    void loadProviderModels();
   }, [loadProviderModels]);
-
-  const reloadProviderModels = useCallback(() => { void loadProviderModels(provider); }, [loadProviderModels, provider]);
 
   useEffect(() => {
     let cancelled = false;
@@ -421,6 +436,61 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
   }, [providerEfforts, providerModels, reconcileStoredEffort]);
 
   useEffect(() => {
+    const projectId = selectedProject?.projectId;
+    if (!projectId) {
+      setProjectDefaults(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await api.projectSettings(projectId);
+        const body = (await response.json()) as {
+          data?: { settings?: ProjectDefaultSettings };
+        };
+        if (!cancelled) {
+          setProjectDefaults(response.ok ? body.data?.settings ?? null : null);
+        }
+      } catch {
+        if (!cancelled) {
+          setProjectDefaults(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedProject?.projectId]);
+
+  useEffect(() => {
+    setNewSessionModelOverride(null);
+    setNewSessionEffortOverride(null);
+  }, [selectedProject?.projectId, selectedSession?.id]);
+
+  useEffect(() => {
+    // A new chat starts from the project default again, but the session id
+    // appearing after the first send must not discard a mode the user just
+    // picked.
+    permissionModeTouchedRef.current = false;
+  }, [selectedProject?.projectId, selectedSession?.id ? null : 'new']);
+
+  useEffect(() => {
+    if (selectedSession?.id || !selectedProject?.projectId || !projectDefaults?.provider) {
+      return;
+    }
+    const targetProvider = projectDefaults.provider as LLMProvider;
+    if (!PROVIDERS.includes(targetProvider)) {
+      return;
+    }
+    const applicationKey = `${selectedProject.projectId}:${targetProvider}`;
+    if (appliedProjectProviderRef.current === applicationKey) {
+      return;
+    }
+    appliedProjectProviderRef.current = applicationKey;
+    setPreferredProvider(targetProvider);
+  }, [projectDefaults?.provider, selectedProject?.projectId, selectedSession?.id]);
+
+  useEffect(() => {
     const validModes = getPermissionModesForProvider(provider);
     const sessionSavedMode = selectedSession?.id
       ? (localStorage.getItem(`permissionMode-${selectedSession.id}`) as PermissionMode | null)
@@ -430,20 +500,30 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     // mode chosen beforehand would snap back to the default as soon as the
     // session id appears.
     const providerSavedMode = localStorage.getItem(`permissionMode-last-${provider}`) as PermissionMode | null;
-    const savedMode = [sessionSavedMode, providerSavedMode].find(
+    const projectMode = (projectDefaults?.permissionMode ?? null) as PermissionMode | null;
+    // Session choice outranks the project default, which outranks the last
+    // choice made for this provider on this account. A manual composer pick
+    // suppresses the project default until the project or session changes.
+    const savedMode = [sessionSavedMode, permissionModeTouchedRef.current ? null : projectMode, providerSavedMode].find(
       (mode): mode is PermissionMode => Boolean(mode && validModes.includes(mode)),
     );
     setPermissionMode(savedMode ?? getDefaultPermissionModeForProvider(provider));
-  }, [selectedSession?.id, provider, getDefaultPermissionModeForProvider, getPermissionModesForProvider]);
+  }, [
+    selectedSession?.id,
+    provider,
+    projectDefaults?.permissionMode,
+    getDefaultPermissionModeForProvider,
+    getPermissionModesForProvider,
+  ]);
 
   useEffect(() => {
-    if (!selectedSession?.__provider || selectedSession.__provider === provider) {
+    if (sshProject || !selectedSession?.__provider || selectedSession.__provider === provider) {
       return;
     }
 
     setProvider(selectedSession.__provider);
     writeSelectedProvider(selectedSession.__provider);
-  }, [provider, selectedSession]);
+  }, [provider, selectedSession, sshProject, setProvider]);
 
   // Permission prompts belong to a session, not to the transient provider
   // selection that is synchronized after navigation.
@@ -454,6 +534,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
   }, [selectedSession?.id]);
 
   const selectPermissionMode = useCallback((nextMode: PermissionMode) => {
+    permissionModeTouchedRef.current = true;
     setPermissionMode(nextMode);
 
     // Persist per provider as well as per session: a brand-new chat has no
@@ -498,8 +579,6 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
 
   /** Model and reasoning effort recorded for the open session by the backend. */
   const [sessionSelection, setSessionSelection] = useState<SessionProviderSelection | null>(null);
-  // Explicit retries reload only the selected session without replacing its draft.
-  const [sessionSelectionReload, setSessionSelectionReload] = useState(0);
   const selectedSessionId = selectedSession?.id?.trim() || null;
   const selectedSessionProvider = selectedSession?.__provider ?? provider;
   const selectedSessionKey = selectedSessionId
@@ -515,14 +594,6 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     ? sessionSelection
     : null;
   const sessionModel = activeSessionSelection?.model ?? null;
-  const sessionOptionsReady = !selectedSessionKey || activeSessionSelection?.status === 'ready';
-  const sessionOptionsError = activeSessionSelection?.status === 'error'
-    ? activeSessionSelection.error ?? 'Unable to load this session’s model and reasoning effort.'
-    : null;
-  const reloadSessionOptions = useCallback(() => {
-    setSessionSelection((current) => current ? { ...current, status: 'loading', error: undefined } : current);
-    setSessionSelectionReload((revision) => revision + 1);
-  }, []);
 
   useEffect(() => {
     const requestId = sessionSelectionLoadRequestIdRef.current + 1;
@@ -537,14 +608,6 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     let cancelled = false;
     const targetProvider = selectedSessionProvider;
     const targetSessionKey = getSessionSelectionKey(targetProvider, selectedSessionId);
-    setSessionSelection((current) => ({
-      provider: targetProvider,
-      sessionId: selectedSessionId,
-      model: current?.provider === targetProvider && current.sessionId === selectedSessionId ? current.model : null,
-      effort: current?.provider === targetProvider && current.sessionId === selectedSessionId ? current.effort : null,
-      resolvedModel: current?.provider === targetProvider && current.sessionId === selectedSessionId ? current.resolvedModel : null,
-      status: 'loading',
-    }));
 
     const loadSessionSelection = async () => {
       try {
@@ -557,9 +620,6 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
         ) {
           return;
         }
-        if (!response.ok || !body.success || !body.data) {
-          throw new Error('Unable to load this session’s model and reasoning effort.');
-        }
 
         const resolvedModel = body.data?.model?.trim();
         const resolvedEffort = body.data?.effort?.trim() || null;
@@ -571,7 +631,6 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
             ? liveResolvedModelRef.current.model
             : body.success ? body.data?.resolvedModel?.trim() || null : null,
           effort: body.success ? resolvedEffort : null,
-          status: 'ready',
         });
       } catch (error) {
         if (
@@ -580,16 +639,14 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
           && selectedSessionKeyRef.current === targetSessionKey
         ) {
           console.error('Error loading the session model and reasoning effort:', error);
-          setSessionSelection((current) => ({
+          setSessionSelection({
             provider: targetProvider,
             sessionId: selectedSessionId,
-            model: current?.provider === targetProvider && current.sessionId === selectedSessionId ? current.model : null,
+            model: null,
             resolvedModel: liveResolvedModelRef.current?.key === targetSessionKey
               ? liveResolvedModelRef.current.model : null,
-            effort: current?.provider === targetProvider && current.sessionId === selectedSessionId ? current.effort : null,
-            status: 'error',
-            error: error instanceof Error ? error.message : 'Unable to load this session’s model and reasoning effort.',
-          }));
+            effort: null,
+          });
         }
       }
     };
@@ -598,7 +655,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     return () => {
       cancelled = true;
     };
-  }, [selectedSessionId, selectedSessionProvider, sessionSelectionReload]);
+  }, [selectedSessionId, selectedSessionProvider]);
 
   useEffect(() => subscribe?.((event) => {
     if (event.kind !== 'status' || event.text !== 'model_resolved'
@@ -616,10 +673,6 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
       effort: current?.sessionId === selectedSessionId && current.provider === selectedSessionProvider
         ? current.effort : null,
       resolvedModel: event.model as string,
-      status: current?.sessionId === selectedSessionId && current.provider === selectedSessionProvider
-        ? current.status : 'loading',
-      error: current?.sessionId === selectedSessionId && current.provider === selectedSessionProvider
-        ? current.error : undefined,
     }));
   }), [subscribe, selectedSessionId, selectedSessionProvider]);
 
@@ -629,100 +682,95 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
    * Normal model picks also become the default for new chats. HiRoute picks
    * in an existing session stay scoped to that session; reopening it restores
    * the backend's saved choice without changing other chats.
-   * Queue-control restores provide a validity predicate so stale restores cannot change newer selections.
    */
   const selectProviderModel = useCallback(async (
     targetProvider: LLMProvider,
     model: string,
     sessionId?: string | null,
-    isCurrent: () => boolean = () => true,
   ) => {
     const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
-    const targetSessionKey = getSessionSelectionKey(targetProvider, normalizedSessionId);
-    const selection = { scope: normalizedSessionId ? 'session' as const : 'default' as const, model };
-    if (!isCurrent()) return selection;
-    if (normalizedSessionId && selectedSessionKeyRef.current === targetSessionKey
-      && (sessionSelection?.provider !== targetProvider
-      || sessionSelection.sessionId !== normalizedSessionId || sessionSelection.status !== 'ready')) {
-      throw new Error('Wait for this session’s model and reasoning effort to load before changing them.');
+    if (!normalizedSessionId) {
+      setNewSessionModelOverride(model);
     }
     if (!normalizedSessionId || targetProvider !== 'claude' || model !== 'hiroute') {
       setStoredProviderModel(targetProvider, model);
     }
+
     if (!normalizedSessionId) {
       return { scope: 'default' as const, model };
     }
 
     // A pending GET represents the state before this click and must not win
     // if it resolves after the mutation.
-    if (selectedSessionKeyRef.current === targetSessionKey) sessionSelectionLoadRequestIdRef.current += 1;
+    sessionSelectionLoadRequestIdRef.current += 1;
     const mutationId = sessionModelMutationIdRef.current + 1;
     sessionModelMutationIdRef.current = mutationId;
+    const targetSessionKey = getSessionSelectionKey(targetProvider, normalizedSessionId);
 
-    try {
-      const response = await api.providers.setSessionActiveModel(targetProvider, normalizedSessionId, model);
-      if (!isCurrent()) return selection;
-      const body = (await response.json()) as SessionSelectionApiResponse;
-      if (!isCurrent()) return selection;
-      if (!response.ok || !body.success) {
-        throw new Error('Unable to change the active model for this session.');
-      }
+    const response = await api.providers.setSessionActiveModel(
+      targetProvider,
+      normalizedSessionId,
+      model,
+    );
 
-      const storedModel = body.data?.model?.trim() || model;
-      if (
-        sessionModelMutationIdRef.current === mutationId
-        && selectedSessionKeyRef.current === targetSessionKey
-      ) {
-        // A queued-controls restore can be superseded without changing the selected session id.
-        setSessionSelection((current) => isCurrent() && current?.provider === targetProvider && current.sessionId === normalizedSessionId ? {
-          ...current,
-          model: storedModel,
-        } : current);
-      }
-      return { scope: 'session' as const, model: storedModel };
-    } catch (error) {
-      if (!isCurrent()) return selection;
-      throw error;
+    const body = (await response.json()) as SessionSelectionApiResponse;
+    if (!response.ok || !body.success) {
+      throw new Error('Unable to change the active model for this session.');
     }
-  }, [sessionSelection, setStoredProviderModel]);
+
+    const storedModel = body.data?.model?.trim() || model;
+    if (
+      sessionModelMutationIdRef.current === mutationId
+      && selectedSessionKeyRef.current === targetSessionKey
+    ) {
+      setSessionSelection((current) => ({
+        provider: targetProvider,
+        sessionId: normalizedSessionId,
+        model: storedModel,
+        resolvedModel: current?.sessionId === normalizedSessionId && current.provider === targetProvider
+          ? current.resolvedModel : null,
+        effort: current?.provider === targetProvider && current.sessionId === normalizedSessionId
+          ? current.effort
+          : body.data?.effort?.trim() || null,
+      }));
+    }
+    return { scope: 'session' as const, model: storedModel };
+  }, [setStoredProviderModel]);
 
   /**
    * Applies an effort choice optimistically and persists it for the open
    * session. Mutation counters keep slower earlier requests from overwriting
-   * the latest click; a queued restore also checks its caller's editor validity at each state write.
+   * the latest click.
    */
   const selectProviderEffort = useCallback(async (
     targetProvider: LLMProvider,
     effort: string,
     sessionId?: string | null,
-    isCurrent: () => boolean = () => true,
   ) => {
-    const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
-    const targetSessionKey = getSessionSelectionKey(targetProvider, normalizedSessionId);
-    const selection = { scope: normalizedSessionId ? 'session' as const : 'default' as const, effort };
-    if (!isCurrent()) return selection;
-    if (normalizedSessionId && selectedSessionKeyRef.current === targetSessionKey
-      && (sessionSelection?.provider !== targetProvider
-      || sessionSelection.sessionId !== normalizedSessionId || sessionSelection.status !== 'ready')) {
-      throw new Error('Wait for this session’s model and reasoning effort to load before changing them.');
-    }
     setStoredProviderEffort(targetProvider, effort);
+
+    const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
     if (!normalizedSessionId) {
+      setNewSessionEffortOverride(effort);
       return { scope: 'default' as const, effort };
     }
 
-    if (selectedSessionKeyRef.current === targetSessionKey) sessionSelectionLoadRequestIdRef.current += 1;
+    sessionSelectionLoadRequestIdRef.current += 1;
     const mutationId = sessionEffortMutationIdRef.current + 1;
     sessionEffortMutationIdRef.current = mutationId;
+    const targetSessionKey = getSessionSelectionKey(targetProvider, normalizedSessionId);
     const previousSelection = sessionSelection?.provider === targetProvider
       && sessionSelection.sessionId === normalizedSessionId
       ? sessionSelection
       : null;
 
-    setSessionSelection((current) => isCurrent() && current?.provider === targetProvider && current.sessionId === normalizedSessionId ? {
-      ...current,
+    setSessionSelection({
+      provider: targetProvider,
+      sessionId: normalizedSessionId,
+      model: previousSelection?.model ?? null,
+      resolvedModel: previousSelection?.resolvedModel,
       effort,
-    } : current);
+    });
 
     try {
       const response = await api.providers.setSessionActiveEffort(
@@ -730,9 +778,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
         normalizedSessionId,
         effort,
       );
-      if (!isCurrent()) return selection;
       const body = (await response.json()) as SessionSelectionApiResponse;
-      if (!isCurrent()) return selection;
       if (!response.ok || !body.success) {
         throw new Error('Unable to change the reasoning effort for this session.');
       }
@@ -742,24 +788,28 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
         sessionEffortMutationIdRef.current === mutationId
         && selectedSessionKeyRef.current === targetSessionKey
       ) {
-        setSessionSelection((current) => isCurrent() && current?.provider === targetProvider && current.sessionId === normalizedSessionId ? {
-          ...current,
+        setSessionSelection((current) => ({
+          provider: targetProvider,
+          sessionId: normalizedSessionId,
+          model: current?.provider === targetProvider && current.sessionId === normalizedSessionId
+            ? current.model
+            : previousSelection?.model ?? null,
+          resolvedModel: current?.resolvedModel,
           effort: storedEffort,
-        } : current);
+        }));
       }
 
       return { scope: 'session' as const, effort: storedEffort };
     } catch (error) {
-      if (!isCurrent()) return selection;
       if (
         sessionEffortMutationIdRef.current === mutationId
         && selectedSessionKeyRef.current === targetSessionKey
       ) {
         setSessionSelection((current) => (
-          isCurrent() && current?.provider === targetProvider
+          current?.provider === targetProvider
           && current.sessionId === normalizedSessionId
           && current.effort === effort
-            ? { ...current, effort: previousSelection?.effort ?? null }
+            ? previousSelection
             : current
         ));
       }
@@ -768,19 +818,36 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
   }, [sessionSelection, setStoredProviderEffort]);
 
   // The open session's model wins over the per-provider default, so switching
-  // sessions shows (and sends) what each session actually runs with.
-  const currentProviderModel = sessionModel ?? providerModels[provider];
+  // sessions shows (and sends) what each session actually runs with. A new
+  // chat uses a composer override first, then the selected project's default.
+  const projectDefaultAppliesToProvider = !projectDefaults?.provider || projectDefaults.provider === provider;
+  const newSessionProjectModel = selectedSession
+    ? null
+    : newSessionModelOverride ?? (projectDefaultAppliesToProvider ? projectDefaults?.model ?? null : null);
+  const currentProviderModel = sessionModel ?? newSessionProjectModel ?? providerModels[provider];
   const currentProviderEffortOptions = useMemo(() => {
     return getEffortOptionsForModel(provider, currentProviderModel);
   }, [currentProviderModel, getEffortOptionsForModel, provider]);
+  const newSessionProjectEffort = selectedSession
+    ? null
+    : newSessionEffortOverride ?? (projectDefaultAppliesToProvider ? projectDefaults?.effort ?? null : null);
   const currentProviderEffort = useMemo(() => {
     return reconcileStoredEffort(
       provider,
       currentProviderModel,
-      activeSessionSelection ? activeSessionSelection.effort ?? DEFAULT_EFFORT_VALUE
-        : providerEfforts[provider] ?? DEFAULT_EFFORT_VALUE,
+      activeSessionSelection?.effort
+        ?? newSessionProjectEffort
+        ?? providerEfforts[provider]
+        ?? DEFAULT_EFFORT_VALUE,
     );
-  }, [activeSessionSelection, currentProviderModel, provider, providerEfforts, reconcileStoredEffort]);
+  }, [
+    activeSessionSelection?.effort,
+    currentProviderModel,
+    newSessionProjectEffort,
+    provider,
+    providerEfforts,
+    reconcileStoredEffort,
+  ]);
   const currentProviderModelOptions = useMemo(
     () => providerModelCatalog[provider]?.OPTIONS ?? [],
     [provider, providerModelCatalog],
@@ -827,26 +894,26 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     if (!existing.recordId) {
       throw new Error('This model cannot be edited.');
     }
-    const targetSessionKey = selectedSessionKeyRef.current;
 
     const response = await api.providers.updateModel(targetProvider, existing.recordId, input);
     const result = await readModelMutationResponse(response);
     applyProviderCatalog(targetProvider, result.models);
 
-    if (providerModelsRef.current[targetProvider] === existing.value) {
+    if (providerModels[targetProvider] === existing.value) {
       setStoredProviderModel(targetProvider, result.model.value);
     }
-    if (selectedSessionKeyRef.current === targetSessionKey) {
-      setSessionSelection((current) => current?.provider === targetProvider
-        && getSessionSelectionKey(current.provider, current.sessionId) === targetSessionKey
-        && current.model === existing.value ? {
+    if (provider === targetProvider && sessionModel === existing.value) {
+      setSessionSelection((current) => current ? {
         ...current,
         model: result.model.value,
       } : current);
     }
   }, [
     applyProviderCatalog,
+    provider,
+    providerModels,
     readModelMutationResponse,
+    sessionModel,
     setStoredProviderModel,
   ]);
 
@@ -857,26 +924,26 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     if (!existing.recordId) {
       throw new Error('This model cannot be deleted.');
     }
-    const targetSessionKey = selectedSessionKeyRef.current;
 
     const response = await api.providers.deleteModel(targetProvider, existing.recordId);
     const result = await readModelMutationResponse(response);
     applyProviderCatalog(targetProvider, result.models);
 
-    if (providerModelsRef.current[targetProvider] === existing.value) {
+    if (providerModels[targetProvider] === existing.value) {
       setStoredProviderModel(targetProvider, result.models.DEFAULT);
     }
-    if (selectedSessionKeyRef.current === targetSessionKey) {
-      setSessionSelection((current) => current?.provider === targetProvider
-        && getSessionSelectionKey(current.provider, current.sessionId) === targetSessionKey
-        && current.model === existing.value ? {
+    if (provider === targetProvider && sessionModel === existing.value) {
+      setSessionSelection((current) => current ? {
         ...current,
         model: result.models.DEFAULT,
       } : current);
     }
   }, [
     applyProviderCatalog,
+    provider,
+    providerModels,
     readModelMutationResponse,
+    sessionModel,
     setStoredProviderModel,
   ]);
 
@@ -894,9 +961,6 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     currentProviderEffort,
     currentProviderEffortOptions,
     currentProviderModel,
-    sessionOptionsReady,
-    sessionOptionsError,
-    reloadSessionOptions,
     currentResolvedModel: activeSessionSelection?.resolvedModel ?? null,
     currentProviderModelOptions,
     permissionMode,
@@ -905,10 +969,8 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
     availablePermissionModes,
     selectPermissionMode,
     cyclePermissionMode,
-    providerModelCatalog,
-    providerModelsLoading: modelCatalogLoading[provider] ?? true,
-    providerModelsError: modelCatalogErrors[provider] ?? false,
-    reloadProviderModels,
+    providerModelCatalog: sshProject ? { claude: providerModelCatalog.claude } : providerModelCatalog,
+    providerModelsLoading,
     providerModelActions,
     selectProviderModel,
     selectProviderEffort,

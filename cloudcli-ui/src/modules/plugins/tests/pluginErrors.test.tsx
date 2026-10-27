@@ -10,8 +10,8 @@ import { api } from '@/shared/api';
 
 const auth = vi.hoisted(() => ({ user: { id: 1 } as { id: number; username?: string } | null, isLoading: false }));
 vi.mock('@/modules/auth', () => ({ useAuth: () => auth }));
-vi.mock('@/modules/plugins/ClaudeUsagePanel', () => ({
-  ClaudeUsagePanel: function MockClaudeUsagePanel() {
+vi.mock('@/modules/plugins/PluginTabContent', () => ({
+  default: function MockPluginContent() {
     const [count, setCount] = React.useState(0);
     return <button onClick={() => setCount(value => value + 1)}>额度内容计数 {count}</button>;
   },

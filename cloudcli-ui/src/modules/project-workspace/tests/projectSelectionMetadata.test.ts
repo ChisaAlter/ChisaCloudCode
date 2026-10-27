@@ -41,6 +41,15 @@ test('updates workspace metadata without replacing selected-project sessions', (
   assert.equal(result.sessionMeta, selectedProject.sessionMeta);
 });
 
+test('refreshes SSH display metadata while preserving the opaque API path and sessions', () => {
+  const result = mergeProjectSelectionMetadata(selectedProject, { ...selectedProject, sourceMode: 'ssh', displayPath: 'C:\\work\\app', sshConnectionId: 'laptop', connectionLabel: 'Laptop', connectionState: 'online' });
+  assert.equal(result.sourceMode, 'ssh');
+  assert.equal(result.displayPath, 'C:\\work\\app');
+  assert.equal(result.fullPath, selectedProject.fullPath);
+  assert.equal(result.connectionState, 'online');
+  assert.equal(result.sessions, selectedProject.sessions);
+});
+
 test('keeps taskmaster metadata when a realtime project snapshot omits it', () => {
   const result = mergeProjectSelectionMetadata(selectedProject, {
     projectId: selectedProject.projectId,

@@ -64,12 +64,6 @@ test('a switch made elsewhere reaches the panel', () => {
   assert.equal(result.current, 'codex');
 });
 
-test.each(['cursor', 'opencode'])('an unsupported stored %s provider falls back to claude', (provider) => {
-  writeUserPreference('selectedProvider', provider);
-  const { result } = renderHook(() => useSelectedProvider());
-  assert.equal(result.current, 'claude');
-});
-
 test('an unrelated preference change does not change the reported provider', () => {
   writeSelectedProvider('codex');
   const { result } = renderHook(() => useSelectedProvider());
@@ -93,12 +87,12 @@ test('the panel releases its subscription when it unmounts', () => {
   const stopCounting = subscribeToUserPreferences(countLive);
 
   const { unmount } = renderHook(() => useSelectedProvider());
-  writeUserPreference('selectedProvider', 'cursor');
+  writeUserPreference('selectedProvider', 'codex');
   const withPanelMounted = liveSubscribers;
 
   unmount();
   liveSubscribers = 0;
-  writeUserPreference('selectedProvider', 'opencode');
+  writeUserPreference('selectedProvider', 'claude');
 
   stopCounting();
   assert.equal(withPanelMounted, 1, 'the counter itself must be notified once per write');

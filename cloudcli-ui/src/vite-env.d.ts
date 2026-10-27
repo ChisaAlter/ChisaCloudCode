@@ -6,5 +6,3 @@
  * runners such as `tsx` that do not apply Vite's define replacement.
  */
 declare const __APP_VERSION__: string;
-
-declare const __BUILD_IDENTITY__: import('./shared/types').ComponentBuildIdentity;

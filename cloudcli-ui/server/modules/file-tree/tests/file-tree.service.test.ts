@@ -1,22 +1,27 @@
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:http';
 import type { IncomingMessage } from 'node:http';
+import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
-import { Readable } from 'node:stream';
-import test from 'node:test';
+import { PassThrough, Readable } from 'node:stream';
+import test, { mock } from 'node:test';
 import type { TestContext } from 'node:test';
 
 import { createFileTreeService } from '@/modules/file-tree/file-tree.service.js';
-import { bridgeFileSystem } from '@/modules/workspace-bridge/index.js';
-import type {
-  FileTreeDirectoryEntry,
-  FileTreeFileSystem,
-  FileTreeServiceDependencies,
-  FileTreeStats,
-} from '@/shared/types.js';
-import { AppError, WORKSPACES_ROOT } from '@/shared/utils.js';
+// File-tree integration uses a controlled cloud sandbox without restoring accounts.
+mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
+  ensureCloudWorkspaceBinding() {}, excludeCloudWorkspaceMetadata() {}, getWorkspaceRuntimeIdentity() { return undefined; },
+  executeWorkspaceRuntimePreview() { assert.fail('unexpected preview'); },
+} });
+const { bridgeFileSystem } = await import('@/modules/workspace-bridge/index.js');
+import type { FileTreeFileSystem } from '@/shared/index.js';
+type FileTreeDirectoryEntry = ReturnType<FileTreeFileSystem['openDirectory']> extends AsyncIterable<infer Entry> ? Entry : never;
+type FileTreeServiceDependencies = Parameters<typeof createFileTreeService>[0];
+type FileTreeStats = Awaited<ReturnType<FileTreeFileSystem['stat']>>;
+import { AppError, WORKSPACES_ROOT, registerWorkspaceRuntimeNetwork } from '@/shared/index.js';
 
 function createDirectoryEntry(name: string, directory: boolean): FileTreeDirectoryEntry {
   return {
@@ -77,43 +82,29 @@ function createFakeFileSystem(
 async function startWorkspaceControl<T>(
   context: TestContext,
   roots: string[],
-  readBatch: boolean,
-  handle: (request: T, incoming: IncomingMessage) => Response | Promise<Response>,
+  _legacyReadBatch: boolean,
+  handle: (request: T, incoming: Pick<IncomingMessage, 'headers'>) => Response | Promise<Response>,
 ) {
   let fixtureError: unknown;
-  const server = createServer((incoming, outgoing) => {
-    void (async () => {
-      assert.equal(incoming.method, 'POST');
-      assert.equal(incoming.url, '/workspace/rpc');
-      assert.equal(incoming.headers['x-bridge-token'], 'test-token');
-      assert.equal(incoming.headers['x-binding-epoch'], 'test-epoch');
-      const cwd = Buffer.from(String(incoming.headers['x-cwd']), 'latin1').toString('utf8');
-      assert.ok(roots.includes(cwd));
-      const chunks: Buffer[] = [];
-      for await (const chunk of incoming) chunks.push(Buffer.from(chunk));
-      const reply = await handle(JSON.parse(Buffer.concat(chunks).toString('utf8')) as T, incoming);
-      outgoing.writeHead(reply.status, { 'Content-Type': 'application/json' });
-      outgoing.end(Buffer.from(await reply.arrayBuffer()));
-    })().catch(error => {
-      fixtureError = error;
-      outgoing.statusCode = 500;
-      outgoing.end(JSON.stringify({ error: 'HTTP fixture failed' }));
-    });
+  registerWorkspaceRuntimeNetwork(path.resolve(WORKSPACES_ROOT), 'chisa-workspace-network-' + 'f'.repeat(24), 'file-tree-cloud-fixture');
+  const spawning = mock.method(childProcess, 'spawn', (_command: string, args: string[]) => {
+    const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill() {} });
+    if (args[0] !== 'run') { queueMicrotask(() => child.emit('close', 0)); return child as never; }
+    const mount = args[args.indexOf('--volume') + 1]!;
+    const cwd = mount.slice(0, mount.lastIndexOf(':/workspace:'));
+    assert.ok(roots.includes(cwd));
+    let input = '';
+    child.stdin.on('data', chunk => { input += String(chunk); });
+    child.stdin.once('finish', () => { void (async () => {
+      const request = JSON.parse(input) as T;
+      const reply = await handle(request, { headers: { 'x-cwd': Buffer.from(cwd).toString('latin1') } });
+      child.stdout.write(JSON.stringify(await reply.json())); child.emit('close', 0);
+    })().catch(error => { fixtureError = error; child.emit('error', error); child.emit('close', 1); }); });
+    return child as never;
   });
-  context.after(async () => {
-    server.closeAllConnections();
-    if (server.listening) await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-    // Handler assertions must not disappear inside the product's RPC errors.
-    if (fixtureError) throw fixtureError;
-  });
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  assert.ok(address && typeof address !== 'string');
-  const marker = { protocol: 1, port: address.port, token: 'test-token', bindingEpoch: 'test-epoch' };
-  await Promise.all(roots.map(root => writeFile(path.join(root, '.chisa-bridge.json'), JSON.stringify({
-    ...marker, ...(readBatch ? { readBatch: true } : {}),
-  }))));
-  return marker;
+  syncBuiltinESMExports();
+  context.after(() => { spawning.mock.restore(); syncBuiltinESMExports(); if (fixtureError) throw fixtureError; });
+  await Promise.all(roots.map(root => writeFile(path.join(root, '.chisa-bridge.json'), JSON.stringify({ protocol: 3, root, owner: 'cloud-file-tree-fixture', bindingEpoch: 'test-epoch' }))));
 }
 
 test('workspace editor saves use the hash of the loaded snapshot', async () => {
@@ -279,62 +270,28 @@ test('workspace directory listing supplies tree metadata without per-entry lstat
   }]);
 });
 
-test('workspace batches capable same-binding reads and preserves each result independently', async (context) => {
-  const projectRoot = await mkdtemp(path.join(path.resolve(WORKSPACES_ROOT), '.chisa-read-batch-'));
-  context.after(() => {
-    assert.equal(path.dirname(projectRoot), path.resolve(WORKSPACES_ROOT));
-    return rm(projectRoot, { recursive: true, force: true });
-  });
-  const markerPath = path.join(projectRoot, '.chisa-bridge.json');
-  const requests: Array<{ op: string; path?: string; requests?: Array<{ op: string; path: string }> }> = [];
-  const modified = new Date('2026-01-02T03:04:05.000Z');
-  const answer = (request: { path?: string }) => {
-    if (request.path?.endsWith('/missing')) return { ok: false, error: 'No such file', code: 'ENOENT' };
-    if (request.path?.endsWith('/unavailable')) return { ok: false, error: 'Workspace connection unavailable', code: 'WORKSPACE_UNAVAILABLE' };
-    return { ok: true, size: 17, mtime: modified.getTime() / 1000, mode: 0o644, dir: false, symlink: false };
-  };
-  const marker = await startWorkspaceControl<typeof requests[number]>(context, [projectRoot], true, async request => {
+test('cloud snapshot reads preserve each result independently without local callbacks', async (context) => {
+  const projectRoot = await mkdtemp(path.join(path.resolve(WORKSPACES_ROOT), '.chisa-cloud-read-'));
+  context.after(() => { assert.equal(path.dirname(projectRoot), path.resolve(WORKSPACES_ROOT)); return rm(projectRoot, { recursive: true, force: true }); });
+  const requests: Array<{ op: string; path: string }> = [];
+  await startWorkspaceControl<typeof requests[number]>(context, [projectRoot], false, async request => {
     requests.push(request);
-    return Response.json(request.op === 'batch'
-      ? { ok: true, results: request.requests!.map(answer) }
-      : answer(request));
+    if (request.path.endsWith('/missing')) return Response.json({ error: 'No such file', code: 'ENOENT' });
+    if (request.path.endsWith('/unavailable')) return Response.json({ error: 'Workspace unavailable', code: 'WORKSPACE_UNAVAILABLE' });
+    return Response.json({ size: 17, mtime: 1, mode: 0o644, dir: false, symlink: false });
   });
-  const fileSystem = bridgeFileSystem(createFakeFileSystem());
-  const results = await Promise.allSettled([
-    fileSystem.stat(path.join(projectRoot, 'current')),
-    fileSystem.lstat(path.join(projectRoot, 'missing')),
-    fileSystem.stat(path.join(projectRoot, 'unavailable')),
-  ]);
-  assert.deepEqual(requests, [{ op: 'batch', requests: [
-    { op: 'stat', path: '/workspace/current' },
-    { op: 'lstat', path: '/workspace/missing' },
-    { op: 'stat', path: '/workspace/unavailable' },
-  ] }]);
+  const files = bridgeFileSystem(createFakeFileSystem());
+  const results = await Promise.allSettled([files.stat(path.join(projectRoot, 'current')), files.lstat(path.join(projectRoot, 'missing')), files.stat(path.join(projectRoot, 'unavailable'))]);
   assert.equal(results[0]!.status, 'fulfilled');
-  if (results[0]!.status === 'fulfilled') {
-    assert.equal(results[0]!.value.size, 17);
-    assert.equal(results[0]!.value.mtime.toISOString(), modified.toISOString());
-  }
+  if (results[0]!.status === 'fulfilled') assert.equal(results[0]!.value.size, 17);
   assert.equal(results[1]!.status, 'rejected');
   if (results[1]!.status === 'rejected') assert.equal(results[1]!.reason.code, 'ENOENT');
   assert.equal(results[2]!.status, 'rejected');
-  if (results[2]!.status === 'rejected') {
-    assert.ok(results[2]!.reason instanceof AppError);
-    assert.equal(results[2]!.reason.code, 'WORKSPACE_UNAVAILABLE');
-    assert.equal(results[2]!.reason.statusCode, 503);
-  }
-
-  // Already deployed protocol-1 clients without the capability keep separate RPCs.
-  await writeFile(markerPath, JSON.stringify(marker));
-  requests.length = 0;
-  await Promise.all([
-    fileSystem.stat(path.join(projectRoot, 'current')),
-    fileSystem.lstat(path.join(projectRoot, 'another')),
-  ]);
-  assert.deepEqual(requests.map(request => request.op), ['stat', 'lstat']);
+  if (results[2]!.status === 'rejected') assert.equal(results[2]!.reason.code, 'WORKSPACE_UNAVAILABLE');
+  assert.deepEqual(requests.map(request => request.op), ['stat', 'lstat', 'stat']);
 });
 
-test('workspace read batches stay isolated between bindings and contain at most 64 requests', async (context) => {
+test('cloud snapshot reads stay isolated between project bindings', async (context) => {
   const roots = await Promise.all([0, 1].map(() => mkdtemp(path.join(path.resolve(WORKSPACES_ROOT), '.chisa-read-isolation-'))));
   context.after(() => Promise.all(roots.map(root => {
     assert.equal(path.dirname(root), path.resolve(WORKSPACES_ROOT));
@@ -356,13 +313,13 @@ test('workspace read batches stay isolated between bindings and contain at most 
   ]);
   const firstBindingRequests = requests.filter(request => request.cwd === roots[0]);
   const secondBindingRequests = requests.filter(request => request.cwd === roots[1]);
-  assert.deepEqual(firstBindingRequests.map(request => [request.op, request.paths.length]), [['batch', 64], ['stat', 1]]);
-  assert.deepEqual(secondBindingRequests.map(request => [request.op, request.paths.length]), [['batch', 2]]);
-  assert.ok(firstBindingRequests[0]!.paths.every(candidate => candidate.startsWith('/workspace/first-')));
-  assert.deepEqual(secondBindingRequests[0]!.paths, ['/workspace/second-0', '/workspace/second-1']);
+  assert.equal(firstBindingRequests.length, 65);
+  assert.equal(secondBindingRequests.length, 2);
+  assert.ok(firstBindingRequests.every(request => request.op === 'stat' && request.paths.every(candidate => candidate.startsWith('/workspace/first-'))));
+  assert.deepEqual(secondBindingRequests.flatMap(request => request.paths).sort(), ['/workspace/second-0', '/workspace/second-1']);
 });
 
-test('concurrent file-tree traversals keep one read batch in flight and drain all directories', async (context) => {
+test('concurrent cloud file-tree traversals drain all directories and keep metadata', async (context) => {
   const projectRoot = await mkdtemp(path.join(path.resolve(WORKSPACES_ROOT), '.chisa-traversal-flight-'));
   context.after(() => {
     assert.equal(path.dirname(projectRoot), path.resolve(WORKSPACES_ROOT));
@@ -396,7 +353,7 @@ test('concurrent file-tree traversals keep one read batch in flight and drain al
   const fileSystem = bridgeFileSystem(createFakeFileSystem());
   const service = createFileTreeService({ ...createDependencies(fileSystem, projectRoot), fileSystemConcurrency: 64 });
   const trees = await Promise.all([service.listProjectFiles('project-1'), service.listProjectFiles('project-1')]);
-  assert.equal(maximumActiveRequests, 1);
+  assert.ok(maximumActiveRequests <= 128, 'each traversal keeps its configured 64-reader limit');
   assert.equal(listedDirectories, 162);
   for (const tree of trees) {
     assert.equal(tree.length, 80);

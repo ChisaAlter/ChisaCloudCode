@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { api, readApiJson } from '@/shared/api';
+import { api, readApiJson, subscribeToProviderConnectionChanges } from '@/shared/api';
 import { Badge, Button, Input } from '@/shared/ui';
 
 type ModelConnection = { id: string; name: string; baseUrl: string; model: string; hasApiKey: boolean; authType?: 'api_key' | 'auth_token' };
@@ -60,22 +60,44 @@ export function ModelConnectionsSection() {
   const [busy, setBusy] = useState(false);
   // Generic request results and local validation feedback never echo server error payloads.
   const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const mounted = useRef(false);
+  const busyRef = useRef(false);
+  const pendingConnectionRead = useRef(false);
+  const listRequest = useRef<AbortController | null>(null);
+  const requestGeneration = useRef(0);
   const editing = snapshot?.connections.find(connection => connection.id === editingId);
 
   useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; requestGeneration.current += 1; listRequest.current?.abort(); };
+  }, []);
+
+  useEffect(() => {
+    listRequest.current?.abort();
     const controller = new AbortController();
+    listRequest.current = controller;
+    const generation = ++requestGeneration.current;
     void (async () => {
       try {
         const response = await api.providers.connections.list({ signal: controller.signal });
         const { data } = await readApiJson<ConnectionsResponse>(response);
         const next = publicSnapshot(data);
-        if (!controller.signal.aborted) setSnapshot(next);
+        if (mounted.current && !controller.signal.aborted && generation === requestGeneration.current) {
+          setSnapshot(next);
+          setLoadError(false);
+        }
       } catch {
-        if (!controller.signal.aborted) setLoadError(true);
+        if (mounted.current && !controller.signal.aborted && generation === requestGeneration.current) setLoadError(true);
       }
     })();
     return () => controller.abort();
   }, [loadAttempt]);
+
+  useEffect(() => subscribeToProviderConnectionChanges(source => {
+    if (source !== 'accounts') return;
+    if (busyRef.current) pendingConnectionRead.current = true;
+    else setLoadAttempt(attempt => attempt + 1);
+  }), []);
 
   function resetDraft() {
     setEditingId(null);
@@ -83,19 +105,30 @@ export function ModelConnectionsSection() {
   }
 
   async function mutate(request: () => Promise<Response>, resetForm = false) {
-    if (!snapshot || busy) return;
+    if (!snapshot || busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setFeedback(null);
+    listRequest.current?.abort();
+    const generation = ++requestGeneration.current;
     try {
       const { data } = await readApiJson<ConnectionsResponse>(await request());
+      if (!mounted.current || generation !== requestGeneration.current) return;
       setSnapshot(publicSnapshot(data));
       setConfirmDeleteId(null);
       if (resetForm) resetDraft();
       setFeedback({ error: false, message: t('modelConnections.saved', { defaultValue: 'Settings saved. Changes apply to the next Claude turn; the connection has not been tested.' }) });
     } catch {
-      setFeedback({ error: true, message: t('modelConnections.saveFailed', { defaultValue: 'Could not save model connections. Check your settings and try again.' }) });
+      if (mounted.current && generation === requestGeneration.current) setFeedback({ error: true, message: t('modelConnections.saveFailed', { defaultValue: 'Could not save model connections. Check your settings and try again.' }) });
     } finally {
-      setBusy(false);
+      busyRef.current = false;
+      if (mounted.current) {
+        setBusy(false);
+        if (pendingConnectionRead.current) {
+          pendingConnectionRead.current = false;
+          setLoadAttempt(attempt => attempt + 1);
+        }
+      }
     }
   }
 

@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { api } from '@/shared/api';
+import { getAuthSessionVersion } from '@/shared/authToken';
+import { getServerConnectionVersion } from '@/shared/chisa';
+import { useWorkspaceExecutionScope } from '@/shared/context/WorkspaceScopeContext';
 import type { ScheduledMessage } from '@/shared/types';
+import { resolveExecutionWorkspace } from '@/modules/chat/utils/workspaceExecution';
 
 /**
  * The messages queued to be sent to one session later.
@@ -15,6 +19,16 @@ export function useScheduledMessages(sessionId: string | null) {
   // Which session the list on screen belongs to. A fetch that resolves after
   // the user has moved on must not put the old session's banner on the new one.
   const activeSessionRef = useRef(sessionId);
+  const workspace = useWorkspaceExecutionScope();
+  const scopeKey = JSON.stringify([sessionId, workspace === undefined ? 'legacy' : workspace === null ? 'unavailable'
+    : [workspace.projectId, workspace.workspaceId, workspace.generation]]);
+  const scopeRef = useRef({ key: scopeKey, revision: 0 });
+  if (scopeRef.current.key !== scopeKey) scopeRef.current = { key: scopeKey, revision: scopeRef.current.revision + 1 };
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   const refresh = useCallback(async () => {
     // No session means nothing to fetch; the render-time reset below already
@@ -55,24 +69,32 @@ export function useScheduledMessages(sessionId: string | null) {
     options?: Record<string, unknown>;
   }) => {
     if (!sessionId) return false;
+    const revision = scopeRef.current.revision;
+    const authVersion = getAuthSessionVersion();
+    const connectionVersion = getServerConnectionVersion();
+    const current = () => mountedRef.current && scopeRef.current.revision === revision
+      && getAuthSessionVersion() === authVersion && getServerConnectionVersion() === connectionVersion;
 
     try {
+      const selectedWorkspace = await resolveExecutionWorkspace(workspace, workspace?.projectId ?? '', sessionId);
+      if (!current()) return false;
       const response = await api.scheduledMessages.create({
         sessionId,
         content: input.content,
         scheduledFor: input.scheduledFor.toISOString(),
-        options: input.options,
+        options: selectedWorkspace ? { ...input.options, workspace: selectedWorkspace } : input.options,
       });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
+      if (!current()) return false;
       await refresh();
-      return true;
+      return current();
     } catch (error) {
       console.error('Failed to schedule message:', error);
       return false;
     }
-  }, [refresh, sessionId]);
+  }, [refresh, sessionId, workspace]);
 
   const cancel = useCallback(async (id: string) => {
     try {

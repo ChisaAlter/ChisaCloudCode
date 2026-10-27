@@ -1,5 +1,5 @@
 import express from 'express';
-import { workspaceRequestScope } from '@/modules/workspace-bridge/index.js';
+import type { RequestHandler } from 'express';
 
 import type { WorktreeServices } from '@/shared/types.js';
 import { AppError, asyncHandler, createApiSuccessResponse } from '@/shared/utils.js';
@@ -39,9 +39,9 @@ function readRequiredString(value: unknown, name: string): string {
  * Keeping construction explicit lets route tests supply deterministic services
  * and ensures parsing remains the route layer's only responsibility.
  */
-export function createWorktreesRouter(services: WorktreeServices): express.Router {
+export function createWorktreesRouter(services: WorktreeServices, selectionScope?: RequestHandler): express.Router {
   const router = express.Router();
-  router.use(workspaceRequestScope);
+  if (selectionScope) router.use(selectionScope);
 
   router.get(
     '/',

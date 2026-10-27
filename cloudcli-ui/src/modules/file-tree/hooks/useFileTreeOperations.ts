@@ -2,7 +2,7 @@ import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import JSZip from 'jszip';
 
-import { api } from '@/shared/api';
+import { useWorkspaceApi } from '@/shared/context/WorkspaceScopeContext';
 import type { FileTreeNode,Project } from '@/shared/types';
 
 // Invalid filename characters
@@ -65,6 +65,7 @@ export function useFileTreeOperations({
   onRefresh,
   showToast,
 }: UseFileTreeOperationsOptions): UseFileTreeOperationsResult {
+  const api = useWorkspaceApi();
   const { t } = useTranslation();
 
   // State
@@ -143,7 +144,7 @@ export function useFileTreeOperations({
     } finally {
       setOperationLoading(false);
     }
-  }, [renamingItem, renameValue, selectedProject, validateFilename, showToast, t, onRefresh, handleCancelRename]);
+  }, [api, renamingItem, renameValue, selectedProject, validateFilename, showToast, t, onRefresh, handleCancelRename]);
 
   // Delete operations
   const handleStartDelete = useCallback((item: FileTreeNode) => {
@@ -183,7 +184,7 @@ export function useFileTreeOperations({
     } finally {
       setOperationLoading(false);
     }
-  }, [deleteConfirmation, selectedProject, showToast, t, onRefresh, handleCancelDelete]);
+  }, [api, deleteConfirmation, selectedProject, showToast, t, onRefresh, handleCancelDelete]);
 
   // Create operations
   const handleStartCreate = useCallback((parentPath: string, type: 'file' | 'directory') => {
@@ -235,7 +236,7 @@ export function useFileTreeOperations({
     } finally {
       setOperationLoading(false);
     }
-  }, [selectedProject, newItemParent, newItemType, newItemName, validateFilename, showToast, t, onRefresh, handleCancelCreate]);
+  }, [api, selectedProject, newItemParent, newItemType, newItemName, validateFilename, showToast, t, onRefresh, handleCancelCreate]);
 
   // Copy path to clipboard
   const handleCopyPath = useCallback((item: FileTreeNode) => {
@@ -274,7 +275,7 @@ export function useFileTreeOperations({
 
     const blob = await response.blob();
     triggerBrowserDownload(blob, item.name);
-  }, [selectedProject, triggerBrowserDownload]);
+  }, [api, selectedProject, triggerBrowserDownload]);
 
   // Download folder as ZIP
   const downloadFolderAsZip = useCallback(async (folder: FileTreeNode) => {
@@ -315,7 +316,7 @@ export function useFileTreeOperations({
     triggerBrowserDownload(zipBlob, `${folder.name}.zip`);
 
     showToast(t('fileTree.toast.folderDownloaded', 'Folder downloaded as ZIP'), 'success');
-  }, [selectedProject, showToast, t, triggerBrowserDownload]);
+  }, [api, selectedProject, showToast, t, triggerBrowserDownload]);
 
   // Download file or folder. Declared after the two helpers it dispatches to so
   // it does not read them before initialization; both are memoized on

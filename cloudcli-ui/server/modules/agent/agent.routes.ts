@@ -17,6 +17,7 @@ type AgentRouterDependencies = {
   apiKeys: { validateApiKey(apiKey: string): unknown };
   githubTokens: { getActiveGithubToken(userId: number): string | null };
   projects: { createProjectPath(projectPath: string, customName: string | null): unknown };
+  resolveProjectTarget: typeof import('./agent-target.service.js').resolveAgentProjectTarget;
   models: typeof import('../providers/index.js').providerModelsService;
   queryClaude: ProviderRunFunction;
   queryCursor: ProviderRunFunction;
@@ -906,6 +907,20 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
       return res.status(400).json({ error: 'createBranch and createPR require either githubUrl or projectPath with a GitHub remote' });
     }
 
+    // Validate the requested target before clone tokens, filesystem checks or
+    // registration can mistake an SSH history anchor for a local checkout.
+    let requestedTarget = null;
+    try {
+      if (projectPath !== undefined && projectPath !== null && projectPath !== '') {
+        requestedTarget = dependencies.resolveProjectTarget({
+          projectPath, provider, userId: req.user.id,
+          cloneRepository: Boolean(githubUrl), manageGit: createBranch || createPR,
+        });
+      }
+    } catch (error) {
+      return res.status(error.statusCode || 500).json({ success: false, code: error.code, error: error.message });
+    }
+
     let finalProjectPath = null;
     let clonedProjectCreated = false;
     let writer = null;
@@ -917,8 +932,8 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
         const tokenToUse = githubToken || githubTokensDb.getActiveGithubToken(req.user.id);
 
         let targetPath;
-        if (projectPath) {
-          targetPath = projectPath;
+        if (requestedTarget) {
+          targetPath = requestedTarget.projectPath;
         } else {
           // Generate a unique path for cloning
           const repoHash = crypto.createHash('md5').update(githubUrl + Date.now()).digest('hex');
@@ -930,24 +945,29 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
         clonedProjectCreated = clonedProject.created;
       } else {
         // Use existing project path
-        finalProjectPath = normalizeProjectPath(path.resolve(projectPath));
+        finalProjectPath = requestedTarget.projectPath;
 
-        // Verify the path exists
-        try {
-          await fs.access(finalProjectPath);
-        } catch (error) {
-          throw new Error(`Project path does not exist: ${finalProjectPath}`);
+        // SSH anchors hold history; transport admission verifies the real root.
+        if (requestedTarget.sourceMode !== 'ssh') {
+          try {
+            await fs.access(finalProjectPath);
+          } catch (error) {
+            throw new Error(`Project path does not exist: ${finalProjectPath}`);
+          }
         }
       }
 
-      finalProjectPath = normalizeProjectPath(finalProjectPath);
+      if (requestedTarget?.sourceMode !== 'ssh') finalProjectPath = normalizeProjectPath(finalProjectPath);
 
-      // Register project path in DB (or reuse existing active registration)
-      const registrationResult = projectsDb.createProjectPath(finalProjectPath, null);
-      if (registrationResult.outcome === 'active_conflict') {
-        console.log('Project registration already exists for:', finalProjectPath);
-      } else {
-        console.log('Project registered:', registrationResult.project);
+      // SSH projects already have an owner-scoped registration and must never
+      // be re-registered through the legacy cloud path API.
+      if (requestedTarget?.sourceMode !== 'ssh') {
+        const registrationResult = projectsDb.createProjectPath(finalProjectPath, null);
+        if (registrationResult.outcome === 'active_conflict') {
+          console.log('Project registration already exists for:', finalProjectPath);
+        } else {
+          console.log('Project registered:', registrationResult.project);
+        }
       }
 
       // Set up writer based on streaming mode
@@ -978,10 +998,8 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
         });
       }
 
-      const codexModels = await providerModelsService.getProviderModels('codex');
-      const opencodeModels = await providerModelsService.getProviderModels('opencode');
-
-      // Start the appropriate session
+      // Start the appropriate session; catalog lookups belong only to the
+      // provider that needs them, after target authorization.
       if (provider === 'claude') {
         console.log('🤖 Starting Claude SDK session');
 
@@ -1006,6 +1024,7 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
         }, writer);
       } else if (provider === 'codex') {
         console.log('🤖 Starting Codex SDK session');
+        const codexModels = await providerModelsService.getProviderModels('codex');
 
         await queryCodex(message.trim(), {
           projectPath: finalProjectPath,
@@ -1017,6 +1036,7 @@ export function createAgentRouter(dependencies: AgentRouterDependencies): expres
         }, writer);
       } else if (provider === 'opencode') {
         console.log('Starting OpenCode CLI session');
+        const opencodeModels = await providerModelsService.getProviderModels('opencode');
 
         await spawnOpenCode(message.trim(), {
           projectPath: finalProjectPath,

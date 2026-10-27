@@ -19,10 +19,7 @@ type CreateFolderResponse = {
   details?: string;
 };
 
-type CreateProjectPayload = {
-  path: string;
-  customName?: string;
-};
+type CreateProjectPayload = { path: string; customName?: string } | { sourceMode: 'ssh'; connectionId: string; rootPath: string; customName?: string };
 
 type CreateProjectApiError = {
   code?: string;
@@ -138,7 +135,12 @@ export const createProjectRequest = async (payload: CreateProjectPayload) => {
   const data = await parseJson<CreateProjectResponse>(response);
 
   if (!response.ok) {
-    throw new Error(resolveCreateProjectErrorMessage(data) || 'Failed to create project');
+    const message = resolveCreateProjectErrorMessage(data);
+    const code = typeof data.error === 'object' ? data.error?.code : undefined;
+    if ('sourceMode' in payload && response.status === 409 && (code === 'SSH_PROJECT_ALREADY_EXISTS' || /physical directory identity is already registered|project path already exists/i.test(message || ''))) {
+      throw new Error('此目录已在当前账号中登记。请在项目列表打开已有项目；若项目已归档，请先恢复。刷新后重新验证目录也可获取已有项目信息。');
+    }
+    throw new Error(message || 'Failed to create project');
   }
 
   return data.project;

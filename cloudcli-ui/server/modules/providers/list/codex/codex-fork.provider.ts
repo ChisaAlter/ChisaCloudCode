@@ -1,3 +1,5 @@
+import { sessionsDb } from '@/modules/database/index.js';
+import { resolveProviderHome } from '@/modules/providers/services/provider-state.service.js';
 import { codexAppServer } from '@/modules/providers/list/codex/codex-app-server.client.js';
 import type { IProviderFork } from '@/shared/interfaces.js';
 
@@ -26,10 +28,13 @@ export class CodexForkProvider implements IProviderFork {
     // `title` is deliberately not forwarded. The sidebar name lives in this
     // app's own session row, and naming the thread inside Codex would mean a
     // second call that could fail after the fork already succeeded.
+    const source = sessionsDb.getSessionByProviderSessionId(input.providerSessionId) ?? sessionsDb.getSessionById(input.providerSessionId);
+    const profileHome = source?.provider_profile_path ? resolveProviderHome('codex', source.session_id, source.provider_profile_path) : undefined;
     const fork = await codexAppServer.forkThread({
       threadId: input.providerSessionId,
       lastTurnId: input.upToAnchorId,
       cwd: input.projectPath,
+      ...(profileHome ? { profileHome } : {}),
     });
 
     // The path is the one the server reported and already confirmed on disk,

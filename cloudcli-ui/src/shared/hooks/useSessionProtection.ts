@@ -22,8 +22,6 @@ const sessionActivityMapsMatch = (
       || leftActivity.statusText !== rightActivity.statusText
       || leftActivity.canInterrupt !== rightActivity.canInterrupt
       || leftActivity.startedAt !== rightActivity.startedAt
-      || leftActivity.runId !== rightActivity.runId
-      || leftActivity.modelStopped !== rightActivity.modelStopped
     ) {
       return false;
     }
@@ -46,39 +44,26 @@ export function useSessionProtection() {
   );
   const processingSessionsRef = useRef<SessionActivityMap>(processingSessions);
   processingSessionsRef.current = processingSessions;
-  // HTTP snapshots requested before any newer local/socket activity cannot replace it.
-  const activityRevisionRef = useRef(0);
-  const getActivityRevision = useCallback(() => activityRevisionRef.current, []);
 
   const markSessionProcessing = useCallback<MarkSessionProcessing>((sessionId, activity) => {
     if (!sessionId) {
       return;
     }
-    activityRevisionRef.current += 1;
 
     setProcessingSessions((prev) => {
       const existing = prev.get(sessionId);
-      const newRun = Boolean(existing && activity?.runId && existing.runId !== activity.runId);
-      const statusText = activity?.statusText !== undefined ? activity.statusText : newRun ? null : existing?.statusText ?? null;
-      // Process exit is monotonic within a run, even when an older subscribe/poll reply arrives late.
-      const modelStopped = newRun ? activity?.modelStopped ?? false
-        : existing?.modelStopped === true || activity?.modelStopped === true;
+      const statusText = activity?.statusText !== undefined ? activity.statusText : existing?.statusText ?? null;
       const next: SessionActivity = {
         statusText,
-        runId: activity?.runId ?? existing?.runId,
-        modelStopped,
         // File handback must finish before the run becomes idle; another abort cannot cancel it.
-        canInterrupt: !modelStopped && statusText !== 'workspace_finalizing'
-          && (activity?.canInterrupt ?? (newRun ? true : existing?.canInterrupt ?? true)),
-        startedAt: newRun ? Date.now() : existing?.startedAt ?? Date.now(),
+        canInterrupt: statusText !== 'workspace_finalizing' && (activity?.canInterrupt ?? existing?.canInterrupt ?? true),
+        startedAt: existing?.startedAt ?? Date.now(),
       };
 
       if (
         existing
         && existing.statusText === next.statusText
         && existing.canInterrupt === next.canInterrupt
-        && existing.runId === next.runId
-        && existing.modelStopped === next.modelStopped
       ) {
         return prev;
       }
@@ -93,14 +78,10 @@ export function useSessionProtection() {
     if (!sessionId) {
       return;
     }
-    activityRevisionRef.current += 1;
 
     setProcessingSessions((prev) => {
       const existing = prev.get(sessionId);
       if (!existing) {
-        return prev;
-      }
-      if (opts?.runId && existing.runId && opts.runId !== existing.runId) {
         return prev;
       }
 
@@ -138,17 +119,11 @@ export function useSessionProtection() {
             ? snapshot.startedAt
             : undefined;
 
-        const newRun = Boolean(existing && snapshot.runId && existing.runId !== snapshot.runId);
-        const statusText = snapshot.statusText !== undefined ? snapshot.statusText : newRun ? null : existing?.statusText ?? null;
-        const modelStopped = newRun ? snapshot.modelStopped ?? false
-          : existing?.modelStopped === true || snapshot.modelStopped === true;
+        const statusText = snapshot.statusText !== undefined ? snapshot.statusText : existing?.statusText ?? null;
         updated.set(sessionId, {
           statusText,
-          runId: snapshot.runId ?? existing?.runId,
-          modelStopped,
-          canInterrupt: !modelStopped && statusText !== 'workspace_finalizing'
-            && (snapshot.canInterrupt ?? (newRun ? true : existing?.canInterrupt ?? true)),
-          startedAt: snapshotStartedAt ?? (newRun ? now : existing?.startedAt ?? now),
+          canInterrupt: statusText !== 'workspace_finalizing' && (snapshot.canInterrupt ?? existing?.canInterrupt ?? true),
+          startedAt: snapshotStartedAt ?? existing?.startedAt ?? now,
         });
       }
 
@@ -173,6 +148,5 @@ export function useSessionProtection() {
     markSessionIdle,
     syncProcessingSessions,
     isSessionProcessing,
-    getActivityRevision,
   };
 }

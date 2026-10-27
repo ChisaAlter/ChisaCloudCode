@@ -67,6 +67,7 @@ export default function Shell({
     isConnected,
     isInitialized,
     isConnecting,
+    transport,
     connectToShell,
     disconnectFromShell,
   } = useShellRuntime({
@@ -275,7 +276,9 @@ export default function Shell({
     );
   }
 
-  const readyDescription = isPlainShell
+  const readyDescription = selectedProject.sourceMode === 'ssh'
+    ? 'Windows 命令按行执行，每条命令从项目目录开始，不保留变量或目录切换。'
+    : isPlainShell
     ? t('shell.runCommand', {
         command: initialCommand || t('shell.defaultCommand'),
         projectName: selectedProject.displayName,
@@ -284,7 +287,9 @@ export default function Shell({
       ? t('shell.resumeSession', { displayName: sessionDisplayNameLong })
       : t('shell.startSession');
 
-  const connectingDescription = isPlainShell
+  const connectingDescription = selectedProject.sourceMode === 'ssh'
+    ? '正在连接 Windows SSH 项目命令通道…'
+    : isPlainShell
     ? t('shell.runCommand', {
         command: initialCommand || t('shell.defaultCommand'),
         projectName: selectedProject.displayName,
@@ -320,6 +325,9 @@ export default function Shell({
           bypassPermissions ? 'shell.actions.bypassOnTitle' : 'shell.actions.bypassOffTitle',
         )}
       />
+      {isConnected && transport === 'pipe' && (
+        <p role="status" className="border-b border-amber-800/50 bg-amber-950/40 px-3 py-2 text-xs text-amber-100">{selectedProject.sourceMode === 'ssh' ? 'Windows 命令：按 Enter 执行，每条命令从项目目录开始；不保留变量，不支持全屏程序，Ctrl+C 停止当前命令。' : '基础命令终端：按 Enter 执行，不支持全屏程序或窗口调整；Ctrl+C 会结束此终端。'}</p>
+      )}
 
       <div className="relative flex-1 overflow-hidden p-2">
         <div

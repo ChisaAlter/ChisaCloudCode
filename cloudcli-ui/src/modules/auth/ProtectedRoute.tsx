@@ -12,7 +12,7 @@ type ProtectedRouteProps = {
   children: ReactNode;
 };
 
-/** Used by App to gate login; only web users enter the separate setup flow. */
+/** Used by App to gate the routed application behind login and the signed-in onboarding flow. */
 export default function ProtectedRoute({ children }: ProtectedRouteProps) {
   const { user, isLoading, hasCompletedOnboarding, refreshOnboardingStatus } = useAuth();
 
@@ -32,7 +32,7 @@ export default function ProtectedRoute({ children }: ProtectedRouteProps) {
     return isDesktop() ? <SignedOutDesktop /> : <LoginForm />;
   }
 
-  if (!hasCompletedOnboarding && !isDesktop()) {
+  if (!hasCompletedOnboarding) {
     return <Onboarding onComplete={refreshOnboardingStatus} />;
   }
 

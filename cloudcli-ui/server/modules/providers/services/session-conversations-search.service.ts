@@ -60,6 +60,7 @@ type SearchSessionConversationsInput = {
   signal?: AbortSignal;
   onTitleResults?: (results: SessionTitleSearchResult[]) => void;
   onProgress?: (update: SessionConversationSearchProgressUpdate) => void;
+  canReadSession?: (sessionId: string) => boolean;
 };
 
 type SessionRepositoryRow = ReturnType<typeof sessionsDb.getAllSessions>[number];
@@ -1152,6 +1153,7 @@ export async function searchConversations(
   onProjectResult: ((update: SessionConversationSearchProgressUpdate) => void) | null = null,
   signal: AbortSignal | null = null,
   onTitleResults: ((results: SessionTitleSearchResult[]) => void) | null = null,
+  canReadSession?: (sessionId: string) => boolean,
 ): Promise<{
   results: ProjectConversationResult[];
   titleResults: SessionTitleSearchResult[];
@@ -1171,7 +1173,7 @@ export async function searchConversations(
     return { results: [], titleResults: [], totalMatches: 0, query: safeQuery };
   }
 
-  const activeSessions = sessionsDb.getAllSessions();
+  const activeSessions = sessionsDb.getAllSessions().filter(session => !canReadSession || canReadSession(session.session_id));
   const titleResults = findSessionTitleResults(activeSessions, safeQuery, safeLimit);
   onTitleResults?.(titleResults);
 
@@ -1316,6 +1318,7 @@ export const sessionConversationsSearchService = {
       input.onProgress ?? null,
       input.signal ?? null,
       input.onTitleResults ?? null,
+      input.canReadSession,
     );
   },
 };

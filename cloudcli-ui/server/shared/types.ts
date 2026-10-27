@@ -69,33 +69,260 @@ export type AuthenticatedWebSocketRequest = IncomingMessage & {
 export type LLMProvider = 'claude' | 'codex' | 'cursor' | 'opencode';
 
 //----------------- HIROUTE CONNECTION SETTINGS ------------
-/** Per-user gateway configuration safe to return to settings; never includes the grant. */
-export type HiRouteSettings = { enabled: boolean; baseUrl: string; routeModel: string; hasAuthToken: boolean };
-/** Validated settings update; omitted or blank tokens retain the grant, while null removes it. */
-export type HiRouteSettingsInput = { enabled: boolean; baseUrl: string; routeModel: string; authToken?: string | null };
+/** Per-user gateway configuration safe to return to the settings UI; never includes the grant. */
+export type HiRouteSettings = {
+  enabled: boolean;
+  baseUrl: string;
+  routeModel: string;
+  hasAuthToken: boolean;
+};
+
+/** Validated settings update; omitted/blank token retains the grant and null explicitly removes it. */
+export type HiRouteSettingsInput = {
+  enabled: boolean;
+  baseUrl: string;
+  routeModel: string;
+  authToken?: string | null;
+};
+
 /** Server-only stored gateway connection. Keep authToken out of API responses and logs. */
 export type HiRouteConnection = Omit<HiRouteSettings, 'hasAuthToken'> & { authToken: string };
 
 // ---------------------------
+//----------------- CLAUDE SUBSCRIPTION ACCOUNTS ------------
+/** Database-owned subscription identity. Paths are derived from userId/id, and OAuth secrets never enter this row. */
+export type ClaudeAccountRecord = {
+  id: string;
+  name: string;
+  email: string | null;
+  organizationUuid: string | null;
+  organizationName: string | null;
+  plan: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+/** A provider quota window; null reset means the endpoint did not supply a valid timestamp, not that usage is zero. */
+export type ClaudeAccountUsageWindow = { kind: string; label: string; usedPercent: number; resetsAt: number | null; model?: string | null };
+
+/** Optional extra usage is informational; amounts are normalized currency units and may remain unknown. */
+export type ClaudeAccountExtraUsage = { enabled: boolean; spent: number | null; limit: number | null; balance: number | null; usedPercent: number | null; currency: string };
+
+/** Browser-safe quota snapshot. Errors may retain unexpired windows only when stale=true, with their original updatedAt. */
+export type ClaudeAccountUsage = {
+  status: 'ok' | 'error' | 'unavailable' | 'loading';
+  windows: ClaudeAccountUsageWindow[];
+  updatedAt: number | null;
+  checkedAt: number;
+  error: string | null;
+  failureKind?: string;
+  retryAt?: number;
+  stale: boolean;
+  extraUsage?: ClaudeAccountExtraUsage | null;
+};
+
+/** Account metadata returned to React; needsSignIn observes credentials but does not perform a live authentication request. */
+export type ClaudeAccountSummary = Omit<ClaudeAccountRecord, 'organizationUuid'> & { needsSignIn: boolean; usage: ClaudeAccountUsage };
+
+/** Full account screen response. Route describes ordinary Claude runs; explicit HiRoute model selections are per session. */
+export type ClaudeAccountsState = {
+  runtime: { id: 'server'; label: string };
+  activeId: string | null;
+  accounts: ClaudeAccountSummary[];
+  defaultAccount: (ClaudeAccountSummary & { id: 'default' }) | null;
+  route: { kind: 'subscription' | 'api' | 'hiroute' | 'default'; label: string; accountId: string | null };
+};
+
+/** A single caller-owned CLI sign-in task; raw process output and OAuth tokens are deliberately excluded. */
+export type ClaudeAccountLoginTask = {
+  id: string;
+  accountId: string;
+  status: 'starting' | 'waiting_code' | 'completing' | 'succeeded' | 'failed' | 'cancelled';
+  url: string | null;
+  error: string | null;
+  expiresAt: number;
+};
+
+/** Per-launch immutable identity captured by Providers before starting a process. Call the idempotent release after all work ends. */
+export type ClaudeAccountLaunchSnapshot = {
+  userId: number;
+  accountId: string;
+  configDir: string;
+  authDir: string;
+  email: string | null;
+  release: () => void;
+};
+
+/** Execution-host-only subscription read used by managed routing; never serialize this type to browser responses or logs. */
+export type ClaudeAccountSubscription = {
+  accountId: string;
+  email: string | null;
+  accessToken: string;
+  expiresAt: number | null;
+  refreshable: boolean;
+  subscriptionType: string | null;
+  rateLimitTier: string | null;
+};
+
+/** Internal bounded profile read shared by account, quota, login and renewal services. The CLI is the sole token writer/refresher; renewalFingerprint is a one-way digest used only for retry invalidation and is never serialized to clients. */
+export type ClaudeAccountCredentialRead = {
+  accessToken: string | null;
+  expiresAt: number | null;
+  refreshable: boolean;
+  email: string | null;
+  organizationUuid: string | null;
+  organizationName: string | null;
+  plan: string | null;
+  tier: string | null;
+  unavailable: boolean;
+  renewalFingerprint?: string;
+};
+
+// ---------------------------
 //----------------- CLAUDE CUSTOM MODEL CONNECTIONS ------------
-/** Public metadata for the authenticated user's settings. API keys are never returned. */
+/** Public connection metadata for the authenticated user's settings. API keys are never returned. */
 export type ClaudeModelConnection = { id: string; name: string; baseUrl: string; model: string; hasApiKey: boolean; authType: 'api_key' | 'auth_token' };
-/** Mutation snapshot; a null activeId selects the ordinary Claude connection. */
+
+/** List response and mutation snapshot; null activeId means ordinary Claude or HiRoute is selected. */
 export type ClaudeModelConnections = { activeId: string | null; connections: ClaudeModelConnection[] };
-/** Server-only runtime connection. Never serialize apiKey to HTTP clients or logs. */
+
+/** Server-only connection used for runtime startup and edits. Never log or serialize apiKey to HTTP clients. */
 export type ClaudeModelConnectionSecret = Omit<ClaudeModelConnection, 'hasApiKey'> & { apiKey: string };
-/** Create or edit payload. Omitted or blank keys retain existing secrets; null is rejected. */
+
+/** Validated create/edit payload. Edits retain an omitted/blank key; null is always rejected. */
 export type ClaudeModelConnectionInput = { name: string; baseUrl: string; model: string; apiKey?: string; authType?: 'api_key' | 'auth_token' };
-/** Messages endpoint override distinguishing bearer grants from x-api-key authentication. */
+
+/** Common Claude Messages endpoint override, with explicit bearer-grant versus x-api-key authentication. */
 export type ClaudeEndpointOptions = { baseUrl: string; model: string; auth: { type: 'api_key' | 'auth_token'; value: string } };
 
 // ---------------------------
-//----------------- SESSION WORKSPACE EXECUTION ------------
-/** Durable session intent: isolated selects VPS worktrees; shared opts into synchronization leases. Native protocol-1 bindings still serialize writes. */
-export type SessionWorkspaceMode = 'isolated' | 'shared';
+//----------------- SSH PROJECT TARGETS ------------
+/** Public connection catalog shared by Projects and Workspaces. Credential paths are intentionally absent; platform identifies the Windows helper protocol. */
+export type SshWorkspaceConnection = { id: string; name: string; host: string; port: number; username: string; platform: 'win32'; transport?: 'ssh' | 'agent'; delivery?: 'direct' | 'relay' };
+
+/** Structured Windows-helper response consumed by SSH, workspace and Git adapters. Operation-specific fields are optional; binary content uses b64, and commands must confirm cleanup before their writer is released. */
+export type SshWorkspaceRpcResult = {
+  ok: true;
+  protocol?: number;
+  platform?: 'win32';
+  helperVersion?: string;
+  connectionId?: string;
+  connectionLabel?: string;
+  rootPath?: string;
+  rootIdentity?: string;
+  username?: string;
+  capabilities?: { files: boolean; exec: boolean; terminal: boolean };
+  size?: number; mtime?: number; mode?: number; dir?: boolean; symlink?: boolean;
+  b64?: string; hash?: string; path?: string;
+  entries?: Array<{ name: string; dir: boolean; stats?: { size: number; mtime: number; mode: number; dir: boolean; symlink: boolean } }>;
+  results?: SshWorkspaceRpcResult[];
+  matches?: Array<{ path: string; line?: number; text?: string }>;
+  stdout?: string; stderr?: string; exitCode?: number; truncated?: boolean;
+  jobId?: string; state?: string; cleanupConfirmed?: boolean; timedOut?: boolean; cancelled?: boolean;
+  /** Exact native receipt identity and workspace generation; recovery never substitutes another operation. */
+  operationId?: string; generation?: string;
+};
+
+/** Verified probe shared by SSH project registration and transport tests. Required identity fields are persisted before any project execution can occur. */
+export type SshWorkspaceProbeResult = SshWorkspaceRpcResult & {
+  protocol: 1; platform: 'win32'; helperVersion: string; rootPath: string; rootIdentity: string;
+  username: string; connectionId: string; connectionLabel: string;
+  capabilities: { files: boolean; exec: boolean; terminal: boolean };
+};
+
+/** A server-owned Windows project target. The anchor stores VPS history only; rootPath is resolved on Windows and never used as a server cwd. Generation pins sessions to one verified device/root. */
+export type SshProjectTarget = {
+  projectId: string;
+  ownerId: string;
+  connectionId: string;
+  connectionLabel: string;
+  rootPath: string;
+  rootIdentity: string;
+  generation: string;
+  workspaceId: string;
+  anchorPath: string;
+  phase: 'idle' | 'running' | 'recovery';
+  activeRunId: string | null;
+  pendingJobId: string | null;
+};
+
+/** Durable app-session binding to an SSH target generation; resume/fork must never retarget it implicitly. */
+export type SshSessionTarget = { sessionId: string; projectId: string; generation: string };
 
 // ---------------------------
-//----------------- PROVIDER MODEL CATALOG ------------
+//----------------- SESSION WORKSPACE EXECUTION ------------
+/**
+ * Durable session intent for workspace execution. `isolated` preserves the
+ * VPS worktree path; `shared` opts into the shared lease and synchronization
+ * path. Local protocol-1 bindings still serialize writes regardless of this
+ * value because native sibling worktrees are not supported there.
+ */
+export type SessionWorkspaceMode = 'isolated' | 'shared';
+
+/** Server-verified persistent workspace identity. A generation changes on binding or repository replacement; clients must echo it on scoped operations. */
+export type WorkspaceDescriptor = {
+  workspaceId: string;
+  projectId: string;
+  kind: 'cloudReplica' | 'session';
+  sessionId?: string;
+  generation: string;
+  rootPath: string;
+  sourceRoot: string;
+  /** Explicit source location; absent retains the legacy cloud contract. Display paths are never executable server paths. */
+  sourceMode?: 'cloud' | 'ssh';
+  displayPath?: string;
+  connectionState?: 'online' | 'offline' | 'recovery';
+  requestedMode: SessionWorkspaceMode;
+  effectiveMode: SessionWorkspaceMode;
+  baseRevision?: string;
+  phase: 'idle' | 'running' | 'recovery';
+  publicationState: 'unpublished' | 'integrated' | 'conflicted';
+  capabilities: { read: boolean; write: boolean; git: boolean; shell: boolean; preview: boolean; integrate: boolean; cloudExecutionIndependentOfDesktop: boolean };
+};
+
+//----------------- PROJECT RUNTIME CONTEXT ------------
+/** Sanitized provenance for the exact configuration content loaded by a cloud Claude run; no file contents or secrets are exposed. */
+export type ProjectRuntimeManifest = {
+  runId: string;
+  sessionId?: string;
+  projectId: string;
+  workspaceId: string;
+  generation: string;
+  at: string;
+  configRevision: string;
+  status: 'loading' | 'loaded' | 'failed' | 'completed';
+  files: Array<{ path: string; hash: string; kind: 'instruction' | 'rule' | 'settings' | 'skill' | 'mcp' }>;
+  skills: Array<{ name: string; path: string; status: 'available' | 'activated' | 'unsupported'; reason?: string }>;
+  mcp: Array<{ name: string; transport: 'http' | 'sse' | 'stdio' | 'unknown'; location: 'cloud' | 'local'; status: 'selected' | 'connected' | 'failed' | 'disabled' | 'unsupported'; reason?: string }>;
+  warnings: string[];
+  error?: string;
+};
+
+/** Private launch identity captured by Providers, consumed only after workspace admission, never forwarded as SDK options or returned through APIs. */
+export type ProjectRuntimeLaunchContext = {
+  userId: string;
+  accountKey: string;
+  configDir: string;
+  sessionId?: string;
+  prompt: string;
+};
+// ---------------------------
+
+/** Opaque workspace selector echoed by File Tree, Git and Shell; paths are never selected by client-supplied execution directories. */
+export type WorkspaceSelector = { workspaceId: string; generation: string; sessionId?: string };
+
+/** Runtime previews borrow a bridge-owned startup reservation. Long-lived containers remain recorded until removal is confirmed; delivery alone never releases their writer lease. */
+export type WorkspaceRuntimePreviewReservation = {
+  root: string;
+  /** Server-private immutable cloud writer birth identity; runtime persists it before container startup for exact orphan cleanup. Never return this witness to clients. */
+  lease?: Readonly<{ owner: 'claude'; id: string; epoch: string; pid: number; processStartTime: string; bootId: string; writerGate: true }>;
+  finish(cleanupConfirmed: boolean, containerId?: string): Promise<void>;
+  retain(containerId: string, cleanup: () => Promise<void>): void;
+  release(containerId: string, cleanupConfirmed: boolean): Promise<void>;
+};
+
+/** The project replica and an optional already-materialized session, resolved from persisted ownership. A missing session never implies permission to write the project replica. */
+export type WorkspaceResolution = { cloudReplica: WorkspaceDescriptor; session: WorkspaceDescriptor | null };
 
 /**
  * One selectable model row in a provider model catalog.
@@ -257,6 +484,11 @@ export type SessionUpsertedProject = {
   fullPath: string;
   displayName: string;
   isStarred: boolean;
+  sourceMode?: 'cloud' | 'ssh';
+  displayPath?: string;
+  remotePath?: string;
+  connectionLabel?: string;
+  sshConnectionId?: string;
 };
 
 /**
@@ -306,16 +538,12 @@ export type NormalizedMessage = {
   provider: LLMProvider;
   kind: MessageKind;
   /**
-   * Monotonic per-session sequence number assigned by the chat run registry when a
+   * Monotonic per-run sequence number assigned by the chat run registry when a
    * live event is forwarded to the websocket. History messages loaded over
    * REST do not carry it. Clients use it with `chat.subscribe` to replay only
    * the live events they missed across websocket reconnects.
    */
   seq?: number;
-  /** Identifies this execution independently of the channel replay cursor; REST history has no run identity. */
-  runId?: string;
-  /** Identifies the session channel that owns seq; replay cursors cannot cross epochs. */
-  replayEpoch?: string;
   role?: 'user' | 'assistant';
   content?: string;
   /**
@@ -481,8 +709,57 @@ export type ProviderRuntimeContext = {
   getProviderModels(): Promise<ProviderModelsDefinition>;
   normalizeMessage(raw: unknown, sessionId: string | null): NormalizedMessage[];
   isProviderInstalled(): Promise<boolean>;
+  /**
+   * Server-owned process capability selected after workspace admission. Bound
+   * VPS runs receive a container launcher; transport options cannot supply or
+   * replace it. Omitted only for historical unbound host execution and focused
+   * adapter tests, which use their own trusted process dependency.
+   */
+  runProcess?: ProviderProcessRunner;
 };
 
+// ---------------------------
+//----------------- PROVIDER PROCESS OWNERSHIP ------------
+/**
+ * One private provider worker job. The supervisor sends this only over its
+ * inherited IPC channel or container stdin frame, never through CLI arguments
+ * or a model prompt. CLI
+ * workers own their command tree; Codex workers keep the SDK's thread/attachment
+ * protocol while making its otherwise hidden child tree observable to teardown.
+ * Optional executable/env values are trusted composition overrides, never chat
+ * input; focused tests supply fake SDK processes without invoking a model.
+ */
+export type ProviderProcessJob =
+  | { kind: 'cli'; command: string; args: string[]; cwd: string; env?: Record<string, string> }
+  | { kind: 'codex'; providerSessionId: string | null; threadOptions: AnyRecord; input: string | Array<{ type: 'text'; text: string } | { type: 'local_image'; path: string }>; executable?: string; env?: Record<string, string> };
+
+/**
+ * Private worker-to-supervisor messages. `done` confirms the provider stream
+ * ended, but does not release a workspace: the supervisor must still terminate
+ * and confirm the worker's complete process tree before resolving its run.
+ */
+export type ProviderProcessEvent =
+  | { kind: 'stdout' | 'stderr'; text: string }
+  | { kind: 'event'; event: AnyRecord }
+  | { kind: 'done'; code: number | null; error?: { name: string; message: string } };
+
+/**
+ * Provider SDK/CLI process execution capability passed only by trusted server
+ * composition. Resolves after every owned process/container is stopped; stream
+ * callbacks preserve native output/event ordering. Cancellation is propagated
+ * only after teardown is confirmed, and teardown failures remain explicit.
+ */
+export type ProviderProcessRunner = (
+  job: ProviderProcessJob,
+  handlers: {
+    stdout?(text: string): void;
+    stderr?(text: string): void;
+    event?(event: AnyRecord): void;
+  },
+  signal?: AbortSignal,
+) => Promise<{ code: number | null; error?: { name: string; message: string } }>;
+
+// ---------------------------
 export type ProviderRunFunction = (
   command: string,
   options: AnyRecord,
@@ -506,6 +783,8 @@ export type FetchHistoryOptions = {
   limit?: number | null;
   offset?: number;
   providerSessionId?: string;
+  /** Server-owned durable provider HOME; supplied from the stored session, never client input. */
+  providerProfilePath?: string | null;
 };
 
 /**
@@ -536,14 +815,18 @@ export type FetchHistoryResult = {
 export type ProviderSkillScope = 'user' | 'project' | 'plugin' | 'repo' | 'admin' | 'system';
 
 /**
- * Shared input accepted by provider skill listing operations.
- *
- * Routes pass `workspacePath` when a caller wants project/repository skills for
- * a specific folder. Providers should fall back to the backend process cwd when
- * this option is omitted.
+ * Internal provider skill discovery context. The skills service resolves any
+ * client selector before supplying `workspaceDescriptor`; clients cannot send a
+ * descriptor or validation callback. Scoped repository sources and symlinks must
+ * stay inside that descriptor's root. `assertWorkspace` rechecks durable ownership
+ * and generation around awaited reads. `globalOnly` excludes project/repo sources
+ * for callers that did not select a workspace; legacy unbound paths remain valid.
  */
 export type ProviderSkillListOptions = {
   workspacePath?: string;
+  workspaceDescriptor?: WorkspaceDescriptor;
+  assertWorkspace?: () => void;
+  globalOnly?: boolean;
 };
 
 /**

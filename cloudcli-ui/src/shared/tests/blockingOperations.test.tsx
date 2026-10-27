@@ -5,7 +5,6 @@ import { afterEach, expect, test, vi } from 'vitest';
 import { BlockingOperationDialog } from '@/shared/ui/BlockingOperationDialog';
 import { beginBackgroundOperation, beginBlockingOperation, getBlockingOperations, withBlockingOperation } from '@/shared/utils';
 
-vi.mock('@/shared/chisa', () => ({ subscribeWorkspaceSynchronization: () => () => {} }));
 afterEach(cleanup);
 
 test('loading blocks background controls and shortcuts and cannot be dismissed', () => {

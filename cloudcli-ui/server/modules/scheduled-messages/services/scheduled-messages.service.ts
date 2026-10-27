@@ -1,5 +1,6 @@
 import { scheduledMessagesDb, sessionsDb } from '@/modules/database/index.js';
 import type { ScheduledMessageRow } from '@/modules/database/index.js';
+import { assertSshSessionAccess } from '@/modules/providers/index.js';
 import { AppError } from '@/shared/utils.js';
 
 /** How far ahead a message may be scheduled. Beyond this it is almost certainly a mistake. */
@@ -85,12 +86,15 @@ export const scheduledMessagesService = {
       });
     }
 
-    if (!sessionsDb.getSessionById(input.sessionId)) {
+    const session = sessionsDb.getSessionById(input.sessionId);
+    if (!session) {
       throw new AppError(`Session "${input.sessionId}" was not found.`, {
         code: 'SESSION_NOT_FOUND',
         statusCode: 404,
       });
     }
+
+    assertSshSessionAccess(input.sessionId, input.userId);
 
     return toScheduledMessage(scheduledMessagesDb.create({
       userId: input.userId,

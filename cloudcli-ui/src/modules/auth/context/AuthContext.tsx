@@ -106,6 +106,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
   userRef.current = user;
   // Only the latest account check can apply its response or finish initial loading.
   const authCheckRevision = useRef(0);
+  // A stored session that cannot be checked yet remains retryable without resubmitting credentials.
+  const [connectionRetry, setConnectionRetry] = useState(0);
+  // Retry backoff is reset when the account is verified or explicitly signed out.
+  const retryAttempt = useRef(0);
 
   const setSession = useCallback((nextUser: AuthUserProfile, nextToken: string) => {
     startAuthSession(nextToken);
@@ -118,6 +122,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
     clearAuthToken();
     if (isDesktop()) void FrontendBridge.endServerSession().catch((error: unknown) => console.error('账号连接关闭失败', error));
     authCheckRevision.current += 1;
+    retryAttempt.current = 0;
+    setConnectionRetry(0);
     userRef.current = null;
     setUser(null);
     setToken(null);
@@ -214,7 +220,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     const revision = ++authCheckRevision.current;
     const current = () => identity === getAuthSessionVersion() && revision === authCheckRevision.current;
     try {
-      if (!userRef.current) setIsLoading(true);
+      if (!userRef.current && retryAttempt.current === 0) setIsLoading(true);
 
       if (!token) {
         return;
@@ -228,7 +234,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
         if (userResponse.status === 401 || userResponse.status === 403) {
           clearSession();
         } else {
-          setError(t(AUTH_ERROR_MESSAGES.authStatusCheckFailed));
+          retryAttempt.current += 1;
+          setConnectionRetry(value => value + 1);
+          setError('暂时无法连接账号服务，已保留登录状态，恢复连接后会自动重试。');
         }
         return;
       }
@@ -240,17 +248,21 @@ export function AuthProvider({ children }: AuthProviderProps) {
         return;
       }
 
+      retryAttempt.current = 0;
+      setConnectionRetry(0);
       userRef.current = userPayload.user;
       setUser(userPayload.user);
       await checkOnboardingStatus();
     } catch (caughtError) {
       if (!current()) return;
       console.error('[Auth] Auth status check failed:', caughtError);
-      setError(t(AUTH_ERROR_MESSAGES.authStatusCheckFailed));
+      retryAttempt.current += 1;
+      setConnectionRetry(value => value + 1);
+      setError('暂时无法连接账号服务，已保留登录状态，恢复连接后会自动重试。');
     } finally {
       if (current()) setIsLoading(false);
     }
-  }, [checkOnboardingStatus, clearSession, t, token]);
+  }, [checkOnboardingStatus, clearSession, token]);
 
   useEffect(() => {
     if (IS_PLATFORM) {
@@ -297,6 +309,22 @@ export function AuthProvider({ children }: AuthProviderProps) {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [refreshSession, token, user]);
+
+  useEffect(() => {
+    if (IS_PLATFORM || !token || !connectionRetry) return;
+    const identity = getAuthSessionVersion();
+    let pending = false;
+    const retry = async () => {
+      if (pending || identity !== getAuthSessionVersion()) return;
+      pending = true;
+      try { await checkAuthStatus(); } finally { pending = false; }
+    };
+    const timer = window.setTimeout(() => void retry(), Math.min(30000, 1000 * 2 ** Math.min(retryAttempt.current - 1, 5)));
+    const onOnline = () => { void retry(); };
+    window.addEventListener('online', onOnline);
+    window.addEventListener('focus', onOnline);
+    return () => { window.clearTimeout(timer); window.removeEventListener('online', onOnline); window.removeEventListener('focus', onOnline); };
+  }, [token, connectionRetry, checkAuthStatus]);
 
   const login = useCallback<AuthContextValue['login']>(
     async (username, password) => {

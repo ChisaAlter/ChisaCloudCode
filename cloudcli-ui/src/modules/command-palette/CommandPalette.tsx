@@ -28,6 +28,7 @@ import {
   DialogTitle,
 } from '@/shared/ui';
 import { useTheme } from '@/shared/context/ThemeContext';
+import { useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
 import { usePaletteOps } from '@/modules/command-palette/context/PaletteOpsContext';
 import { SETTINGS_MAIN_TABS } from '@/shared/constants';
 import type { AppTab, Project } from '@/shared/types';
@@ -67,6 +68,7 @@ function CommandPalette({
   const [search, setSearch] = React.useState('');
   const [pages, setPages] = React.useState<Page[]>([]);
   const { toggleDarkMode } = useTheme();
+  const workspace = useWorkspaceScope();
   const navigate = useNavigate();
   const ops = usePaletteOps();
 
@@ -217,7 +219,7 @@ function CommandPalette({
 
             {showActions && (
               <CommandGroup heading={t('commandPalette.groupNavigate')}>
-                {NAV_TABS.map((tab) => (
+                {NAV_TABS.filter((tab) => tab.id !== 'tasks' || (selectedProject?.sourceMode !== 'ssh' && workspace?.sourceMode !== 'ssh')).map((tab) => (
                   <CommandItem
                     key={tab.id as string}
                     value={`${t(tab.labelKey)} ${tab.keywords}`}
@@ -229,7 +231,7 @@ function CommandPalette({
               </CommandGroup>
             )}
 
-            {showActions && projectId && (
+            {showActions && projectId && (workspace === undefined || workspace?.capabilities.git) && (
               <CommandGroup heading={t('commandPalette.groupGit')}>
                 <CommandItem
                   value={`${t('commandPalette.gitFetch')} fetch remote`}

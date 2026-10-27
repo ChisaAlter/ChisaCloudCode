@@ -32,10 +32,8 @@ export class ClaudeProviderAuth implements IProviderAuth {
     // usable fallback here even where the SDK's raw spawn could not use it.
     const cliPath = resolveClaudeCodeExecutablePath(process.env.CLAUDE_CLI_PATH) ?? 'claude';
     try {
-      // spawn.sync reports ENOENT through `error` instead of throwing, so a
-      // missing CLI used to be reported as installed.
-      const result = spawn.sync(cliPath, ['--version'], { stdio: 'ignore', timeout: 5000 });
-      return !(result.error && hasErrorCode(result.error, 'ENOENT'));
+      spawn.sync(cliPath, ['--version'], { stdio: 'ignore', timeout: 5000 });
+      return true;
     } catch {
       return false;
     }

@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Dispatch, KeyboardEvent, RefObject, SetStateAction } from 'react';
 
 import { api } from '@/shared/api';
+import { getAuthSessionVersion } from '@/shared/authToken';
+import { getServerConnectionVersion } from '@/shared/chisa';
+import { useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
 import { safeLocalStorage } from '@/modules/chat/utils/chatStorage';
 import type { LLMProvider, Project, SlashCommand } from '@/shared/types';
 
@@ -134,6 +137,18 @@ export function useSlashCommands({
   textareaRef,
   onExecuteCommand,
 }: UseSlashCommandsOptions) {
+  const workspace = useWorkspaceScope();
+  const projectId = selectedProject?.projectId;
+  const workspaceProjectId = workspace?.projectId;
+  const workspaceId = workspace?.workspaceId;
+  const generation = workspace?.generation;
+  const sessionId = workspace?.kind === 'session' ? workspace.sessionId : undefined;
+  const workspacePath = workspace?.rootPath || selectedProject?.fullPath || selectedProject?.path || '';
+  const hasWorkspace = workspace !== undefined && workspace !== null;
+  const canDiscover = Boolean(selectedProject) && workspace !== null && workspace?.capabilities.read !== false;
+  const authVersion = getAuthSessionVersion();
+  const serverVersion = getServerConnectionVersion();
+  // Catalogue results belong to the stable workspace identity, never its polled status object or composer input.
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
   const [filteredCommands, setFilteredCommands] = useState<SlashCommand[]>([]);
   const [showCommandMenu, setShowCommandMenu] = useState(false);
@@ -159,65 +174,42 @@ export function useSlashCommands({
   }, [clearCommandQueryTimer]);
 
   useEffect(() => {
-    let cancelled = false;
-
+    const controller = new AbortController();
+    const current = () => !controller.signal.aborted && authVersion === getAuthSessionVersion() && serverVersion === getServerConnectionVersion();
+    setSlashCommands([]);
+    setFilteredCommands([]);
+    if (!canDiscover || !projectId) return () => controller.abort();
+    const selector = hasWorkspace && workspaceProjectId && workspaceId && generation ? {
+      projectId: workspaceProjectId, workspaceId, generation, ...(sessionId ? { sessionId } : {}),
+    } : undefined;
     const fetchCommands = async () => {
-      if (!selectedProject) {
-        setSlashCommands([]);
-        setFilteredCommands([]);
-        return;
-      }
-
       try {
-        const workspacePath = selectedProject.fullPath || selectedProject.path || '';
-        const response = await api.commands.list(workspacePath || selectedProject.path);
-
-        if (!response.ok) {
-          throw new Error('Failed to fetch commands');
-        }
-
+        const response = await api.commands.list(workspacePath || undefined, selector, { signal: controller.signal });
+        if (!current()) return;
+        if (!response.ok) throw new Error('Failed to fetch commands');
         const data = await response.json();
-        const skillsResponse = await api.providers.skills(provider, { workspacePath });
-        const skillsData = skillsResponse.ok
-          ? ((await skillsResponse.json()) as ProviderSkillsResponse)
-          : null;
-        const skillCommands = dedupeProviderSkills(skillsData?.data?.skills || [])
-          .map(mapSkillToSlashCommand);
+        // A replaced workspace must not start the second helper lookup after a late commands body.
+        if (!current()) return;
+        const skillsResponse = await api.providers.skills(provider, selector ?? { workspacePath }, { signal: controller.signal });
+        const skillsData = skillsResponse.ok ? ((await skillsResponse.json()) as ProviderSkillsResponse) : null;
+        if (!current()) return;
+        const skillCommands = dedupeProviderSkills(skillsData?.data?.skills || []).map(mapSkillToSlashCommand);
         const allCommands: SlashCommand[] = [
-          ...((data.builtIn || []) as SlashCommand[]).map((command) => ({
-            ...command,
-            type: 'built-in',
-          })),
+          ...((data.builtIn || []) as SlashCommand[]).map(command => ({ ...command, type: 'built-in' })),
           ...skillCommands,
-          ...((data.custom || []) as SlashCommand[]).map((command) => ({
-            ...command,
-            type: 'custom',
-          })),
+          ...((data.custom || []) as SlashCommand[]).map(command => ({ ...command, type: 'custom' })),
         ];
-
-        const parsedHistory = readCommandHistory(selectedProject.projectId);
-        const sortedCommands = [...allCommands].sort((commandA, commandB) => {
-          const commandAUsage = parsedHistory[commandA.name] || 0;
-          const commandBUsage = parsedHistory[commandB.name] || 0;
-          return commandBUsage - commandAUsage;
-        });
-
-        if (!cancelled) {
-          setSlashCommands(sortedCommands);
-        }
+        const parsedHistory = readCommandHistory(projectId);
+        setSlashCommands([...allCommands].sort((left, right) => (parsedHistory[right.name] || 0) - (parsedHistory[left.name] || 0)));
       } catch (error) {
+        if (!current()) return;
         console.error('Error fetching slash commands:', error);
-        if (!cancelled) {
-          setSlashCommands([]);
-        }
+        setSlashCommands([]);
       }
     };
-
-    fetchCommands();
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedProject, provider]);
+    void fetchCommands();
+    return () => controller.abort();
+  }, [authVersion, canDiscover, generation, hasWorkspace, projectId, provider, serverVersion, sessionId, workspaceId, workspacePath, workspaceProjectId]);
 
   useEffect(() => {
     if (!showCommandMenu) {

@@ -21,10 +21,6 @@ import type { QueuedSendOptions } from '@/shared/types';
 export type StoredQueuedMessage = {
   content: string;
   options?: QueuedSendOptions;
-  /** False keeps the complete queue editable without authorizing automatic dispatch. */
-  autoSend?: boolean;
-  /** Server revision of the queued turn currently being dispatched. */
-  claimRevision?: string;
   /** Legacy image-only descriptors retained for queued draft compatibility. */
   images?: unknown[];
   /**
@@ -212,10 +208,7 @@ function flushServerWrites(): void {
     const version = pendingTextVersions.get(scope);
     if (version === undefined) continue;
     const generation = storeGeneration;
-    const draft = drafts.get(scope) ?? EMPTY_DRAFT;
-    // A manual queue editor persists the changed complete snapshot, not just its text mirror.
-    const queueVersion = draft.queuedMessage?.autoSend === false ? pendingQueueVersions.get(scope) : undefined;
-    void persistDraft(scope, draft, version, queueVersion).catch((error: unknown) => {
+    void persistDraft(scope, drafts.get(scope) ?? EMPTY_DRAFT, version).catch((error: unknown) => {
       if (generation === storeGeneration) console.error('Chat draft write was not confirmed:', error);
     });
   }
@@ -279,12 +272,8 @@ export function readDraftText(scope: string): string {
   return drafts.get(scope)?.text ?? '';
 }
 
-export function writeDraftText(scope: string, text: string, editingQueued = false): void {
-  ensureDraftSession();
-  const queued = drafts.get(scope)?.queuedMessage;
-  // Ordinary typing is independent; only an explicit queue editor updates its retained input.
-  updateDraft(scope, { text, ...(editingQueued && queued?.autoSend === false
-    ? { queuedMessage: { ...queued, content: text } } : {}) });
+export function writeDraftText(scope: string, text: string): void {
+  updateDraft(scope, { text });
 }
 
 export function readQueuedMessage(scope: string): StoredQueuedMessage | null {

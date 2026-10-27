@@ -4,6 +4,9 @@ import { I18nextProvider } from 'react-i18next';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 import { i18n } from '@/modules/i18n';
+import { ClaudeAccountsProvider } from '@/modules/claude-accounts';
+import { api } from '@/shared/api';
+import type { ClaudeAccountsState } from '@/shared/types';
 import AccountContent from '@/modules/settings/tabs/agents-settings/sections/content/AccountContent';
 import { HiRouteSettingsSection } from '@/modules/settings/tabs/agents-settings/sections/content/HiRouteSettingsSection';
 
@@ -35,7 +38,7 @@ beforeEach(() => {
   localStorage.setItem('auth-token', 'test-account-token');
 });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 test('loads only token presence through the authenticated helper and retains it on an empty-token save', async () => {
   let resolve!: (response: Response) => void;
@@ -146,8 +149,13 @@ test('the account section loads HiRoute only for Claude', async () => {
   const { rerender } = render(<AccountContent agent="codex" authStatus={authStatus} onLogin={vi.fn()} />);
   expect(screen.queryByRole('region', { name: 'HiRoute for Claude' })).toBeNull();
   expect(fetchMock).not.toHaveBeenCalled();
+  // App owns this provider; keep its real account panel mounted beside HiRoute with separate endpoint fixtures.
+  const accounts: ClaudeAccountsState = { runtime: { id: 'test', label: 'Test runtime' }, activeId: null, defaultAccount: null, accounts: [], route: { kind: 'default', label: 'Default Claude', accountId: null } };
+  vi.spyOn(api.providers.claudeAccounts, 'state').mockImplementation(async () => Response.json({ success: true, data: accounts }));
+  vi.spyOn(api.providers.claudeAccounts, 'refresh').mockImplementation(async () => Response.json({ success: true, data: accounts }));
   fetchMock.mockResolvedValueOnce(settingsResponse());
-  rerender(<AccountContent agent="claude" authStatus={authStatus} onLogin={vi.fn()} />);
+  rerender(<ClaudeAccountsProvider><AccountContent agent="claude" authStatus={authStatus} onLogin={vi.fn()} /></ClaudeAccountsProvider>);
   await screen.findByText(/A token is saved/);
+  expect(screen.getByRole('region', { name: 'Claude accounts and quota' })).toBeTruthy();
   expect(fetchMock).toHaveBeenCalledTimes(1);
 });

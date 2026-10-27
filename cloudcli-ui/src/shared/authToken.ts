@@ -7,8 +7,6 @@
  * AuthContext, the shell socket and the file-tree uploader actually import.
  */
 
-export const AUTH_IDENTITY_CHANGED_EVENT = 'auth-identity-changed';
-
 export const AUTH_TOKEN_REFRESHED_EVENT = 'auth-token-refreshed';
 export const AUTH_SESSION_EXPIRED_EVENT = 'auth-session-expired';
 
@@ -21,7 +19,6 @@ export const getAuthSessionVersion = (): number => authSessionVersion;
 /** AuthContext ends the identity before clearing its account state and local mirrors. */
 export const clearAuthToken = (): void => {
   authSessionVersion += 1;
-  if (typeof window !== 'undefined') window.dispatchEvent(new Event(AUTH_IDENTITY_CHANGED_EVENT));
   localStorage.removeItem('auth-token');
 };
 
@@ -118,6 +115,5 @@ export const storeAuthToken = (token: unknown): boolean => {
 export const startAuthSession = (token: string): boolean => {
   if (!isValidRefreshedToken(token)) return false;
   authSessionVersion += 1;
-  if (typeof window !== 'undefined') window.dispatchEvent(new Event(AUTH_IDENTITY_CHANGED_EVENT));
   return storeAuthToken(token);
 };

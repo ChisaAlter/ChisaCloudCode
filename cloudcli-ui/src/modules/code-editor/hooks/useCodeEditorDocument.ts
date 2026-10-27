@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { SetStateAction } from 'react';
 
-import { api } from '@/shared/api';
+import { readApiJson } from '@/shared/api';
+import { useEditorWorkspaceApi, useEditorWorkspaceSaveFile } from '@/shared/context/WorkspaceScopeContext';
 import type { CodeEditorFile } from '@/shared/types';
 import { isBinaryFile } from '@/modules/code-editor/utils/binaryFile';
 import { getPreviewKind } from '@/modules/code-editor/utils/previewableFile';
@@ -21,6 +22,8 @@ const getErrorMessage = (error: unknown) => {
 
 /** CodeEditor keeps its document and explicit save requests independent of presentation changes. */
 export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocumentParams) => {
+  const api = useEditorWorkspaceApi(file);
+  const saveFile = useEditorWorkspaceSaveFile(file);
   // The current editor buffer remains editable while its earlier snapshot is saving.
   const [content, setContentState] = useState('');
   const [loading, setLoading] = useState(true);
@@ -40,7 +43,7 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
   const fileDiffNewString = file.diffInfo?.new_string;
   const fileDiffOldString = file.diffInfo?.old_string;
   // Async reads, saves and success timers belong to one exact editor document.
-  const scope = JSON.stringify([fileProjectId, filePath, fileDiffNewString, fileDiffOldString]);
+  const scope = JSON.stringify([fileProjectId, filePath, fileDiffNewString, fileDiffOldString, file.workspace?.workspaceId, file.workspace?.generation, file.workspace === null]);
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
   const revisionRef = useRef(0);
@@ -99,11 +102,7 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
         }
 
         const response = await api.readFile(fileProjectId, filePath, { signal: controller.signal });
-        if (!response.ok) {
-          throw new Error(`Failed to load file: ${response.status} ${response.statusText}`);
-        }
-
-        const data = await response.json();
+        const data = await readApiJson<{ content: string; hash?: string }>(response);
         if (!current()) return;
         const hasDiffSnapshot = fileDiffNewString !== undefined && fileDiffOldString !== undefined;
         setContent(hasDiffSnapshot ? fileDiffNewString : data.content);
@@ -130,7 +129,7 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
       requestedSave.current = false;
       if (successTimerRef.current) clearTimeout(successTimerRef.current);
     };
-  }, [fileName, filePath, fileProjectId, fileDiffNewString, fileDiffOldString, scope, setContent]);
+  }, [api, fileName, filePath, fileProjectId, fileDiffNewString, fileDiffOldString, scope, setContent]);
 
   const handleSave = useCallback(async () => {
     // Preview-only and binary files have no editable text buffer; never write
@@ -162,21 +161,9 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
         requestedSave.current = false;
         const submittedContent = contentRef.current;
         activeSaveContent.current = submittedContent;
-        const response = await api.saveFile(fileProjectId, filePath, submittedContent, hashRef.current, { signal: controller.signal });
+        const response = await saveFile(fileProjectId, filePath, submittedContent, hashRef.current, { signal: controller.signal });
 
-        if (!response.ok) {
-          const contentType = response.headers.get('content-type');
-          if (contentType?.includes('application/json')) {
-            const errorData = await response.json();
-            throw new Error(errorData.error || `Save failed: ${response.status}`);
-          }
-
-          const textError = await response.text();
-          console.error('Non-JSON error response:', textError);
-          throw new Error(`Save failed: ${response.status} ${response.statusText}`);
-        }
-
-        const saved = await response.json();
+        const saved = await readApiJson<{ hash?: string }>(response);
         if (!current()) return;
         hashRef.current = saved.hash;
 
@@ -200,7 +187,7 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
         requestedSave.current = false;
       }
     }
-  }, [filePath, fileProjectId, previewKind, fileName, loading, scope]);
+  }, [saveFile, filePath, fileProjectId, previewKind, fileName, loading, scope]);
 
   const handleDownload = useCallback(() => {
     const blob = new Blob([content], { type: 'text/plain' });

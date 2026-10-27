@@ -164,7 +164,7 @@
       "existingPlaceholder": "/path/to/existing/workspace",
       "newPlaceholder": "/path/to/new/workspace",
       "existingHelp": "您现有工作区目录的完整路径",
-      "newHelp": "工作区目录的完整路径",
+      "newHelp": "服务器上工作区目录的完整路径；可打开已有目录或创建新项目",
       "githubUrl": "GitHub URL（可选）",
       "githubPlaceholder": "https://github.com/username/repository",
       "githubHelp": "可选：提供 GitHub URL 以克隆仓库",
@@ -195,7 +195,7 @@
       "noAuthentication": "无身份验证",
       "sshKey": "SSH 密钥",
       "existingInfo": "工作区将被添加到您的项目列表中，并可用于 Claude/Cursor 会话。",
-      "newWithClone": "仓库将从此文件夹克隆。",
+      "newWithClone": "仓库将克隆到服务器上的此目录。",
       "newEmpty": "工作区将被添加到您的项目列表中，并可用于 Claude/Cursor 会话。",
       "cloningRepository": "正在克隆仓库..."
     },

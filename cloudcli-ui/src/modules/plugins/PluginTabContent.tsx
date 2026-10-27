@@ -4,7 +4,8 @@ import { useTranslation } from 'react-i18next';
 import { useTheme } from '@/shared/context/ThemeContext';
 import { api } from '@/shared/api';
 import { usePlugins } from '@/modules/plugins/context/PluginsContext';
-import type { Project, ProjectSession } from '@/shared/types';
+import type { Project, ProjectSession, WorkspaceDescriptor } from '@/shared/types';
+import { useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
 
 type PluginTabContentProps = {
   pluginName: string;
@@ -17,11 +18,13 @@ type PluginContext = {
   // The plugin contract uses name as the stable project identifier.
   project: { name: string; path: string } | null;
   session: { id: string; title: string } | null;
+  workspace: WorkspaceDescriptor | null;
 };
 
-function buildContext(isDarkMode: boolean, selectedProject: Project | null, selectedSession: ProjectSession | null): PluginContext {
+function buildContext(isDarkMode: boolean, selectedProject: Project | null, selectedSession: ProjectSession | null, workspace: WorkspaceDescriptor | null | undefined): PluginContext {
   return {
     theme: isDarkMode ? 'dark' : 'light',
+    workspace: workspace ?? null,
     project: selectedProject ? { name: selectedProject.projectId, path: selectedProject.fullPath || selectedProject.path || '' } : null,
     session: selectedSession ? { id: selectedSession.id, title: selectedSession.title || selectedSession.name || selectedSession.id } : null,
   };
@@ -35,13 +38,14 @@ export default function PluginTabContent({ pluginName, selectedProject, selected
   const [loadError, setLoadError] = useState<string | null>(null);
   const { isDarkMode } = useTheme();
   const { plugins } = usePlugins();
-  const contextRef = useRef<PluginContext>(buildContext(isDarkMode, selectedProject, selectedSession));
+  const workspace = useWorkspaceScope();
+  const contextRef = useRef<PluginContext>(buildContext(isDarkMode, selectedProject, selectedSession, workspace));
   const contextCallbacksRef = useRef(new Set<(context: PluginContext) => void>());
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const plugin = plugins.find((candidate) => candidate.name === pluginName);
 
   useEffect(() => {
-    const context = buildContext(isDarkMode, selectedProject, selectedSession);
+    const context = buildContext(isDarkMode, selectedProject, selectedSession, workspace);
     contextRef.current = context;
     const root = frameRef.current?.contentDocument?.documentElement;
     if (root) {
@@ -54,7 +58,7 @@ export default function PluginTabContent({ pluginName, selectedProject, selected
     for (const callback of contextCallbacksRef.current) {
       try { callback(context); } catch (error) { setLoadError(String(error)); }
     }
-  }, [isDarkMode, selectedProject, selectedSession]);
+  }, [isDarkMode, selectedProject, selectedSession, workspace]);
 
   useEffect(() => {
     setLoadError(null);

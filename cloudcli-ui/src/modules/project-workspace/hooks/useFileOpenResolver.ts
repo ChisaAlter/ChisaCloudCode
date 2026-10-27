@@ -1,7 +1,7 @@
-import { useCallback, useRef } from 'react';
+import { useCallback, useMemo, useRef } from 'react';
 
-import { api } from '@/shared/api';
-import type { Project } from '@/shared/types';
+import { api as defaultApi, createWorkspaceApi } from '@/shared/api';
+import type { Project, WorkspaceDescriptor } from '@/shared/types';
 
 type FileNode = {
   type: 'file' | 'directory';
@@ -60,8 +60,13 @@ const findBestMatch = (files: FlatFile[], ref: string): string | null => {
 export function useFileOpenResolver(
   selectedProject: Project | null | undefined,
   onFileOpen: OnFileOpen,
+  workspace?: WorkspaceDescriptor | null,
 ): OnFileOpen {
   const projectId = selectedProject?.projectId;
+  const api = useMemo(() => workspace === undefined ? defaultApi : createWorkspaceApi(workspace), [workspace]);
+  const scopeKey = JSON.stringify([projectId, workspace?.workspaceId, workspace?.generation, workspace === null]);
+  const scopeRef = useRef(scopeKey);
+  scopeRef.current = scopeKey;
   const cacheRef = useRef<{ projectId?: string; files: Promise<FlatFile[]> | null }>({
     projectId: undefined,
     files: null,
@@ -71,7 +76,7 @@ export function useFileOpenResolver(
     if (!projectId) {
       return Promise.resolve([]);
     }
-    if (cacheRef.current.projectId === projectId && cacheRef.current.files) {
+    if (cacheRef.current.projectId === scopeKey && cacheRef.current.files) {
       return cacheRef.current.files;
     }
 
@@ -91,12 +96,13 @@ export function useFileOpenResolver(
       }
     })();
 
-    cacheRef.current = { projectId, files: filesPromise };
+    cacheRef.current = { projectId: scopeKey, files: filesPromise };
     return filesPromise;
-  }, [projectId]);
+  }, [api, projectId, scopeKey]);
 
   return useCallback(
     (filePath: string, diffInfo?: any) => {
+      if (workspace === null || (workspace && !workspace.capabilities.read)) return;
       const ref = normalize(filePath).trim();
       // An explicit absolute path must not be replaced by a same-named file
       // found in the active project's tree.
@@ -105,10 +111,11 @@ export function useFileOpenResolver(
         return;
       }
       void loadFiles().then((files) => {
+        if (scopeRef.current !== scopeKey) return;
         const match = findBestMatch(files, ref);
         onFileOpen(match ?? filePath, diffInfo);
       });
     },
-    [loadFiles, onFileOpen],
+    [loadFiles, onFileOpen, scopeKey, workspace],
   );
 }

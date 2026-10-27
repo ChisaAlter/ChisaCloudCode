@@ -70,7 +70,6 @@
           "server/shared/utils.{js,ts}",
           "server/shared/frontmatter.ts",
           "server/shared/claude-cli-path.ts",
-          "server/shared/claude-sandbox-env.ts",
           "server/shared/image-attachments.ts",
           "server/shared/message-unification.ts"
         ],

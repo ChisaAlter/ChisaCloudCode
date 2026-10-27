@@ -1,7 +1,6 @@
 import spawn from 'cross-spawn';
 
 import { sessionDraftsDb, userDb, userPreferencesDb } from '@/modules/database/index.js';
-import { wakeQueuedMessageDispatcher } from '@/modules/scheduled-messages/index.js';
 
 import { createUserRouter } from './user.routes.js';
 import { createUserService } from './user.service.js';
@@ -52,12 +51,7 @@ const userService = createUserService({
   },
   drafts: {
     getDrafts: (userId) => sessionDraftsDb.getDrafts(userId),
-    saveDraft: (userId, scope, draft) => {
-      sessionDraftsDb.saveDraft(userId, scope, draft);
-      const queued = draft.queuedMessage;
-      if (queued && typeof queued === 'object' && !Array.isArray(queued)
-        && (queued as Record<string, unknown>).autoSend !== false) wakeQueuedMessageDispatcher();
-    },
+    saveDraft: (userId, scope, draft) => sessionDraftsDb.saveDraft(userId, scope, draft),
     deleteDraft: (userId, scope) => sessionDraftsDb.deleteDraft(userId, scope),
   },
   readSystemGitConfig,

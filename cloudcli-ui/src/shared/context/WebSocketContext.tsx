@@ -2,9 +2,9 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 
 import { useAuth } from '@/modules/auth';
 import { beginBackgroundOperation, IS_PLATFORM } from '@/shared/utils';
-import { AUTH_IDENTITY_CHANGED_EVENT, expireAuthSession, isAuthTokenExpired } from '@/shared/authToken';
+import { expireAuthSession, getAuthSessionVersion, isAuthTokenExpired } from '@/shared/authToken';
 import type { ServerEvent } from '@/shared/types';
-import { desktopWebSocketUrl } from '@/shared/chisa';
+import { desktopWebSocketUrl, FrontendBridge, getServerConnectionVersion, isDesktop } from '@/shared/chisa';
 
 
 type ServerEventListener = (event: ServerEvent) => void;
@@ -23,7 +23,7 @@ type WebSocketContextType = {
   subscribe: (listener: ServerEventListener) => () => void;
   isConnected: boolean;
   /** Uses an already-fetched authoritative snapshot to settle stops whose terminal frame was lost. */
-  reconcileRunningSessions: (sessionIds: ReadonlySet<string>, snapshotRequestedAt: number, stoppedSessionIds?: ReadonlySet<string>) => boolean;
+  reconcileRunningSessions: (sessionIds: ReadonlySet<string>, snapshotRequestedAt: number) => boolean;
 };
 
 const WebSocketContext = createContext<WebSocketContextType | null>(null);
@@ -65,6 +65,8 @@ const useWebSocketProviderState = (): WebSocketContextType => {
   const pendingStopsRef = useRef(new Map<string, { finish: () => void; requestedAt: number }>());
   const [isConnected, setIsConnected] = useState(false);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  // Each effect incarnation owns its lookup and socket; a refreshed account invalidates both.
+  const connectionGeneration = useRef(0);
   const { isLoading: isAuthLoading, token, user } = useAuth();
 
   const dispatch = useCallback((event: ServerEvent) => {
@@ -77,41 +79,19 @@ const useWebSocketProviderState = (): WebSocketContextType => {
     }
   }, []);
 
-  const closeActiveSocket = useCallback(() => {
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-    const activeSocket = wsRef.current;
-    if (!activeSocket) return;
-    // A deliberately closed socket cannot deliver old-account frames or reconnect.
-    activeSocket.onopen = null;
-    activeSocket.onmessage = null;
-    activeSocket.onclose = null;
-    activeSocket.onerror = null;
-    activeSocket.close();
-    wsRef.current = null;
-  }, []);
-
-  useEffect(() => {
-    const endIdentity = () => {
-      // JWT rotation keeps the identity and its pending stops; login/logout do not.
-      pendingStopsRef.current.forEach(stop => stop.finish());
-      pendingStopsRef.current.clear();
-      hasConnectedRef.current = false;
-      closeActiveSocket();
-      setIsConnected(false);
-    };
-    window.addEventListener(AUTH_IDENTITY_CHANGED_EVENT, endIdentity);
-    return () => window.removeEventListener(AUTH_IDENTITY_CHANGED_EVENT, endIdentity);
-  }, [closeActiveSocket]);
-
   // Named function expression so the reconnect timer below can call itself
   // without reading the `connect` binding while it is still initializing.
-  const connect = useCallback(function connect() {
-    if (unmountedRef.current) return; // Prevent connection if unmounted
+  const connect = useCallback(async function connect() {
+    if (unmountedRef.current) return;
     if (!IS_PLATFORM && (isAuthLoading || !user)) return;
+    const generation = connectionGeneration.current;
+    const authVersion = getAuthSessionVersion();
+    const serverVersion = getServerConnectionVersion();
+    const current = () => !unmountedRef.current && generation === connectionGeneration.current && authVersion === getAuthSessionVersion() && serverVersion === getServerConnectionVersion();
     try {
+      // Login changes the auth epoch after HTTP completes; reacquire the native URL for that identity.
+      if (isDesktop()) await FrontendBridge.getApiConnection();
+      if (!current()) return;
       // Construct WebSocket URL
       const wsUrl = buildWebSocketUrl(token);
 
@@ -123,7 +103,7 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       wsRef.current = websocket;
 
       websocket.onopen = () => {
-        if (wsRef.current !== websocket) return;
+        if (wsRef.current !== websocket || !current()) return;
         setIsConnected(true);
         if (pendingStopsRef.current.size) websocket.send(JSON.stringify({
           type: 'chat.subscribe', sessions: [...pendingStopsRef.current.keys()].map(sessionId => ({ sessionId })),
@@ -136,11 +116,10 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       };
 
       websocket.onmessage = (event) => {
+        if (wsRef.current !== websocket || !current()) return;
         try {
           const data = JSON.parse(event.data) as ServerEvent;
           if (data.sessionId && (data.kind === 'complete'
-            || (data.kind === 'status' && data.text === 'model_stopped')
-            || (data.kind === 'chat_subscribed' && data.modelStopped === true)
             || (data.kind === 'chat_subscribed' && data.isProcessing === false)
             || (data.kind === 'protocol_error' && ['CHAT_ABORT_FAILED', 'NO_ACTIVE_RUN'].includes(String(data.code))))) {
             pendingStopsRef.current.get(data.sessionId)?.finish();
@@ -153,7 +132,7 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       };
 
       websocket.onclose = () => {
-        if (wsRef.current !== websocket) {
+        if (wsRef.current !== websocket || !current()) {
           return;
         }
         setIsConnected(false);
@@ -161,8 +140,7 @@ const useWebSocketProviderState = (): WebSocketContextType => {
 
         // Attempt to reconnect after 3 seconds
         reconnectTimeoutRef.current = setTimeout(() => {
-          if (unmountedRef.current) return; // Prevent reconnection if unmounted
-          connect();
+          if (current()) void connect();
         }, 3000);
       };
 
@@ -171,7 +149,9 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       };
 
     } catch (error) {
+      if (!current()) return;
       console.error('Error creating WebSocket connection:', error);
+      reconnectTimeoutRef.current = setTimeout(() => { if (current()) void connect(); }, 3000);
     }
   }, [dispatch, isAuthLoading, token, user]); // reconnect with current authentication state
 
@@ -184,6 +164,7 @@ const useWebSocketProviderState = (): WebSocketContextType => {
     // re-run of the effect (e.g. on token refresh) would short-circuit connect()
     // at its unmounted guard and leave the socket permanently disconnected.
     unmountedRef.current = false;
+    ++connectionGeneration.current;
     setIsConnected(false);
     if (!IS_PLATFORM && (isAuthLoading || !user)) {
       return undefined;
@@ -192,9 +173,23 @@ const useWebSocketProviderState = (): WebSocketContextType => {
 
     return () => {
       unmountedRef.current = true;
-      closeActiveSocket();
+      ++connectionGeneration.current;
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+      const activeSocket = wsRef.current;
+      if (activeSocket) {
+        // Prevent the intentionally closed, old-token socket from scheduling
+        // a reconnect after the refreshed-token effect has already started.
+        activeSocket.onopen = null;
+        activeSocket.onmessage = null;
+        activeSocket.onclose = null;
+        activeSocket.onerror = null;
+        activeSocket.close();
+        wsRef.current = null;
+      }
     };
-  }, [closeActiveSocket, connect, isAuthLoading, user]); // reconnect after authentication or token refresh
+  }, [connect, isAuthLoading, user]); // reconnect after authentication or token refresh
 
   const sendMessage = useCallback((message: unknown) => {
     const socket = wsRef.current;
@@ -218,11 +213,11 @@ const useWebSocketProviderState = (): WebSocketContextType => {
     pendingStopsRef.current.clear();
   }, []);
 
-  const reconcileRunningSessions = useCallback((sessionIds: ReadonlySet<string>, snapshotRequestedAt: number, stoppedSessionIds?: ReadonlySet<string>) => {
+  const reconcileRunningSessions = useCallback((sessionIds: ReadonlySet<string>, snapshotRequestedAt: number) => {
     // Reject the same stale snapshot for both the busy map and the stop notice.
     if ([...pendingStopsRef.current.values()].some(stop => stop.requestedAt >= snapshotRequestedAt)) return false;
     for (const [sessionId, stop] of pendingStopsRef.current) {
-      if (sessionIds.has(sessionId) && !stoppedSessionIds?.has(sessionId)) continue;
+      if (sessionIds.has(sessionId)) continue;
       stop.finish();
       pendingStopsRef.current.delete(sessionId);
     }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { api } from '@/shared/api';
+import { useWorkspaceApi } from '@/shared/context/WorkspaceScopeContext';
 
 type UseRevertLocalCommitOptions = {
   // DB primary key for the project; forwarded to the git API via the
@@ -11,6 +11,7 @@ type UseRevertLocalCommitOptions = {
 };
 
 export function useRevertLocalCommit({ projectId, onSuccess, onError }: UseRevertLocalCommitOptions) {
+  const api = useWorkspaceApi();
   // Project-scoped ownership keeps pending feedback visible through the write and its refresh.
   const [pendingOperation, setPendingOperation] = useState<{ projectId: string | null; operation: symbol | null }>({ projectId, operation: null });
   const projectEpochRef = useRef(0);
@@ -27,7 +28,7 @@ export function useRevertLocalCommit({ projectId, onSuccess, onError }: UseRever
       projectEpochRef.current = epoch + 1;
       pendingRef.current = null;
     };
-  }, [projectId]);
+  }, [api, projectId]);
 
   const revertLatestLocalCommit = useCallback(async () => {
     if (!projectId || pendingRef.current) return;
@@ -68,7 +69,7 @@ export function useRevertLocalCommit({ projectId, onSuccess, onError }: UseRever
         setPendingOperation({ projectId, operation: null });
       }
     }
-  }, [onError, onSuccess, projectId]);
+  }, [api, onError, onSuccess, projectId]);
 
   return { isRevertingLocalCommit, revertLatestLocalCommit };
 }

@@ -5,7 +5,7 @@ import { useCodeEditorDocument } from '@/modules/code-editor/hooks/useCodeEditor
 import type { CodeEditorFile } from '@/shared/types';
 
 const requests = vi.hoisted(() => ({ readFile: vi.fn(), saveFile: vi.fn() }));
-vi.mock('@/shared/api', () => ({ api: requests }));
+vi.mock('@/shared/api', async (importOriginal) => ({ ...await importOriginal<Record<string, unknown>>(), api: requests }));
 const file = (path: string): CodeEditorFile => ({ name: path, path, projectId: 'project' });
 const json = (content: string, hash: string) => new Response(JSON.stringify({ content, hash }), { headers: { 'Content-Type': 'application/json' } });
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; }

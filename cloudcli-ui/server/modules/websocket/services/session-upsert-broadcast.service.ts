@@ -1,8 +1,9 @@
 import path from 'node:path';
 
-import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+import { projectsDb, sessionsDb, sshProjectTargetsDb } from '@/modules/database/index.js';
 import { generateDisplayName } from '@/modules/projects/index.js';
-import { connectedClients, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
+import { canReadSshSession } from '@/modules/providers/index.js';
+import { connectedClients, getConnectedClientUserId, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import type { SessionUpsertedEvent } from '@/shared/types.js';
 
 /**
@@ -33,9 +34,11 @@ async function buildSessionUpsertedEvent(
 
   const projectPath = row.project_path;
   const project = projectPath ? projectsDb.getProjectPath(projectPath) : null;
+  const ssh = project ? sshProjectTargetsDb.getByProjectId(project.project_id) : null;
   const displayName = project?.custom_project_name?.trim()
     ? project.custom_project_name
-    : await generateDisplayName(path.basename(projectPath ?? '') || (projectPath ?? ''), projectPath);
+    : ssh ? path.win32.basename(ssh.rootPath) || ssh.rootPath
+      : await generateDisplayName(path.basename(projectPath ?? '') || (projectPath ?? ''), projectPath);
 
   return {
     kind: 'session_upserted',
@@ -57,22 +60,26 @@ async function buildSessionUpsertedEvent(
         fullPath: project.project_path,
         displayName,
         isStarred: Boolean(project.isStarred),
+        ...(ssh ? { sourceMode: 'ssh' as const, displayPath: ssh.rootPath, remotePath: ssh.rootPath,
+          connectionLabel: ssh.connectionLabel, sshConnectionId: ssh.connectionId } : {}),
       }
       : null,
     timestamp: new Date().toISOString(),
   };
 }
 
-function sendToConnectedClients(payloads: string[]): void {
-  if (payloads.length === 0) {
-    return;
-  }
-
+function sendToConnectedClients(events: SessionUpsertedEvent[]): void {
+  const payloads = events.flatMap(event => {
+    const target = event.project ? sshProjectTargetsDb.getByProjectId(event.project.projectId) : null;
+    // A deleted SSH binding must never turn an already-built local event into a public cloud event.
+    if (event.project?.sourceMode === 'ssh' && !target) return [];
+    return [{ payload: JSON.stringify(event), ownerId: target?.ownerId, sessionId: event.sessionId }];
+  });
   connectedClients.forEach((client) => {
-    if (client.readyState === WS_OPEN_STATE) {
-      for (const payload of payloads) {
-        client.send(payload);
-      }
+    if (client.readyState !== WS_OPEN_STATE) return;
+    const userId = getConnectedClientUserId(client);
+    for (const item of payloads) {
+      if ((item.ownerId === undefined || item.ownerId === userId) && canReadSshSession(item.sessionId, userId)) client.send(item.payload);
     }
   });
 }
@@ -81,7 +88,7 @@ function sendToConnectedClients(payloads: string[]): void {
 export async function broadcastSessionUpserted(sessionIdOrProviderSessionId: string): Promise<void> {
   const event = await buildSessionUpsertedEvent(sessionIdOrProviderSessionId);
   if (event) {
-    sendToConnectedClients([JSON.stringify(event)]);
+    sendToConnectedClients([event]);
   }
 }
 
@@ -93,15 +100,13 @@ export async function broadcastSessionUpserted(sessionIdOrProviderSessionId: str
 export async function broadcastSessionUpsertedBatch(
   sessionIds: Iterable<string>,
 ): Promise<void> {
-  const payloads: string[] = [];
+  const events: SessionUpsertedEvent[] = [];
   for (const sessionId of sessionIds) {
     const event = await buildSessionUpsertedEvent(sessionId);
-    if (event) {
-      payloads.push(JSON.stringify(event));
-    }
+    if (event) events.push(event);
   }
 
-  sendToConnectedClients(payloads);
+  sendToConnectedClients(events);
 }
 
 /** @internal Exported for the broadcast tests, which assert the payload shape directly. */

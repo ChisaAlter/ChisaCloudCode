@@ -5,7 +5,7 @@ import os from 'node:os';
 import mime from 'mime-types';
 import multer from 'multer';
 
-import { projectsDb } from '@/modules/database/index.js';
+import { resolveSelectedProjectPath, workspaceSelectionScope } from '@/modules/workspaces/index.js';
 import { bridgeFileSystem } from '@/modules/workspace-bridge/index.js';
 import { createFileTreeRouter } from '@/modules/file-tree/file-tree.routes.js';
 import { createFileTreeService } from '@/modules/file-tree/file-tree.service.js';
@@ -58,12 +58,12 @@ const fileTreeFileSystem: FileTreeFileSystem = {
 };
 
 /**
- * Database boundary used only by File Tree production composition.
- * The Database module is consumed through its barrel; services and routes see
- * only the narrow project-path lookup contract.
+ * Selected-workspace boundary used only by File Tree production composition.
+ * The Workspaces catalog validates durable ownership and generation; services
+ * and routes retain the narrow project-path lookup contract.
  */
 const fileTreeProjects: FileTreeProjectGateway = {
-  getProjectPathById: (projectId) => projectsDb.getProjectPathById(projectId),
+  getProjectPathById: resolveSelectedProjectPath,
 };
 
 /**
@@ -114,4 +114,5 @@ export const fileTreeRoutes = createFileTreeRouter(
     maximumFileCount: MAXIMUM_UPLOAD_FILE_COUNT,
   },
   fileTreeLogger,
+  workspaceSelectionScope,
 );

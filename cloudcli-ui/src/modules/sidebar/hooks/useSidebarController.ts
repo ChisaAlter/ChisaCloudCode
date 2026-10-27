@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { TFunction } from 'i18next';
 
-import { api } from '@/shared/api';
-import { isDesktop } from '@/shared/chisa';
+import { api, ApiRequestError, readApiJson } from '@/shared/api';
+import { getServerConnectionVersion, isDesktop } from '@/shared/chisa';
+import { getAuthSessionVersion } from '@/shared/authToken';
 import { subscribeToUserPreferences } from '@/shared/userSettings';
 import { usePaletteOps } from '@/modules/command-palette';
 import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationProjectResult, ConversationSearchResults, LLMProvider, Project, ProjectSession, ProjectSortOrder, RecentConversationListItem, SearchProgress, ActiveSidebarRename, PendingSidebarDeletion, SessionTitleSearchResult, SessionWithProvider, SidebarSearchMode } from '@/shared/types';
@@ -36,6 +37,8 @@ type RecentConversationsApiPayload = {
   success?: boolean;
   data?: {
     conversations?: RecentConversationListItem[];
+    /** Visible pins resolved independently of the requested page. */
+    pinned?: RecentConversationListItem[];
     total?: number;
     hasMore?: boolean;
   };
@@ -79,6 +82,15 @@ export function useSidebarController({
   setSidebarVisible,
   sidebarVisible,
 }: UseSidebarControllerArgs) {
+  // App replaces this account-owned controller; late HTTP bodies and SSE events are fenced too.
+  const [identity] = useState(() => ({ auth: getAuthSessionVersion(), server: getServerConnectionVersion() }));
+  const mounted = useRef(true);
+  const deletionRequest = useRef<AbortController | null>(null);
+  const accountCurrent = useCallback(() => mounted.current && identity.auth === getAuthSessionVersion() && identity.server === getServerConnectionVersion(), [identity]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; deletionRequest.current?.abort(); };
+  }, []);
   const paletteOps = usePaletteOps();
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
   // The one rename the sidebar has open, as a single value so a project and a
@@ -95,6 +107,12 @@ export function useSidebarController({
   // project and session dialogs are portalled at the same z-index and would
   // otherwise stack. See PendingSidebarDeletion.
   const [pendingDeletion, setPendingDeletion] = useState<PendingSidebarDeletion | null>(null);
+  // The confirmation remains open and locked until its server mutation settles.
+  const [isDeleting, setIsDeleting] = useState(false);
+  // Confirmed deletions show retryable errors beside the unchanged target.
+  const [deletionError, setDeletionError] = useState<string | null>(null);
+  // One-click archive failures belong above the sidebar content, without opening a confirmation.
+  const [sidebarError, setSidebarError] = useState<string | null>(null);
   // Desktop starts with recent conversations; projects remain one click away.
   const [searchMode, setSearchMode] = useState<SidebarSearchMode>(() => isDesktop() ? 'conversations' : 'projects');
   const [conversationResults, setConversationResults] = useState<ConversationSearchResults | null>(null);
@@ -104,6 +122,9 @@ export function useSidebarController({
   const [archivedSessions, setArchivedSessions] = useState<ArchivedSessionListItem[]>([]);
   const [isArchivedSessionsLoading, setIsArchivedSessionsLoading] = useState(false);
   const [recentConversations, setRecentConversations] = useState<RecentConversationListItem[]>([]);
+  // Pinned rows come from their own server lookup, so an older pin is visible
+  // even when it falls beyond the paginated recent-conversations page.
+  const [pinnedConversations, setPinnedConversations] = useState<RecentConversationListItem[]>([]);
   const [recentConversationsTotal, setRecentConversationsTotal] = useState(0);
   const [recentConversationsHasMore, setRecentConversationsHasMore] = useState(false);
   const [isRecentConversationsLoading, setIsRecentConversationsLoading] = useState(false);
@@ -118,6 +139,8 @@ export function useSidebarController({
   const starToggleSequenceByProjectRef = useRef<Map<string, number>>(new Map());
   const migrationStartedRef = useRef(false);
   const onRefreshRef = useRef(onRefresh);
+  const onSessionDeleteRef = useRef(onSessionDelete);
+  useEffect(() => { onSessionDeleteRef.current = onSessionDelete; }, [onSessionDelete]);
 
   const isSidebarCollapsed = !isMobile && !sidebarVisible;
   const activeSessionIds = activeSessions;
@@ -183,6 +206,7 @@ export function useSidebarController({
   }, [onRefresh]);
 
   const fetchArchivedSessions = useCallback(async () => {
+    if (!accountCurrent()) return;
     setIsArchivedSessionsLoading(true);
 
     try {
@@ -207,16 +231,18 @@ export function useSidebarController({
         ? archivedSessionsPayload.data.sessions.filter((session) => !session.projectId || !archivedProjectIds.has(session.projectId))
         : [];
 
+      if (!accountCurrent()) return;
       setArchivedProjects(nextProjects);
       setArchivedSessions(nextStandaloneSessions);
     } catch (error) {
       console.error('[Sidebar] Failed to load archived sessions:', error);
     } finally {
-      setIsArchivedSessionsLoading(false);
+      if (accountCurrent()) setIsArchivedSessionsLoading(false);
     }
-  }, []);
+  }, [accountCurrent]);
 
   const fetchRecentConversationsPage = useCallback(async (offset: number, append: boolean) => {
+    if (!accountCurrent()) return;
     const requestSequence = ++recentConversationsSeqRef.current;
     if (append) {
       setIsLoadingMoreRecentConversations(true);
@@ -236,8 +262,12 @@ export function useSidebarController({
         ? payload.data.conversations
         : [];
 
-      if (requestSequence !== recentConversationsSeqRef.current) {
+      if (!accountCurrent() || requestSequence !== recentConversationsSeqRef.current) {
         return;
+      }
+
+      if (Array.isArray(payload.data?.pinned)) {
+        setPinnedConversations(payload.data.pinned);
       }
 
       setRecentConversations((previous) => {
@@ -254,18 +284,18 @@ export function useSidebarController({
       setRecentConversationsTotal(Number(payload.data?.total ?? conversations.length));
       setRecentConversationsHasMore(Boolean(payload.data?.hasMore));
     } catch (error) {
-      if (requestSequence !== recentConversationsSeqRef.current) {
+      if (!accountCurrent() || requestSequence !== recentConversationsSeqRef.current) {
         return;
       }
       console.error('[Sidebar] Failed to load recent conversations:', error);
       setRecentConversationsError(true);
     } finally {
-      if (requestSequence === recentConversationsSeqRef.current) {
+      if (accountCurrent() && requestSequence === recentConversationsSeqRef.current) {
         setIsRecentConversationsLoading(false);
         setIsLoadingMoreRecentConversations(false);
       }
     }
-  }, []);
+  }, [accountCurrent]);
 
   const reloadRecentConversations = useCallback(() => {
     void fetchRecentConversationsPage(0, false);
@@ -391,7 +421,7 @@ export function useSidebarController({
     setSearchProgress(null);
     const seq = ++searchSeqRef.current;
 
-    if (seq !== searchSeqRef.current) {
+    if (!accountCurrent() || seq !== searchSeqRef.current) {
       return;
     }
 
@@ -404,7 +434,7 @@ export function useSidebarController({
     let totalMatches = 0;
 
     es.addEventListener('title-results', (evt) => {
-      if (seq !== searchSeqRef.current) { es.close(); return; }
+      if (!accountCurrent() || seq !== searchSeqRef.current) { es.close(); return; }
       try {
         const data = JSON.parse(evt.data) as { titleResults: SessionTitleSearchResult[] };
         titleResults = Array.isArray(data.titleResults) ? data.titleResults : [];
@@ -420,7 +450,7 @@ export function useSidebarController({
     });
 
     es.addEventListener('result', (evt) => {
-      if (seq !== searchSeqRef.current) { es.close(); return; }
+      if (!accountCurrent() || seq !== searchSeqRef.current) { es.close(); return; }
       try {
         const data = JSON.parse(evt.data) as {
           projectResult: ConversationProjectResult;
@@ -443,7 +473,7 @@ export function useSidebarController({
     });
 
     es.addEventListener('progress', (evt) => {
-      if (seq !== searchSeqRef.current) { es.close(); return; }
+      if (!accountCurrent() || seq !== searchSeqRef.current) { es.close(); return; }
       try {
         const data = JSON.parse(evt.data) as { totalMatches: number; scannedProjects: number; totalProjects: number };
         totalMatches = data.totalMatches;
@@ -454,7 +484,7 @@ export function useSidebarController({
     });
 
     es.addEventListener('done', () => {
-      if (seq !== searchSeqRef.current) { es.close(); return; }
+      if (!accountCurrent() || seq !== searchSeqRef.current) { es.close(); return; }
       es.close();
       eventSourceRef.current = null;
       setIsSearching(false);
@@ -468,7 +498,7 @@ export function useSidebarController({
     });
 
     es.addEventListener('error', () => {
-      if (seq !== searchSeqRef.current) { es.close(); return; }
+      if (!accountCurrent() || seq !== searchSeqRef.current) { es.close(); return; }
       es.close();
       eventSourceRef.current = null;
       setIsSearching(false);
@@ -487,7 +517,7 @@ export function useSidebarController({
         eventSourceRef.current = null;
       }
     };
-  }, [debouncedSearchQuery, searchMode]);
+  }, [accountCurrent, debouncedSearchQuery, searchMode]);
 
   // All sidebar state keys (expanded, starred, loading, etc.) use the DB
   // `projectId` as their identifier after the migration.
@@ -770,59 +800,74 @@ export function useSidebarController({
     [paletteOps],
   );
 
+  const cancelDeletion = useCallback(() => {
+    if (!accountCurrent() || deletionRequest.current) return;
+    setPendingDeletion(null);
+    setDeletionError(null);
+  }, [accountCurrent]);
+
+  const dismissSidebarError = useCallback(() => {
+    if (accountCurrent()) setSidebarError(null);
+  }, [accountCurrent]);
+
   const showDeleteSessionConfirmation = useCallback(
     (
       sessionId: string,
       sessionTitle: string,
       options: { isArchived?: boolean } = {},
     ) => {
-      setPendingDeletion({
-        kind: 'session',
-        sessionId,
-        sessionTitle,
-        isArchived: Boolean(options.isArchived),
-      });
+      if (!accountCurrent() || deletionRequest.current) return;
+      setDeletionError(null);
+      setSidebarError(null);
+      setPendingDeletion({ kind: 'session', sessionId, sessionTitle, isArchived: Boolean(options.isArchived) });
     },
-    [],
+    [accountCurrent],
   );
 
-  const deleteSession = useCallback(async (sessionId: string, hardDelete = false) => {
-    try {
-      const response = await api.deleteSession(sessionId, hardDelete);
+  const deletionMessage = useCallback((cause: unknown) => {
+    const fallback = t('messages.deleteSessionFailed');
+    // Only parsed API errors are suitable for display; malformed JSON and transport errors use a local explanation.
+    if (!(cause instanceof ApiRequestError)) return fallback;
+    const message = typeof cause.message === 'string' && cause.message.trim() ? cause.message : fallback;
+    return cause.code ? `${message} (${cause.code})` : message;
+  }, [t]);
 
-      if (response.ok) {
-        onSessionDelete?.(sessionId);
-        // Same gap as rename: nothing refetched the recents feed, so the row the
-        // user just archived stayed in the list. Archiving keeps the session, so
-        // only the non-archived total moves.
-        setRecentConversations((previous) => {
-          const remaining = previous.filter((conversation) => conversation.sessionId !== sessionId);
-          if (remaining.length !== previous.length) {
-            setRecentConversationsTotal((total) => Math.max(0, total - 1));
-          }
-          return remaining;
-        });
-        await fetchArchivedSessions();
-      } else {
-        const errorText = await response.text();
-        console.error('[Sidebar] Failed to delete session:', {
-          status: response.status,
-          error: errorText,
-        });
-        alert(t('messages.deleteSessionFailed'));
+  const deleteSession = useCallback(async (sessionId: string, hardDelete = false, confirmation = false) => {
+    if (!accountCurrent() || deletionRequest.current || (!confirmation && pendingDeletion)) return;
+    const controller = new AbortController();
+    deletionRequest.current = controller;
+    setIsDeleting(true);
+    if (confirmation) setDeletionError(null);
+    else setSidebarError(null);
+    try {
+      const response = await api.deleteSession(sessionId, hardDelete, { signal: controller.signal });
+      await readApiJson<{ success: true }>(response);
+      if (!accountCurrent() || controller.signal.aborted) return;
+      onSessionDeleteRef.current?.(sessionId);
+      // Remove both paginated and independently pinned rows; a pinned-only session still contributes to the server total.
+      const wasVisible = recentConversations.some(row => row.sessionId === sessionId) || pinnedConversations.some(row => row.sessionId === sessionId);
+      setRecentConversations(previous => previous.filter(row => row.sessionId !== sessionId));
+      setPinnedConversations(previous => previous.filter(row => row.sessionId !== sessionId));
+      if (wasVisible) setRecentConversationsTotal(total => Math.max(0, total - 1));
+      if (confirmation) setPendingDeletion(previous => previous?.kind === 'session' && previous.sessionId === sessionId ? null : previous);
+      await fetchArchivedSessions();
+    } catch (cause) {
+      if (!accountCurrent() || controller.signal.aborted) return;
+      const message = deletionMessage(cause);
+      if (confirmation) setDeletionError(message);
+      else setSidebarError(message);
+    } finally {
+      if (accountCurrent() && deletionRequest.current === controller) {
+        deletionRequest.current = null;
+        setIsDeleting(false);
       }
-    } catch (error) {
-      console.error('[Sidebar] Error deleting session:', error);
-      alert(t('messages.deleteSessionError'));
     }
-  }, [fetchArchivedSessions, onSessionDelete, t]);
+  }, [accountCurrent, deletionMessage, fetchArchivedSessions, pendingDeletion, pinnedConversations, recentConversations]);
 
   const confirmDeleteSession = useCallback(async (hardDelete = false) => {
-    if (pendingDeletion?.kind !== 'session') return;
-    const { sessionId } = pendingDeletion;
-    setPendingDeletion(null);
-    await deleteSession(sessionId, hardDelete);
-  }, [deleteSession, pendingDeletion]);
+    if (!accountCurrent() || pendingDeletion?.kind !== 'session') return;
+    await deleteSession(pendingDeletion.sessionId, hardDelete, true);
+  }, [accountCurrent, deleteSession, pendingDeletion]);
 
   const archiveSession = useCallback((sessionId: string) => {
     void deleteSession(sessionId);
@@ -830,50 +875,40 @@ export function useSidebarController({
 
   const requestProjectDelete = useCallback(
     (project: Project) => {
-      setPendingDeletion({
-        kind: 'project',
-        project,
-        sessionCount: getProjectSessions(project).length,
-      });
+      if (!accountCurrent() || deletionRequest.current) return;
+      setDeletionError(null);
+      setSidebarError(null);
+      setPendingDeletion({ kind: 'project', project, sessionCount: getProjectSessions(project).length });
     },
-    [getProjectSessions],
+    [accountCurrent, getProjectSessions],
   );
 
   const confirmDeleteProject = useCallback(async (deleteData = false) => {
-    if (pendingDeletion?.kind !== 'project') {
-      return;
-    }
-
+    if (!accountCurrent() || deletionRequest.current || pendingDeletion?.kind !== 'project') return;
     const { project } = pendingDeletion;
-
     setPendingDeletion(null);
-    // Track in-flight deletes by projectId so the UI can disable actions
-    // even if the project object is rebuilt while the request is flying.
-    setDeletingProjects((prev) => new Set([...prev, project.projectId]));
-
+    setDeletingProjects(prev => new Set([...prev, project.projectId]));
     try {
       const response = await api.deleteProject(project.projectId, deleteData);
-
       if (response.ok) {
         onProjectDelete?.(project.projectId);
       } else {
         const data = (await response.json()) as { error?: string | { message?: string } };
         const err = data.error;
-        const message =
-          typeof err === 'string' ? err : err && typeof err === 'object' && err.message ? err.message : t('messages.deleteProjectFailed');
+        const message = typeof err === 'string' ? err : err && typeof err === 'object' && err.message ? err.message : t('messages.deleteProjectFailed');
         alert(message);
       }
     } catch (error) {
       console.error('Error deleting project:', error);
       alert(t('messages.deleteProjectError'));
     } finally {
-      setDeletingProjects((prev) => {
+      setDeletingProjects(prev => {
         const next = new Set(prev);
         next.delete(project.projectId);
         return next;
       });
     }
-  }, [pendingDeletion, onProjectDelete, t]);
+  }, [accountCurrent, pendingDeletion, onProjectDelete, t]);
 
   const handleProjectSelect = useCallback(
     (project: Project) => {
@@ -1055,6 +1090,11 @@ export function useSidebarController({
     deletingProjects,
     loadingMoreProjects,
     pendingDeletion,
+    isDeleting,
+    deletionError,
+    sidebarError,
+    cancelDeletion,
+    dismissSidebarError,
     filteredProjects,
     runningSessionsCount,
     archivedProjects: filteredArchivedProjects,
@@ -1062,6 +1102,7 @@ export function useSidebarController({
     archivedSessionsCount: archivedProjects.length + archivedSessions.length,
     isArchivedSessionsLoading,
     recentConversations,
+    pinnedConversations,
     recentConversationsTotal,
     recentConversationsHasMore,
     isRecentConversationsLoading,

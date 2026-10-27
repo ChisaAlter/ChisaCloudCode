@@ -31,6 +31,8 @@ async function runCliBootstrapFixture(isPlatform: boolean): Promise<BootstrapRes
   const fixtureDatabasePath = path.join(fixtureRoot, 'auth.db');
 
   try {
+    // This fixture starts a fresh account; do not import the host's legacy DB.
+    await writeFile(fixtureDatabasePath, '');
     await mkdir(fixtureCliDirectory, { recursive: true });
     await Promise.all([
       copyFile(

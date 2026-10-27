@@ -1,26 +1,30 @@
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
 
 import type { WebSocket } from 'ws';
 
-import { sessionDraftsDb, sessionsDb } from '@/modules/database/index.js';
+import { projectsDb, sessionsDb, userDb } from '@/modules/database/index.js';
 import { providerModelsService, sessionsService } from '@/modules/providers/index.js';
+import { assertCloudWorkspaceOwner } from '@/modules/workspace-runtime/index.js';
+import { assertWorkspaceDescriptor, assertSshProjectOwner, resolveSshProjectTarget, isWorkspaceBound } from '@/modules/workspace-bridge/index.js';
+import { resolveSelectedWorkspace } from '@/modules/workspaces/index.js';
 import { chatRunRegistry } from '@/modules/websocket/services/chat-run-registry.service.js';
-import { connectedClients, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
+import { connectedClients, setConnectedClientUserId, WS_OPEN_STATE } from '@/modules/websocket/services/websocket-state.service.js';
 import {
+  AppError,
   getGlobalImageAssetsDir,
   isImageAttachmentDescriptor,
   normalizeAttachmentDescriptors,
-  type ChatAttachmentDescriptor,
-} from '@/shared/image-attachments.js';
+  parseIncomingJsonObject,
+} from '@/shared/index.js';
 import type {
   AnyRecord,
   AuthenticatedWebSocketRequest,
+  ChatAttachmentDescriptor,
   LLMProvider,
   ProviderPermissionDecision,
   ProviderRuntimeWriter,
-} from '@/shared/types.js';
-import { createNormalizedMessage, parseIncomingJsonObject } from '@/shared/utils.js';
+  WorkspaceDescriptor,
+} from '@/shared/index.js';
 
 /**
  * Trust boundary for client-supplied image attachments: chat.send options come
@@ -83,62 +87,11 @@ type ChatWebSocketDependencies = {
   runtime: ProviderRuntimeGateway;
 };
 
-type ChatTurnResult = {
-  started: boolean;
-  error: string | null;
-  reason?: 'busy' | 'unavailable';
-  code?: string;
-  retryable?: boolean;
-};
-
 // A cancelled runtime can settle before abort finishes releasing its workspace.
 // Its dispatch fallback must leave completion to the abort handler until then.
 const stoppingRuns = new WeakSet<NonNullable<ReturnType<typeof chatRunRegistry.getRun>>>();
 const runCancellations = new WeakMap<NonNullable<ReturnType<typeof chatRunRegistry.getRun>>, AbortController>();
 const settledRuns = new WeakSet<NonNullable<ReturnType<typeof chatRunRegistry.getRun>>>();
-const runtimeStartedRuns = new WeakSet<NonNullable<ReturnType<typeof chatRunRegistry.getRun>>>();
-const runSettlements = new WeakMap<NonNullable<ReturnType<typeof chatRunRegistry.getRun>>, Promise<void>>();
-const runStops = new WeakMap<NonNullable<ReturnType<typeof chatRunRegistry.getRun>>, Promise<boolean>>();
-
-function stopRun(run: NonNullable<ReturnType<typeof chatRunRegistry.getRun>>, dependencies: ChatWebSocketDependencies): Promise<boolean> {
-  const currentStop = runStops.get(run);
-  // Before runtime startup there is no current provider handle to retry.
-  if (currentStop && !runtimeStartedRuns.has(run)) return currentStop;
-  stoppingRuns.add(run);
-  runCancellations.get(run)?.abort();
-  const request = (async () => {
-    // An edit may still be forking its transcript. It owns this run even though no provider runtime exists yet.
-    if (!runtimeStartedRuns.has(run)) { await runSettlements.get(run); return true; }
-    return dependencies.runtime.abort(run.provider, run.appSessionId);
-  })();
-  // Each explicit retry reaches the provider, but cannot acknowledge ahead of
-  // earlier stop/cleanup requests. One confirmed stop is sufficient; report a
-  // failure only when none of the requests confirms this run has stopped.
-  const stop = currentStop
-    ? Promise.allSettled([currentStop, request]).then(results => {
-      if (results.some(result => result.status === 'fulfilled' && result.value)) return true;
-      const failure = results.find(result => result.status === 'rejected');
-      if (failure?.status === 'rejected') throw failure.reason;
-      return false;
-    })
-    : request;
-  runStops.set(run, stop);
-  return stop;
-}
-
-function finishStop(
-  run: NonNullable<ReturnType<typeof chatRunRegistry.getRun>>,
-  stop: Promise<boolean> | null,
-  success: boolean,
-): void {
-  if (success) chatRunRegistry.completeRunIfCurrent(run, { exitCode: 0, aborted: true });
-  // An earlier failed request must not release the barrier owned by a retry.
-  if (runStops.get(run) !== stop) return;
-  stoppingRuns.delete(run);
-  runStops.delete(run);
-  if (!success && settledRuns.has(run)) chatRunRegistry.completeRunIfCurrent(run, { exitCode: 1 });
-  finishSettledRun(run);
-}
 const notifiedRuns = new WeakSet<NonNullable<ReturnType<typeof chatRunRegistry.getRun>>>();
 const admissionRejectedRuns = new WeakSet<NonNullable<ReturnType<typeof chatRunRegistry.getRun>>>();
 const unsettledRuns = new Map<string, Set<NonNullable<ReturnType<typeof chatRunRegistry.getRun>>>>();
@@ -193,6 +146,15 @@ function readRequestUserId(
   return null;
 }
 
+/** Replay, cancellation, approvals and new turns share the same persisted cloud/SSH account check. */
+function assertSshSessionOwner(sessionId: string, userId: string | number | null) {
+  const session = sessionsDb.getSessionById(sessionId);
+  const target = session?.project_path ? resolveSshProjectTarget(session.project_path) : null;
+  if (target) assertSshProjectOwner(target, userId);
+  else if (session) assertCloudWorkspaceOwner(session.project_path, userId, userDb.getActiveUserIds());
+  return target;
+}
+
 function sendJson(ws: WebSocket, payload: unknown): void {
   if (ws.readyState === WS_OPEN_STATE) {
     ws.send(JSON.stringify(payload));
@@ -237,7 +199,7 @@ async function handleChatSend(
   data: AnyRecord,
   dependencies: ChatWebSocketDependencies
 ): Promise<void> {
-  const resolved = resolveSendTarget(ws, data, dependencies, 'chat.send');
+  const resolved = resolveSendTarget(ws, userId, data, dependencies, 'chat.send');
   if (!resolved) {
     return;
   }
@@ -251,12 +213,66 @@ type ResolvedSendTarget = {
   provider: LLMProvider;
 };
 
+/** Chat selects the persisted app session, even when the file browser selects another workspace. */
+function resolveChatWorkspace(
+  sessionId: string,
+  session: ResolvedSendTarget['session'],
+  data: AnyRecord,
+): WorkspaceDescriptor | undefined {
+  const current = sessionsDb.getSessionById(sessionId);
+  if (!current || current.project_path !== session.project_path || current.provider !== session.provider
+    || current.workspace_mode !== session.workspace_mode) {
+    throw new AppError('The session workspace changed before this turn could start.', { code: 'WORKSPACE_SELECTION_MISMATCH', statusCode: 409 });
+  }
+
+  const hasSelector = ['projectId', 'workspaceId', 'generation'].some(key => Object.hasOwn(data, key));
+  if (!hasSelector) {
+    if (session.project_path && isWorkspaceBound(session.project_path)) {
+      throw new AppError('projectId, workspaceId and generation are required for a bound chat session.', { code: 'WORKSPACE_SELECTOR_REQUIRED', statusCode: 400 });
+    }
+    // Existing standalone clients have no workspace catalog. An explicit but
+    // malformed selector never takes this compatibility path.
+    return undefined;
+  }
+  if (typeof data.projectId !== 'string' || !data.projectId.trim()
+    || typeof data.workspaceId !== 'string' || !data.workspaceId.trim()
+    || typeof data.generation !== 'string' || !data.generation.trim()) {
+    throw new AppError('Chat requires a complete projectId, workspaceId and generation selector.', { code: 'INVALID_WORKSPACE_SELECTOR', statusCode: 400 });
+  }
+  const projectId = data.projectId.trim();
+  const project = session.project_path ? projectsDb.getProjectPath(session.project_path) : null;
+  if (!project || project.project_id !== projectId) {
+    throw new AppError('The selected project does not own this chat session.', { code: 'WORKSPACE_SELECTION_MISMATCH', statusCode: 409 });
+  }
+  const selector = { workspaceId: data.workspaceId.trim(), generation: data.generation.trim() };
+  try {
+    return resolveSelectedWorkspace(projectId, { ...selector, sessionId });
+  } catch (error) {
+    if (!(error instanceof AppError) || error.code !== 'WORKSPACE_SESSION_NOT_READY') throw error;
+    // Admission creates a first session workspace. Until then only this
+    // project's exact source generation may authorize that materialization.
+    const descriptor = resolveSelectedWorkspace(projectId, selector);
+    if (descriptor.kind !== 'cloudReplica') {
+      throw new AppError('A new session must select its project replica.', { code: 'WORKSPACE_SELECTION_MISMATCH', statusCode: 409 });
+    }
+    return descriptor;
+  }
+}
+
+function workspaceRejection(ws: WebSocket | null, error: unknown, sessionId: string) {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = error instanceof AppError ? error.code : 'INTERNAL_ERROR';
+  if (ws) sendProtocolError(ws, code, message, sessionId);
+  return { started: false, error: message, code };
+}
+
 /**
  * Shared front half of `chat.send` and `chat.edit-send`: the session row and
  * provider come from the database, never from the client.
  */
 function resolveSendTarget(
   ws: WebSocket,
+  userId: string | number | null,
   data: AnyRecord,
   dependencies: ChatWebSocketDependencies,
   frameName: string,
@@ -284,6 +300,13 @@ function resolveSendTarget(
     return null;
   }
 
+  try {
+    assertSshSessionOwner(sessionId, userId);
+    resolveChatWorkspace(sessionId, session, data);
+  } catch (error) {
+    workspaceRejection(ws, error, sessionId);
+    return null;
+  }
   return { sessionId, session, provider };
 }
 
@@ -302,10 +325,24 @@ async function dispatchRun(
   dependencies: ChatWebSocketDependencies,
   extraRuntimeOptions: AnyRecord = {},
   beforeRun?: (run: NonNullable<ReturnType<typeof chatRunRegistry.startRun>>) => void | Promise<void>,
-): Promise<ChatTurnResult> {
+): Promise<{ started: boolean; error: string | null; code?: string; retryable?: boolean }> {
   const provider = session.provider as LLMProvider;
   const clientOptions = (data.options ?? {}) as AnyRecord;
   const command = typeof data.content === 'string' ? data.content : '';
+  let workspaceDescriptor: WorkspaceDescriptor | undefined;
+  try {
+    // Edit anchor lookup and scheduled cancellation can yield between the
+    // first validation and here. Recheck before history/model changes.
+    assertSshSessionOwner(sessionId, userId);
+    workspaceDescriptor = resolveChatWorkspace(sessionId, session, data);
+    const ssh = session.project_path ? resolveSshProjectTarget(session.project_path) : null;
+    if (ssh) {
+      assertSshProjectOwner(ssh, userId);
+      if (provider !== 'claude') throw new AppError('SSH 本地项目目前仅支持 VPS Claude Code。', { code: 'WORKSPACE_PROVIDER_UNSUPPORTED', statusCode: 409 });
+    }
+  } catch (error) {
+    return workspaceRejection(ws, error, sessionId);
+  }
 
   const run = chatRunRegistry.startRun({
     appSessionId: sessionId,
@@ -324,15 +361,13 @@ async function dispatchRun(
         sessionId
       );
     }
-    return { started: false, error: 'A run is already in progress for this session.', code: 'RUN_IN_PROGRESS', retryable: true, reason: 'busy' };
+    return { started: false, error: 'A run is already in progress for this session.', code: 'RUN_IN_PROGRESS', retryable: true };
   }
   const pending = unsettledRuns.get(sessionId) ?? new Set();
   pending.add(run);
   unsettledRuns.set(sessionId, pending);
   const cancellation = new AbortController();
   runCancellations.set(run, cancellation);
-  let finishRun!: () => void;
-  runSettlements.set(run, new Promise<void>(resolve => { finishRun = resolve; }));
   chatRunRegistry.setPhase(run, 'queued');
 
   // Record what this turn runs with so reopening the session later restores the
@@ -376,6 +411,10 @@ async function dispatchRun(
     cwd: session.project_path ?? undefined,
     projectPath: session.project_path ?? undefined,
     workspaceMode: session.workspace_mode,
+    // Only the catalog-validated value reaches provider admission. Neither a
+    // client descriptor object nor a queue's selector may replace it.
+    workspaceDescriptor,
+    workspace: undefined,
     abortSignal: cancellation.signal,
   };
 
@@ -389,23 +428,13 @@ async function dispatchRun(
     // run instead of leaving the session processing forever.
     await beforeRun?.(run);
     cancellation.signal.throwIfAborted();
-    // Detached sends have no composer to echo the accepted user turn. Publish
-    // it before provider status/stream events, through the same replay log.
-    if (!ws) {
-      run.writer.send(createNormalizedMessage({
-        // Reuse optimistic-row reconciliation when persisted provider history
-        // returns the same user turn with its authoritative transcript id.
-        id: `local_detached_${randomUUID()}`,
-        kind: 'text',
-        role: 'user',
-        provider,
-        sessionId,
-        content: command,
-        images: uniqueAttachments.filter(isImageAttachmentDescriptor),
-        files: uniqueAttachments.filter((descriptor) => !isImageAttachmentDescriptor(descriptor)),
-      }));
+    try {
+      resolveChatWorkspace(sessionId, session, data);
+      if (workspaceDescriptor) assertWorkspaceDescriptor(workspaceDescriptor);
+    } catch (error) {
+      workspaceRejection(ws, error, sessionId);
+      throw error;
     }
-    runtimeStartedRuns.add(run);
     chatRunRegistry.setPhase(run, 'running');
     await dependencies.runtime.run(provider, command, runtimeOptions, run.writer);
   } catch (error) {
@@ -415,7 +444,7 @@ async function dispatchRun(
     retryable = !runtimeError?.workspaceCleanupError && !runtimeError?.cleanupError && (
       code === 'RUN_IN_PROGRESS' || runtimeError?.workspaceAdmissionRejected === true
     );
-    if (retryable) { admissionRejectedRuns.add(run); run.admissionRejected = true; }
+    if (retryable) admissionRejectedRuns.add(run);
     console.error(`[Chat] Provider runtime "${provider}" failed`, { sessionId, error: failure, code });
   } finally {
     // Safety net: a runtime that crashed (or resolved) without emitting its
@@ -424,23 +453,12 @@ async function dispatchRun(
     // a queued message can start the session's next run before this promise
     // settles, and the session-keyed completeRun would kill that new run.
     settledRuns.add(run);
-    finishRun();
     if (!stoppingRuns.has(run)) chatRunRegistry.completeRunIfCurrent(run, { exitCode: 1 });
     runCancellations.delete(run);
     finishSettledRun(run);
   }
 
-  const completion = run.events.find((event) => event.kind === 'complete');
-  // During an abort, runtime settlement can precede workspace release. The
-  // abort handler still owns completion, so the queue must not call this success.
-  if (!failure && !completion) failure = 'The turn has not confirmed completion. Its input has been preserved.';
-  if (!failure && completion && (completion.success === false || completion.aborted
-    || (typeof completion.exitCode === 'number' && completion.exitCode !== 0))) {
-    failure = completion.aborted
-      ? 'The queued turn was stopped. Its input has been preserved.'
-      : 'The provider did not complete the turn successfully.';
-  }
-  return { started: !retryable, error: failure, ...(code ? { code } : {}), ...(retryable ? { retryable, reason: 'busy' as const } : {}) };
+  return { started: !retryable, error: failure, ...(code ? { code } : {}), ...(retryable ? { retryable } : {}) };
 }
 
 /**
@@ -458,7 +476,7 @@ async function handleChatEditSend(
   data: AnyRecord,
   dependencies: ChatWebSocketDependencies
 ): Promise<void> {
-  const resolved = resolveSendTarget(ws, data, dependencies, 'chat.edit-send');
+  const resolved = resolveSendTarget(ws, userId, data, dependencies, 'chat.edit-send');
   if (!resolved) {
     return;
   }
@@ -565,9 +583,7 @@ async function handleChatAbort(
     return;
   }
 
-  const draftUserId = Number(userId);
-  if (Number.isInteger(draftUserId) && draftUserId > 0) sessionDraftsDb.pauseQueuedMessage(draftUserId, sessionId);
-
+  assertSshSessionOwner(sessionId, userId);
   const run = chatRunRegistry.getRun(sessionId);
   if (!run || run.status !== 'running') {
     sendProtocolError(ws, 'NO_ACTIVE_RUN', `Session "${sessionId}" has no active run.`, sessionId);
@@ -575,16 +591,19 @@ async function handleChatAbort(
   }
 
   let success = false;
-  let stop: Promise<boolean> | null = null;
+  stoppingRuns.add(run);
+  runCancellations.get(run)?.abort();
   try {
-    stop = stopRun(run, dependencies);
-    success = await stop;
+    success = await dependencies.runtime.abort(run.provider, sessionId);
     if (!success) sendProtocolError(ws, 'CHAT_ABORT_FAILED', 'The task has not confirmed cancellation; it is still running or finalizing.', sessionId);
   } catch (error) {
     sendProtocolError(ws, 'CHAT_ABORT_FAILED', error instanceof Error ? error.message : String(error), sessionId);
   } finally {
     // Aborting a provider can outlive its run; never complete a subsequent run.
-    finishStop(run, stop, success);
+    if (success) chatRunRegistry.completeRunIfCurrent(run, { exitCode: 0, aborted: true });
+    stoppingRuns.delete(run);
+    if (!success && settledRuns.has(run)) chatRunRegistry.completeRunIfCurrent(run, { exitCode: 1 });
+    finishSettledRun(run);
   }
 }
 
@@ -598,6 +617,7 @@ async function handleChatAbort(
  */
 function handleChatSubscribe(
   ws: WebSocket,
+  userId: string | number | null,
   data: AnyRecord,
   dependencies: ChatWebSocketDependencies
 ): void {
@@ -615,25 +635,26 @@ function handleChatSubscribe(
       continue;
     }
 
+    try { assertSshSessionOwner(sessionId, userId); }
+    catch (error) { workspaceRejection(ws, error, sessionId); continue; }
+
     const lastSeqRaw = (target as AnyRecord).lastSeq;
     const lastSeq = typeof lastSeqRaw === 'number' && Number.isFinite(lastSeqRaw)
       ? Math.max(0, Math.floor(lastSeqRaw))
       : 0;
-    const requestedRunId = typeof (target as AnyRecord).runId === 'string' ? (target as AnyRecord).runId : null;
-    const clientEpoch = (target as AnyRecord).replayEpoch;
-    const replayEpoch = chatRunRegistry.getReplayEpoch(sessionId);
 
     const run = chatRunRegistry.getRun(sessionId);
     const isProcessing = chatRunRegistry.isProcessing(sessionId);
-    // Modern cursors span runs within one channel lifetime. Earlier clients
-    // only supplied a run identity, so their watermark is valid for that run.
-    const replayFromSeq = typeof clientEpoch === 'string'
-      ? clientEpoch === replayEpoch ? lastSeq : 0
-      : requestedRunId === run?.runId ? lastSeq : 0;
+    // Sequence numbers restart for each run. Older clients omit runId and keep
+    // their previous cursor semantics; null explicitly means no known run.
+    const cursorRunId = (target as AnyRecord).runId;
+    const replayAfter = cursorRunId !== undefined && cursorRunId !== run?.runId ? 0 : lastSeq;
 
-    // Keep idle subscribers too: a queued turn starts without an initiating
-    // socket, but still has to reach pages already watching this session.
-    chatRunRegistry.attachConnection(sessionId, ws);
+    // Future live events for this run should land on the socket that asked —
+    // this is what makes mid-stream page refreshes work for all providers.
+    if (run && run.status === 'running') {
+      chatRunRegistry.attachConnection(sessionId, ws);
+    }
 
     // Pending approvals are tracked under the app session id inside the
     // Claude runtime, so they can be looked up directly.
@@ -642,12 +663,10 @@ function handleChatSubscribe(
     sendJson(ws, {
       kind: 'chat_subscribed',
       sessionId,
-      runId: run?.runId,
       isProcessing,
-      modelStopped: run?.modelStopped ?? false,
+      runId: run?.runId ?? null,
       runPhase: run?.phase ?? null,
       lastSeq: run?.lastSeq ?? 0,
-      replayEpoch,
       pendingPermissions,
       timestamp: new Date().toISOString(),
     });
@@ -659,7 +678,7 @@ function handleChatSubscribe(
     // replaying them (e.g. after a page reload where the client's lastSeq is
     // 0) would duplicate messages the history fetch already returned.
     if (isProcessing) {
-      for (const event of chatRunRegistry.replayEvents(sessionId, replayFromSeq)) {
+      for (const event of chatRunRegistry.replayEvents(sessionId, replayAfter)) {
         sendJson(ws, event);
       }
     }
@@ -671,11 +690,20 @@ function handleChatSubscribe(
  * pending approval resolver (Claude is the only provider with interactive
  * approvals today, but the message is intentionally provider-neutral).
  */
-function handlePermissionResponse(data: AnyRecord, dependencies: ChatWebSocketDependencies): void {
+function handlePermissionResponse(ws: WebSocket, userId: string | number | null, data: AnyRecord, dependencies: ChatWebSocketDependencies): void {
   if (typeof data.requestId !== 'string' || data.requestId.length === 0) {
     return;
   }
 
+  // Never trust a client-supplied session id for a global approval resolver.
+  // Only an actual pending request in an owned registered run may be resolved.
+  const matches = chatRunRegistry.listRunningRuns().filter(run => dependencies.runtime.getPendingApprovalsForSession(run.sessionId)
+    .some(value => value !== null && typeof value === 'object' && (value as AnyRecord).requestId === data.requestId));
+  if (matches.length !== 1) {
+    sendProtocolError(ws, 'PERMISSION_REQUEST_NOT_FOUND', 'The permission request is no longer pending.');
+    return;
+  }
+  assertSshSessionOwner(matches[0]!.sessionId, userId);
   dependencies.runtime.resolveToolApproval(data.requestId, {
     allow: Boolean(data.allow),
     updatedInput: data.updatedInput,
@@ -688,9 +716,11 @@ function handlePermissionResponse(data: AnyRecord, dependencies: ChatWebSocketDe
  * Handles authenticated chat websocket messages used by the main chat panel.
  *
  * Inbound protocol (client to server):
- * - `chat.send`                { sessionId, content, options? }
+ * - `chat.send`                { sessionId, projectId?, workspaceId?, generation?, content, options? }
+ * - `chat.edit-send`           { sessionId, projectId?, workspaceId?, generation?, anchorId, content, options? }
+ *   Bound sessions require all three workspace selector fields.
  * - `chat.abort`               { sessionId }
- * - `chat.subscribe`           { sessions: [{ sessionId, lastSeq?, replayEpoch?, runId? }] }
+ * - `chat.subscribe`           { sessions: [{ sessionId, lastSeq? }] }
  * - `chat.permission-response` { requestId, allow, updatedInput?, message?, rememberEntry? }
  *
  * Outbound protocol (server to client): every frame is `kind`-based — either
@@ -725,15 +755,35 @@ export async function runDetachedChatTurn(
     interruptActiveRun?: boolean;
   },
   dependencies: ChatWebSocketDependencies,
-): Promise<ChatTurnResult> {
+): Promise<{ started: boolean; error: string | null; code?: string; retryable?: boolean }> {
   const session = sessionsDb.getSessionById(input.sessionId);
   if (!session) {
-    return { started: false, error: 'The session no longer exists.', reason: 'unavailable' };
+    return { started: false, error: 'The session no longer exists.' };
   }
 
   const provider = session.provider as LLMProvider;
   if (!dependencies.runtime.hasRuntime(provider)) {
-    return { started: false, error: `Provider "${provider}" is not available.`, reason: 'unavailable' };
+    return { started: false, error: `Provider "${provider}" is not available.` };
+  }
+
+  const data: AnyRecord = { sessionId: input.sessionId, content: input.content, options: input.options ?? {} };
+  try {
+    // Persisted queues/schedules retain their enqueue-time selector. Never
+    // silently resolve a newer generation when their stored choice is stale.
+    const selector: unknown = input.options?.workspace;
+    if (selector !== undefined) {
+      if (!selector || typeof selector !== 'object' || Array.isArray(selector)) {
+        throw new AppError('The queued workspace selector is invalid.', { code: 'INVALID_WORKSPACE_SELECTOR', statusCode: 400 });
+      }
+      const snapshot = selector as AnyRecord;
+      Object.assign(data, { projectId: snapshot.projectId, workspaceId: snapshot.workspaceId, generation: snapshot.generation });
+    }
+    const ssh = assertSshSessionOwner(input.sessionId, input.userId);
+    if (ssh && provider !== 'claude') throw new AppError('SSH 本地项目目前仅支持 VPS Claude Code。', { code: 'WORKSPACE_PROVIDER_UNSUPPORTED', statusCode: 409 });
+    resolveChatWorkspace(input.sessionId, session, data);
+  } catch (error) {
+    // A stale scheduled message must not cancel a current, valid run.
+    return workspaceRejection(null, error, input.sessionId);
   }
 
   const activeRun = chatRunRegistry.getRun(input.sessionId);
@@ -746,15 +796,18 @@ export async function runDetachedChatTurn(
     // interrupted run end before this turn's stream begins. The interrupted
     // run's own dispatch settles later through completeRunIfCurrent, which is
     // scoped to that run and cannot touch the one started here.
+    stoppingRuns.add(activeRun);
     let aborted = false;
-    let stop: Promise<boolean> | null = null;
+    runCancellations.get(activeRun)?.abort();
     try {
-      stop = stopRun(activeRun, dependencies);
-      aborted = await stop;
+      aborted = await dependencies.runtime.abort(activeRun.provider, input.sessionId);
     } catch (error) {
       return { started: false, error: error instanceof Error ? error.message : String(error) };
     } finally {
-      finishStop(activeRun, stop, aborted);
+      if (aborted) chatRunRegistry.completeRunIfCurrent(activeRun, { exitCode: 0, aborted: true });
+      stoppingRuns.delete(activeRun);
+      if (!aborted && settledRuns.has(activeRun)) chatRunRegistry.completeRunIfCurrent(activeRun, { exitCode: 1 });
+      finishSettledRun(activeRun);
     }
     if (!aborted) return { started: false, error: 'The previous task has not confirmed cancellation; the replacement was not started.' };
   }
@@ -764,7 +817,7 @@ export async function runDetachedChatTurn(
     input.userId,
     input.sessionId,
     session,
-    { sessionId: input.sessionId, content: input.content, options: input.options ?? {} },
+    data,
     dependencies,
   );
 }
@@ -778,6 +831,7 @@ export function handleChatConnection(
   connectedClients.add(ws);
 
   const userId = readRequestUserId(request);
+  setConnectedClientUserId(ws, userId);
 
   ws.on('message', async (rawMessage) => {
     try {
@@ -800,10 +854,10 @@ export function handleChatConnection(
           await handleChatAbort(ws, userId, data, dependencies);
           return;
         case 'chat.subscribe':
-          handleChatSubscribe(ws, data, dependencies);
+          handleChatSubscribe(ws, userId, data, dependencies);
           return;
         case 'chat.permission-response':
-          handlePermissionResponse(data, dependencies);
+          handlePermissionResponse(ws, userId, data, dependencies);
           return;
         default:
           sendProtocolError(ws, 'UNKNOWN_MESSAGE_TYPE', `Unknown message type "${messageType}".`);
@@ -812,13 +866,13 @@ export function handleChatConnection(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error('[ERROR] Chat WebSocket error:', message);
-      sendProtocolError(ws, 'INTERNAL_ERROR', message);
+      sendProtocolError(ws, error instanceof AppError ? error.code : 'INTERNAL_ERROR', message);
     }
   });
 
   ws.on('close', () => {
     console.log('[INFO] Chat client disconnected');
     connectedClients.delete(ws);
-    chatRunRegistry.removeConnection(ws);
+    setConnectedClientUserId(ws, null);
   });
 }

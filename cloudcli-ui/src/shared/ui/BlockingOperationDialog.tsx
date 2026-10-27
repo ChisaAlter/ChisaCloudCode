@@ -2,7 +2,6 @@ import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { Loader2 } from 'lucide-react';
 
 import { Dialog, DialogContent, DialogTitle } from '@/shared/ui/Dialog';
-import { subscribeWorkspaceSynchronization } from '@/shared/chisa';
 import { getBlockingOperations, subscribeBlockingOperations } from '@/shared/utils';
 
 /** App mounts this once for chat, desktop settings and project creation operations. */
@@ -12,8 +11,6 @@ export function BlockingOperationDialog() {
   const backgroundOperation = operations.filter(item => !item.blocking).at(-1);
   const panel = useRef<HTMLDivElement>(null);
   const busy = Boolean(operation);
-
-  useEffect(subscribeWorkspaceSynchronization, []);
 
   useEffect(() => {
     if (!busy) return;

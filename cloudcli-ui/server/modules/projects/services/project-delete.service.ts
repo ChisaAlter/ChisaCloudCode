@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+import { projectsDb, sessionsDb, sshProjectTargetsDb } from '@/modules/database/index.js';
 import { AppError } from '@/shared/utils.js';
 
 function uniqueJsonlPathsFromSessions(
@@ -74,6 +74,11 @@ export async function deleteOrArchiveProject(projectId: string, force: boolean):
       code: 'PROJECT_NOT_FOUND',
       statusCode: 404,
     });
+  }
+
+  const target = sshProjectTargetsDb.getByProjectId(projectId);
+  if (target && target.phase !== 'idle') {
+    throw new AppError('Stop or recover the local task before removing this project', { code: 'WORKSPACE_BUSY', statusCode: 409 });
   }
 
   if (!force) {

@@ -7,6 +7,7 @@ import type { Project, ProjectSession } from '@/shared/types';
 import { TERMINAL_INIT_DELAY_MS } from '@/shared/constants';
 import { getShellWebSocketUrl, parseShellMessage, sendSocketMessage } from '@/modules/shell/utils/socket';
 import { readSelectedProvider } from '@/shared/selectedProvider';
+import { useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
 
 const ANSI_ESCAPE_REGEX =
   /(?:\u001B\[[0-?]*[ -/]*[@-~]|\u009B[0-?]*[ -/]*[@-~]|\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)|\u009D[^\u0007\u009C]*(?:\u0007|\u009C)|\u001B[PX^_][^\u001B]*\u001B\\|[\u0090\u0098\u009E\u009F][^\u009C]*\u009C|\u001B[@-Z\\-_])/g;
@@ -32,6 +33,7 @@ type UseShellConnectionOptions = {
 type UseShellConnectionResult = {
   isConnected: boolean;
   isConnecting: boolean;
+  transport: 'pty' | 'pipe' | null;
   closeSocket: () => void;
   connectToShell: (options?: { forceRestart?: boolean }) => void;
   disconnectFromShell: (options?: { suppressAutoConnect?: boolean }) => void;
@@ -53,8 +55,13 @@ export function useShellConnection({
   clearTerminalScreen,
   onOutputRef,
 }: UseShellConnectionOptions): UseShellConnectionResult {
+  const workspace = useWorkspaceScope();
+  const workspaceRef = useRef(workspace);
+  workspaceRef.current = workspace;
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
+  // Report the server's actual terminal support so users can choose suitable commands.
+  const [transport, setTransport] = useState<'pty' | 'pipe' | null>(null);
   const connectingRef = useRef(false);
   const forceRestartOnInitRef = useRef(false);
   const suppressAutoConnectRef = useRef(false);
@@ -119,6 +126,13 @@ export function useShellConnection({
 
   const connectWebSocket = useCallback(
     (isConnectionLocked = false) => {
+      const connectedWorkspace = workspaceRef.current;
+      if (connectedWorkspace === null || (connectedWorkspace && !connectedWorkspace.capabilities.shell)) {
+        connectingRef.current = false;
+        setIsConnecting(false);
+        suppressAutoConnectRef.current = true;
+        return;
+      }
       if ((connectingRef.current && !isConnectionLocked) || isConnecting || isConnected) {
         return;
       }
@@ -132,20 +146,29 @@ export function useShellConnection({
         }
 
         connectingRef.current = true;
+        setTransport(null);
 
         const socket = new WebSocket(wsUrl);
         wsRef.current = socket;
 
+        const ownsSocket = () => wsRef.current === socket
+          && workspaceRef.current !== null
+          && workspaceRef.current?.workspaceId === connectedWorkspace?.workspaceId
+          && workspaceRef.current?.generation === connectedWorkspace?.generation;
         socket.onopen = () => {
-          setIsConnected(true);
-          setIsConnecting(false);
-          connectingRef.current = false;
+          if (!ownsSocket()) { socket.close(); return; }
+          // Scoped shells become usable only after the server validates init.
+          setIsConnected(connectedWorkspace === undefined);
+          setIsConnecting(connectedWorkspace !== undefined);
+          connectingRef.current = connectedWorkspace !== undefined;
 
           window.setTimeout(() => {
             const currentTerminal = terminalRef.current;
             const currentFitAddon = fitAddonRef.current;
             const currentProject = selectedProjectRef.current;
-            if (!currentTerminal || !currentFitAddon || !currentProject) {
+            if (!currentTerminal || !currentFitAddon || !currentProject || wsRef.current !== socket
+              || workspaceRef.current?.workspaceId !== connectedWorkspace?.workspaceId
+              || workspaceRef.current?.generation !== connectedWorkspace?.generation) {
               return;
             }
 
@@ -155,8 +178,9 @@ export function useShellConnection({
 
             sendSocketMessage(socket, {
               type: 'init',
-              projectPath: currentProject.fullPath || currentProject.path || '',
-              sessionId: isPlainShellRef.current ? null : selectedSessionRef.current?.id || null,
+              projectPath: connectedWorkspace?.rootPath ?? (currentProject.fullPath || currentProject.path || ''),
+              ...(connectedWorkspace ? { projectId: connectedWorkspace.projectId, workspaceId: connectedWorkspace.workspaceId, generation: connectedWorkspace.generation } : {}),
+              ...(connectedWorkspace ? (connectedWorkspace.kind === 'session' ? { sessionId: connectedWorkspace.sessionId } : {}) : { sessionId: isPlainShellRef.current ? null : selectedSessionRef.current?.id || null }),
               hasSession: isPlainShellRef.current ? false : Boolean(selectedSessionRef.current),
               provider: isPlainShellRef.current ? 'plain-shell' : (selectedSessionRef.current?.__provider || readSelectedProvider()),
               cols: currentTerminal.cols,
@@ -172,11 +196,32 @@ export function useShellConnection({
         };
 
         socket.onmessage = (event) => {
+          if (!ownsSocket()) return;
           const rawPayload = typeof event.data === 'string' ? event.data : String(event.data ?? '');
+          const message = parseShellMessage(rawPayload);
+          if (message?.type === 'ready') {
+            if (connectedWorkspace && (message.projectId !== connectedWorkspace.projectId || message.workspaceId !== connectedWorkspace.workspaceId || message.generation !== connectedWorkspace.generation || (connectedWorkspace.kind === 'session' && message.sessionId !== connectedWorkspace.sessionId))) {
+              socket.close();
+              return;
+            }
+            setTransport(message.transport === 'pipe' ? 'pipe' : 'pty');
+            if (message.transport === 'pipe') terminalRef.current?.write(connectedWorkspace?.sourceMode === 'ssh'
+              ? '\r\nWindows 命令：按 Enter 执行，每条命令从项目目录开始；不保留变量或目录切换，不支持全屏程序。Ctrl+C 停止当前命令。\r\n'
+              : '\r\n基础命令终端：按 Enter 执行命令；不支持全屏程序或窗口调整。Ctrl+C 将结束此终端。\r\n');
+            setIsConnected(true);
+            setIsConnecting(false);
+            connectingRef.current = false;
+          } else if (message?.type === 'error') {
+            setIsConnected(false);
+            setIsConnecting(false);
+            connectingRef.current = false;
+            suppressAutoConnectRef.current = true;
+          }
           handleSocketMessage(rawPayload);
         };
 
         socket.onclose = () => {
+          if (!ownsSocket()) return;
           setIsConnected(false);
           setIsConnecting(false);
           connectingRef.current = false;
@@ -184,6 +229,7 @@ export function useShellConnection({
         };
 
         socket.onerror = () => {
+          if (!ownsSocket()) return;
           setIsConnected(false);
           setIsConnecting(false);
           connectingRef.current = false;
@@ -253,6 +299,7 @@ export function useShellConnection({
   return {
     isConnected,
     isConnecting,
+    transport,
     closeSocket,
     connectToShell,
     disconnectFromShell,

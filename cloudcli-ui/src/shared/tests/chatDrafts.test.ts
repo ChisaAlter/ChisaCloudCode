@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 
 import { afterEach, beforeEach, test, vi } from 'vitest';
-import type * as ChatDraftStore from '@/shared/chatDrafts';
+
+import type * as ChatDraftsModule from '@/shared/chatDrafts';
 
 /**
  * Drafts moved out of the browser and into auth.db so a message half-typed on
@@ -19,7 +20,7 @@ const deletedScopes: string[] = [];
 let serverDrafts: unknown[] = [];
 let draftsRequestFailed = false;
 const requests = vi.hoisted(() => ({ drafts: vi.fn(), saveDraft: vi.fn(), deleteDraft: vi.fn() }));
-const loadedStores: Array<typeof ChatDraftStore> = [];
+const loadedStores: Array<typeof ChatDraftsModule> = [];
 
 vi.mock('@/shared/api', () => ({
   api: { user: requests },
@@ -36,7 +37,7 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
   headers: { 'Content-Type': 'application/json' },
 });
 
-const loadStore = async (): Promise<typeof ChatDraftStore> => {
+const loadStore = async (): Promise<typeof ChatDraftsModule> => {
   vi.resetModules();
   const store = await import('@/shared/chatDrafts');
   loadedStores.push(store);
@@ -84,31 +85,6 @@ test('a draft is readable synchronously and reaches the server after the debounc
   assert.deepEqual(savedDrafts, [
     { scope: 'session-a', text: 'half a thought' },
   ]);
-});
-
-test('editing a manual queue persists text together with its durable attachments and options across reload', async () => {
-  const store = await loadStore();
-  const snapshot = { content: 'original', autoSend: false, attachments: [{ path: '/asset/report.txt', name: 'report.txt' }],
-    options: { model: 'saved-model', customOption: 'retained' } };
-  await store.writeQueuedMessage('session-a', snapshot);
-  store.writeDraftText('session-a', 'original', true);
-  store.writeDraftText('session-a', 'edited', true);
-  await vi.advanceTimersByTimeAsync(1_500);
-  assert.deepEqual(savedDrafts.at(-1), { scope: 'session-a', text: 'edited', queuedMessage: { ...snapshot, content: 'edited' } });
-  const reloaded = await loadStore();
-  assert.equal(reloaded.readDraftText('session-a'), 'edited');
-  assert.deepEqual(reloaded.readQueuedMessage('session-a'), { ...snapshot, content: 'edited' });
-});
-
-test('a separate newer text draft does not replace the paused queue snapshot', async () => {
-  const store = await loadStore();
-  const snapshot = { content: 'paused turn', autoSend: false, attachments: [{ path: '/asset/original.txt' }], options: { effort: 'high' } };
-  await store.writeQueuedMessage('session-a', snapshot);
-  store.writeDraftText('session-a', 'independent newer draft');
-  await vi.advanceTimersByTimeAsync(1_500);
-  assert.equal(store.readDraftText('session-a'), 'independent newer draft');
-  assert.deepEqual(store.readQueuedMessage('session-a'), snapshot);
-  assert.deepEqual(savedDrafts.at(-1), { scope: 'session-a', text: 'independent newer draft' });
 });
 
 test('each session keeps its own draft', async () => {
@@ -211,44 +187,6 @@ test('a queued message round-trips alongside the draft text', async () => {
     text: 'still editing',
     queuedMessage: { content: 'send this next', attachments: [] },
   }]);
-});
-
-test('an explicit paused-queue text editor debounces the complete retained snapshot', async () => {
-  const store = await loadStore();
-  const snapshot = {
-    content: 'original task', autoSend: false, attachments: [{ name: 'saved.txt', path: '/asset/saved.txt' }],
-    options: { model: 'saved-model', permissionMode: 'plan', customOption: 'retained' },
-  };
-  await store.writeQueuedMessage('session-a', snapshot);
-  savedDrafts.length = 0;
-
-  store.writeDraftText('session-a', 'edited task', true);
-  assert.equal(store.readDraftText('session-a'), 'edited task');
-  assert.deepEqual(store.readQueuedMessage('session-a'), { ...snapshot, content: 'edited task' });
-  assert.deepEqual(savedDrafts, [], 'typing does not issue a queue write for every keystroke');
-  await vi.advanceTimersByTimeAsync(1_000);
-  assert.deepEqual(savedDrafts, [{
-    scope: 'session-a', text: 'edited task', queuedMessage: { ...snapshot, content: 'edited task' },
-  }]);
-  assert.equal(store.isChatDraftPending('session-a'), false);
-  assert.deepEqual(deletedScopes, []);
-});
-
-test('ordinary typing beside a paused queue persists only independent text', async () => {
-  const store = await loadStore();
-  const snapshot = {
-    content: 'paused task', autoSend: false, attachments: [{ name: 'saved.txt', path: '/asset/saved.txt' }],
-    options: { model: 'saved-model', customOption: 'retained' },
-  };
-  await store.writeQueuedMessage('session-a', snapshot);
-  savedDrafts.length = 0;
-
-  store.writeDraftText('session-a', 'an unrelated unsent thought');
-  assert.deepEqual(store.readQueuedMessage('session-a'), snapshot);
-  await vi.advanceTimersByTimeAsync(1_000);
-  assert.deepEqual(savedDrafts, [{ scope: 'session-a', text: 'an unrelated unsent thought' }]);
-  assert.equal(Object.prototype.hasOwnProperty.call(savedDrafts[0], 'queuedMessage'), false);
-  assert.deepEqual(store.readQueuedMessage('session-a'), snapshot);
 });
 
 test('a queued message with neither text nor attachments reads as absent', async () => {

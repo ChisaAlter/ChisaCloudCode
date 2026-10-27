@@ -1,4 +1,4 @@
-import { api } from '@/shared/api';
+import { useWorkspaceApi, useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
 import { useApiSource } from '@/modules/command-palette/hooks/useApiSource';
 
 export type FileResult = {
@@ -27,9 +27,11 @@ function flatten(nodes: FileNode[], out: FileResult[]): void {
 }
 
 export function useFilesSource(projectId: string | undefined, enabled: boolean) {
+  const api = useWorkspaceApi();
+  const workspace = useWorkspaceScope();
   return useApiSource<FileResult, unknown>({
-    enabled: enabled && !!projectId,
-    deps: [projectId],
+    enabled: enabled && !!projectId && workspace !== null && workspace?.capabilities.read !== false,
+    deps: [projectId, api],
     fetcher: (signal) => api.getFiles(projectId!, { signal }),
     parse: (data) => {
       const tree: FileNode[] = Array.isArray(data) ? (data as FileNode[]) : [];

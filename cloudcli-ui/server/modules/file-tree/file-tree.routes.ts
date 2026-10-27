@@ -1,3 +1,5 @@
+import { AsyncResource } from 'node:async_hooks';
+
 import express from 'express';
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 
@@ -93,7 +95,7 @@ function createRouteHandler(
     } catch (error) {
       if (response.destroyed) return;
       if (error instanceof AppError) {
-        response.status(error.statusCode).json({ error: error.message });
+        response.status(error.statusCode).json({ error: error.message, code: error.code, ...(error.details === undefined ? {} : { details: error.details }) });
         return;
       }
 
@@ -114,8 +116,10 @@ export function createFileTreeRouter(
   uploadFilesMiddleware: RequestHandler,
   uploadLimits: FileTreeUploadLimits,
   logger: FileTreeLogger,
+  selectionScope?: RequestHandler,
 ): express.Router {
   const router = express.Router();
+  if (selectionScope) router.use(selectionScope);
   router.use(workspaceRequestScope);
 
   router.get('/browse-filesystem', createRouteHandler(async (request, response) => {
@@ -233,7 +237,7 @@ export function createFileTreeRouter(
   router.post(
     '/projects/:projectId/files/upload',
     (request: Request, response: Response, next: NextFunction) => {
-      uploadFilesMiddleware(request, response, (error?: unknown) => {
+      uploadFilesMiddleware(request, response, AsyncResource.bind((error?: unknown) => {
         if (!error) {
           void uploadHandler(request, response, next);
           return;
@@ -257,7 +261,7 @@ export function createFileTreeRouter(
 
         const message = error instanceof Error ? error.message : String(error);
         response.status(500).json({ error: message });
-      });
+      }));
     },
   );
 

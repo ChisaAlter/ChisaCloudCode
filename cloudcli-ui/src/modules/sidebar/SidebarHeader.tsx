@@ -1,9 +1,9 @@
 import { useEffect } from 'react';
-import { Activity, Archive, Folder, FolderPlus, MessageSquare, PanelLeftClose, Plus, RefreshCw, Search, SquarePen, X } from 'lucide-react';
+import { Activity, Archive, Folder, FolderPlus, MessageSquare, MoreHorizontal, PanelLeftClose, Plus, RefreshCw, Search, SquarePen, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
 import { isDesktop } from '@/shared/chisa';
-import { Input } from '@/shared/ui';
+import { ActionMenu, Input } from '@/shared/ui';
 import { cn } from '@/shared/utils';
 import type { SidebarSearchMode } from '@/shared/types';
 
@@ -70,11 +70,13 @@ export default function SidebarHeader({
       </div>
 
       <div className="sidebar-primary-actions space-y-1 px-3 pb-3">
-        <button type="button" onClick={compose} aria-keyshortcuts={desktop ? 'Control+Alt+N Meta+Alt+N' : undefined} className="sidebar-new-chat flex h-10 w-full items-center gap-3 rounded-lg px-3 text-sm font-medium">
-          {desktop ? <SquarePen className="h-4 w-4 shrink-0" /> : <Plus className="h-4 w-4" />}
-          <span className="min-w-0 truncate">{onNewSession ? t('sessions.newSession') : t('tooltips.createProject')}</span>
-          {desktop && <kbd className="sidebar-compose-shortcut" aria-hidden="true">{shortcut}</kbd>}
-        </button>
+        {(!desktop || onNewSession) && (
+          <button type="button" onClick={compose} aria-keyshortcuts={desktop ? 'Control+Alt+N Meta+Alt+N' : undefined} className="sidebar-new-chat flex h-10 w-full items-center gap-3 rounded-lg px-3 text-sm font-medium">
+            {desktop ? <SquarePen className="h-4 w-4 shrink-0" /> : <Plus className="h-4 w-4" />}
+            <span className="min-w-0 truncate">{onNewSession ? t('sessions.newSession') : t('tooltips.createProject')}</span>
+            {desktop && <kbd className="sidebar-compose-shortcut" aria-hidden="true">{shortcut}</kbd>}
+          </button>
+        )}
 
         {showSearchTools && (
           <>
@@ -94,6 +96,19 @@ export default function SidebarHeader({
               <button type="button" onClick={() => onSearchModeChange('projects')} aria-pressed={searchMode === 'projects'} className={cn('sidebar-nav-item', searchMode === 'projects' && 'is-active')}>
                 <Folder className="h-4 w-4" /><span>{t('search.modeProjects')}</span>
               </button>
+              {desktop && (
+                <button
+                  type="button"
+                  onClick={onCreateProject}
+                  aria-keyshortcuts={!onNewSession ? 'Control+Alt+N Meta+Alt+N' : undefined}
+                  className="sidebar-nav-item focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  title={t('tooltips.createProject')}
+                >
+                  <FolderPlus className="h-4 w-4 shrink-0" />
+                  <span className="min-w-0 truncate">{t('projects.newProject')}</span>
+                  {!onNewSession && <kbd className="sidebar-compose-shortcut" aria-hidden="true">{shortcut}</kbd>}
+                </button>
+              )}
             </nav>
           </>
         )}
@@ -103,14 +118,33 @@ export default function SidebarHeader({
         <span className="min-w-0 flex-1 truncate text-xs font-medium text-muted-foreground">
           {searchMode === 'conversations' ? t('recent.title', 'Recent conversations') : searchMode === 'archived' ? t('search.archiveOnlyTooltip', 'Archive') : searchMode === 'running' ? t('search.runningTooltip', 'Running sessions') : t('search.modeProjects')}
         </span>
-        {showSearchTools && <>
-          <button type="button" onClick={() => onSearchModeChange(searchMode === 'running' ? 'projects' : 'running')} aria-pressed={searchMode === 'running'} aria-label={t('search.runningTooltip', 'Running sessions')} title={t('search.runningTooltip', 'Running sessions')} className={cn('sidebar-icon', searchMode === 'running' && 'is-active')}>
-            <Activity className="h-3.5 w-3.5" />{runningSessionsCount > 0 && <span className="text-[10px]">{runningSessionsCount}</span>}
-          </button>
-          <button type="button" onClick={() => onSearchModeChange(searchMode === 'archived' ? 'projects' : 'archived')} aria-pressed={searchMode === 'archived'} aria-label={t('search.archiveOnlyTooltip', 'Archive')} title={t('search.archiveOnlyTooltip', 'Archive')} className={cn('sidebar-icon', searchMode === 'archived' && 'is-active')}><Archive className="h-3.5 w-3.5" /></button>
+        {desktop ? (
+          <ActionMenu
+            label={t('projects.options')}
+            icon={MoreHorizontal}
+            iconOnly
+            portal
+            variant="ghost"
+            size="icon"
+            triggerClassName="sidebar-icon sidebar-section-options"
+            menuClassName="w-[260px] rounded-lg p-1.5"
+            items={[
+              { key: 'running', label: `${t('search.runningTooltip', 'Running sessions')}${runningSessionsCount > 0 ? ` · ${runningSessionsCount}` : ''}`, icon: Activity, onSelect: () => onSearchModeChange(searchMode === 'running' ? 'projects' : 'running') },
+              { key: 'archive', label: t('search.archiveOnlyTooltip', 'Archive'), icon: Archive, onSelect: () => onSearchModeChange(searchMode === 'archived' ? 'projects' : 'archived') },
+              { key: 'refresh', label: t('tooltips.refresh'), icon: RefreshCw, disabled: isRefreshing, loading: isRefreshing, showDividerBefore: true, onSelect: onRefresh },
+              { key: 'create', label: t('tooltips.createProject'), icon: FolderPlus, onSelect: onCreateProject },
+            ]}
+          />
+        ) : <>
+          {showSearchTools && <>
+            <button type="button" onClick={() => onSearchModeChange(searchMode === 'running' ? 'projects' : 'running')} aria-pressed={searchMode === 'running'} aria-label={t('search.runningTooltip', 'Running sessions')} title={t('search.runningTooltip', 'Running sessions')} className={cn('sidebar-icon', searchMode === 'running' && 'is-active')}>
+              <Activity className="h-3.5 w-3.5" />{runningSessionsCount > 0 && <span className="text-[10px]">{runningSessionsCount}</span>}
+            </button>
+            <button type="button" onClick={() => onSearchModeChange(searchMode === 'archived' ? 'projects' : 'archived')} aria-pressed={searchMode === 'archived'} aria-label={t('search.archiveOnlyTooltip', 'Archive')} title={t('search.archiveOnlyTooltip', 'Archive')} className={cn('sidebar-icon', searchMode === 'archived' && 'is-active')}><Archive className="h-3.5 w-3.5" /></button>
+          </>}
+          <button type="button" onClick={onRefresh} disabled={isRefreshing} aria-label={t('tooltips.refresh')} title={t('tooltips.refresh')} className="sidebar-icon"><RefreshCw className={cn('h-3.5 w-3.5', isRefreshing && 'animate-spin')} /></button>
+          <button type="button" onClick={onCreateProject} aria-label={t('tooltips.createProject')} title={t('tooltips.createProject')} className="sidebar-icon"><FolderPlus className="h-3.5 w-3.5" /></button>
         </>}
-        <button type="button" onClick={onRefresh} disabled={isRefreshing} aria-label={t('tooltips.refresh')} title={t('tooltips.refresh')} className="sidebar-icon"><RefreshCw className={cn('h-3.5 w-3.5', isRefreshing && 'animate-spin')} /></button>
-        <button type="button" onClick={onCreateProject} aria-label={t('tooltips.createProject')} title={t('tooltips.createProject')} className="sidebar-icon"><FolderPlus className="h-3.5 w-3.5" /></button>
       </div>
     </div>
   );

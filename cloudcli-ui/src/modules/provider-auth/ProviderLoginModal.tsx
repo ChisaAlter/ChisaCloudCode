@@ -3,7 +3,6 @@ import { X } from 'lucide-react';
 
 import { StandaloneShell } from '@/modules/standalone-shell';
 import { IS_PLATFORM } from '@/shared/utils';
-import { getProviderCommand } from '@/modules/provider-auth/providerLoginCommand';
 import type { LLMProvider } from '@/shared/types';
 
 /**
@@ -29,6 +28,38 @@ type ProviderLoginModalProps = {
   onComplete?: (exitCode: number) => void;
   customCommand?: string;
   isAuthenticated?: boolean;
+};
+
+const getProviderCommand = ({
+  provider,
+  customCommand,
+  isAuthenticated: _isAuthenticated,
+}: {
+  provider: LLMProvider;
+  customCommand?: string;
+  isAuthenticated: boolean;
+}) => {
+  if (customCommand) {
+    return customCommand;
+  }
+
+  if (provider === 'claude') {
+    return 'claude --dangerously-skip-permissions /login';
+  }
+
+  if (provider === 'cursor') {
+    return 'cursor-agent login';
+  }
+
+  if (provider === 'codex') {
+    return IS_PLATFORM ? 'codex login --device-auth' : 'codex login';
+  }
+
+  if (provider === 'opencode') {
+    return 'opencode auth login';
+  }
+
+  return 'claude --dangerously-skip-permissions /login';
 };
 
 const getProviderTitle = (provider: LLMProvider) => {

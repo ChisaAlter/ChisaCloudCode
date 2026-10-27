@@ -1,16 +1,23 @@
 import { BrowserRouter as Router, Route, Routes } from 'react-router-dom';
+import { Fragment, useLayoutEffect, useRef, useState } from 'react';
 import { I18nextProvider } from 'react-i18next';
+import type { ReactNode } from 'react';
 
 import { ThemeProvider } from '@/shared/context/ThemeContext';
 import { UiPreferencesProvider } from '@/shared/context/UiPreferencesContext';
-import { AuthProvider, ProtectedRoute } from '@/modules/auth';
+import { AuthProvider, ProtectedRoute, useAuth } from '@/modules/auth';
 import { TaskMasterProvider,TasksSettingsProvider } from '@/modules/task-master';
 import { WebSocketProvider } from '@/shared/context/WebSocketContext';
 import { PluginsProvider } from '@/modules/plugins';
 import { ProjectWorkspaceRoute } from '@/modules/project-workspace';
+import { ClaudeAccountsProvider } from '@/modules/claude-accounts';
 import { i18n } from '@/modules/i18n';
 import { DesktopChrome } from '@/modules/desktop-chrome';
+import { SshAgentProvider } from '@/modules/ssh-workspaces';
 import { BlockingOperationDialog } from '@/shared/ui';
+import { getAuthSessionVersion } from '@/shared/authToken';
+import { getServerConnectionVersion } from '@/shared/chisa';
+import { getPageTitle } from '@/shared/utils';
 
 const DEPLOYMENT_ASSET_DIRECTORIES = new Set(['assets', 'static', 'icons', 'images']);
 
@@ -107,6 +114,28 @@ function detectRouterBasename() {
   return detectedBasename;
 }
 
+function AccountSshAgentProvider({ children }: { children: ReactNode }) {
+  const { user } = useAuth();
+  const accountId = user ? String(user.id ?? user.username) : null;
+  const accountKey = JSON.stringify([accountId, getAuthSessionVersion(), getServerConnectionVersion()]);
+  // Every account incarnation owns its project, recents, transcript and task caches.
+  const previousAccount = useRef({ key: accountKey, id: accountId, auth: getAuthSessionVersion(), server: getServerConnectionVersion() });
+  const [settledAccount, setSettledAccount] = useState(accountKey);
+  useLayoutEffect(() => {
+    const previous = previousAccount.current;
+    if (previous.key === accountKey) return;
+    document.title = getPageTitle(null, null);
+    // Cold-start auth hydration may keep an authorized deep link; explicit login/logout/service changes may not.
+    if (previous.id !== null || previous.auth !== getAuthSessionVersion() || previous.server !== getServerConnectionVersion()) {
+      const pathname = window.location.pathname.replace(/\/session\/[^/]+\/?$/, '/') || '/';
+      window.history.replaceState(null, '', pathname);
+    }
+    previousAccount.current = { key: accountKey, id: accountId, auth: getAuthSessionVersion(), server: getServerConnectionVersion() };
+    setSettledAccount(accountKey);
+  }, [accountId, accountKey]);
+  return <SshAgentProvider accountId={accountId}><Fragment key={accountKey}>{settledAccount === accountKey ? children : null}</Fragment></SshAgentProvider>;
+}
+
 /** Rendered by main.tsx; mounts the shared providers, the auth gate and the project workspace routes. */
 export default function App() {
   const routerBasename = detectRouterBasename();
@@ -118,22 +147,26 @@ export default function App() {
         <DesktopChrome />
         <UiPreferencesProvider>
         <AuthProvider>
+          <AccountSshAgentProvider>
           <WebSocketProvider>
             <PluginsProvider>
               <TasksSettingsProvider>
                 <TaskMasterProvider>
                 <ProtectedRoute>
+                  <ClaudeAccountsProvider>
                   <Router basename={routerBasename}>
                     <Routes>
                       <Route path="/" element={<ProjectWorkspaceRoute />} />
                       <Route path="/session/:sessionId" element={<ProjectWorkspaceRoute />} />
                     </Routes>
                   </Router>
+                  </ClaudeAccountsProvider>
                 </ProtectedRoute>
                 </TaskMasterProvider>
               </TasksSettingsProvider>
             </PluginsProvider>
           </WebSocketProvider>
+          </AccountSshAgentProvider>
         </AuthProvider>
         </UiPreferencesProvider>
       </ThemeProvider>

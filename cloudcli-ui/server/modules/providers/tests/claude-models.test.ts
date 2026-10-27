@@ -12,17 +12,6 @@ const SESSION_ID = 'session-1';
 
 test('fixed Opus versions have distinct IDs and automatic aliases remain available', () => {
   const options = CLAUDE_PREDEFINED_MODELS.OPTIONS;
-  assert.deepEqual(options.slice(0, 4).map(({ value, label }) => ({ value, label })), [
-    { value: 'claude-opus-5-5', label: 'Opus 5.5' },
-    { value: 'claude-fable-5-1', label: 'Fable 5.1' },
-    { value: 'claude-sonnet-5-5', label: 'Sonnet 5.5' },
-    { value: 'claude-haiku-5-5', label: 'Haiku 5.5' },
-  ]);
-  for (const model of ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5']) {
-    const effort = options.find((item) => item.value === model)?.effort;
-    assert.equal(effort?.default, 'medium');
-    assert.deepEqual(effort?.values.map((item) => item.value), ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode']);
-  }
   assert.equal(options.find((item) => item.value === 'claude-opus-5')?.label, 'Opus 5');
   assert.equal(options.find((item) => item.value === 'claude-opus-4-8')?.label, 'Opus 4.8');
   assert.match(options.find((item) => item.value === 'opus[1m]')!.label, /auto/);

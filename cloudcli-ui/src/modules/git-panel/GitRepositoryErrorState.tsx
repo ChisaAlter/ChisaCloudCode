@@ -29,9 +29,7 @@ export default function GitRepositoryErrorState({
 }: GitRepositoryErrorStateProps) {
   const { t } = useTranslation();
   const showInitAction = canInitRepository && Boolean(onInitRepository);
-  // A workspace that is not connected to this desktop hides every repository
-  // operation behind a transport error; say what is wrong instead of echoing
-  // "Workspace connection unavailable" as the only thing on screen.
+  // A cloud workspace outage needs an actionable retry rather than only the raw transport failure.
   const workspaceUnavailable = !showInitAction && WORKSPACE_UNAVAILABLE.test(`${error} ${details ?? ''}`);
 
   return (
@@ -70,9 +68,9 @@ export default function GitRepositoryErrorState({
         </>
       ) : workspaceUnavailable ? (
         <>
-          <h3 className="mb-3 text-center text-lg font-medium text-foreground">工作区未连接到这台电脑</h3>
+          <h3 className="mb-3 text-center text-lg font-medium text-foreground">云端工作区暂不可用</h3>
           <p className="mb-6 max-w-md text-center text-sm leading-relaxed">
-            源代码管理要通过本机工作区通道读取仓库。请确认账号服务在线、该项目已绑定本地目录，然后重试。
+            请确认账号服务在线，并刷新云端工作区状态后重试。
           </p>
           {onRetry && (
             <button

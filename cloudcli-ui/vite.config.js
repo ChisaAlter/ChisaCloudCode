@@ -2,7 +2,6 @@ import { createRequire } from 'node:module'
 import { fileURLToPath, URL } from 'node:url'
 import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
-import { captureBuildIdentity } from './scripts/build-identity.mjs'
 import { getConnectableHost, normalizeLoopbackHost } from './shared/networkHosts.js'
 
 // The client shows the installed package version so it can be compared against the
@@ -28,12 +27,10 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     define: {
-      __APP_VERSION__: JSON.stringify(pkg.version),
-      __BUILD_IDENTITY__: JSON.stringify(captureBuildIdentity())
+      __APP_VERSION__: JSON.stringify(pkg.version)
     },
     resolve: {
       alias: {
-        '@builtin-plugins': fileURLToPath(new URL('./vendor/builtin-plugins', import.meta.url)),
         '@': fileURLToPath(new URL('./src', import.meta.url))
       }
     },

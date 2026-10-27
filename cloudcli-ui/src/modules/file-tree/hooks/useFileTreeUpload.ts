@@ -3,7 +3,7 @@ import type { DragEvent } from 'react';
 
 import { IS_PLATFORM } from '@/shared/utils';
 import type { FileTreeUploadProgressState, Project } from '@/shared/types';
-import { api } from '@/shared/api';
+import { useWorkspaceApi } from '@/shared/context/WorkspaceScopeContext';
 import { expireAuthSession, getAuthSessionVersion, getStoredAuthToken, storeAuthToken } from '@/shared/authToken';
 import { MAX_FILE_UPLOAD_SIZE_BYTES, MAX_FILE_UPLOAD_SIZE_LABEL } from '@/shared/constants';
 
@@ -96,14 +96,14 @@ const buildUploadFormData = (files: File[], targetPath: string) => {
 };
 
 const uploadFormDataWithProgress = (
-  projectId: string,
+  uploadUrl: string,
   formData: FormData,
   onProgress: (progress: number) => void,
 ) =>
   new Promise<UploadResponse>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
 
-    xhr.open('POST', api.uploadFilesUrl(projectId));
+    xhr.open('POST', uploadUrl);
 
     const token = getStoredAuthToken();
     const identity = getAuthSessionVersion();
@@ -245,6 +245,7 @@ export const useFileTreeUpload = ({
   onRefresh,
   showToast,
 }: UseFileTreeUploadOptions) => {
+  const api = useWorkspaceApi();
   const [isDragOver, setIsDragOver] = useState(false);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [operationLoading, setOperationLoading] = useState(false);
@@ -324,7 +325,7 @@ export const useFileTreeUpload = ({
 
       try {
         const response = await uploadFormDataWithProgress(
-          selectedProject.projectId,
+          api.uploadFilesUrl(selectedProject.projectId),
           buildUploadFormData(files, targetPath),
           (progress) => {
             latestProgress = progress;
@@ -364,6 +365,7 @@ export const useFileTreeUpload = ({
       }
     },
     [
+      api,
       clearProgressTimer,
       onRefresh,
       scheduleProgressClear,

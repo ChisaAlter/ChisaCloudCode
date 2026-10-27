@@ -226,9 +226,7 @@
       "analyzing": "正在分析",
       "working": "正在处理",
       "computing": "正在计算",
-      "reasoning": "正在推理",
-      "workspaceFinalizing": "正在收尾并交还工作区",
-      "modelStopped": "已停止，正在交还工作区"
+      "reasoning": "正在推理"
     },
     "state": {
       "live": "Live",
@@ -238,7 +236,6 @@
       "seconds": "{{count}} 秒",
       "minutesSeconds": "{{minutes}} 分 {{seconds}} 秒",
       "label": "已用时 {{time}}",
-      "turnTotal": "本轮用时 {{time}}",
       "startingNow": "正在开始"
     },
     "stop": "停止",
@@ -261,9 +258,6 @@
     "forkFromHere": "从此处派生"
   },
   "composer": {
-    "reloadModels": "重新加载模型",
-    "modelsLoadFailed": "模型加载失败，请点击右侧刷新按钮重试。",
-    "restoringSessionOptions": "正在恢复会话模型设置",
     "lastUsedModel": "上次实际使用：{{model}}",
     "add": "添加",
     "thisComputer": "此计算机",
@@ -280,6 +274,11 @@
     "effortDefault": "默认",
     "loadingModels": "正在加载模型…",
     "modelMenu": "选择模型和推理强度",
+    "closeModelPicker": "关闭模型选择",
+    "noReasoningOptions": "此模型使用默认推理设置。",
+    "reasoningDescription": "设置下一条消息的推理强度。",
+    "savingModel": "正在保存选择…",
+    "effortSaveFailed": "无法保存推理强度，请重试。",
     "permissionHeading": "如何批准 {{provider}} 的操作？"
   },
   "export": {

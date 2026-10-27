@@ -8,6 +8,7 @@ import { providerTokenUsageService } from '@/modules/providers/services/provider
 import { providerSkillsService } from '@/modules/providers/services/skills.service.js';
 import { sessionConversationsSearchService } from '@/modules/providers/services/session-conversations-search.service.js';
 import { sessionsService } from '@/modules/providers/services/sessions.service.js';
+import { assertSshSessionAccess, canReadSshSession } from '@/modules/providers/services/ssh-session-access.service.js';
 import type {
   CustomProviderModelInput,
   LLMProvider,
@@ -16,12 +17,47 @@ import type {
   ProviderSkillCreateFile,
   ProviderSkillCreateInput,
   UpsertProviderMcpServerInput,
-} from '@/shared/types.js';
-import { AppError, asyncHandler, createApiSuccessResponse } from '@/shared/utils.js';
+} from '@/shared/index.js';
+import { AppError, asyncHandler, createApiSuccessResponse } from '@/shared/index.js';
+import { assertSshProjectOwner, resolveSshProjectTarget, workspaceRequestScope } from '@/modules/workspace-bridge/index.js';
 import { hirouteService } from '@/modules/providers/services/hiroute.service.js';
 import { claudeConnectionsService } from '@/modules/providers/services/claude-connections.service.js';
+import { createClaudeAccountsRouter } from '@/modules/providers/claude-accounts.routes.js';
+import { userDb, userPreferencesDb } from '@/modules/database/index.js';
+import { assertCloudWorkspaceOwner } from '@/modules/workspace-runtime/index.js';
 
 const router = express.Router();
+// Fixed account paths precede the provider/session wildcards below.
+router.use('/claude/accounts', createClaudeAccountsRouter());
+const authenticatedUserId = (request: Request): string | number | null => {
+  const user = (request as Request & { user?: { id?: string | number; userId?: string | number } }).user;
+  return user?.id ?? user?.userId ?? null;
+};
+
+/**
+ * Reads the caller's pinned session ids so the recent feed can resolve every
+ * pin before pagination. A missing or malformed preference is an unpinned feed,
+ * never a request failure.
+ */
+const readPinnedSessionIds = (request: Request): string[] => {
+  const rawUserId = authenticatedUserId(request);
+  const userId = typeof rawUserId === 'number' ? rawUserId : Number(rawUserId);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return [];
+  }
+  const uiPreferences = userPreferencesDb.getPreferences(userId).uiPreferences;
+  if (!uiPreferences || typeof uiPreferences !== 'object' || Array.isArray(uiPreferences)) {
+    return [];
+  }
+  const pinned = (uiPreferences as Record<string, unknown>).pinnedSessionIds;
+  return Array.isArray(pinned)
+    ? pinned.filter((sessionId): sessionId is string => typeof sessionId === 'string' && sessionId.trim().length > 0)
+    : [];
+};
+router.param('sessionId', (request, _response, next, value) => {
+  try { assertSshSessionAccess(parseSessionId(value), authenticatedUserId(request)); next(); }
+  catch (error) { next(error); }
+});
 
 router.get('/claude/connections', asyncHandler(async (req: Request, res: Response) => {
   res.json(createApiSuccessResponse(claudeConnectionsService.getSettings((req as Request & { user?: { id?: number | string } }).user?.id)));
@@ -645,12 +681,25 @@ router.post(
 );
 
 // ----------------- Skills routes -----------------
+function parseSkillsContext(query: Request['query']): Parameters<typeof providerSkillsService.listProviderSkills>[1] {
+  const context: NonNullable<Parameters<typeof providerSkillsService.listProviderSkills>[1]> = {};
+  for (const key of ['workspacePath', 'projectId', 'workspaceId', 'generation', 'sessionId'] as const) {
+    const value = query[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'string' || !value.trim() || value.includes('\0')) {
+      throw new AppError(`${key} must be a nonempty string.`, { code: 'INVALID_WORKSPACE_SELECTOR', statusCode: 400 });
+    }
+    context[key] = value.trim();
+  }
+  return context;
+}
+
 router.get(
   '/:provider/skills',
+  workspaceRequestScope,
   asyncHandler(async (req: Request, res: Response) => {
     const provider = parseProvider(req.params.provider);
-    const workspacePath = readOptionalQueryString(req.query.workspacePath);
-    const skills = await providerSkillsService.listProviderSkills(provider, { workspacePath });
+    const skills = await providerSkillsService.listProviderSkills(provider, { ...parseSkillsContext(req.query), userId: authenticatedUserId(req) });
     res.json(createApiSuccessResponse({ provider, skills }));
   }),
 );
@@ -660,7 +709,7 @@ router.post(
   asyncHandler(async (req: Request, res: Response) => {
     const provider = parseProvider(req.params.provider);
     const input = parseProviderSkillCreatePayload(req.body);
-    const skills = await providerSkillsService.addProviderSkills(provider, input);
+    const skills = await providerSkillsService.addProviderSkills(provider, input, { userId: authenticatedUserId(req) });
     res.json(createApiSuccessResponse({ provider, skills }));
   }),
 );
@@ -671,7 +720,7 @@ router.delete(
     const provider = parseProvider(req.params.provider);
     const result = await providerSkillsService.removeProviderSkill(provider, {
       directoryName: readPathParam(req.params.directoryName, 'directoryName'),
-    });
+    }, { userId: authenticatedUserId(req) });
     res.json(createApiSuccessResponse(result));
   }),
 );
@@ -679,34 +728,37 @@ router.delete(
 // ----------------- MCP routes -----------------
 router.get(
   '/:provider/mcp/servers',
+  workspaceRequestScope,
   asyncHandler(async (req: Request, res: Response) => {
     const provider = parseProvider(req.params.provider);
-    const workspacePath = readOptionalQueryString(req.query.workspacePath);
+    const context = { ...parseSkillsContext(req.query), userId: authenticatedUserId(req) };
     const scope = parseMcpScope(req.query.scope);
 
     if (scope) {
-      const servers = await providerMcpService.listProviderMcpServersForScope(provider, scope, { workspacePath });
+      const servers = await providerMcpService.listProviderMcpServersForScope(provider, scope, context);
       res.json(createApiSuccessResponse({ provider, scope, servers }));
       return;
     }
 
-    const groupedServers = await providerMcpService.listProviderMcpServers(provider, { workspacePath });
+    const groupedServers = await providerMcpService.listProviderMcpServers(provider, context);
     res.json(createApiSuccessResponse({ provider, scopes: groupedServers }));
   }),
 );
 
 router.post(
   '/:provider/mcp/servers',
+  workspaceRequestScope,
   asyncHandler(async (req: Request, res: Response) => {
     const provider = parseProvider(req.params.provider);
     const payload = parseMcpUpsertPayload(req.body);
-    const server = await providerMcpService.upsertProviderMcpServer(provider, payload);
+    const server = await providerMcpService.upsertProviderMcpServer(provider, payload, { ...parseSkillsContext(req.body), userId: authenticatedUserId(req) });
     res.status(201).json(createApiSuccessResponse({ server }));
   }),
 );
 
 router.delete(
   '/:provider/mcp/servers/:name',
+  workspaceRequestScope,
   asyncHandler(async (req: Request, res: Response) => {
     const provider = parseProvider(req.params.provider);
     const scope = parseMcpScope(req.query.scope);
@@ -715,13 +767,14 @@ router.delete(
       name: readPathParam(req.params.name, 'name'),
       scope,
       workspacePath,
-    });
+    }, { ...parseSkillsContext(req.query), userId: authenticatedUserId(req) });
     res.json(createApiSuccessResponse(result));
   }),
 );
 
 router.post(
   '/mcp/servers/global',
+  workspaceRequestScope,
   asyncHandler(async (req: Request, res: Response) => {
     const payload = parseMcpUpsertPayload(req.body);
     if (payload.scope === 'local') {
@@ -734,7 +787,7 @@ router.post(
     const results = await providerMcpService.addMcpServerToAllProviders({
       ...payload,
       scope: payload.scope === 'user' ? 'user' : 'project',
-    });
+    }, { ...parseSkillsContext(req.body), userId: authenticatedUserId(req) });
     res.status(201).json(createApiSuccessResponse({ results }));
   }),
 );
@@ -772,7 +825,14 @@ router.post(
     const provider = parseProvider(body.provider);
     const projectPath = typeof body.projectPath === 'string' ? body.projectPath : '';
     const initialMessage = typeof body.initialMessage === 'string' ? body.initialMessage : '';
-    const workspaceMode = body.workspaceMode === 'shared' ? 'shared' : 'isolated';
+    const ssh = projectPath ? resolveSshProjectTarget(projectPath) : null;
+    if (ssh) {
+      const user = (req as Request & { user?: { id?: string | number; userId?: string | number } }).user;
+      assertSshProjectOwner(ssh, user?.id ?? user?.userId);
+      if (provider !== 'claude') throw new AppError('SSH 本地项目目前仅支持 VPS Claude Code。', { code: 'WORKSPACE_PROVIDER_UNSUPPORTED', statusCode: 409 });
+    }
+    if (!ssh) assertCloudWorkspaceOwner(projectPath, authenticatedUserId(req), userDb.getActiveUserIds());
+    const workspaceMode = ssh || body.workspaceMode === 'shared' ? 'shared' : 'isolated';
     const result = sessionsService.createAppSession(provider, projectPath, initialMessage, workspaceMode);
     res.status(201).json(createApiSuccessResponse(result));
   }),
@@ -780,8 +840,8 @@ router.post(
 
 router.get(
   '/sessions/running',
-  asyncHandler(async (_req: Request, res: Response) => {
-    const sessions = sessionsService.listRunningSessions();
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessions = sessionsService.listRunningSessions().filter(session => canReadSshSession(session.sessionId, authenticatedUserId(req)));
     res.json(createApiSuccessResponse({ sessions }));
   }),
 );
@@ -791,15 +851,20 @@ router.get(
   asyncHandler(async (req: Request, res: Response) => {
     const limit = parseBoundedIntegerQuery(req.query.limit, 'limit', 40, 1, 100);
     const offset = parseBoundedIntegerQuery(req.query.offset, 'offset', 0, 0);
-    const page = sessionsService.listRecentSessions(limit, offset);
+    const page = sessionsService.listRecentSessions(
+      limit,
+      offset,
+      sessionId => canReadSshSession(sessionId, authenticatedUserId(req)),
+      readPinnedSessionIds(req),
+    );
     res.json(createApiSuccessResponse(page));
   }),
 );
 
 router.get(
   '/sessions/archived',
-  asyncHandler(async (_req: Request, res: Response) => {
-    const sessions = sessionsService.listArchivedSessions();
+  asyncHandler(async (req: Request, res: Response) => {
+    const sessions = sessionsService.listArchivedSessions().filter(session => canReadSshSession(session.sessionId, authenticatedUserId(req)));
     res.json(createApiSuccessResponse({ sessions }));
   }),
 );
@@ -913,6 +978,7 @@ router.get('/search/sessions', asyncHandler(async (req: Request, res: Response) 
       query,
       limit,
       signal: abortController.signal,
+      canReadSession: sessionId => canReadSshSession(sessionId, authenticatedUserId(req)),
       onTitleResults: (titleResults) => {
         if (!closed) {
           res.write(`event: title-results\ndata: ${JSON.stringify({ titleResults })}\n\n`);

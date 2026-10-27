@@ -4,7 +4,6 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, test, vi } from 'vitest';
 
 import { resetUserPreferences, writeUserPreference } from '@/shared/userSettings';
-import type { ProjectSession } from '@/shared/types';
 
 /**
  * The four per-provider default models used to be four useState slots with four
@@ -19,8 +18,6 @@ const okJson = (data: unknown) => Promise.resolve({
   json: async () => data,
 });
 
-const sessionRequests = vi.hoisted(() => ({ read: vi.fn(), model: vi.fn(), effort: vi.fn() }));
-
 vi.mock('@/shared/api', () => ({
   api: {
     // The preference store PATCHes through api.user; it is stubbed rather than
@@ -32,9 +29,9 @@ vi.mock('@/shared/api', () => ({
     providers: {
       models: () => okJson({ success: true, data: null }),
       capabilities: () => okJson({ success: true, data: null }),
-      sessionActiveModel: sessionRequests.read,
-      setSessionActiveModel: sessionRequests.model,
-      setSessionActiveEffort: sessionRequests.effort,
+      sessionActiveModel: () => okJson({ success: true, data: null }),
+      setSessionActiveModel: () => okJson({ success: true, data: null }),
+      setSessionActiveEffort: () => okJson({ success: true, data: null }),
       createModel: () => okJson({ success: true, data: null }),
       updateModel: () => okJson({ success: true, data: null }),
       removeModel: () => okJson({ success: true, data: null }),
@@ -42,12 +39,12 @@ vi.mock('@/shared/api', () => ({
   },
 }));
 
-const renderProviderState = async (selectedSession: ProjectSession | null = null) => {
+const renderProviderState = async () => {
   const { useChatProviderState } = await import(
     '@/modules/chat/hooks/useChatProviderState'
   );
   return renderHook(() =>
-    useChatProviderState({ selectedSession, selectedProject: null }),
+    useChatProviderState({ selectedSession: null, selectedProject: null }),
   );
 };
 
@@ -56,9 +53,6 @@ beforeEach(() => {
   // The preference store is a module-level singleton, so its in-memory copy
   // outlives localStorage.clear() and would leak one test's writes into the next.
   resetUserPreferences();
-  sessionRequests.read.mockReset().mockImplementation(() => okJson({ success: true, data: null }));
-  sessionRequests.model.mockReset().mockImplementation(() => okJson({ success: true, data: null }));
-  sessionRequests.effort.mockReset().mockImplementation(() => okJson({ success: true, data: null }));
 });
 
 afterEach(() => {
@@ -151,27 +145,4 @@ test('the active provider’s model is what currentProviderModel reports', async
     assert.equal(result.current.provider, 'codex');
   });
   assert.equal(result.current.currentProviderModel, 'codex-active');
-});
-
-test.each([false, true])('an older effort selector preserves the newly restored model through its API completion or rollback: %s', async failEffort => {
-  sessionRequests.read.mockImplementation(() => okJson({ success: true, data: {
-    provider: 'claude', sessionId: 'restored-session', source: 'session', model: 'old-model', effort: 'medium',
-  } }));
-  const { result } = await renderProviderState({ id: 'restored-session', provider: 'claude' } as ProjectSession);
-  await waitFor(() => assert.equal(result.current.currentProviderModel, 'old-model'));
-  const originalSelectors = result.current;
-  await act(async () => { await originalSelectors.selectProviderModel('claude', 'saved-model', 'restored-session'); });
-  assert.equal(result.current.currentProviderModel, 'saved-model');
-  let finishEffort!: (value: { ok: boolean; json: () => Promise<unknown> }) => void;
-  sessionRequests.effort.mockImplementation(() => new Promise(resolve => { finishEffort = resolve; }));
-  let updating!: Promise<unknown>;
-  await act(async () => { updating = originalSelectors.selectProviderEffort('claude', 'high', 'restored-session'); });
-  assert.equal(result.current.currentProviderModel, 'saved-model', 'the optimistic effort write must retain the model restored by the newer state');
-  await act(async () => {
-    finishEffort({ ok: !failEffort, json: async () => ({ success: !failEffort, data: { effort: 'high' } }) });
-    if (failEffort) await assert.rejects(updating, /Unable to change the reasoning effort/);
-    else await updating;
-  });
-  assert.equal(result.current.currentProviderModel, 'saved-model');
-  assert.equal(result.current.currentProviderEffort, failEffort ? 'medium' : 'high');
 });

@@ -12,6 +12,7 @@ import cors from 'cors';
 import { AppError, findApplicationRoot, getModuleDirectory, IS_PLATFORM, terminalTextStyles } from '@/shared/utils.js';
 import {
     closeSessionsWatcher,
+    closeClaudeAccountLogins,
     initializeSessionsWatcher,
     providerRuntimeService,
 } from '@/modules/providers/index.js';
@@ -51,7 +52,8 @@ import browserUseRoutes from './modules/browser-use/browser-use.routes.js';
 import { assetsRoutes } from './modules/assets/index.js';
 import { fileTreeRoutes } from './modules/file-tree/index.js';
 import { worktreesRoutes } from './modules/worktrees/index.js';
-import { createWorkspaceSyncRouter, createWorkspaceSyncService } from './modules/workspace-sync/index.js';
+import { createWorkspaceRuntimePreviewRouter, createWorkspaceRuntimeService } from './modules/workspace-runtime/index.js';
+import { createSshWorkspacesRouter, createWorkspacesRouter } from './modules/workspaces/index.js';
 import browserUseMcpRoutes from './modules/browser-use/browser-use-mcp.routes.js';
 import { browserUseService } from './modules/browser-use/browser-use.service.js';
 import { initializeDatabase, sessionsDb, userDb } from './modules/database/index.js';
@@ -82,8 +84,8 @@ const systemRoutes = createSystemModule({
 });
 console.log('SERVER_PORT from env:', process.env.SERVER_PORT);
 
+const workspaceRuntimeService = createWorkspaceRuntimeService();
 const app = express();
-const workspaceSyncService = createWorkspaceSyncService();
 const server = http.createServer(app);
 const queryClaude = providerRuntimeService.getRunner('claude');
 const queryCursor = providerRuntimeService.getRunner('cursor');
@@ -123,6 +125,8 @@ createWebSocketServer(server, {
 });
 
 app.use(cors({ exposedHeaders: ['X-Refreshed-Token', 'X-Auth-Error'] }));
+// Preview capabilities authorize only their running sandbox, and proxy bodies must remain streams.
+app.use('/api/workspace-runtime', createWorkspaceRuntimePreviewRouter());
 app.use(express.json({
     limit: '50mb',
     type: (req) => {
@@ -166,9 +170,11 @@ app.use('/api/git', authenticateToken, gitRoutes);
 
 // Git worktree management (protected)
 app.use('/api/worktrees', authenticateToken, worktreesRoutes);
-
-// Device public-key enrollment and sandboxed managed desktop workspace operations.
-app.use('/api/workspace-sync', authenticateToken, createWorkspaceSyncRouter(workspaceSyncService));
+app.use('/api/workspace-sync', authenticateToken, (_request, response) => {
+    response.status(410).json({ error: { code: 'LOCAL_WORKSPACE_REMOVED', message: '本地实时同步已移除，请使用云端项目。' } });
+});
+app.use('/api/workspaces', authenticateToken, createWorkspacesRouter());
+app.use('/api/ssh-workspaces', authenticateToken, createSshWorkspacesRouter());
 
 // TaskMaster API Routes (protected)
 app.use('/api/taskmaster', authenticateToken, taskmasterRoutes);
@@ -336,11 +342,8 @@ async function startServer() {
         await initializeDatabase();
         const workspaceAccount = userDb.getFirstUser();
         if (workspaceAccount) {
-            try { await workspaceSyncService.restore(String(workspaceAccount.id)); }
-            catch (error) {
-                // Optional file synchronization must not prevent account/chat startup.
-                console.warn('[workspace-sync] Transport restoration unavailable:', error instanceof Error ? error.message : String(error));
-            }
+            try { await workspaceRuntimeService.restore(String(workspaceAccount.id)); }
+            catch (error) { console.warn('[workspace-runtime] Cloud execution unavailable:', getErrorMessage(error)); }
         }
 
         // Configure Web Push (VAPID keys)
@@ -392,6 +395,7 @@ async function startServer() {
         closeScheduledMessageDispatcher();
         // Clean up plugin processes on shutdown
         const shutdownRuntimeServices = async () => {
+            await closeClaudeAccountLogins();
             try {
                 await browserUseService.stopAllSessions();
             } catch (err) {

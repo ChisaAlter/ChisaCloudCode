@@ -1,11 +1,17 @@
 import assert from 'node:assert/strict';
+
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, test, vi } from 'vitest';
+
 import EditorSidebar from '@/modules/code-editor/EditorSidebar';
+import type * as SharedApi from '@/shared/api';
 import type { CodeEditorFile } from '@/shared/types';
 
 const requests = vi.hoisted(() => ({ readFile: vi.fn(), saveFile: vi.fn() }));
-vi.mock('@/shared/api', () => ({ api: requests }));
+vi.mock('@/shared/api', async (importOriginal) => ({
+  ...await importOriginal<typeof SharedApi>(),
+  api: requests,
+}));
 vi.mock('@/modules/code-editor/CodeEditor', async () => {
   const { useCodeEditorDocument } = await import('@/modules/code-editor/hooks/useCodeEditorDocument');
   return { default: function MockCodeEditor({ file, isSidebar, onPopOut }: { file: CodeEditorFile; isSidebar: boolean; onPopOut: () => void }) {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Dispatch, KeyboardEvent, RefObject, SetStateAction } from 'react';
 
-import { api } from '@/shared/api';
+import { useWorkspaceApi, useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
 import { escapeRegExp } from '@/modules/chat/utils/chatFormatting';
 import type { Project } from '@/shared/types';
 
@@ -63,9 +63,12 @@ export function useFileMentions({ isActive, selectedProject, input, setInput, te
   const [atSymbolPosition, setAtSymbolPosition] = useState(-1);
 
   const projectId = selectedProject?.projectId;
+  const api = useWorkspaceApi();
+  const workspace = useWorkspaceScope();
+  const scopeKey = JSON.stringify([projectId, workspace?.workspaceId, workspace?.generation, workspace === null]);
   const fileList = useMemo(
-    () => projectFiles && projectFiles.projectId === projectId ? projectFiles.files : [],
-    [projectFiles, projectId],
+    () => projectFiles && projectFiles.projectId === scopeKey ? projectFiles.files : [],
+    [projectFiles, scopeKey],
   );
   const textBeforeCursor = input.slice(0, cursorPosition);
   const lastAtIndex = textBeforeCursor.lastIndexOf('@');
@@ -76,16 +79,16 @@ export function useFileMentions({ isActive, selectedProject, input, setInput, te
   useEffect(() => () => {
     fileRequestRef.current?.controller.abort();
     fileRequestRef.current = null;
-  }, [projectId]);
+  }, [scopeKey]);
 
   useEffect(() => {
     // Chat stays mounted while Files is visible. Only an active @ completion
     // needs the tree, so mounting or switching projects alone must not scan it.
-    if (!projectId || !needsFileList || projectFiles?.projectId === projectId || fileRequestRef.current?.projectId === projectId) {
+    if (!projectId || workspace === null || workspace?.capabilities.read === false || !needsFileList || projectFiles?.projectId === scopeKey || fileRequestRef.current?.projectId === scopeKey) {
       return;
     }
     const abortController = new AbortController();
-    fileRequestRef.current = { projectId, controller: abortController };
+    fileRequestRef.current = { projectId: scopeKey, controller: abortController };
 
     const fetchProjectFiles = async () => {
       // File list is keyed by DB projectId now; the backend resolves it to
@@ -100,7 +103,7 @@ export function useFileMentions({ isActive, selectedProject, input, setInput, te
 
         const files = (await response.json()) as ProjectFileNode[];
         if (!abortController.signal.aborted) {
-          setProjectFiles({ projectId, files: flattenFileTree(files) });
+          setProjectFiles({ projectId: scopeKey, files: flattenFileTree(files) });
         }
       } catch (error) {
         // Ignore aborts from rapid project switches; we only care about the latest request.
@@ -116,7 +119,7 @@ export function useFileMentions({ isActive, selectedProject, input, setInput, te
     };
 
     fetchProjectFiles();
-  }, [projectId, needsFileList, projectFiles?.projectId]);
+  }, [api, workspace, scopeKey, projectId, needsFileList, projectFiles?.projectId]);
 
   useEffect(() => {
     if (!isActive || mentionQuery === null) {

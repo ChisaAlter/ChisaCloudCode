@@ -14,7 +14,7 @@ import { PromptInput, PromptInputSubmit } from '@/shared/ui';
  * for a composer that was actually streaming.
  *
  * The shared composer reads the root's status through context, which is the
- * only place status is set for both chat and local-agent consumers.
+ * only place status is set for the cloud chat composer.
  */
 
 const renderSubmit = (status: 'ready' | 'streaming') =>

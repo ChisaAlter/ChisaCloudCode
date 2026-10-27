@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
+import { ChevronDown, ChevronRight } from 'lucide-react';
 
 import type { ProviderModelOption } from '@/shared/types';
 import { DEFAULT_EFFORT_VALUE } from '@/shared/constants';
@@ -26,9 +26,6 @@ type ComposerModelMenuProps = {
   modelOptions: ProviderModelOption[];
   onSelectModel: (model: string) => void;
   modelsLoading: boolean;
-  modelsError?: boolean;
-  modelsErrorMessage?: string;
-  onReloadModels?: () => void;
 };
 
 /**
@@ -44,9 +41,6 @@ function ComposerModelMenu({
   modelOptions,
   onSelectModel,
   modelsLoading,
-  modelsError = false,
-  modelsErrorMessage,
-  onReloadModels,
 }: ComposerModelMenuProps) {
   const { t } = useTranslation('chat');
   const [isOpen, setIsOpen] = useState(false);
@@ -82,7 +76,7 @@ function ComposerModelMenu({
     : null;
 
   const hasEffortSection = resolvedEffortOptions.length > 0;
-  const hasModelSection = modelOptions.length > 0 || modelsLoading || modelsError || Boolean(onReloadModels);
+  const hasModelSection = modelOptions.length > 0 || modelsLoading;
   if (!hasEffortSection && !hasModelSection) {
     return null;
   }
@@ -98,7 +92,6 @@ function ComposerModelMenu({
         ref={triggerRef}
         type="button"
         onClick={() => {
-          if (!isOpen && !modelsLoading) onReloadModels?.();
           updateAnchor();
           setIsOpen((current) => !current);
         }}
@@ -134,7 +127,6 @@ function ComposerModelMenu({
                   description={option.description}
                   isSelected={option.value === effort}
                   onSelect={() => {
-                    if (modelsLoading) return;
                     onSelectEffort(option.value);
                     setIsOpen(false);
                   }}
@@ -166,28 +158,8 @@ function ComposerModelMenu({
               {(!hasEffortSection || isModelSectionOpen) && (
                 <>
                   <ComposerMenuHeading>
-                    <span className="flex items-center justify-between gap-2">
-                      <span>{t('composer.model', { defaultValue: 'Model' })}</span>
-                      {onReloadModels && (
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onClick={onReloadModels}
-                          disabled={modelsLoading}
-                          aria-label={t('composer.reloadModels', { defaultValue: 'Reload models' })}
-                          title={t('composer.reloadModels', { defaultValue: 'Reload models' })}
-                          className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
-                        >
-                          <RefreshCw className={`h-3.5 w-3.5${modelsLoading ? ' animate-spin' : ''}`} aria-hidden />
-                        </button>
-                      )}
-                    </span>
+                    {t('composer.model', { defaultValue: 'Model' })}
                   </ComposerMenuHeading>
-                  {modelsError && (
-                    <p role="alert" className="px-2.5 py-1.5 text-sm text-destructive">
-                      {modelsErrorMessage || t('composer.modelsLoadFailed', { defaultValue: 'Could not load models. Reload to try again.' })}
-                    </p>
-                  )}
                   {modelOptions.length === 0 && modelsLoading && (
                     <p className="px-2.5 py-1.5 text-sm text-muted-foreground">
                       {t('composer.loadingModels', { defaultValue: 'Loading models…' })}
@@ -200,7 +172,6 @@ function ComposerModelMenu({
                       description={option.description || (option.value.startsWith('claude-') ? option.value : undefined)}
                       isSelected={option.value === model}
                       onSelect={() => {
-                        if (modelsLoading) return;
                         onSelectModel(option.value);
                         setIsOpen(false);
                       }}

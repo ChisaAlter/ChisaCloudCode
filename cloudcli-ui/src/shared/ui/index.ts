@@ -14,8 +14,8 @@
  * assistant-reasoning disclosure, the tool todo list and the inline
  * tool-permission request — with chat vocabulary in their prop names and
  * no plausible second consumer. Alert went with Confirmation, which was its only
- * importer and the reason it existed. PromptInput is shared again now that the
- * chat and local-agent modules both render its presentational form controls.
+ * importer and the reason it existed. PromptInput retains its existing shared
+ * entry point for the chat composer while its generic form controls remain stable.
  */
 
 export { ActionMenu } from '@/shared/ui/ActionMenu';

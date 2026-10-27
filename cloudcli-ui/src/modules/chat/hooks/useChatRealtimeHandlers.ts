@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 
-import type { ChatReplayCursor, ChatStreamBuffer, ServerEvent,MarkSessionIdle,MarkSessionProcessing,PendingPermissionRequest,ProjectSession,LLMProvider,NormalizedMessage } from '@/shared/types';
+import type { ServerEvent,MarkSessionIdle,MarkSessionProcessing,PendingPermissionRequest,ProjectSession,LLMProvider,NormalizedMessage } from '@/shared/types';
 import { showCompletionTitleIndicator } from '@/modules/chat/utils/pageTitleNotification';
 import { playChatCompletionSound, playNotificationSound } from '@/shared/utils';
 import type { SessionStore } from '@/modules/chat/hooks/useSessionStore';
@@ -23,12 +23,12 @@ type UseChatRealtimeHandlersArgs = {
   setTokenBudget: (budget: Record<string, unknown> | null) => void;
   pendingPermissionRequests: PendingPermissionRequest[];
   setPendingPermissionRequests: Dispatch<SetStateAction<PendingPermissionRequest[]>>;
-  streamBuffersRef: MutableRefObject<Map<string, ChatStreamBuffer>>;
   /**
-   * Highest consumed seq in the session's channel. Only a new replay epoch resets
-   * the watermark; a later run continues the same channel's monotonic sequence.
+   * Highest live `seq` observed for each session's current run. Subscribe sends
+   * this with its run id so a subsequent run cannot inherit an old cursor.
    */
-  replayCursorsRef: MutableRefObject<Map<string, ChatReplayCursor>>;
+  lastSeqRef: MutableRefObject<Map<string, number>>;
+  cursorRunIdRef: MutableRefObject<Map<string, string>>;
   /** When each session's `chat.subscribe` was last sent; guards stale idle acks. */
   statusCheckSentAtRef: MutableRefObject<Map<string, number>>;
   onSessionProcessing?: MarkSessionProcessing;
@@ -60,8 +60,8 @@ export function useChatRealtimeHandlers({
   setTokenBudget,
   pendingPermissionRequests,
   setPendingPermissionRequests,
-  streamBuffersRef,
-  replayCursorsRef,
+  lastSeqRef,
+  cursorRunIdRef,
   statusCheckSentAtRef,
   onSessionProcessing,
   onSessionIdle,
@@ -82,21 +82,39 @@ export function useChatRealtimeHandlers({
   // listener so back-to-back permission events can dedupe and re-arm the
   // notification sound before React finishes a rerender.
   const pendingPermissionRequestsRef = useRef(pendingPermissionRequests);
-  // A live run announced after a subscribe must survive an older idle acknowledgement.
-  const runStartedAtRef = useRef(new Map<string, number>());
 
   useEffect(() => {
     pendingPermissionRequestsRef.current = pendingPermissionRequests;
   }, [pendingPermissionRequests]);
 
+  // A socket can deliver several sessions at once. Each reply retains its own
+  // text/provider; its start time guards against an older idle subscribe ack.
+  const streamsRef = useRef(new Map<string, { content: string; provider: LLMProvider; dirty: boolean; startedAt: number }>());
+  // A run can announce itself before its first text; protect its cursor from
+  // an idle acknowledgement for a subscribe sent before that announcement.
+  const runStartedAtRef = useRef(new Map<string, number>());
+  // One timer batches updates for all dirty sessions without coupling their text.
+  const streamTimerRef = useRef<number | null>(null);
+
+  useEffect(() => () => {
+    if (streamTimerRef.current !== null) {
+      clearTimeout(streamTimerRef.current);
+      streamTimerRef.current = null;
+    }
+    streamsRef.current.clear();
+    runStartedAtRef.current.clear();
+  }, []);
+
   useEffect(() => {
-    const finishStream = (sessionId: string) => {
-      const buffer = streamBuffersRef.current.get(sessionId);
-      if (buffer?.timer !== null && buffer?.timer !== undefined) clearTimeout(buffer.timer);
-      if (buffer?.text) sessionStore.updateStreaming(sessionId, buffer.text, buffer.provider);
+    const finalizeStream = (sessionId: string) => {
+      const stream = streamsRef.current.get(sessionId);
+      if (stream?.content) {
+        sessionStore.updateStreaming(sessionId, stream.content, stream.provider);
+      }
       sessionStore.finalizeStreaming(sessionId);
-      streamBuffersRef.current.delete(sessionId);
+      streamsRef.current.delete(sessionId);
     };
+
     const handleEvent = (msg: ServerEvent) => {
       if (!msg.kind) {
         return;
@@ -104,39 +122,35 @@ export function useChatRealtimeHandlers({
 
       const activeViewSessionId = activeViewSessionIdRef.current;
       const sid = (typeof msg.sessionId === 'string' && msg.sessionId) || activeViewSessionId;
-      const subscribedAt = sid ? statusCheckSentAtRef.current.get(sid) : undefined;
-      const liveRunStartedAt = sid ? runStartedAtRef.current.get(sid) : undefined;
-      if (msg.kind === 'chat_subscribed' && msg.isProcessing === false
-        && (!msg.replayEpoch || msg.replayEpoch === replayCursorsRef.current.get(sid ?? '')?.replayEpoch)
-        && liveRunStartedAt !== undefined && subscribedAt !== undefined && liveRunStartedAt >= subscribedAt) return;
 
-      if (sid && typeof msg.replayEpoch === 'string'
-        && replayCursorsRef.current.get(sid)?.replayEpoch !== msg.replayEpoch) {
-        const previous = replayCursorsRef.current.get(sid);
-        if (previous?.replayEpoch) finishStream(sid);
-        replayCursorsRef.current.set(sid, { replayEpoch: msg.replayEpoch, runId: previous?.runId, seq: 0 });
+      const runId = typeof msg.runId === 'string' && msg.runId ? msg.runId : null;
+      const isRunSnapshot = msg.kind === 'chat_subscribed' || msg.kind === 'chat_run_status';
+      const isActiveSnapshot = msg.kind === 'chat_subscribed'
+        ? msg.isProcessing === true
+        : msg.phase !== 'completed' && msg.status !== 'completed';
+      if (sid && runId && (!isRunSnapshot || isActiveSnapshot)) {
+        const previousRunId = cursorRunIdRef.current.get(sid);
+        if (previousRunId && previousRunId !== runId) {
+          finalizeStream(sid);
+          lastSeqRef.current.set(sid, 0);
+        }
+        // The first identified snapshot may follow anonymous events from this
+        // same run. Keep those observed events when learning its identity.
+        cursorRunIdRef.current.set(sid, runId);
+        if (previousRunId !== runId) {
+          // An ack describes the subscribe already in flight. Only a live
+          // announcement can establish a newer run after that request.
+          if (msg.kind === 'chat_subscribed') runStartedAtRef.current.delete(sid);
+          else runStartedAtRef.current.set(sid, Date.now());
+        }
       }
+
+      // Snapshot lastSeq describes frames on the server, not frames we received.
       if (sid && typeof msg.seq === 'number') {
-        const cursor = replayCursorsRef.current.get(sid);
-        // Deduplicate before touching stream ownership: an old-run duplicate cannot flush a new run.
-        if (msg.seq <= (cursor?.seq ?? 0)) return;
-      }
-      if (sid && msg.runId && replayCursorsRef.current.get(sid)?.runId !== msg.runId) {
-        const cursor = replayCursorsRef.current.get(sid);
-        // First metadata attaches to an existing partial paragraph; a known run change finalizes it.
-        if (cursor?.runId || (streamBuffersRef.current.get(sid)?.runId
-          && streamBuffersRef.current.get(sid)?.runId !== msg.runId)) finishStream(sid);
-        replayCursorsRef.current.set(sid, { ...cursor, runId: msg.runId, seq: cursor?.seq ?? 0 });
-        if (msg.kind === 'chat_subscribed') runStartedAtRef.current.delete(sid);
-        else runStartedAtRef.current.set(sid, Date.now());
-      }
-      if (sid && typeof msg.seq === 'number') {
-        const cursor = replayCursorsRef.current.get(sid);
-        replayCursorsRef.current.set(sid, {
-          replayEpoch: msg.replayEpoch ?? cursor?.replayEpoch,
-          runId: msg.runId ?? cursor?.runId,
-          seq: Math.max(cursor?.seq ?? 0, msg.seq),
-        });
+        const known = lastSeqRef.current.get(sid) ?? 0;
+        if (msg.seq > known) {
+          lastSeqRef.current.set(sid, msg.seq);
+        }
       }
 
       switch (msg.kind) {
@@ -160,21 +174,26 @@ export function useChatRealtimeHandlers({
           if (!sid) return;
 
           if (msg.isProcessing) {
-            onSessionProcessing?.(sid, {
-              runId: msg.runId,
-              modelStopped: msg.modelStopped,
-              ...(typeof msg.statusText === 'string' ? { statusText: msg.statusText } : {}),
-            });
+            onSessionProcessing?.(sid);
           } else {
-            // Idle ack: ignore it if a newer request started after the subscribe was sent.
-            onSessionIdle?.(sid, {
-              ifStartedBefore: statusCheckSentAtRef.current.get(sid),
-            });
-            finishStream(sid);
-            runStartedAtRef.current.delete(sid);
-            if (sid === activeViewSessionId && replayCursorsRef.current.has(sid)) {
-              void requestLatestMessages(sid, isActiveRef.current);
+            const subscribedAt = statusCheckSentAtRef.current.get(sid);
+            const stream = streamsRef.current.get(sid);
+            const runStartedAt = runStartedAtRef.current.get(sid);
+            const newerRun = runStartedAt !== undefined && subscribedAt !== undefined && runStartedAt >= subscribedAt;
+            const newerStream = stream && subscribedAt !== undefined && stream.startedAt >= subscribedAt;
+            // Completed runs are not replayed after reconnect. Retire their
+            // buffer/cursor, preserving a run started after this subscribe.
+            if (!newerRun && !newerStream) {
+              if (stream) finalizeStream(sid);
+              lastSeqRef.current.set(sid, 0);
+              cursorRunIdRef.current.delete(sid);
+              runStartedAtRef.current.delete(sid);
             }
+            // Idle ack: ignore it if a newer request started after the
+            // subscribe was sent — the ack describes the older state.
+            onSessionIdle?.(sid, {
+              ifStartedBefore: subscribedAt,
+            });
           }
 
           const isViewedSession = sid === activeViewSessionId;
@@ -194,15 +213,16 @@ export function useChatRealtimeHandlers({
         }
 
         case 'chat_run_status':
-          // Lifecycle metadata owns activity and replay identity, never a transcript row.
+          // Lifecycle snapshots establish the replay run, not transcript rows.
+          // `complete` remains the terminal event for processing/activity.
           return;
 
         case 'protocol_error': {
           console.error('[Chat] Protocol error:', msg.code, msg.error);
           if (sid) {
-            // These rejections leave the existing run or its file handback live.
-            // Only a terminal event or an authoritative idle snapshot can unlock it.
-            if (msg.code !== 'CHAT_ABORT_FAILED' && msg.code !== 'RUN_IN_PROGRESS') {
+            // Rejected sends can end optimistic activity; these errors instead
+            // confirm an existing run is still running or handing files back.
+            if (msg.code !== 'RUN_IN_PROGRESS' && msg.code !== 'CHAT_ABORT_FAILED') {
               onSessionIdle?.(sid);
             }
             sessionStore.appendRealtime(sid, {
@@ -233,27 +253,31 @@ export function useChatRealtimeHandlers({
       // --- Streaming: buffer for performance ---
       if (msg.kind === 'stream_delta') {
         const text = (msg.content as string) || '';
-        if (!text || !sid) return;
-        let buffer = streamBuffersRef.current.get(sid);
-        if (!buffer) {
-          const current = sessionStore.getMessages(sid).find(row => row.id === `__streaming_${sid}`);
-          buffer = { runId: msg.runId, provider: (msg.provider as LLMProvider) || provider, text: current?.content ?? '', timer: null };
-          streamBuffersRef.current.set(sid, buffer);
-          if (!runStartedAtRef.current.has(sid)) runStartedAtRef.current.set(sid, Date.now());
-        }
-        buffer.text += text;
-        if (buffer.timer === null) {
-          const pendingBuffer = buffer;
-          buffer.timer = window.setTimeout(() => {
-            pendingBuffer.timer = null;
-            sessionStore.updateStreaming(sid, pendingBuffer.text, pendingBuffer.provider);
+        if (!sid || !text) return;
+        const stream = streamsRef.current.get(sid) ?? {
+          content: '',
+          provider: (msg.provider as LLMProvider) || provider,
+          dirty: false,
+          startedAt: Date.now(),
+        };
+        stream.content += text;
+        stream.dirty = true;
+        streamsRef.current.set(sid, stream);
+        if (streamTimerRef.current === null) {
+          streamTimerRef.current = window.setTimeout(() => {
+            streamTimerRef.current = null;
+            for (const [sessionId, pendingStream] of streamsRef.current) {
+              if (!pendingStream.dirty) continue;
+              pendingStream.dirty = false;
+              sessionStore.updateStreaming(sessionId, pendingStream.content, pendingStream.provider);
+            }
           }, 100);
         }
         return;
       }
 
       if (msg.kind === 'stream_end') {
-        if (sid) finishStream(sid);
+        if (sid) finalizeStream(sid);
         return;
       }
 
@@ -272,20 +296,32 @@ export function useChatRealtimeHandlers({
       // --- UI side effects for specific kinds ---
       switch (msg.kind) {
         case 'complete': {
-          if (sid) finishStream(sid);
+          // A terminal event only owns the matching session's stream.
+          if (sid) {
+            finalizeStream(sid);
+            lastSeqRef.current.set(sid, 0);
+            cursorRunIdRef.current.delete(sid);
+            runStartedAtRef.current.delete(sid);
+          }
 
           // `complete` is the unified terminal event — every provider run ends
           // with exactly one, regardless of success, failure, or abort. The
           // indicator derives from the processing map, so deleting the entry
           // hides it immediately and atomically.
-          onSessionIdle?.(sid, { runId: msg.runId });
+          onSessionIdle?.(sid);
           if (sid === activeViewSessionId) {
             pendingPermissionRequestsRef.current = [];
             setPendingPermissionRequests([]);
           }
 
+          if (msg.aborted) {
+            // Abort was requested — the complete event confirms it. No
+            // further UI action is needed beyond clearing the entry above.
+            break;
+          }
+
           // Celebrate only successful runs (failed runs end with success: false).
-          if (!msg.aborted && msg.success !== false) {
+          if (msg.success !== false) {
             showCompletionTitleIndicator();
             void playChatCompletionSound();
           }
@@ -361,8 +397,6 @@ export function useChatRealtimeHandlers({
             onSessionProcessing?.(sid, {
               statusText: msg.text as string,
               canInterrupt: msg.canInterrupt !== false,
-              runId: msg.runId,
-              modelStopped: msg.text === 'model_stopped' ? true : msg.modelStopped,
             });
           }
           break;
@@ -384,8 +418,8 @@ export function useChatRealtimeHandlers({
     setTokenBudget,
     pendingPermissionRequests,
     setPendingPermissionRequests,
-    streamBuffersRef,
-    replayCursorsRef,
+    lastSeqRef,
+    cursorRunIdRef,
     statusCheckSentAtRef,
     onSessionProcessing,
     onSessionIdle,

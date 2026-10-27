@@ -2950,7 +2950,7 @@ function requireDumper() {
     return quotingType === QUOTING_TYPE_DOUBLE ? STYLE_DOUBLE : STYLE_SINGLE;
   }
   function writeScalar(state, string, level, iskey, inblock) {
-    state.dump = (function() {
+    state.dump = function() {
       if (string.length === 0) {
         return state.quotingType === QUOTING_TYPE_DOUBLE ? '""' : "''";
       }
@@ -2989,7 +2989,7 @@ function requireDumper() {
         default:
           throw new YAMLException2("impossible error: invalid scalar style");
       }
-    })();
+    }();
   }
   function blockHeader(string, indentPerLevel) {
     const indentIndicator = needIndentIndicator(string) ? String(indentPerLevel) : "";
@@ -3003,12 +3003,12 @@ function requireDumper() {
   }
   function foldString(string, width) {
     const lineRe = /(\n+)([^\n]*)/g;
-    let result = (function() {
+    let result = function() {
       let nextLF = string.indexOf("\n");
       nextLF = nextLF !== -1 ? nextLF : string.length;
       lineRe.lastIndex = nextLF;
       return foldLine(string.slice(0, nextLF), width);
-    })();
+    }();
     let prevMoreIndented = string[0] === "\n" || string[0] === " ";
     let moreIndented;
     let match;

@@ -18,10 +18,20 @@ function createFakeSocket() {
     readyState: number;
     frames: Array<Record<string, unknown>>;
     send: (data: string) => void;
+    receive: (frame: Record<string, unknown>) => Promise<void>;
+    settled: () => Promise<void>;
   };
+  const pendingMessages: Promise<void>[] = [];
   socket.readyState = 1;
   socket.frames = [];
   socket.send = (data: string) => socket.frames.push(JSON.parse(data) as Record<string, unknown>);
+  socket.receive = (frame) => {
+    const handled = Promise.all(socket.listeners('message').map(listener => listener.call(socket, JSON.stringify(frame))))
+      .then(() => {});
+    pendingMessages.push(handled);
+    return handled;
+  };
+  socket.settled = async () => { await Promise.all(pendingMessages); };
   return socket;
 }
 
@@ -60,16 +70,10 @@ const CODEX_TRANSCRIPT_ROWS = [
 
 type RunCall = { provider: string; command: string; options: Record<string, unknown> };
 
-/**
- * Set by a test that needs a run to still be in flight when the next frame
- * arrives; the stub runtime returns immediately otherwise. Released when the
- * test ends, so no stub run is left pending for the rest of the file.
- */
-let holdRun: Promise<void> | null = null;
-let releaseHeldRun: (() => void) | null = null;
-
-function holdTheNextRun(): void {
-  holdRun = new Promise<void>((resolve) => { releaseHeldRun = resolve; });
+function gate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
 }
 
 async function withGateway(
@@ -77,6 +81,7 @@ async function withGateway(
   runTest: (context: {
     socket: ReturnType<typeof createFakeSocket>;
     runs: RunCall[];
+    holdNextRun: () => { entered: Promise<void>; release: () => void };
   }) => Promise<void>,
   rows: unknown[] = TRANSCRIPT_ROWS,
 ): Promise<void> {
@@ -87,12 +92,21 @@ async function withGateway(
 
   closeConnection();
   process.env.DATABASE_PATH = path.join(tempDirectory, 'auth.db');
-  await initializeDatabase();
-
   const runs: RunCall[] = [];
   const socket = createFakeSocket();
+  const heldRuns: Array<{ entered: ReturnType<typeof gate>; handback: ReturnType<typeof gate> }> = [];
+  let nextHeldRun: (typeof heldRuns)[number] | null = null;
+  const holdNextRun = () => {
+    const held = { entered: gate(), handback: gate() };
+    heldRuns.push(held);
+    nextHeldRun = held;
+    return { entered: held.entered.promise, release: held.handback.resolve };
+  };
 
   try {
+    // An existing empty database bypasses migration of the developer's legacy DB.
+    await writeFile(process.env.DATABASE_PATH, '');
+    await initializeDatabase();
     const now = new Date().toISOString();
     sessionsDb.createSession(SESSION_ID, provider, tempDirectory, 'Edit session', now, now, transcriptPath);
 
@@ -104,43 +118,44 @@ async function withGateway(
           hasRuntime: () => true,
           run: async (runProvider: string, command: string, options: Record<string, unknown>) => {
             runs.push({ provider: runProvider, command, options });
-            if (holdRun) {
-              await holdRun;
+            const held = nextHeldRun;
+            nextHeldRun = null;
+            if (held) {
+              held.entered.resolve();
+              await held.handback.promise;
             }
           },
         } as never,
       },
     );
 
-    await runTest({ socket, runs });
+    await runTest({ socket, runs, holdNextRun });
   } finally {
-    releaseHeldRun?.();
-    releaseHeldRun = null;
-    holdRun = null;
-    connectedClients.clear();
-    chatRunRegistry.clearAll();
-    closeConnection();
-    if (previousDatabasePath === undefined) {
-      delete process.env.DATABASE_PATH;
-    } else {
-      process.env.DATABASE_PATH = previousDatabasePath;
+    for (const held of heldRuns) held.handback.resolve();
+    try {
+      await socket.settled();
+    } finally {
+      connectedClients.clear();
+      chatRunRegistry.clearAll();
+      closeConnection();
+      if (previousDatabasePath === undefined) {
+        delete process.env.DATABASE_PATH;
+      } else {
+        process.env.DATABASE_PATH = previousDatabasePath;
+      }
+      await rm(tempDirectory, { recursive: true, force: true });
     }
-    await rm(tempDirectory, { recursive: true, force: true });
   }
 }
 
-/** The handler is async and the socket listener does not await it. */
-const settle = () => new Promise((resolve) => { setTimeout(resolve, 30); });
-
 test('an edit resumes through the turn before the one being replaced', async () => {
   await withGateway('claude', async ({ socket, runs }) => {
-    socket.emit('message', JSON.stringify({
+    await socket.receive({
       type: 'chat.edit-send',
       sessionId: SESSION_ID,
       anchorId: 'e-u2',
       content: 'a better second prompt',
-    }));
-    await settle();
+    });
 
     assert.equal(runs.length, 1);
     assert.equal(runs[0].command, 'a better second prompt');
@@ -152,13 +167,12 @@ test('an edit resumes through the turn before the one being replaced', async () 
 
 test('editing the first prompt starts the conversation over', async () => {
   await withGateway('claude', async ({ socket, runs }) => {
-    socket.emit('message', JSON.stringify({
+    await socket.receive({
       type: 'chat.edit-send',
       sessionId: SESSION_ID,
       anchorId: 'e-u1',
       content: 'a better first prompt',
-    }));
-    await settle();
+    });
 
     assert.equal(runs.length, 1);
     assert.equal(runs[0].options.resumeAnchorId, undefined);
@@ -168,13 +182,12 @@ test('editing the first prompt starts the conversation over', async () => {
 
 test('every subscribed client is told to drop the superseded turns', async () => {
   await withGateway('claude', async ({ socket }) => {
-    socket.emit('message', JSON.stringify({
+    await socket.receive({
       type: 'chat.edit-send',
       sessionId: SESSION_ID,
       anchorId: 'e-u2',
       content: 'replacement',
-    }));
-    await settle();
+    });
 
     const truncation = socket.frames.find((frame) => frame.kind === 'history_truncated');
     assert.ok(truncation, 'a history_truncated frame is emitted');
@@ -187,12 +200,11 @@ test('every subscribed client is told to drop the superseded turns', async () =>
 
 test('an edit without an anchor is refused', async () => {
   await withGateway('claude', async ({ socket, runs }) => {
-    socket.emit('message', JSON.stringify({
+    await socket.receive({
       type: 'chat.edit-send',
       sessionId: SESSION_ID,
       content: 'no anchor',
-    }));
-    await settle();
+    });
 
     assert.equal(runs.length, 0);
     assert.equal(socket.frames.at(-1)?.code, 'ANCHOR_REQUIRED');
@@ -201,13 +213,12 @@ test('an edit without an anchor is refused', async () => {
 
 test('an anchor the transcript does not hold is refused', async () => {
   await withGateway('claude', async ({ socket, runs }) => {
-    socket.emit('message', JSON.stringify({
+    await socket.receive({
       type: 'chat.edit-send',
       sessionId: SESSION_ID,
       anchorId: 'not-in-transcript',
       content: 'replacement',
-    }));
-    await settle();
+    });
 
     assert.equal(runs.length, 0);
     assert.equal(socket.frames.at(-1)?.code, 'ANCHOR_NOT_FOUND');
@@ -216,21 +227,20 @@ test('an anchor the transcript does not hold is refused', async () => {
 
 test('a provider that cannot re-run from a point is refused rather than sending a new message', async () => {
   await withGateway('cursor', async ({ socket, runs }) => {
-    socket.emit('message', JSON.stringify({
+    await socket.receive({
       type: 'chat.edit-send',
       sessionId: SESSION_ID,
       anchorId: 'e-u2',
       content: 'replacement',
-    }));
-    await settle();
+    });
 
     assert.equal(runs.length, 0);
     assert.equal(socket.frames.at(-1)?.code, 'EDIT_NOT_SUPPORTED');
   });
 });
 
-test('a refused send never rewinds the conversation', async () => {
-  await withGateway('codex', async ({ socket, runs }) => {
+test('a refused send never rewinds the conversation', { timeout: 15_000 }, async () => {
+  await withGateway('codex', async ({ socket, runs, holdNextRun }) => {
     // The rewind moves the session onto a different provider transcript and
     // cannot be undone, so a send the gateway is about to refuse must not
     // reach it. A run already in flight is the realistic way that happens: a
@@ -238,31 +248,32 @@ test('a refused send never rewinds the conversation', async () => {
     const realRewind = sessionsService.rewindSessionForEdit;
     let rewound = false;
     sessionsService.rewindSessionForEdit = async () => { rewound = true; };
-    holdTheNextRun();
+    const held = holdNextRun();
+    const original = socket.receive({
+      type: 'chat.send',
+      sessionId: SESSION_ID,
+      content: 'a turn that is already running',
+    });
 
     try {
-      socket.emit('message', JSON.stringify({
-        type: 'chat.send',
-        sessionId: SESSION_ID,
-        content: 'a turn that is already running',
-      }));
-      await settle();
+      await held.entered;
       assert.equal(runs.length, 1);
 
-      socket.emit('message', JSON.stringify({
+      await socket.receive({
         type: 'chat.edit-send',
         sessionId: SESSION_ID,
         anchorId: 'turn-b',
         content: 'an edit that arrives too late',
-      }));
-      await settle();
+      });
+
+      assert.equal(rewound, false);
+      assert.equal(runs.length, 1);
+      assert.equal(socket.frames.at(-1)?.code, 'RUN_IN_PROGRESS');
     } finally {
+      held.release();
+      await original;
       sessionsService.rewindSessionForEdit = realRewind;
     }
-
-    assert.equal(rewound, false);
-    assert.equal(runs.length, 1);
-    assert.equal(socket.frames.at(-1)?.code, 'RUN_IN_PROGRESS');
   }, CODEX_TRANSCRIPT_ROWS);
 });
 
@@ -281,13 +292,12 @@ test('a provider that has to branch to rewind is rewound before the run, not dur
     };
 
     try {
-      socket.emit('message', JSON.stringify({
+      await socket.receive({
         type: 'chat.edit-send',
         sessionId: SESSION_ID,
         anchorId: 'turn-b',
         content: 'a better second prompt',
-      }));
-      await settle();
+      });
     } finally {
       sessionsService.rewindSessionForEdit = realRewind;
     }

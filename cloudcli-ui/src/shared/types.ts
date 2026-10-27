@@ -127,17 +127,151 @@ type ProjectTaskmasterInfo = {
 // folder-derived `name` string. Projects are now addressed everywhere by the
 // DB-assigned `projectId` (primary key in the `projects` table), and the UI
 // uses the same identifier for routing, state keys and API calls.
+/** Where a project's source and commands execute; an omitted value keeps the existing cloud behavior. */
+export type ProjectSourceMode = 'cloud' | 'ssh';
+
+/** Server-reported SSH reachability, separate from a desktop tunnel's forwarding state. */
+export type SshWorkspaceConnectionState = 'online' | 'offline' | 'recovery';
+
+/** Explicit defaults a project applies to a new session; null means inherit. */
+export type ProjectDefaultSettings = {
+  provider: string | null;
+  model: string | null;
+  effort: string | null;
+  permissionMode: string | null;
+  workspaceMode: string | null;
+};
+
+/** A saved project command that can run in the current workspace. */
+export type ProjectActionKind = 'run' | 'test' | 'build' | 'custom';
+
+export type ProjectAction = {
+  id: string;
+  projectId: string;
+  name: string;
+  command: string;
+  kind: ProjectActionKind;
+  cwd: string | null;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ProjectActionRunResult = {
+  actionId: string;
+  command: string;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+  durationMs: number;
+  workspaceMode: 'bridged' | 'direct';
+};
+
+/** Actual sanitized configuration provenance from one cloud Claude run; selected extensions are distinct from connected tools. */
+export type ProjectRuntimeManifest = {
+  runId: string;
+  sessionId?: string;
+  projectId: string;
+  workspaceId: string;
+  generation: string;
+  at: string;
+  configRevision: string;
+  status: 'loading' | 'loaded' | 'failed' | 'completed';
+  files: Array<{ path: string; hash: string; kind: 'instruction' | 'rule' | 'settings' | 'skill' | 'mcp' }>;
+  skills: Array<{ name: string; path: string; status: 'available' | 'activated' | 'unsupported'; reason?: string }>;
+  mcp: Array<{ name: string; transport: 'http' | 'sse' | 'stdio' | 'unknown'; location: 'cloud' | 'local'; status: 'selected' | 'connected' | 'failed' | 'disabled' | 'unsupported'; reason?: string }>;
+  warnings: string[];
+  error?: string;
+};
+
+/** Effective context-source policy with optional actual run provenance for the selected project. */
+export type ProjectContextView = {
+  projectId: string;
+  sourceMode: ProjectSourceMode;
+  displayPath: string;
+  execution: { provider: 'claude'; location: 'vps' | 'local' };
+  workspace: { mode: 'bridged' | 'direct'; instructionPath: string };
+  instructions: { access: 'workspace-tool' | 'direct'; note: string };
+  runtime: {
+    settingSources: string[];
+    autoMemory: boolean;
+    strictMcpConfig: boolean;
+    workspaceToolsOnly: boolean;
+    effectiveMcpServers: string[];
+  };
+  defaults: ProjectDefaultSettings;
+  runtimeManifest?: ProjectRuntimeManifest | null;
+  notes: string[];
+};
+
+/** Project defaults plus the execution constraints the project cannot override. */
+export type ProjectSettingsView = {
+  projectId: string;
+  sourceMode: ProjectSourceMode;
+  settings: ProjectDefaultSettings;
+  constraints: {
+    providers: string[] | null;
+    workspaceMode: 'shared' | null;
+  };
+  updatedAt: string | null;
+};
+
 /** A workspace project as the UI knows it: identity, path, star state and its loaded sessions. */
 export type Project = {
   projectId: string;
   displayName: string;
   fullPath: string;
   path?: string;
+  sourceMode?: ProjectSourceMode;
+  /** User-facing location; SSH project fullPath/path remain the VPS metadata anchor. */
+  displayPath?: string;
+  remotePath?: string;
+  sshConnectionId?: string;
+  connectionLabel?: string;
+  connectionState?: SshWorkspaceConnectionState;
   isStarred?: boolean;
   sessions?: ProjectSession[];
   sessionMeta?: ProjectSessionMeta;
   taskmaster?: ProjectTaskmasterInfo;
   [key: string]: unknown;
+};
+
+// ----------------- WORKSPACE IDENTITY -----------------
+
+/** An opaque server-issued workspace and its current incarnation; paths never substitute for this identity. */
+export type WorkspaceSelector = { workspaceId: string; generation: string };
+
+/** Capabilities and paths resolved by the server for a persistent replica or one execution session. */
+export type WorkspaceDescriptor = WorkspaceSelector & {
+  projectId: string;
+  kind: 'cloudReplica' | 'session';
+  sessionId?: string;
+  rootPath: string;
+  sourceRoot: string;
+  sourceMode?: ProjectSourceMode;
+  connectionState?: SshWorkspaceConnectionState;
+  displayPath?: string;
+  requestedMode: 'isolated' | 'shared';
+  effectiveMode: 'isolated' | 'shared';
+  baseRevision?: string;
+  phase: 'idle' | 'running' | 'recovery';
+  publicationState: 'unpublished' | 'integrated' | 'conflicted';
+  capabilities: {
+    read: boolean;
+    write: boolean;
+    git: boolean;
+    shell: boolean;
+    preview: boolean;
+    integrate: boolean;
+    cloudExecutionIndependentOfDesktop: boolean;
+  };
+};
+
+/** A missing session is deliberately unavailable, never an alias for the persistent replica. */
+export type WorkspaceResolution = {
+  cloudReplica: WorkspaceDescriptor;
+  session: WorkspaceDescriptor | null;
 };
 
 /** Progress payload streamed while the backend enumerates projects, used to drive the sidebar loading bar. */
@@ -174,10 +308,6 @@ export type SessionActivity = {
   /** Provider-supplied status line; null renders the default activity label. */
   statusText: string | null;
   canInterrupt: boolean;
-  /** The server run that owns this activity; a new run resets stopped state. */
-  runId?: string;
-  /** True only after the execution process exited; workspace handback can remain busy. */
-  modelStopped?: boolean;
   /**
    * When this request was first marked as processing (client clock). Drives
    * the elapsed-time display and the stale `chat_subscribed` idle-ack guard.
@@ -191,13 +321,13 @@ export type SessionActivityMap = ReadonlyMap<string, SessionActivity>;
 /** Marks a session as producing a response; call it as soon as a send is dispatched so the UI reacts immediately. */
 export type MarkSessionProcessing = (
   sessionId?: string | null,
-  activity?: { statusText?: string | null; canInterrupt?: boolean; runId?: string; modelStopped?: boolean },
+  activity?: { statusText?: string | null; canInterrupt?: boolean },
 ) => void;
 
 /** Marks a session as finished; `ifStartedBefore` lets a late acknowledgement clear only a stale run. */
 export type MarkSessionIdle = (
   sessionId?: string | null,
-  opts?: { ifStartedBefore?: number; runId?: string },
+  opts?: { ifStartedBefore?: number },
 ) => void;
 
 /** Replaces the whole processing map with the server's view, used by the periodic running-sessions poll. */
@@ -214,8 +344,6 @@ export type SessionActivitySnapshot = {
   statusText?: string | null;
   canInterrupt?: boolean;
   startedAt?: number;
-  runId?: string;
-  modelStopped?: boolean;
 };
 
 // ---------------------------
@@ -234,17 +362,8 @@ export type ServerEvent = {
   type?: string;
   sessionId?: string;
   seq?: number;
-  replayEpoch?: string;
-  runId?: string;
-  modelStopped?: boolean;
   [key: string]: unknown;
 };
-
-/** Session-channel replay progress; epoch resets the log, while runId identifies its current execution. */
-export type ChatReplayCursor = { replayEpoch?: string; runId?: string; seq: number };
-
-/** One session's pending streamed paragraph and its independent render timer. */
-export type ChatStreamBuffer = { runId?: string; provider: LLMProvider; text: string; timer: number | null };
 
 
 // ---------------------------
@@ -274,9 +393,6 @@ export type ChatAttachment = {
   mimeType?: string;
   size?: number;
 };
-
-/** One editable composer attachment, retaining its browser file and/or its uploaded descriptor. */
-export type ComposerDraftAttachment = { file: File; uploaded?: ChatAttachment } | { file?: undefined; uploaded: ChatAttachment };
 
 /** A chat attachment that is an image, extending ChatAttachment with the inline base64 data URL that Claude history uses when no stored path is available. */
 export type ChatImage = {
@@ -470,7 +586,7 @@ export type NormalizedMessage = {
   provider: LLMProvider;
   kind: MessageKind;
   /**
-   * Session-channel monotonic sequence number assigned by the backend to live
+   * Per-run monotonic sequence number assigned by the backend to live
    * websocket events. Used to compute `lastSeq` for `chat.subscribe` replay;
    * REST history messages do not carry it.
    */
@@ -611,10 +727,6 @@ export type CommandModalPayload = {
 /** A composer message queued while its session is still busy, holding the text, the in-memory and already-uploaded attachments and the send options snapshotted at queue time so it can be auto-sent unchanged once the session goes idle. */
 export type QueuedDraft = {
   content: string;
-  /** False retains the complete draft until the user explicitly resumes it. */
-  autoSend?: boolean;
-  /** Server-owned claim remains recoverable but is hidden while its turn runs. */
-  claimRevision?: string;
   /** Browser files retained while this composer stays mounted, for editing. */
   attachments: File[];
   /** JSON-safe descriptors uploaded when the message is queued. */
@@ -750,6 +862,8 @@ export type CodeEditorFile = {
   // DB projectId; used by the editor to build `/api/file-tree/projects/:projectId/file`
   // URLs for reading and saving content.
   projectId?: string;
+  /** Captured when opened, so changing tabs or sessions cannot retarget a pending save. */
+  workspace?: WorkspaceDescriptor | null;
   diffInfo?: CodeEditorDiffInfo | null;
   [key: string]: unknown;
 };
@@ -1101,12 +1215,115 @@ export type GithubTokenCredential = {
 
 /** The full set of user-entered values carried across the project-creation wizard's steps, owned by ProjectCreationWizard and passed down to each step. */
 export type WizardFormState = {
+  sourceMode?: ProjectSourceMode;
+  connectionId?: string;
+  rootPath?: string;
   workspacePath: string;
   githubUrl: string;
   tokenMode: TokenMode;
   selectedGithubToken: string;
   newGithubToken: string;
 };
+
+// ---------------------------
+
+//----------------- SSH WORKSPACES ------------
+
+/** Safe server connection metadata; private keys and authentication material are never included. */
+export type SshWorkspaceConnection = { id: string; name: string; host?: string; port?: number; username?: string; platform?: 'win32'; transport?: 'ssh' | 'agent' };
+
+/** The server's registered SSH catalog, usable without a desktop bridge for preprovisioned endpoints. */
+export type SshWorkspaceConnectionsResponse = { connections: SshWorkspaceConnection[]; configured: boolean };
+
+/** An account-owned registered SSH project matched by verified physical directory; opening must still revalidate on the server. */
+export type SshExistingProject = Project & { sourceMode: 'ssh'; isArchived: boolean; customName?: string | null };
+
+/** Successful end-to-end Windows directory verification, with optional read-only existing-project discovery. */
+export type SshWorkspaceProbe = { ok: true; protocol: number; platform: 'win32'; rootPath: string; rootIdentity: string; username?: string; helperVersion?: string; capabilities?: { files: boolean; exec: boolean; terminal: boolean }; existingProject?: SshExistingProject };
+
+/** Native picker outcome distinguishes cancellation from an actionable failure. */
+export type SshNativePathResult = { ok: boolean; cancelled?: boolean; path?: string; error?: string; code?: string };
+
+/** Nonsecret local tunnel configuration; keyPath and knownHostsPath reference files, not their contents. */
+export type SshTunnelProfileInput = {
+  id?: string;
+  name: string;
+  /** agent uses the bundled loopback workspace agent; ssh retains the system OpenSSH Server path. */
+  mode?: 'ssh' | 'agent';
+  /** relay uses the authenticated HTTPS service; omitted keeps saved reverse SSH profiles compatible. */
+  agentTransport?: 'relay' | 'ssh';
+  sshHost: string;
+  sshPort: number;
+  sshUser: string;
+  keyPath: string;
+  knownHostsPath: string;
+  remotePort: number;
+  localPort: number;
+};
+
+/** Native saved profile is scoped to the authenticated account by an opaque binding. */
+export type SshTunnelProfile = SshTunnelProfileInput & { id: string; accountBinding: string; serviceUrl: string };
+
+/** Native forwarding and account registration are separate; neither verifies a project directory. */
+export type SshTunnelStatus = {
+  profileId: string;
+  state: 'stopped' | 'starting' | 'forwarding' | 'reconnecting' | 'stopping' | 'error';
+  generation: number;
+  outerConnected: boolean;
+  verified: false;
+  registrationState?: 'unregistered' | 'registering' | 'registered' | 'error';
+  registrationError?: string;
+  reconnectAttempt?: number;
+  code?: string;
+  message?: string;
+};
+
+/** Native prerequisite check performs no installation or service configuration changes. */
+export type SshPreflight = { ok: boolean; platform?: string; sshAvailable?: boolean; agentAvailable?: boolean; sshdAvailable?: boolean; sshdServiceInstalled?: boolean; sshdServiceRunning?: boolean; issues?: { code: string; message: string }[]; error?: string; code?: string };
+
+export type SshDefaultsResult = {
+  ok: boolean;
+  sshHost?: string;
+  sshPort?: number;
+  sshUser?: string;
+  keyPath?: string;
+  knownHostsPath?: string;
+  remotePort?: number;
+  localPort?: number;
+  error?: string;
+  code?: string;
+};
+
+/** Native control replies surface failures rather than synthesizing a connected state. */
+export type SshNativeResult = { ok: boolean; error?: string; code?: string };
+
+/** Account-owned native profile catalog and actual live statuses. */
+export type SshTunnelProfilesResult = SshNativeResult & { profiles?: SshTunnelProfile[]; statuses?: SshTunnelStatus[] };
+
+/** The saved profile is returned only after native persistence succeeds. */
+export type SshTunnelSaveResult = SshNativeResult & { profile?: SshTunnelProfile };
+
+/** Start/stop/status response carries the tunnel manager's current state. */
+export type SshTunnelStatusResult = SshNativeResult & { status?: SshTunnelStatus };
+
+/** Ensure starts and registers an Agent natively, returning no authentication material to JavaScript. */
+export type SshAgentEnsureResult = SshTunnelStatusResult & { profile?: SshTunnelProfile };
+
+/** The SSH feature's shared account-bound lifecycle, consumed by setup panels and the selected workspace. */
+export type SshAgentController = {
+  profiles: SshTunnelProfile[];
+  statuses: Record<string, SshTunnelStatus>;
+  loading: boolean;
+  pending: string[];
+  errors: Record<string, string>;
+  revision: number;
+  refresh: () => Promise<SshTunnelProfilesResult | null>;
+  ensure: (profileId?: string) => Promise<SshAgentEnsureResult | null>;
+  activate: (connectionId?: string) => Promise<void>;
+};
+
+/** Installing the fixed helper returns its location and access requirements without changing permissions. */
+export type SshHelperInstallResult = SshNativeResult & { path?: string; sha256?: string; accessNotice?: string };
 
 // ---------------------------
 
@@ -1610,7 +1827,7 @@ type TaskStatus =
 type TaskPriority = 'high' | 'medium' | 'low' | string;
 
 
-//----------------- DESKTOP WORKSPACE BRIDGE ------------
+//----------------- DESKTOP ACCOUNT BRIDGE ------------
 
 /** API transport consumes an HTTP response returned by the desktop bridge. */
 export type BridgeResponse = {
@@ -1628,127 +1845,12 @@ export type FrontendErrorReport = {
   componentStack: string;
 };
 
-/** Desktop settings and the project sync bar identify the local folder bound to a VPS project. */
-export type ChisaMapping = {
-  localPath: string;
-  serverPath: string;
-  bindingEpoch?: string;
-  syncName?: string;
-  mode?: 'vps';
-  serverId?: string;
-}
-
-/** A project switch applies only to explicitly selected inactive bindings. */
-export type ChisaWorkspaceBindingSelection = {
-  serverPath: string;
-  bindingEpoch: string;
-};
-
-/** Settings registers newly rebound paths in the current account's project list. */
-export type ChisaWorkspaceSwitchResult = {
-  ok: boolean;
-  error?: string;
-  projects?: LocalSelection[];
-  clearedMappings?: number;
-  bindingsCleared?: boolean;
-};
-
-/** Settings displays independently measured local and VPS file allocation, preserving unavailable errors. */
-export type ChisaProjectStorage = {
-  localBytes: number | null;
-  serverBytes: number | null;
-  localError?: string;
-  serverError?: string;
-};
-
-/** Clear confirmation reports only observed file movement, independently of sync restart. */
-export type ChisaClearResult = {
-  ok: boolean;
-  error?: string;
-  clearState: 'not-started' | 'partial' | 'completed' | 'unknown';
-  backupPath?: string;
-};
-
-/** Desktop settings and the project bar consume versioned engine observations, never periodic UI guesses. */
-export type ChisaSyncInfo = {
-  status: string;
-  detail?: string;
-  checkedAt: string;
-  bindingEpoch: string;
-  sequence: number;
-  localPath?: string;
-  serverPath: string;
-  engineStatus?: string;
-  /** Root-empty recovery is offered only for the side confirmed empty by the native engine. */
-  emptySide?: 'local' | 'vps';
-  /** Only the native engine can admit a blocked binding to explicit Git state recovery. */
-  gitRecoveryRequired?: boolean;
-  taskOwner?: 'claude' | 'pi';
-};
-
-/** Recovery review displays one side's observed branch, commit, staging and in-progress Git operation. */
-export type ChisaGitRecoverySide = {
-  branch: string;
-  head: string;
-  staged: boolean;
-  operation: string;
-};
-
-/** Recovery selects the authoritative Git state while project files continue safe bidirectional synchronization. */
-export type ChisaGitRecoverySource = 'local' | 'remote';
-
-/** The recovery dialog must confirm this observation's token against the same project and binding epoch. */
-export type ChisaGitRecovery = {
-  token: string;
-  serverPath: string;
-  bindingEpoch: string;
-  local: ChisaGitRecoverySide;
-  remote: ChisaGitRecoverySide;
-  localAllowed: boolean;
-  localReason: string;
-  remoteAllowed: boolean;
-  remoteReason: string;
-};
-
-/** The desktop bridge returns a recovery observation or a typed failure without starting file synchronization. */
-export type ChisaGitRecoveryResponse = {
-  ok: boolean;
-  error?: string;
-  code?: string;
-  recovery?: ChisaGitRecovery;
-};
-
-/** Native synchronization operations notify the project bar and background-operation indicator. */
-export type ChisaWorkspaceSyncEvent = {
-  serverPath: string;
-  status: string;
-};
-
-/** Desktop settings consumes connection, workspace and preview state. */
+/** Auth reads the configured cloud account address; legacy native sync fields are deliberately ignored. */
 export type ChisaState = {
-  tunnel: boolean;
   serverUrl: string;
-  workspaceConnecting?: boolean;
-  workspaceError?: string;
-  workspaceServerUrl?: string;
-  accountWorkspaceServerUrl?: string;
-  sshHost?: string;
-  sshUser?: string;
-  keyPath?: string;
-  mappings: ChisaMapping[];
-  /** Local bindings unavailable to this account remain manageable without exposing them as active projects. */
-  inactiveMappings?: ChisaMapping[];
-  previews?: Array<{ id: string; serverPath: string; localUrl: string }>;
-  /** A failed authoritative preview recovery remains visible in desktop settings. */
-  previewRecoveryError?: string;
-  sync?: Record<string, ChisaSyncInfo>;
-  syncOperations?: Record<string, { status: string; detail?: string }>;
-  executor?: {
-    backend: "vps" | "unavailable";
-  };
-}
+};
 
-/** Account HTTP and realtime connections share this native service identity, independently of SSH. */
+/** Account HTTP and realtime connections share this native cloud-service identity. */
 export type ChisaApiConnection = {
   configured: boolean;
   loginUrl?: string;
@@ -1757,87 +1859,97 @@ export type ChisaApiConnection = {
   webSocketUrl: string;
 };
 
-/** Project creation retains the user's local selection for the review step. */
-export type LocalSelection = {
-  localPath: string;
-  serverPath: string;
-}
+// ---------------------------
 
-//----------------- DESKTOP LOCAL PI AGENT ------------
+//----------------- CLAUDE SUBSCRIPTION ACCOUNTS ------------
 
-/** Write-only credentials and model choices for the desktop's native Windows Pi process. */
-export type PiConfigInput = {
-  provider: string;
-  model: string;
-  baseUrl: string;
-  api: 'openai-completions' | 'openai-responses' | 'anthropic-messages';
-  apiKey: string;
+/** One authoritative quota window returned by the execution server; timestamps are Unix milliseconds. */
+export type ClaudeAccountUsageWindow = {
+  kind: string;
+  label: string;
+  usedPercent: number;
+  resetsAt: number | null;
 };
 
-/** Public Pi configuration; the bridge never returns an API key. */
-export type PiConfigView = Omit<PiConfigInput, 'apiKey'> & {
-  ok?: boolean;
-  error?: string;
-  installed: boolean;
-  version?: string;
-  hasApiKey: boolean;
-  configured: boolean;
+/** An account's quota snapshot, retaining successful data explicitly marked stale during transient failures. */
+export type ClaudeAccountUsage = {
+  status: 'ok' | 'error' | 'unavailable' | 'loading';
+  windows: ClaudeAccountUsageWindow[];
+  updatedAt: number | null;
+  checkedAt: number;
+  error: string | null;
+  failureKind?: string;
+  retryAt?: number;
+  stale: boolean;
+  extraUsage?: {
+    enabled: boolean;
+    spent: number | null;
+    limit: number | null;
+    balance: number | null;
+    usedPercent: number | null;
+    currency: string;
+  } | null;
 };
 
-/** Selected file bytes sent to the desktop with a Pi turn, never to Claude. */
-export type PiAttachmentInput = { name: string; mimeType: string; dataBase64: string };
-
-/** File metadata retained in Pi history; path is assigned when the desktop accepts it. */
-export type PiAttachment = { name: string; mimeType: string; size: number; path?: string };
-
-/** Independent Pi history stored only on the desktop, scoped to the selected project conversation. */
-export type PiMessage = { id: string; role: 'user' | 'assistant'; content: string; timestamp: string; attachments?: PiAttachment[] };
-
-/** Native Pi progress delivered by the desktop without exposing its raw RPC protocol. */
-export type PiAgentEvent = { seq: number; type: string; data: Record<string, unknown> };
-
-/** Result envelope returned by native desktop Pi operations. */
-export type PiBridgeResult = { ok: boolean; error?: string };
-
-/** Native Pi outcome displayed in its private workspace; never automatically sent to the cloud. */
-export type PiLastResult = {
-  status: 'completed' | 'error' | 'aborted';
-  content: string;
-  error?: string;
-  completedAt: string;
-  changedFiles?: string[];
-  observedToolFailures?: { toolName: string; error: string; exitCode?: number }[];
-  /** Observed calls from this Pi turn; a completed reply alone is not test evidence. */
-  toolCalls?: number;
-  successfulToolCalls?: number;
-  failedToolCalls?: number;
-  stopReason?: string;
-  /** Model outcome and confirmed project hand-back are separate lifecycle phases. */
-  workspaceStatus?: 'releasing' | 'syncing' | 'released' | 'failed';
-  /** A failed hand-back preserves ownership and supports recovery without running the model again. */
-  workspaceError?: string;
+/** Public identity and quota only; profile paths and access/refresh credentials remain on the server. */
+export type ClaudeAccountSummary = {
+  id: string;
+  name: string;
+  email: string | null;
+  organizationName: string | null;
+  plan: string | null;
+  needsSignIn: boolean;
+  createdAt: number;
+  updatedAt: number;
+  usage: ClaudeAccountUsage;
 };
 
-/** Desktop-only Pi runtime and project write lock; not part of the cloud conversation protocol. */
-export type PiSessionView = PiBridgeResult & {
-  owner: 'claude' | 'pi';
-  ownerSessionId?: string;
-  running: boolean;
-  runtimeActive: boolean;
-  cursor: number;
-  messages: PiMessage[];
-  /** True for an authoritative reload; false means upsert only these messages by ID. */
-  messagesReset?: boolean;
-  /** Unchanged outcomes are omitted from incremental polls. */
-  lastResult?: PiLastResult | null;
-  events?: PiAgentEvent[];
+/** Effective request route is separate from the selected subscription profile so API/HiRoute billing is explicit. */
+export type ClaudeAccountRoute = {
+  kind: 'subscription' | 'api' | 'hiroute' | 'default';
+  label: string;
+  accountId: string | null;
 };
 
-//----------------- RUNNING COMPONENT IDENTITY ------------
-/** About and workspace diagnostics show build identity only, never runtime account data. */
-export type ComponentBuildIdentity = {
-  version: string | null;
-  commit: string | null;
-  dirty: boolean | null;
-  builtAt: string | null;
+/** The user-scoped account catalogue and current execution-server selection, including an optional default login. */
+export type ClaudeAccountsState = {
+  runtime: { id: string; label: string };
+  activeId: string | null;
+  accounts: ClaudeAccountSummary[];
+  defaultAccount: ClaudeAccountSummary | null;
+  route: ClaudeAccountRoute;
+};
+
+/** A short-lived CLI sign-in task; only its browser URL and one-time code workflow cross the transport. */
+export type ClaudeAccountLogin = {
+  id: string;
+  accountId: string;
+  status: 'starting' | 'waiting_code' | 'completing' | 'succeeded' | 'failed' | 'cancelled';
+  url: string | null;
+  error: string | null;
+  expiresAt: number;
+};
+
+/** Shared result shape for local account controls; errors contain readable text and never credentials. */
+export type ClaudeAccountActionResult = { ok: boolean; error?: string };
+
+/** Public context shared by the quota trigger, management panel and their focused interaction tests. */
+export type ClaudeAccountsContextValue = {
+  snapshot: ClaudeAccountsState | null;
+  loading: boolean;
+  refreshing: boolean;
+  busy: boolean;
+  error: string | null;
+  login: ClaudeAccountLogin | null;
+  loginError: string | null;
+  loginBusy: boolean;
+  refresh(options?: { all?: boolean; automatic?: boolean }): Promise<void>;
+  openAccounts(): void;
+  activate(id: string | null): Promise<ClaudeAccountActionResult>;
+  rename(id: string, name: string): Promise<ClaudeAccountActionResult>;
+  remove(id: string): Promise<ClaudeAccountActionResult>;
+  startLogin(input?: { accountId?: string; name?: string }): Promise<ClaudeAccountActionResult>;
+  submitCode(code: string): Promise<ClaudeAccountActionResult>;
+  cancelLogin(): Promise<ClaudeAccountActionResult>;
+  dismissLogin(): void;
 };

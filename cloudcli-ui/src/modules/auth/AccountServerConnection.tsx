@@ -4,7 +4,6 @@ import { Check, CircleAlert, Globe, Loader2 } from 'lucide-react';
 
 import { FrontendBridge } from '@/shared/chisa';
 import { useAuth } from '@/modules/auth/context/AuthContext';
-import { WorkspaceConnectionForm } from '@/modules/auth/WorkspaceConnectionForm';
 import { Button } from '@/shared/ui';
 
 // Keep simultaneously mounted desktop login/settings forms aligned after a switch.
@@ -14,9 +13,9 @@ type AccountServerConnectionProps = {
   onConnectionChange?: (ready: boolean) => void;
 };
 
-/** Desktop login, AccountPopup and Settings share account-service and optional file-sync setup. */
+/** Desktop login, AccountPopup and Settings share the cloud account-service connection form. */
 export function AccountServerConnection({ onConnectionChange }: AccountServerConnectionProps = {}) {
-  const { user, logout } = useAuth();
+  const { logout } = useAuth();
   const originalUrl = useRef('');
   const serverInputId = useId();
   // The user edits the native app's server URL before any protected APIs are available.
@@ -49,14 +48,13 @@ export function AccountServerConnection({ onConnectionChange }: AccountServerCon
   }, [onConnectionChange]);
   const connect = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (connecting) return;
     setConnecting(true);
     setConnected(false);
     onConnectionChange?.(false);
     setMessage('');
     try {
       const result = await FrontendBridge.connectServer(serverUrl.trim());
-      if (result.ok !== true) throw new Error(String(result.error || '连接失败'));
+      if (result.ok === false) throw new Error(String(result.error || '连接失败'));
       const connectedUrl = String(result.serverUrl || serverUrl.trim().replace(/\/$/, ''));
       if (originalUrl.current !== connectedUrl) {
         logout();
@@ -101,7 +99,6 @@ export function AccountServerConnection({ onConnectionChange }: AccountServerCon
           {message || '连接你的 ChisaCloudCode 服务器'}
         </p>
       </form>
-      {user && <WorkspaceConnectionForm />}
     </div>
   );
 }

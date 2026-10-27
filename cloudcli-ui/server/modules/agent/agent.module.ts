@@ -15,6 +15,7 @@ import { providerModelsService } from '@/modules/providers/index.js';
 import { IS_PLATFORM } from '@/shared/utils.js';
 
 import { createAgentRouter } from './agent.routes.js';
+import { resolveAgentProjectTarget } from './agent-target.service.js';
 
 type AgentExternalDependencies = Pick<
   Parameters<typeof createAgentRouter>[0],
@@ -45,6 +46,7 @@ export function createAgentModule(externalDependencies: AgentExternalDependencie
       createProjectPath: (projectPath, customName) =>
         projectsDb.createProjectPath(projectPath, customName),
     },
+    resolveProjectTarget: resolveAgentProjectTarget,
     models: providerModelsService,
     GithubClient: Octokit,
     ...externalDependencies,

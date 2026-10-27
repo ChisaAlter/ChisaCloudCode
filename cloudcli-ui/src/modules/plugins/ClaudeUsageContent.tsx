@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next';
 
 import { useAuth } from '@/modules/auth';
-import { ClaudeUsagePanel } from '@/modules/plugins/ClaudeUsagePanel';
+import PluginTabContent from '@/modules/plugins/PluginTabContent';
 import { usePlugins } from '@/modules/plugins/context/PluginsContext';
 import { Button } from '@/shared/ui';
 
@@ -18,7 +18,7 @@ export function ClaudeUsageContent() {
       <Button variant="outline" disabled={loading} onClick={() => void refreshPlugins()}>{t('common:buttons.retry')}</Button>
     </div>}
     {plugin?.enabled
-      ? <ClaudeUsagePanel key={JSON.stringify([user?.id, user?.username])} />
+      ? <PluginTabContent key={JSON.stringify([user?.id, user?.username])} pluginName="claude-usage" selectedProject={null} selectedSession={null} />
       : !pluginsError && <p className="p-4 text-sm text-muted-foreground">{t('pluginSettings.usageDisabled', { defaultValue: 'Claude 额度已关闭，可在插件设置中启用。' })}</p>}
   </div>;
 }

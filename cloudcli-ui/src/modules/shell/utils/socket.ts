@@ -5,7 +5,10 @@ import { desktopWebSocketUrl, isDesktop } from '@/shared/chisa';
 type ShellInitMessage = {
   type: 'init';
   projectPath: string;
-  sessionId: string | null;
+  projectId?: string;
+  workspaceId?: string;
+  generation?: string;
+  sessionId?: string | null;
   hasSession: boolean;
   provider: string;
   cols: number;

@@ -2,9 +2,10 @@
 import path from 'path';
 
 import express from 'express';
+import type { RequestHandler } from 'express';
 
-import type { ProviderRunFunction, WorkspaceGitFileSystem } from '@/shared/types.js';
-import { AppError } from '@/shared/utils.js';
+import type { ProviderRunFunction, WorkspaceGitFileSystem } from '@/shared/index.js';
+import { AppError } from '@/shared/index.js';
 import { runWorkspaceCommand, workspaceRequestScope, workspaceRequestSignal } from '@/modules/workspace-bridge/index.js';
 
 // cross-spawn: drop-in spawn with Windows .cmd/PATHEXT resolution.
@@ -12,6 +13,8 @@ import { parseGitLogWithStats, parseGitStatusOutput } from './git-parsing.servic
 import { getDeletedFileContent, resolveRepositoryFilePath } from './git-read.service.js';
 import { changeGitBranch } from './git-branch.service.js';
 import { createGitOperationHandlers, gitOperationReadOnly } from './git-operation.service.js';
+import { createGitCommitMessageService } from './git-commit-message.service.js';
+import { readSshGitMetadata } from './ssh-git-metadata.service.js';
 
 type GitRouterDependencies = {
   fileSystem: WorkspaceGitFileSystem;
@@ -19,6 +22,7 @@ type GitRouterDependencies = {
   resolveProjectPathById(projectId: string): string | null;
   queryClaude: ProviderRunFunction;
   queryCursor: ProviderRunFunction;
+  selectionScope?: RequestHandler;
 };
 
 /** Creates Git routes around explicit repository, filesystem, subprocess, and AI adapters. */
@@ -26,14 +30,13 @@ export function createGitRouter(dependencies: GitRouterDependencies): express.Ro
 const fs = dependencies.fileSystem;
 const spawn = dependencies.spawnProcess;
 const projectsDb = { getProjectPathById: dependencies.resolveProjectPathById };
-const queryClaudeSDK = dependencies.queryClaude;
-const spawnCursor = dependencies.queryCursor;
 const router = express.Router();
 const operations = createGitOperationHandlers(getActualProjectPath);
 const routes = {
   get: (url, handler) => router.get(url, operations.read(handler)),
-  post: (url, handler) => router.post(url, url === '/generate-commit-message' ? operations.read(handler) : ['/checkout', '/create-branch', '/delete-branch'].includes(url) ? operations.branch(handler) : operations.write(handler)),
+  post: (url, handler) => router.post(url, ['/checkout', '/create-branch', '/delete-branch'].includes(url) ? operations.branch(handler) : operations.write(handler)),
 };
+if (dependencies.selectionScope) router.use(dependencies.selectionScope);
 router.use(workspaceRequestScope);
 const COMMIT_DIFF_CHARACTER_LIMIT = 500_000;
 
@@ -144,13 +147,10 @@ function validateProjectPath(projectPath) {
 }
 
 /**
- * Resolve the absolute project directory for a given DB `projectId`.
- *
- * After the projectName → projectId migration, every git endpoint receives
- * the DB primary key (`project` query/body param). The legacy filesystem
- * resolver that walked Claude's JSONL history is no longer used here; the
- * path comes straight from the `projects` table and is then sanity-checked
- * by `validateProjectPath` before any `git` command runs against it.
+ * Resolve the selected workspace root for a durable DB `projectId`.
+ * Production composition supplies the Workspaces catalog gateway, which pins
+ * project/session ownership and generation before returning a root. Injected
+ * route tests can still supply their own project gateway.
  */
 async function getActualProjectPath(projectId) {
   const projectPath = await projectsDb.getProjectPathById(projectId);
@@ -293,6 +293,8 @@ routes.get('/status', async (req, res) => {
 
   try {
     const projectPath = await getActualProjectPath(project);
+    const metadata = await readSshGitMetadata(projectPath, 'status');
+    if (metadata) return res.json(metadata);
 
     // Validate git repository
     await validateGitRepository(projectPath);
@@ -344,7 +346,7 @@ routes.post('/init', async (req, res) => {
       if (!(error instanceof AppError) || error.code !== 'NOT_A_GIT_REPOSITORY') {
         throw error;
       }
-      // Not a repository yet — proceed with git init.
+      // Not a repository yet 鈥?proceed with git init.
     }
 
     if (isAlreadyRepository) {
@@ -725,6 +727,8 @@ routes.get('/branches', async (req, res) => {
 
   try {
     const projectPath = await getActualProjectPath(project);
+    const metadata = await readSshGitMetadata(projectPath, 'branches');
+    if (metadata) return res.json(metadata);
     
     // Validate git repository
     await validateGitRepository(projectPath);
@@ -742,7 +746,7 @@ routes.get('/branches', async (req, res) => {
       .filter(b => !b.startsWith('remotes/'))
       .map(b => b.replace(/^[*+] /, ''));
 
-    // Remote branches — strip 'remotes/<remote>/' prefix
+    // Remote branches 鈥?strip 'remotes/<remote>/' prefix
     const remoteBranches = rawLines
       .filter(b => b.startsWith('remotes/'))
       .map(b => b.replace(/^remotes\/[^/]+\//, ''))
@@ -901,231 +905,35 @@ routes.get('/commit-diff', async (req, res) => {
   }
 });
 
-// Generate commit message based on staged changes using AI
-routes.post('/generate-commit-message', async (req, res) => {
-  const { project, files, provider = 'claude' } = req.body;
+const commitMessages = createGitCommitMessageService({
+  resolveProjectPath: getActualProjectPath,
+  validateRepository: validateGitRepository,
+  repositoryHasCommits,
+  runCommand: spawnAsync,
+  fileSystem: fs,
+  queryClaude: dependencies.queryClaude,
+  queryCursor: dependencies.queryCursor,
+});
 
-  if (!project || !files || files.length === 0) {
+// The service closes its Git inspection before the provider takes its own workspace admission.
+router.post('/generate-commit-message', operations.workflow(async (req, res) => {
+  const { project, files, provider = 'claude' } = req.body ?? {};
+  if (typeof project !== 'string' || !project.trim() || !Array.isArray(files) || files.length === 0 || files.some(file => typeof file !== 'string' || !file)) {
     return res.status(400).json({ error: 'Project id and files are required' });
   }
-
-  // Validate provider
   if (!['claude', 'cursor'].includes(provider)) {
     return res.status(400).json({ error: 'provider must be "claude" or "cursor"' });
   }
-
-  try {
-    const projectPath = await getActualProjectPath(project);
-    await validateGitRepository(projectPath);
-    const repositoryRootPath = await getRepositoryRootPath(projectPath);
-
-    // Get diff for selected files
-    let diffContext = '';
-    for (const file of files) {
-      try {
-        const { repositoryRelativeFilePath } = await resolveRepositoryFilePath({
-          projectPath,
-          filePath: validateFilePath(file),
-          repositoryRootPath: await getRepositoryRootPath(projectPath),
-          runCommand: spawnAsync,
-        });
-        const { stdout } = await spawnAsync(
-          'git', ['diff', 'HEAD', '--', repositoryRelativeFilePath],
-          { cwd: repositoryRootPath }
-        );
-        if (stdout) {
-          diffContext += `\n--- ${repositoryRelativeFilePath} ---\n${stdout}`;
-        }
-      } catch (error) {
-        preserveWorkspaceFailure(error);
-        console.error(`Error getting diff for ${file}:`, error);
-      }
-    }
-
-    // If no diff found, might be untracked files
-    if (!diffContext.trim()) {
-      // Try to get content of untracked files
-      for (const file of files) {
-        try {
-          const { repositoryRelativeFilePath } = await resolveRepositoryFilePath({
-            projectPath,
-            filePath: validateFilePath(file),
-            repositoryRootPath: await getRepositoryRootPath(projectPath),
-            runCommand: spawnAsync,
-          });
-          const filePath = path.join(repositoryRootPath, repositoryRelativeFilePath);
-          const stats = await fs.stat(filePath);
-
-          if (!stats.isDirectory()) {
-            const content = await fs.readFile(filePath, 'utf-8');
-            diffContext += `\n--- ${repositoryRelativeFilePath} (new file) ---\n${content.substring(0, 1000)}\n`;
-          } else {
-            diffContext += `\n--- ${repositoryRelativeFilePath} (new directory) ---\n`;
-          }
-        } catch (error) {
-          preserveWorkspaceFailure(error);
-          console.error(`Error reading file ${file}:`, error);
-        }
-      }
-    }
-
-    // Generate commit message using AI
-    const message = await generateCommitMessageWithAI(files, diffContext, provider, projectPath, req.user?.id);
-
-    res.json({ message });
-  } catch (error) {
-    console.error('Generate commit message error:', error);
-    throw error;
-  }
-});
-
-/**
- * Generates a commit message using AI (Claude SDK or Cursor CLI)
- * @param {Array<string>} files - List of changed files
- * @param {string} diffContext - Git diff content
- * @param {string} provider - 'claude' or 'cursor'
- * @param {string} projectPath - Project directory path
- * @returns {Promise<string>} Generated commit message
- */
-async function generateCommitMessageWithAI(files, diffContext, provider, projectPath, userId) {
-  // Create the prompt
-  const prompt = `Generate a conventional commit message for these changes.
-
-REQUIREMENTS:
-- Format: type(scope): subject
-- Include body explaining what changed and why
-- Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore
-- Subject under 50 chars, body wrapped at 72 chars
-- Focus on user-facing changes, not implementation details
-- Consider what's being added AND removed
-- Return ONLY the commit message (no markdown, explanations, or code blocks)
-
-FILES CHANGED:
-${files.map(f => `- ${f}`).join('\n')}
-
-DIFFS:
-${diffContext.substring(0, 4000)}
-
-Generate the commit message:`;
-
-  try {
-    // Create a simple writer that collects the response
-    let responseText = '';
-    let providerError = null;
-    const writer = {
-      // Carry the authenticated caller into per-user provider routing.
-      userId,
-      send: (data) => {
-        try {
-          const parsed = typeof data === 'string' ? JSON.parse(data) : data;
-          if (parsed.kind === 'error') providerError = new AppError(parsed.content || 'Commit message generation failed', { code: 'PROVIDER_RUN_FAILED', statusCode: 503 });
-          console.log('🔍 Writer received message type:', parsed.type);
-
-          // Handle different message formats from Claude SDK and Cursor CLI
-          // Claude SDK sends: {type: 'claude-response', data: {message: {content: [...]}}}
-          if (parsed.type === 'claude-response' && parsed.data) {
-            const message = parsed.data.message || parsed.data;
-            console.log('📦 Claude response message:', JSON.stringify(message, null, 2).substring(0, 500));
-            if (message.content && Array.isArray(message.content)) {
-              // Extract text from content array
-              for (const item of message.content) {
-                if (item.type === 'text' && item.text) {
-                  console.log('✅ Extracted text chunk:', item.text.substring(0, 100));
-                  responseText += item.text;
-                }
-              }
-            }
-          }
-          // Cursor CLI sends: {type: 'cursor-output', output: '...'}
-          else if (parsed.type === 'cursor-output' && parsed.output) {
-            console.log('✅ Cursor output:', parsed.output.substring(0, 100));
-            responseText += parsed.output;
-          }
-          // Also handle direct text messages
-          else if (parsed.type === 'text' && parsed.text) {
-            console.log('✅ Direct text:', parsed.text.substring(0, 100));
-            responseText += parsed.text;
-          }
-        } catch (e) {
-          // Ignore parse errors
-          console.error('Error parsing writer data:', e);
-        }
-      },
-      setSessionId: () => {}, // No-op for this use case
-    };
-
-    console.log('🚀 Calling AI agent with provider:', provider);
-    console.log('📝 Prompt length:', prompt.length);
-
-    // Call the appropriate agent
-    if (provider === 'claude') {
-      await queryClaudeSDK(prompt, {
-        cwd: projectPath,
-        permissionMode: 'bypassPermissions',
-        model: 'sonnet',
-        abortSignal: workspaceRequestSignal(),
-      }, writer);
-    } else if (provider === 'cursor') {
-      await spawnCursor(prompt, {
-        cwd: projectPath,
-        skipPermissions: true,
-        abortSignal: workspaceRequestSignal(),
-      }, writer);
-    }
-    workspaceRequestSignal();
-    if (providerError) throw providerError;
-
-    console.log('📊 Total response text collected:', responseText.length, 'characters');
-    console.log('📄 Response preview:', responseText.substring(0, 200));
-
-    // Clean up the response
-    const cleanedMessage = cleanCommitMessage(responseText);
-    console.log('🧹 Cleaned message:', cleanedMessage.substring(0, 200));
-
-    return cleanedMessage || 'chore: update files';
-  } catch (error) {
-    preserveWorkspaceFailure(error);
-    console.error('Error generating commit message with AI:', error);
-    // Fallback to simple message
-    return `chore: update ${files.length} file${files.length !== 1 ? 's' : ''}`;
-  }
-}
-
-/**
- * Cleans the AI-generated commit message by removing markdown, code blocks, and extra formatting
- * @param {string} text - Raw AI response
- * @returns {string} Clean commit message
- */
-function cleanCommitMessage(text) {
-  if (!text || !text.trim()) {
-    return '';
-  }
-
-  let cleaned = text.trim();
-
-  // Remove markdown code blocks
-  cleaned = cleaned.replace(/```[a-z]*\n/g, '');
-  cleaned = cleaned.replace(/```/g, '');
-
-  // Remove markdown headers
-  cleaned = cleaned.replace(/^#+\s*/gm, '');
-
-  // Remove leading/trailing quotes
-  cleaned = cleaned.replace(/^["']|["']$/g, '');
-
-  // If there are multiple lines, take everything (subject + body)
-  // Just clean up extra blank lines
-  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
-
-  // Remove any explanatory text before the actual commit message
-  // Look for conventional commit pattern and start from there
-  const conventionalCommitMatch = cleaned.match(/(feat|fix|docs|style|refactor|perf|test|build|ci|chore)(\(.+?\))?:.+/s);
-  if (conventionalCommitMatch) {
-    cleaned = cleaned.substring(cleaned.indexOf(conventionalCommitMatch[0]));
-  }
-
-  return cleaned.trim();
-}
+  const validatedFiles = files.map(file => validateFilePath(file));
+  const message = await commitMessages.generate({
+    projectId: project,
+    files: validatedFiles,
+    provider,
+    userId: req.user?.id,
+    signal: workspaceRequestSignal(),
+  });
+  res.json({ message });
+}));
 
 // Get remote status (ahead/behind commits with smart remote detection)
 routes.get('/remote-status', async (req, res) => {
@@ -1137,6 +945,8 @@ routes.get('/remote-status', async (req, res) => {
 
   try {
     const projectPath = await getActualProjectPath(project);
+    const metadata = await readSshGitMetadata(projectPath, 'remote-status');
+    if (metadata) return res.json(metadata);
     await validateGitRepository(projectPath);
 
     const branch = await getCurrentBranchName(projectPath);

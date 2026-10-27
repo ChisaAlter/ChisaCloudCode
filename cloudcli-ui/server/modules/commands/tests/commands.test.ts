@@ -6,6 +6,7 @@ import test from 'node:test';
 import express from 'express';
 
 import { createCommandsRouter } from '../commands.routes.js';
+import { createCommandsService } from '../commands.service.js';
 
 /**
  * Stands in for `providerModelsService`. `resolveSessionModel` mirrors the real
@@ -43,12 +44,16 @@ async function executeCommand(
   context: Record<string, unknown>,
   sessionModels: Record<string, string> = {},
 ): Promise<Record<string, unknown>> {
-  const router = createCommandsRouter({
-    fileSystem: {
-      readFile: async () => JSON.stringify({ name: 'claude-code-ui', version: '0.0.0-test' }),
-    } as unknown as typeof import('node:fs/promises'),
+  const service = createCommandsService({
+    files: {} as never,
+    readPackage: async () => JSON.stringify({ name: 'claude-code-ui', version: '0.0.0-test' }),
     homeDirectory: () => '/home/test',
-    appRoot: '/app',
+    workspace: {
+      resolve: () => { throw new Error('Unscoped metadata must not resolve a workspace'); },
+      assert: () => { throw new Error('Unscoped metadata must not assert a workspace'); },
+      isBound: () => false,
+      projectIdForPath: () => null,
+    },
     models: createModelsService(sessionModels) as never,
     runtime: {
       uptime: () => 0,
@@ -56,7 +61,7 @@ async function executeCommand(
       version: 'v22', platform: 'linux', pid: 1,
     },
   });
-  const app = express().use(express.json()).use('/api/commands', router);
+  const app = express().use(express.json()).use('/api/commands', createCommandsRouter(service));
   const server = app.listen(0, '127.0.0.1');
   await once(server, 'listening');
   try {

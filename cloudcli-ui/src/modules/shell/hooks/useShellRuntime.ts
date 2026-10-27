@@ -27,6 +27,7 @@ type UseShellRuntimeResult = {
   isConnected: boolean;
   isInitialized: boolean;
   isConnecting: boolean;
+  transport: 'pty' | 'pipe' | null;
   connectToShell: (options?: { forceRestart?: boolean }) => void;
   disconnectFromShell: (options?: { suppressAutoConnect?: boolean }) => void;
 };
@@ -93,7 +94,7 @@ export function useShellRuntime({
     closeSocket,
   });
 
-  const { isConnected, isConnecting, connectToShell, disconnectFromShell } = useShellConnection({
+  const { isConnected, isConnecting, transport, connectToShell, disconnectFromShell } = useShellConnection({
     wsRef,
     terminalRef,
     fitAddonRef,
@@ -144,6 +145,7 @@ export function useShellRuntime({
     isConnected,
     isInitialized,
     isConnecting,
+    transport,
     connectToShell,
     disconnectFromShell,
   };

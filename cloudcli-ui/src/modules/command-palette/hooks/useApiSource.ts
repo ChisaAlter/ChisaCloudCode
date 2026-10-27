@@ -16,6 +16,7 @@ export function useApiSource<T, R = unknown>(opts: {
     }
 
     const controller = new AbortController();
+    setItems([]);
 
     fetcher(controller.signal)
       .then((r) => r.json() as Promise<R>)

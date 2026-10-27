@@ -14,7 +14,9 @@ function setting(name) {
 const name = setting('name');
 const version = setting('version');
 const identifier = setting('identifier');
-const stage = path.join(app, 'build', 'windows-amd64');
+const stageArgument = process.argv.indexOf('--stage');
+const stage = stageArgument >= 0 ? path.resolve(process.argv[stageArgument + 1] || '') : path.join(app, 'build', 'windows-amd64');
+if (stageArgument >= 0 && !process.argv[stageArgument + 1]) throw new Error('--stage requires an existing build directory');
 const output = path.join(stage, `${name} Setup ${version}.exe`);
 // A failed guarded packaging attempt must not leave MyGo's unguarded candidate.
 rmSync(output, { force: true });
@@ -40,6 +42,9 @@ function collect(directory, prefix = '') {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     if (!prefix && entry.name.startsWith(`${name} Setup `) && entry.name.endsWith('.exe')) continue;
     const relative = path.join(prefix, entry.name);
+    // MyGo can reuse an older staging directory. Never carry retired local
+    // executors into an installer; leave source/installed files alone.
+    if (['mutagen.exe', 'mutagen-agents.tar.gz', 'ssh.exe', 'scp.exe', 'sync-ssh'].includes(entry.name.toLowerCase())) continue;
     if (entry.isDirectory()) collect(path.join(directory, entry.name), relative);
     else if (entry.isFile()) files.push(relative);
     else throw new Error(`Unsupported staged entry: ${relative}`);

@@ -145,6 +145,7 @@
     "title": "Recent conversations",
     "emptyTitle": "No conversations yet",
     "emptyDescription": "Your most recently updated conversations will appear here.",
+    "desktopEmptyDescription": "Your conversations will appear here.",
     "loadFailed": "Could not load recent conversations",
     "loadMore": "Load older conversations",
     "loadingMore": "Loading more..."

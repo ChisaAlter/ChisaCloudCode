@@ -1,8 +1,67 @@
 // vendor/builtin-plugins/claude-usage/src/server.ts
+import { createHash } from "node:crypto";
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+
+// shared/claude-quota.js
+function parseClaudeQuotaReset(value) {
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  if (typeof value === "string" && !value.trim()) return null;
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (Number.isFinite(numeric)) {
+    const timestamp = numeric > 1e10 ? numeric : numeric * 1e3;
+    return timestamp >= 0 && timestamp <= 864e13 ? timestamp : null;
+  }
+  if (typeof value !== "string") return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function record(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+function percent(value) {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : null;
+}
+function normalizeClaudeQuota(raw) {
+  const data = record(raw);
+  if (!data) return [];
+  const windows = [];
+  const seen = /* @__PURE__ */ new Set();
+  const add2 = (kind, model, input, providedLabel) => {
+    const item = record(input);
+    if (!item) return;
+    const used = percent(item.utilization) ?? percent(item.used_percentage) ?? percent(item.percent);
+    if (used === null) return;
+    const normalizedModel = typeof model === "string" && model.trim() ? model.trim() : null;
+    const key = `${kind}:${normalizedModel?.toLowerCase() ?? ""}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    const base = kind === "session" ? "Session (5h)" : kind === "weekly_all" ? "Weekly (all models)" : kind === "weekly_scoped" ? "Weekly" : providedLabel || kind;
+    windows.push({
+      kind,
+      label: normalizedModel ? `${base} \u2014 ${normalizedModel}` : base,
+      usedPercent: used,
+      resetsAt: parseClaudeQuotaReset(item.resets_at),
+      model: normalizedModel
+    });
+  };
+  add2("session", null, data.five_hour);
+  add2("weekly_all", null, data.seven_day);
+  for (const [field, model] of [["seven_day_opus", "Opus"], ["seven_day_sonnet", "Sonnet"], ["seven_day_oauth_apps", "OAuth apps"], ["seven_day_cowork", "Cowork"]]) {
+    add2("weekly_scoped", model, data[field]);
+  }
+  for (const field of ["fable_weekly", "fable_seven_day", "seven_day_fable"]) add2("weekly_scoped", "Fable", data[field]);
+  if (Array.isArray(data.limits)) {
+    for (const item of data.limits) {
+      if (!record(item) || typeof item.kind !== "string" || !item.kind.trim()) continue;
+      const kind = item.kind === "five_hour" ? "session" : item.kind === "seven_day" ? "weekly_all" : item.kind;
+      add2(kind, record(record(item.scope)?.model)?.display_name ?? null, item);
+    }
+  }
+  return windows;
+}
 
 // vendor/builtin-plugins/claude-usage/src/live.ts
 function parseCredentials(json, nowMs) {
@@ -15,30 +74,15 @@ function parseCredentials(json, nowMs) {
     tier: typeof oauth.rateLimitTier === "string" ? oauth.rateLimitTier : null
   };
 }
-var KIND_LABELS = {
-  session: "Session (5h)",
-  weekly_all: "Weekly (all models)",
-  weekly_scoped: "Weekly"
-};
 function normalizeUsage(raw, plan, tier) {
-  const limits = [];
-  const rawLimits = raw?.limits;
-  if (Array.isArray(rawLimits)) {
-    for (const l of rawLimits) {
-      if (typeof l?.kind !== "string" || typeof l?.percent !== "number") continue;
-      const rawModel = l.scope?.model?.display_name;
-      const model = typeof rawModel === "string" && rawModel !== "" ? rawModel : null;
-      const base = KIND_LABELS[l.kind] ?? l.kind;
-      limits.push({
-        kind: l.kind,
-        label: model ? `${base} \u2014 ${model}` : base,
-        percent: l.percent,
-        severity: typeof l.severity === "string" ? l.severity : "normal",
-        resetsAt: typeof l.resets_at === "string" ? l.resets_at : null,
-        model
-      });
-    }
-  }
+  const limits = normalizeClaudeQuota(raw).map((window) => ({
+    kind: window.kind,
+    label: window.label,
+    percent: window.usedPercent,
+    severity: window.usedPercent >= 90 ? "danger" : window.usedPercent >= 70 ? "warning" : "normal",
+    resetsAt: window.resetsAt === null ? null : new Date(window.resetsAt).toISOString(),
+    model: window.model
+  }));
   return { plan, tier, limits };
 }
 
@@ -166,20 +210,33 @@ var secureStorage = process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
 var CREDENTIAL_DIR = secureStorage !== void 0 ? secureStorage || path.join(os.homedir(), ".claude") : CLAUDE_DIR;
 var USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 var LIVE_CACHE_MS = 3e4;
-var liveCache = null;
-async function getLive() {
-  if (liveCache && Date.now() - liveCache.at < LIVE_CACHE_MS) return liveCache.data;
+var liveCache = /* @__PURE__ */ new Map();
+function readLiveCredentials(credentialDir) {
+  let contents;
   let credsJson;
   try {
-    credsJson = JSON.parse(fs.readFileSync(path.join(CREDENTIAL_DIR, ".credentials.json"), "utf-8"));
+    contents = fs.readFileSync(path.join(credentialDir, ".credentials.json"), "utf-8");
+    credsJson = JSON.parse(contents);
   } catch {
+    liveCache.delete(credentialDir);
     throw Object.assign(new Error("No Claude Code credentials found \u2014 sign in with the claude CLI first."), { status: 404 });
   }
   const creds = parseCredentials(credsJson, Date.now());
-  if (!creds) throw Object.assign(new Error("Unrecognized credentials file format."), { status: 500 });
+  if (!creds) {
+    liveCache.delete(credentialDir);
+    throw Object.assign(new Error("Unrecognized credentials file format."), { status: 500 });
+  }
   if (creds.expired) {
+    liveCache.delete(credentialDir);
     throw Object.assign(new Error("OAuth token expired \u2014 run claude to refresh it, then retry."), { status: 401 });
   }
+  return { creds, fingerprint: createHash("sha256").update(contents).digest("hex") };
+}
+async function getLive(credentialDir) {
+  const { creds, fingerprint } = readLiveCredentials(credentialDir);
+  const cached = liveCache.get(credentialDir);
+  if (cached?.fingerprint === fingerprint && Date.now() - cached.at < LIVE_CACHE_MS) return cached.data;
+  if (cached && cached.fingerprint !== fingerprint) liveCache.delete(credentialDir);
   const res = await fetch(USAGE_URL, {
     headers: {
       Authorization: `Bearer ${creds.accessToken}`,
@@ -192,7 +249,17 @@ async function getLive() {
     throw Object.assign(new Error(`Usage endpoint returned HTTP ${res.status}.`), { status: res.status === 429 ? 429 : 502 });
   }
   const data = normalizeUsage(await res.json(), creds.plan, creds.tier);
-  liveCache = { at: Date.now(), data };
+  let unchanged = false;
+  try {
+    unchanged = readLiveCredentials(credentialDir).fingerprint === fingerprint;
+  } catch {
+  }
+  if (!unchanged) {
+    liveCache.delete(credentialDir);
+    throw Object.assign(new Error("Claude account changed during the usage request \u2014 refresh to read the current account."), { status: 409 });
+  }
+  if (liveCache.size >= 128) liveCache.delete(liveCache.keys().next().value);
+  liveCache.set(credentialDir, { at: Date.now(), fingerprint, data });
   return data;
 }
 var fileCache = /* @__PURE__ */ new Map();
@@ -208,8 +275,8 @@ function readSessionFile(file) {
   fileCache.set(file, { mtimeMs, entries });
   return entries;
 }
-function getHistory(days) {
-  const projectsDir = path.join(CLAUDE_DIR, "projects");
+function getHistory(days, configDir) {
+  const projectsDir = path.join(configDir, "projects");
   const sessions = [];
   let dirs = [];
   try {
@@ -234,17 +301,26 @@ function getHistory(days) {
   }
   return aggregate(sessions, days, Date.now());
 }
+function requestScope(req, header, fallback) {
+  const value = req.headers[header];
+  if (typeof value === "string") {
+    const decoded = Buffer.from(value, "base64").toString("utf8");
+    if (path.isAbsolute(decoded) && !decoded.includes("\0")) return decoded;
+  }
+  if (process.env.PLUGIN_NAME === "claude-usage") throw Object.assign(new Error("Authenticated usage scope is required."), { status: 403 });
+  return fallback;
+}
 var server = http.createServer(async (req, res) => {
   res.setHeader("Content-Type", "application/json");
   try {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (req.method === "GET" && url.pathname === "/live") {
-      res.end(JSON.stringify(await getLive()));
+      res.end(JSON.stringify(await getLive(requestScope(req, "x-chisa-claude-auth-dir", CREDENTIAL_DIR))));
       return;
     }
     if (req.method === "GET" && url.pathname === "/history") {
       const days = Math.min(Math.max(Number(url.searchParams.get("days")) || 30, 1), 365);
-      res.end(JSON.stringify(getHistory(days)));
+      res.end(JSON.stringify(getHistory(days, requestScope(req, "x-chisa-claude-config-dir", CLAUDE_DIR))));
       return;
     }
     res.writeHead(404);

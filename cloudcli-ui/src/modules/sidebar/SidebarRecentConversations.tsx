@@ -1,5 +1,5 @@
 import { Loader2, MessageSquare, MoreHorizontal } from 'lucide-react';
-import type { MouseEvent } from 'react';
+import { useMemo, type MouseEvent } from 'react';
 import type { TFunction } from 'i18next';
 
 import { Button, LLMProviderLogo, Tooltip } from '@/shared/ui';
@@ -11,7 +11,10 @@ import { usePinnedSessions } from '@/modules/sidebar/hooks/usePinnedSessions';
 import SessionOptions from '@/modules/sidebar/SessionOptions';
 
 type SidebarRecentConversationsProps = {
+  isMobile?: boolean;
   conversations: RecentConversationListItem[];
+  /** Visible pins resolved before pagination, rendered ahead of the loaded page. */
+  pinnedConversations?: RecentConversationListItem[];
   total: number;
   hasMore: boolean;
   isLoading: boolean;
@@ -52,7 +55,9 @@ function RecentConversationSkeleton() {
 
 /** Rendered by SidebarContent in the recents search mode to list recently active sessions across all projects. */
 export default function SidebarRecentConversations({
+  isMobile = false,
   conversations,
+  pinnedConversations = [],
   total,
   hasMore,
   isLoading,
@@ -67,15 +72,30 @@ export default function SidebarRecentConversations({
   t,
 }: SidebarRecentConversationsProps) {
   const { pinnedSessionIds } = usePinnedSessions();
-  const desktop = isDesktop();
-  if (isLoading && conversations.length === 0) {
+  const desktop = isDesktop() && !isMobile;
+  // The feed page may not contain an old pin, and a pin may also appear inside
+  // the page. Merge by session id so each conversation is rendered once.
+  const visibleConversations = useMemo(() => {
+    const seen = new Set<string>();
+    const merged: RecentConversationListItem[] = [];
+    for (const conversation of [...pinnedConversations, ...conversations]) {
+      if (seen.has(conversation.sessionId)) {
+        continue;
+      }
+      seen.add(conversation.sessionId);
+      merged.push(conversation);
+    }
+    return merged;
+  }, [conversations, pinnedConversations]);
+
+  if (isLoading && visibleConversations.length === 0) {
     return <RecentConversationSkeleton />;
   }
 
-  if (hasError && conversations.length === 0) {
+  if (hasError && visibleConversations.length === 0) {
     return (
-      <div className="px-4 py-10 text-center">
-        <MessageSquare className="mx-auto mb-3 h-6 w-6 text-muted-foreground" />
+      <div className="sidebar-recents-error px-4 py-10 text-center">
+        {!desktop && <MessageSquare className="mx-auto mb-3 h-6 w-6 text-muted-foreground" />}
         <p className="text-sm font-medium text-foreground">
           {t('recent.loadFailed', 'Could not load recent conversations')}
         </p>
@@ -86,31 +106,37 @@ export default function SidebarRecentConversations({
     );
   }
 
-  if (conversations.length === 0) {
+  if (visibleConversations.length === 0) {
     return (
-      <div className="px-4 py-10 text-center">
-        <MessageSquare className="mx-auto mb-3 h-6 w-6 text-muted-foreground" />
-        <p className="text-sm font-medium text-foreground">
-          {t('recent.emptyTitle', 'No conversations yet')}
-        </p>
-        <p className="mt-1 text-xs text-muted-foreground">
-          {t('recent.emptyDescription', 'Your most recently updated conversations will appear here.')}
-        </p>
+      <div className="sidebar-recents-empty px-4 py-10 text-center">
+        {desktop ? (
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            {t('recent.desktopEmptyDescription', 'Start a new conversation to see it here.')}
+          </p>
+        ) : <>
+          <MessageSquare className="mx-auto mb-3 h-6 w-6 text-muted-foreground" />
+          <p className="text-sm font-medium text-foreground">
+            {t('recent.emptyTitle', 'No conversations yet')}
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {t('recent.emptyDescription', 'Your most recently updated conversations will appear here.')}
+          </p>
+        </>}
       </div>
     );
   }
 
   return (
     <div className="sidebar-recents px-1" data-testid="recent-conversations-list">
-      <div className="sidebar-recents-summary flex items-center justify-between px-2 pb-1.5 pt-0.5">
+      {!desktop && <div className="sidebar-recents-summary flex items-center justify-between px-2 pb-1.5 pt-0.5">
         <span className="text-[11px] font-medium text-muted-foreground">
           {t('recent.title', 'Recent conversations')}
         </span>
         <span className="text-[10px] tabular-nums text-muted-foreground/70">{total}</span>
-      </div>
+      </div>}
 
       <div className="space-y-0.5">
-        {[...conversations].sort((a, b) => Number(pinnedSessionIds.has(b.sessionId)) - Number(pinnedSessionIds.has(a.sessionId))).map((conversation) => {
+        {[...visibleConversations].sort((a, b) => Number(pinnedSessionIds.has(b.sessionId)) - Number(pinnedSessionIds.has(a.sessionId))).map((conversation) => {
           const isSelected = String(selectedSession?.id ?? '') === conversation.sessionId;
           const age = formatCompactAge(conversation.lastActivity, currentTime);
           const isProcessing = sessionActions.activeSessions.has(conversation.sessionId);

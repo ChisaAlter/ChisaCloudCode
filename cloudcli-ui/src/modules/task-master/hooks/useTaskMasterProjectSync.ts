@@ -8,9 +8,10 @@ export function useTaskMasterProjectSync(selectedProject: Project | null) {
   const { currentProject, setCurrentProject } = useTaskMaster();
 
   useEffect(() => {
-    // The TaskMaster context keys its internal maps by the same DB projectId.
-    if (selectedProject && selectedProject.projectId !== currentProject?.projectId) {
-      setCurrentProject(selectedProject);
+    // SSH has no TaskMaster target; null also clears a previously selected cloud project.
+    const target = selectedProject?.sourceMode === 'ssh' ? null : selectedProject;
+    if ((target?.projectId ?? null) !== (currentProject?.projectId ?? null)) {
+      setCurrentProject(target);
     }
   }, [selectedProject, currentProject?.projectId, setCurrentProject]);
 }

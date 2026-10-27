@@ -31,17 +31,19 @@ type serviceDefaults struct {
 }
 
 type serverConnection struct {
-	baseURL               string
-	loginURL              string
-	client                *http.Client
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	version               uint64
-	authenticated         bool
-	accountIdentity       string
-	accessToken           string
-	workspaceSetup        *accountWorkspaceSetup
-	workspaceRecoveryOnly bool
+	baseURL         string
+	loginURL        string
+	client          *http.Client
+	ctx             context.Context
+	cancel          context.CancelFunc
+	version         uint64
+	authenticated   bool
+	accountIdentity string
+	accessToken     string
+	// SSH has its own account-identity context so an identity refresh can revoke
+	// queued SSH work without changing the existing cloud transport lifecycle.
+	sshContext context.Context
+	sshCancel  context.CancelFunc
 }
 
 var apiConnection *serverConnection
@@ -99,10 +101,6 @@ func newServerConnection(loginURL, baseURL string) (*serverConnection, error) {
 	// failure. Select the protocol before sending, never replay an HTTP operation.
 	transport.Protocols = new(http.Protocols)
 	transport.Protocols.SetHTTP1(true)
-	// Clone initializes DefaultTransport's HTTP/2 support and copies its ALPN
-	// list. Start with a fresh verified TLS config even without a custom CA,
-	// otherwise H2 can still be negotiated by an HTTP/1-only transport.
-	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	defaults := distributionService()
 	if defaults.CACertificate != "" {
 		roots, err := x509.SystemCertPool()
@@ -112,9 +110,10 @@ func newServerConnection(loginURL, baseURL string) (*serverConnection, error) {
 		if !roots.AppendCertsFromPEM([]byte(defaults.CACertificate)) {
 			return nil, fmt.Errorf("服务证书配置无效")
 		}
-		transport.TLSClientConfig.RootCAs = roots
+		transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	sshContext, sshCancel := context.WithCancel(ctx)
 	apiConnectionVersion++
 	version := apiConnectionVersion
 	// Explicit diagnostic H2 clients retain PING/ACK liveness. This setting
@@ -123,12 +122,17 @@ func newServerConnection(loginURL, baseURL string) (*serverConnection, error) {
 		SendPingTimeout: 15 * time.Second,
 		PingTimeout:     15 * time.Second,
 	}
-	return &serverConnection{baseURL: baseURL, loginURL: loginURL, ctx: ctx, cancel: cancel, version: version,
+	return &serverConnection{baseURL: baseURL, loginURL: loginURL, ctx: ctx, cancel: cancel, version: version, sshContext: sshContext, sshCancel: sshCancel,
 		client: &http.Client{Transport: &serverTLSRecoveryTransport{transport: transport, account: ctx}, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 
 func replaceServerConnection(next *serverConnection) {
 	previous := apiConnection
+	// Account transitions revoke only this application's optional SSH forward.
+	// The manager never waits for a child or takes the account lock here.
+	if previous != next {
+		stopDesktopSshTunnels(false)
+	}
 	apiConnection = next
 	if previous != nil {
 		previous.cancel()
@@ -176,10 +180,57 @@ func (FrontendBridge) EndServerSession(version uint64) {
 		return
 	}
 	replaceServerConnection(next)
-	if tunnel != nil {
-		tunnel.stop()
+}
+
+type frontendProxyRequest struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// Protected by frontendRequestsMu so a queued proxy handler cannot escape the
+// same closed-window gate as FrontendBridge.ServerRequest reservations.
+var frontendProxyRequests = map[*frontendProxyRequest]struct{}{}
+
+func reserveFrontendProxy(parent context.Context) (context.Context, *frontendProxyRequest, bool) {
+	frontendRequestsMu.Lock()
+	defer frontendRequestsMu.Unlock()
+	if frontendRequestsClosed {
+		return nil, nil, false
 	}
-	stopSyncMonitor(false)
+	ctx, cancel := context.WithCancel(parent)
+	pending := &frontendProxyRequest{cancel: cancel, done: make(chan struct{})}
+	frontendProxyRequests[pending] = struct{}{}
+	return ctx, pending, true
+}
+func finishFrontendProxy(pending *frontendProxyRequest) {
+	pending.cancel()
+	frontendRequestsMu.Lock()
+	defer frontendRequestsMu.Unlock()
+	delete(frontendProxyRequests, pending)
+	close(pending.done)
+}
+func cancelFrontendProxyRequests() {
+	frontendRequestsMu.Lock()
+	defer frontendRequestsMu.Unlock()
+	for pending := range frontendProxyRequests {
+		pending.cancel()
+	}
+}
+func waitFrontendProxyRequests(ctx context.Context) error {
+	frontendRequestsMu.Lock()
+	pending := make([]*frontendProxyRequest, 0, len(frontendProxyRequests))
+	for request := range frontendProxyRequests {
+		pending = append(pending, request)
+	}
+	frontendRequestsMu.Unlock()
+	for _, request := range pending {
+		select {
+		case <-request.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 // Only the current service connection can proxy chat, shell and plugin upgrades.
@@ -206,6 +257,10 @@ func StartAPIProxy() error {
 			http.NotFound(w, request)
 			return
 		}
+		if retiredWorkspaceSyncPath(path) {
+			jsonResp(w, http.StatusGone, map[string]any{"error": map[string]string{"code": cloudOnlyCode, "message": cloudOnlyMessage}})
+			return
+		}
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
@@ -213,6 +268,12 @@ func StartAPIProxy() error {
 			w.WriteHeader(204)
 			return
 		}
+		windowContext, pending, open := reserveFrontendProxy(request.Context())
+		if !open {
+			http.Error(w, "桌面窗口已关闭", http.StatusServiceUnavailable)
+			return
+		}
+		defer finishFrontendProxy(pending)
 		serverConnectionMu.RLock()
 		connection := apiConnection
 		ready := connection != nil && connection.authenticated
@@ -228,7 +289,7 @@ func StartAPIProxy() error {
 		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 			http.Error(w, "聊天服务连接失败", http.StatusBadGateway)
 		}
-		copy := request.Clone(request.Context())
+		copy := request.Clone(windowContext)
 		// Route HTTPS virtual hosts to the account service, not the local proxy host.
 		copy.Host = target.Host
 		copy.URL.Path = path
@@ -242,28 +303,4 @@ func StartAPIProxy() error {
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	go server.Serve(listener)
 	return nil
-}
-
-func workspaceConnectionMatchesSession() bool {
-	if apiConnection == nil || !apiConnection.authenticated {
-		return false
-	}
-	cfg := store.config()
-	if cfg.WorkspaceAccount != "" && (cfg.WorkspaceAccount != apiConnection.accountIdentity || cfg.WorkspaceLoginURL != apiConnection.loginURL) {
-		return false
-	}
-	return cfg.WorkspaceServerURL != "" && strings.TrimRight(cfg.WorkspaceServerURL, "/") == strings.TrimRight(cfg.ServerURL, "/")
-}
-
-func resumeAuthorizedWorkspace(version uint64) {
-	serverConnectionMu.RLock()
-	if apiConnection == nil || apiConnection.version != version {
-		serverConnectionMu.RUnlock()
-		return
-	}
-	connection := apiConnection
-	serverConnectionMu.RUnlock()
-	if err := waitAccountWorkspace(connection, false); err != nil && connection.ctx.Err() == nil {
-		log.Println("[workspace-connection]", err)
-	}
 }

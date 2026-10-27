@@ -160,42 +160,6 @@ test('bypassPermissions launches claude with --dangerously-skip-permissions', ()
   assert.deepEqual(spawnedCommands, ['claude --dangerously-skip-permissions', 'claude']);
 });
 
-test('the PTY env marks root-in-container as a sandbox for Claude', () => {
-  const envs: Array<Record<string, string | undefined>> = [];
-  const dependencies = {
-    resolveProviderSessionId: () => null,
-    spawnPty: (_shell: string, _args: string | string[], options: { env?: Record<string, string | undefined> }) => {
-      envs.push(options.env ?? {});
-      return createFakePty() as never;
-    },
-  };
-
-  const previous = process.env.IS_SANDBOX;
-  delete process.env.IS_SANDBOX;
-  try {
-    const socket = createFakeSocket();
-    handleShellConnection(socket as never, dependencies as never);
-    socket.emit(
-      'message',
-      JSON.stringify({
-        type: 'init',
-        projectPath: process.cwd(),
-        sessionId: `sandbox-env-${Date.now()}`,
-        hasSession: false,
-        provider: 'claude',
-        bypassPermissions: true,
-      })
-    );
-  } finally {
-    if (previous === undefined) delete process.env.IS_SANDBOX;
-    else process.env.IS_SANDBOX = previous;
-  }
-
-  assert.equal(envs.length, 1);
-  const isRoot = os.platform() !== 'win32' && process.getuid?.() === 0;
-  assert.equal(envs[0].IS_SANDBOX, isRoot ? '1' : undefined);
-});
-
 test('bypassPermissions carries through to resumed claude sessions', () => {
   const spawnedCommands: string[] = [];
   const dependencies = {

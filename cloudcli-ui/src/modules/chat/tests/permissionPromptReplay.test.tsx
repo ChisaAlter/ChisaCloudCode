@@ -33,8 +33,8 @@ const renderHandlers = () => {
     setPendingPermissionRequests: (next) => {
       pending = typeof next === 'function' ? next(pending) : next;
     },
-    streamBuffersRef: { current: new Map() },
-    replayCursorsRef: { current: new Map() },
+    lastSeqRef: { current: new Map() },
+    cursorRunIdRef: { current: new Map() },
     statusCheckSentAtRef: { current: new Map() },
     requestLatestMessages: async () => {},
     sessionStore: { appendRealtime: () => {} } as unknown as SessionStore,

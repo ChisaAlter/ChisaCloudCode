@@ -916,29 +916,6 @@ export class ClaudeSessionsProvider implements IProviderSessions {
       return messages;
     }
 
-    if (raw.type === 'assistant' && typeof raw.error === 'string') {
-      const content = typeof raw.message?.content === 'string'
-        ? raw.message.content
-        : Array.isArray(raw.message?.content)
-          ? raw.message.content
-            .filter((part: AnyRecord) => part.type === 'text' && typeof part.text === 'string')
-            .map((part: AnyRecord) => part.text)
-            .join('\n')
-          : '';
-      // The SDK reports quota/auth failures as assistant envelopes. Preserve
-      // their error contract instead of displaying them as a normal reply.
-      messages.push(createNormalizedMessage({
-        id: baseId,
-        sessionId,
-        timestamp: ts,
-        provider: PROVIDER,
-        kind: 'error',
-        code: raw.error,
-        content: content || raw.error,
-      }));
-      return messages;
-    }
-
     if (raw.message?.role === 'assistant' && raw.message?.content) {
       if (Array.isArray(raw.message.content)) {
         let partIndex = 0;

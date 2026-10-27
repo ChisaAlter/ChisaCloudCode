@@ -4,7 +4,7 @@ import type { Dispatch, KeyboardEvent, SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { ActionMenu, Tooltip, PillBar, Pill } from '@/shared/ui';
-import type { AppTab } from '@/shared/types';
+import type { AppTab, ProjectSourceMode } from '@/shared/types';
 import { usePlugins,PluginIcon } from '@/modules/plugins';
 import { GitWorkspaceButton } from '@/modules/git-panel';
 
@@ -15,7 +15,7 @@ type WorkspaceTabsProps = {
   shouldShowBrowserTab: boolean;
   compact?: boolean;
   projectId?: string;
-  serverPath?: string;
+  sourceMode?: ProjectSourceMode;
 };
 
 type BuiltInTab = {
@@ -64,10 +64,12 @@ export default function WorkspaceTabs({
   shouldShowBrowserTab,
   compact = false,
   projectId,
-  serverPath,
+  sourceMode,
 }: WorkspaceTabsProps) {
   const { t } = useTranslation();
   const { plugins } = usePlugins();
+  const sshMode = sourceMode === 'ssh';
+  const labelFor = (tab: TabDefinition) => tab.kind === 'builtin' ? sshMode && tab.id === 'shell' ? 'Windows 命令' : t(tab.labelKey) : tab.label;
 
   const builtInTabs: BuiltInTab[] = [
     ...BASE_TABS,
@@ -76,7 +78,7 @@ export default function WorkspaceTabs({
   ];
 
   const pluginTabs: PluginTab[] = plugins
-    .filter((p) => p.enabled && p.name !== 'claude-usage')
+    .filter((p) => !sshMode && p.enabled && p.name !== 'claude-usage')
     .map((p) => ({
       kind: 'plugin',
       id: `plugin:${p.name}` as AppTab,
@@ -109,7 +111,6 @@ export default function WorkspaceTabs({
   if (compact) {
     const toolTabs = tabs.filter((tab) => tab.id !== 'chat' && tab.id !== 'git');
     const activeTool = toolTabs.find((tab) => tab.id === activeTab);
-    const labelFor = (tab: TabDefinition) => tab.kind === 'builtin' ? t(tab.labelKey) : tab.label;
 
     return (
       <div className="workspace-tools flex shrink-0 items-center gap-1">
@@ -122,7 +123,7 @@ export default function WorkspaceTabs({
           <MessageSquare className="h-3.5 w-3.5" />
           <span>{t('tabs.chat')}</span>
         </button>
-        <GitWorkspaceButton projectId={projectId} serverPath={serverPath} active={activeTab === 'git'} onClick={() => setActiveTab('git')} />
+        <GitWorkspaceButton projectId={projectId} active={activeTab === 'git'} onClick={() => setActiveTab('git')} />
         <ActionMenu
           label={activeTool ? labelFor(activeTool) : t('tabs.tools', { defaultValue: 'Tools' })}
           icon={activeTool?.kind === 'builtin' ? activeTool.icon : PanelsTopLeft}
@@ -151,7 +152,7 @@ export default function WorkspaceTabs({
     >
       {tabs.map((tab, index) => {
         const isActive = tab.id === activeTab;
-        const displayLabel = tab.kind === 'builtin' ? t(tab.labelKey) : tab.label;
+        const displayLabel = labelFor(tab);
 
         return (
           <Fragment key={`${tab.id}-${index}`}>

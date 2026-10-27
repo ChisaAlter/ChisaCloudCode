@@ -10,7 +10,7 @@ type AuthInputFieldProps = {
   onChange: (nextValue: string) => void;
   placeholder: string;
   isDisabled: boolean;
-  type?: 'text' | 'password' | 'email' | 'url';
+  type?: 'text' | 'password' | 'email';
   name?: string;
   autoComplete?: string;
   icon?: ComponentType<{ className?: string }>;

@@ -100,47 +100,6 @@ func readHTTP1TestReply(t *testing.T, connection *serverConnection, method, path
 	return http1TestReply{body: string(reply), address: response.Header.Get("X-Fixture-Connection"), connection: observed.Conn, reused: observed.Reused}
 }
 
-func TestServerConnectionHTTP1WithoutCustomCADoesNotAdvertiseHTTP2(t *testing.T) {
-	previous := serviceConfiguration
-	serviceConfiguration = []byte(`{"loginUrl":"","caCertificate":""}`)
-	t.Cleanup(func() { serviceConfiguration = previous })
-	hellos := make(chan []string, 2)
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		t.Error("the untrusted fixture must not receive an HTTP request")
-	}))
-	server.EnableHTTP2 = true
-	server.Config.ErrorLog = log.New(io.Discard, "", 0)
-	server.TLS = &tls.Config{GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-		hellos <- slices.Clone(hello.SupportedProtos)
-		return nil, errors.New("stop after observing the real ClientHello")
-	}}
-	server.StartTLS()
-	t.Cleanup(server.Close)
-	connection, err := newServerConnection(server.URL, server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { connection.cancel(); connection.client.CloseIdleConnections() })
-	ctx, cancel := context.WithTimeout(context.Background(), http1FixtureWait)
-	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response, err := connection.client.Do(request); err == nil {
-		response.Body.Close()
-		t.Fatal("aborted TLS handshake unexpectedly completed")
-	}
-	protocols := awaitHTTP1TestEvent(t, hellos, "system-trust ClientHello")
-	if slices.Contains(protocols, "h2") {
-		t.Fatalf("system-trust account client still advertised HTTP/2: %v", protocols)
-	}
-	transport, ok := serverHTTPTransport(connection.client.Transport)
-	if !ok || transport.TLSClientConfig == nil || transport.TLSClientConfig.InsecureSkipVerify || transport.TLSClientConfig.MinVersion < tls.VersionTLS12 {
-		t.Fatal("system-trust protocol selection weakened TLS verification")
-	}
-}
-
 func TestServerConnectionHTTP1DefaultReusesVerifiedTLS(t *testing.T) {
 	connection, _ := newHTTP1TestConnection(t, func(w http.ResponseWriter, request *http.Request) {
 		io.WriteString(w, "completed H1 read")

@@ -1,8 +1,36 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import test, { after, before } from 'node:test';
 
+import { closeConnection, initializeDatabase } from '@/modules/database/index.js';
 import { codexAppServer } from '@/modules/providers/list/codex/codex-app-server.client.js';
 import { CodexForkProvider } from '@/modules/providers/list/codex/codex-fork.provider.js';
+
+const previousDatabasePath = process.env.DATABASE_PATH;
+let databaseDirectory: string | undefined;
+
+before(async () => {
+  databaseDirectory = await mkdtemp(path.join(os.tmpdir(), 'codex-fork-db-'));
+  closeConnection();
+  process.env.DATABASE_PATH = path.join(databaseDirectory, 'app.db');
+  // Profile lookup now reads app sessions; an existing empty file prevents
+  // initialization from importing a developer's legacy database.
+  await writeFile(process.env.DATABASE_PATH, '');
+  await initializeDatabase();
+});
+
+after(async () => {
+  closeConnection();
+  if (previousDatabasePath === undefined) delete process.env.DATABASE_PATH;
+  else process.env.DATABASE_PATH = previousDatabasePath;
+  if (databaseDirectory) {
+    assert.equal(path.dirname(databaseDirectory), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(databaseDirectory).startsWith('codex-fork-db-'));
+    await rm(databaseDirectory, { recursive: true, force: true });
+  }
+});
 
 /**
  * The fork endpoint itself is exercised against the real `codex app-server` in

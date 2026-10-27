@@ -99,27 +99,13 @@ npx @cloudcli-ai/cloudcli@latest sandbox ~/my-project
 
 Supports Claude Code and Codex. See the [sandbox docs](docker/) for setup and advanced options.
 
-#### ChisaCloudCode desktop file synchronization
+### MyGo Desktop Host
 
-Desktop users sign in with their server address and application account. The desktop generates a device key locally and enrolls its public key after login; users do not supply a server SSH account or private key.
+The desktop application is hosted by MyGo. This repository supplies the React workspace UI and the `mygo-runtime` bridge for account connections, verified HTTP/WebSocket transport, and desktop diagnostics.
 
-For a Linux server installation, configure each account instance's `WORKSPACES_ROOT` as its dedicated project directory and retain the existing `localhost/chisa-workspace:2` worker image. Install the isolated synchronization transport image before starting the updated server:
+Cloud VPS remains the default project mode: files, Git, terminals, AI execution and previews use the existing server workspace. An optional SSH local mode keeps Claude Code and authentication on the VPS while files, Git, builds and tests run in an existing Windows directory over SSH. The desktop can explicitly manage a reverse tunnel; it does not mirror repositories or run a local AI provider. Its entry provides `globalThis.mygo` before React boots and preserves the authenticated account login flow.
 
-```sh
-sh scripts/install-workspace-sync.sh
-```
-
-The transport publishes a dedicated SSH port, mounts that instance's project directory, and keeps its configuration read only. Each account's transport, workers and previews use its own Docker bridge network, with no host home directory or Docker socket. Existing enrolled devices remain authorized when another device signs in. Migrating a legacy transport to its account network can change a dynamically published SSH port; sign in again or use the desktop's reconnect control to retrieve the current endpoint and refresh project callbacks. The gateway forwards enrollment to the authenticated account instance and returns that instance's workspace address.
-
-### Desktop Companion App
-
-CloudCLI Desktop is an optional native companion for CloudCLI Cloud and Local CloudCLI. It ships from this repository's GitHub Releases and keeps CloudCLI available from your menu bar or tray.
-
-- **[macOS](https://cloudcli.ai/download/macos)**
-- **[Windows](https://cloudcli.ai/download/windows)**
-- **[Download page](https://cloudcli.ai/download)** · **[GitHub Releases and checksums](https://github.com/siteboon/claudecodeui/releases)**
-
-Use it to open CloudCLI Cloud environments, switch between local and remote workspaces, and copy mobile/browser URLs. To work locally, choose **Local CloudCLI** in the desktop app; it will use your running local server or start one for you.
+See [the MyGo desktop architecture](docs/architecture/04-mygo-desktop-host.md) for the host boundary and startup contract, [the cloud workspace guide (中文)](docs/architecture/cloud-workspaces.zh-CN.md) for isolated sessions and integration, and [the SSH local setup guide (中文)](docs/architecture/ssh-local-workspaces.zh-CN.md) for keys, Windows prerequisites and deployment networking.
 
 
 ---

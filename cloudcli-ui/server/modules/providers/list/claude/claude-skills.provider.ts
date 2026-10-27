@@ -1,7 +1,8 @@
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { lstat, readFile, readdir, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import { currentClaudeProjectConfigScope } from '@/modules/providers/services/claude-project-config-scope.service.js';
 import { SkillsProvider } from '@/modules/providers/shared/skills/skills.provider.js';
 import { parseFrontMatter } from '@/shared/frontmatter.js';
 import type {
@@ -10,6 +11,7 @@ import type {
   ProviderSkillSource,
 } from '@/shared/types.js';
 import {
+  AppError,
   findProviderSkillMarkdownFiles,
   readJsonConfig,
   readObjectRecord,
@@ -17,7 +19,7 @@ import {
   readProviderSkillMarkdownDefinition,
 } from '@/shared/utils.js';
 
-const getClaudeHomePath = (): string => path.join(os.homedir(), '.claude');
+const getClaudeHomePath = (): string => currentClaudeProjectConfigScope()?.configDir ?? path.join(os.homedir(), '.claude');
 
 const getClaudePluginName = (pluginId: string): string | null => {
   const normalizedPluginId = pluginId.trim();
@@ -76,13 +78,40 @@ export class ClaudeSkillsProvider extends SkillsProvider {
   }
 
   async listSkills(options?: ProviderSkillListOptions): Promise<ProviderSkill[]> {
+    // Native plugin registries can point at arbitrary VPS directories. The cloud
+    // project runtime reports them unsupported rather than traversing installs.
+    if (currentClaudeProjectConfigScope()) return super.listSkills(options);
     return [
       ...(await super.listSkills(options)),
       ...(await this.listPluginSkills(getClaudeHomePath())),
     ];
   }
 
+  private async assertPrivateSkillRoot(): Promise<void> {
+    const context = currentClaudeProjectConfigScope();
+    if (!context) return;
+    context.assertCurrent();
+    const root = path.join(context.configDir, 'skills');
+    try {
+      const rootStats = await lstat(root);
+      if (rootStats.isSymbolicLink() || !rootStats.isDirectory()) throw new Error('invalid');
+      const entries = await readdir(root, { withFileTypes: true });
+      if (entries.length > 512) throw new Error('invalid');
+      for (const entry of entries) {
+        if (entry.isSymbolicLink()) throw new Error('invalid');
+        if (!entry.isDirectory()) continue;
+        const file = path.join(root, entry.name, 'SKILL.md');
+        try { if ((await lstat(file)).isSymbolicLink()) throw new Error('invalid'); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new AppError('Managed skills must stay inside the selected account without symbolic links.', { code: 'PROVIDER_SKILL_PATH_DENIED', statusCode: 403 });
+    }
+    context.assertCurrent();
+  }
+
   protected async getSkillSources(workspacePath: string): Promise<ProviderSkillSource[]> {
+    await this.assertPrivateSkillRoot();
     const claudeHomePath = getClaudeHomePath();
 
     return [
@@ -100,6 +129,7 @@ export class ClaudeSkillsProvider extends SkillsProvider {
   }
 
   protected async getGlobalSkillSource(): Promise<ProviderSkillSource> {
+    await this.assertPrivateSkillRoot();
     return {
       scope: 'user',
       rootDir: path.join(getClaudeHomePath(), 'skills'),

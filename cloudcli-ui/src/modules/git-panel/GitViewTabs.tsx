@@ -2,6 +2,7 @@ import { FileText, GitBranch, GitFork, History } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import type { GitPanelView } from '@/shared/types';
+import { useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
 
 type GitViewTabsProps = {
   activeView: GitPanelView;
@@ -20,6 +21,7 @@ const TABS: { id: GitPanelView; labelKey: string; Icon: typeof FileText }[] = [
 /** Rendered by GitPanel to switch between its changes, commits, branches and worktrees views. */
 export default function GitViewTabs({ activeView, isHidden, changeCount, onChange }: GitViewTabsProps) {
   const { t } = useTranslation();
+  const workspace = useWorkspaceScope();
   return (
     <div
       className={`border-b border-border/60 transition-all duration-300 ease-in-out ${
@@ -31,7 +33,7 @@ export default function GitViewTabs({ activeView, isHidden, changeCount, onChang
         role="tablist"
         aria-label={t('git:tabs.ariaLabel')}
       >
-        {TABS.map(({ id, labelKey, Icon }) => (
+        {TABS.filter(tab => tab.id !== 'worktrees' || workspace?.sourceMode !== 'ssh' && (workspace === undefined || workspace?.kind === 'cloudReplica')).map(({ id, labelKey, Icon }) => (
           <button
             key={id}
             type="button"

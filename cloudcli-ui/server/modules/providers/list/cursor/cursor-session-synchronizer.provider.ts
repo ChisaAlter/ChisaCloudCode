@@ -5,6 +5,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 
 import { sessionsDb } from '@/modules/database/index.js';
+import { registeredProviderProfiles, profileForArtifact, managedProviderHome } from '@/modules/providers/services/provider-state.service.js';
 import {
   extractFirstValidJsonlData,
   findFilesRecursivelyCreatedAfter,
@@ -37,7 +38,7 @@ async function listDirectoryEntriesSafe(
  */
 export class CursorSessionSynchronizer implements IProviderSessionSynchronizer {
   private readonly provider = 'cursor' as const;
-  private readonly cursorHome = path.join(os.homedir(), '.cursor');
+  constructor(private readonly cursorHome = path.join(os.homedir(), '.cursor')) {}
 
   /**
    * Scans Cursor chats and upserts discovered sessions into DB.
@@ -56,7 +57,7 @@ export class CursorSessionSynchronizer implements IProviderSessionSynchronizer {
       }
 
       const timestamps = await readFileTimestamps(filePath);
-      sessionsDb.createSession(
+      const indexedId = sessionsDb.createSession(
         parsed.sessionId,
         this.provider,
         parsed.projectPath,
@@ -65,9 +66,12 @@ export class CursorSessionSynchronizer implements IProviderSessionSynchronizer {
         timestamps.updatedAt,
         filePath
       );
+      const profile = profileForArtifact('cursor', filePath);
+      if (profile === managedProviderHome('cursor', indexedId)) sessionsDb.setProviderProfilePath(indexedId, profile);
       processed += 1;
     }
 
+    if (this.cursorHome === path.join(os.homedir(), '.cursor')) for (const { home } of registeredProviderProfiles('cursor')) processed += await new CursorSessionSynchronizer(path.join(home, '.cursor')).synchronize(since);
     return processed;
   }
 

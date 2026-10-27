@@ -10,6 +10,8 @@ import type { ServerEvent,
   ProjectSession,IsSessionProcessing } from '@/shared/types';
 import { mergeProjectSelectionMetadata } from '@/modules/project-workspace/utils/projectSelectionMetadata';
 import { readSelectedProvider } from '@/shared/selectedProvider';
+import { getAuthSessionVersion } from '@/shared/authToken';
+import { getServerConnectionVersion } from '@/shared/chisa';
 
 type UseProjectsStateArgs = {
   sessionId?: string;
@@ -34,13 +36,7 @@ type SessionUpsertedEvent = ServerEvent & {
   providerSessionId?: string | null;
   provider: LLMProvider;
   session: ProjectSession;
-  project: {
-    projectId: string;
-    path: string;
-    fullPath: string;
-    displayName: string;
-    isStarred: boolean;
-  } | null;
+  project: Pick<Project, 'projectId' | 'path' | 'fullPath' | 'displayName' | 'isStarred' | 'sourceMode' | 'displayPath' | 'remotePath' | 'sshConnectionId' | 'connectionLabel' | 'connectionState'> | null;
 };
 
 type FetchProjectsOptions = {
@@ -66,13 +62,7 @@ type SessionDetailsApiPayload = {
     summary?: string;
     createdAt?: string | null;
     lastActivity?: string | null;
-    project?: {
-      projectId?: string;
-      path?: string;
-      fullPath?: string;
-      displayName?: string;
-      isStarred?: boolean;
-    } | null;
+    project?: Partial<Pick<Project, 'projectId' | 'path' | 'fullPath' | 'displayName' | 'isStarred' | 'sourceMode' | 'displayPath' | 'remotePath' | 'sshConnectionId' | 'connectionLabel' | 'connectionState'>> | null;
   };
 };
 
@@ -125,6 +115,12 @@ const projectsHaveChanges = (
       nextProject.projectId !== prevProject.projectId ||
       nextProject.displayName !== prevProject.displayName ||
       nextProject.fullPath !== prevProject.fullPath ||
+      nextProject.sourceMode !== prevProject.sourceMode ||
+      nextProject.displayPath !== prevProject.displayPath ||
+      nextProject.remotePath !== prevProject.remotePath ||
+      nextProject.sshConnectionId !== prevProject.sshConnectionId ||
+      nextProject.connectionLabel !== prevProject.connectionLabel ||
+      nextProject.connectionState !== prevProject.connectionState ||
       Boolean(nextProject.isStarred) !== Boolean(prevProject.isStarred) ||
       serialize(nextProject.sessionMeta) !== serialize(prevProject.sessionMeta) ||
       serialize(nextProject.sessions) !== serialize(prevProject.sessions) ||
@@ -327,6 +323,7 @@ const upsertSessionIntoProject = (project: Project, event: SessionUpsertedEvent)
 };
 
 const projectFromRegistration = (project: Project): Project => ({
+  ...project,
   projectId: project.projectId,
   path: project.path || project.fullPath,
   fullPath: project.fullPath || project.path || '',
@@ -365,9 +362,21 @@ const isValidTab = (tab: string): tab is AppTab => {
   return VALID_TABS.has(tab) || tab.startsWith('plugin:');
 };
 
+function tabStorageKey(): string | null {
+  try {
+    const token = localStorage.getItem('auth-token');
+    if (!token) return 'activeTab'; // Anonymous/platform installations retain their local tab preference.
+    const payload = token.split('.')[1]?.replace(/-/g, '+').replace(/_/g, '/');
+    const claims = JSON.parse(atob(payload)) as { userId?: unknown; username?: unknown };
+    if (typeof claims.userId !== 'string' && typeof claims.userId !== 'number') return null;
+    return `activeTab:${JSON.stringify([window.location.origin, getServerConnectionVersion(), claims.userId, claims.username])}`;
+  } catch { return null; }
+}
+
 const readPersistedTab = (): AppTab => {
   try {
-    const stored = localStorage.getItem('activeTab');
+    const key = tabStorageKey();
+    const stored = key ? localStorage.getItem(key) : null;
     if (stored && isValidTab(stored)) {
       return stored as AppTab;
     }
@@ -384,6 +393,8 @@ export function useProjectsState({
   isMobile,
   isSessionProcessing,
 }: UseProjectsStateArgs) {
+  const [identity] = useState(() => ({ auth: getAuthSessionVersion(), server: getServerConnectionVersion() }));
+  const accountCurrent = useCallback(() => identity.auth === getAuthSessionVersion() && identity.server === getServerConnectionVersion(), [identity]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [selectedSession, setSelectedSession] = useState<ProjectSession | null>(null);
@@ -392,11 +403,12 @@ export function useProjectsState({
 
   useEffect(() => {
     try {
-      localStorage.setItem('activeTab', activeTab);
+      const key = tabStorageKey();
+      if (key && accountCurrent()) localStorage.setItem(key, activeTab);
     } catch {
       // Silently ignore storage errors
     }
-  }, [activeTab]);
+  }, [activeTab, accountCurrent]);
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isLoadingProjects, setIsLoadingProjects] = useState(true);
@@ -449,8 +461,6 @@ export function useProjectsState({
    */
   const selectedSessionRef = useRef(selectedSession);
   selectedSessionRef.current = selectedSession;
-  const selectedProjectRef = useRef(selectedProject);
-  selectedProjectRef.current = selectedProject;
   const projectsRef = useRef(projects);
   projectsRef.current = projects;
   const sessionIdRef = useRef(sessionId);
@@ -509,6 +519,7 @@ export function useProjectsState({
   }, []);
 
   const fetchProjects = useCallback(async ({ showLoadingState = true }: FetchProjectsOptions = {}) => {
+    if (!accountCurrent()) return;
     // Claimed before the request starts and read again in `finally`, so the
     // loading flag is only ever cleared by the response that actually wrote
     // `projects`.
@@ -521,7 +532,7 @@ export function useProjectsState({
       const response = await api.projects();
       const projectData = await readProjectsResponse(response);
 
-      if (projectsRequestIdRef.current !== requestId) {
+      if (!accountCurrent() || projectsRequestIdRef.current !== requestId) {
         return;
       }
 
@@ -559,7 +570,7 @@ export function useProjectsState({
           : previousProject;
       });
     } catch (error) {
-      if (projectsRequestIdRef.current === requestId) {
+      if (accountCurrent() && projectsRequestIdRef.current === requestId) {
         setProjectsLoadFailed(true);
       }
       console.error('Error fetching projects:', error);
@@ -574,11 +585,11 @@ export function useProjectsState({
       // — the websocket's reconnect re-sync, a command-palette refresh, React's
       // StrictMode double-mount — supersedes the initial fetch and used to
       // trigger exactly that flash.
-      if (projectsRequestIdRef.current === requestId) {
+      if (accountCurrent() && projectsRequestIdRef.current === requestId) {
         setIsLoadingProjects(false);
       }
     }
-  }, []);
+  }, [accountCurrent]);
 
   const refreshProjectsSilently = useCallback(async () => {
     // Keep chat view stable while still syncing sidebar/session metadata in background.
@@ -591,6 +602,7 @@ export function useProjectsState({
     project,
     summary,
   }: RegisterOptimisticSessionArgs) => {
+    if (!accountCurrent()) return;
     if (!newSessionId || !project?.projectId) {
       return;
     }
@@ -618,6 +630,7 @@ export function useProjectsState({
       provider,
       session: optimisticSession,
       project: {
+        ...project,
         projectId: project.projectId,
         path: project.path || project.fullPath,
         fullPath: project.fullPath || project.path || '',
@@ -648,11 +661,11 @@ export function useProjectsState({
         ? { ...previousSession, ...optimisticSession }
         : optimisticSession
     ));
-  }, []);
+  }, [accountCurrent]);
 
   // Hydrates TaskMaster details for the given `projectId`. The project
   // identifier comes directly from the DB-driven /api/projects response.
-  const hydrateProjectTaskMaster = useCallback(async (projectId: string) => {
+  const hydrateProjectTaskMaster = useCallback(async (projectId: string, isCurrent: () => boolean) => {
     if (!projectId) {
       return;
     }
@@ -665,7 +678,7 @@ export function useProjectsState({
 
       const data = (await response.json()) as { taskmaster?: Project['taskmaster'] };
       const taskMasterInfo = data.taskmaster;
-      if (!taskMasterInfo) {
+      if (!accountCurrent() || !taskMasterInfo || !isCurrent()) {
         return;
       }
 
@@ -688,9 +701,9 @@ export function useProjectsState({
         };
       });
     } catch (error) {
-      console.error(`Error fetching TaskMaster info for project ${projectId}:`, error);
+      if (isCurrent()) console.error(`Error fetching TaskMaster info for project ${projectId}:`, error);
     }
-  }, []);
+  }, [accountCurrent]);
 
   const openSettings = useCallback((tab = 'tools') => {
     setSettingsInitialTab(tab);
@@ -707,12 +720,14 @@ export function useProjectsState({
   }, [fetchProjects]);
 
   useEffect(() => {
-    if (!selectedProject?.projectId) {
+    if (!selectedProject?.projectId || selectedProject.sourceMode === 'ssh') {
       return;
     }
 
-    void hydrateProjectTaskMaster(selectedProject.projectId);
-  }, [hydrateProjectTaskMaster, selectedProject?.projectId]);
+    let current = true;
+    void hydrateProjectTaskMaster(selectedProject.projectId, () => current);
+    return () => { current = false; };
+  }, [hydrateProjectTaskMaster, selectedProject?.projectId, selectedProject?.sourceMode]);
 
   // Auto-select the project when there is only one, so the user lands on the new session page
   useEffect(() => {
@@ -727,6 +742,7 @@ export function useProjectsState({
   // "suppress updates while a run is active" protection is needed anymore.
   useEffect(() => {
     const handleEvent = (event: ServerEvent) => {
+      if (!accountCurrent()) return;
       // The project list is maintained purely by incremental `session_upserted`
       // deltas, so anything that happened while the socket was down is missing
       // from it until something else forces a refresh. Chat re-syncs itself on
@@ -811,6 +827,7 @@ export function useProjectsState({
           }
 
           const newProject: Project = {
+            ...upsert.project,
             projectId: upsert.project.projectId,
             path: upsert.project.path,
             fullPath: upsert.project.fullPath,
@@ -878,7 +895,7 @@ export function useProjectsState({
     };
 
     return subscribe(handleEvent);
-  }, [isSessionProcessing, markSessionAttention, navigate, refreshProjectsSilently, sessionId, subscribe]);
+  }, [accountCurrent, isSessionProcessing, markSessionAttention, navigate, refreshProjectsSilently, sessionId, subscribe]);
 
   useEffect(() => {
     return () => {
@@ -945,26 +962,12 @@ export function useProjectsState({
       }
 
       // The user navigated elsewhere while the lookup was in flight.
-      if (sessionIdRef.current !== sessionId) {
-        return;
-      }
+      if (!accountCurrent() || sessionIdRef.current !== sessionId) return;
 
       if (!details) {
-        // Unknown session id (or lookup failed). Fall back to the legacy
-        // behavior: host a placeholder under the currently selected project so
-        // chat state stays alive (without a `selectedSession`, chat clears
-        // `currentSessionId` and stops reading the session store).
-        const fallbackProject = selectedProjectRef.current;
-        if (!fallbackProject || selectedSessionRef.current?.id === sessionId) {
-          return;
-        }
-
-        setSelectedSession({
-          id: sessionId,
-          __provider: readSelectedProvider(),
-          __projectId: fallbackProject.projectId,
-          summary: '',
-        });
+        // An inaccessible or unknown URL cannot manufacture membership in the selected project.
+        setSelectedSession(null);
+        navigate('/', { replace: true });
         return;
       }
 
@@ -992,6 +995,7 @@ export function useProjectsState({
           // Owning project is not in the active project list (e.g. archived):
           // synthesize a minimal entry so the chat view still gets its paths.
           return {
+            ...details.project,
             projectId: resolvedProjectId,
             path: details.project?.path ?? details.project?.fullPath ?? '',
             fullPath: details.project?.fullPath ?? details.project?.path ?? '',
@@ -1021,7 +1025,7 @@ export function useProjectsState({
           : resolvedSession,
       );
     })();
-  }, [navigate, sessionId, projects, selectedProject, selectedSession?.id, selectedSession?.__provider]);
+  }, [accountCurrent, navigate, sessionId, projects, selectedProject, selectedSession?.id, selectedSession?.__provider]);
 
   const handleProjectSelect = useCallback(
     (project: Project) => {
@@ -1097,9 +1101,11 @@ export function useProjectsState({
   );
 
   const handleSidebarRefresh = useCallback(async () => {
+    if (!accountCurrent()) return;
     try {
       const response = await api.projects();
       const freshProjects = await readProjectsResponse(response);
+      if (!accountCurrent()) return;
       setProjectsLoadFailed(false);
       const projectsWithTaskMaster = mergeTaskMasterCache(freshProjects, projects);
       const mergedProjects = mergeExpandedSessionPages(projects, projectsWithTaskMaster);
@@ -1143,12 +1149,14 @@ export function useProjectsState({
         }
       }
     } catch (error) {
+      if (!accountCurrent()) return;
       setProjectsLoadFailed(true);
       console.error('Error refreshing sidebar:', error);
     }
-  }, [projects, selectedProject, selectedSession]);
+  }, [accountCurrent, projects, selectedProject, selectedSession]);
 
   const loadMoreProjectSessions = useCallback(async (projectId: string) => {
+    if (!accountCurrent()) return;
     const project = projects.find((candidate) => candidate.projectId === projectId);
     if (!project) {
       return;
@@ -1178,6 +1186,7 @@ export function useProjectsState({
     }
 
     const sessionsPage = (await response.json()) as ProjectSessionPage;
+    if (!accountCurrent()) return;
 
     setProjects((previousProjects) =>
       previousProjects.map((candidate) => {
@@ -1188,7 +1197,7 @@ export function useProjectsState({
         return mergeProjectSessionPage(candidate, sessionsPage);
       }),
     );
-  }, [projects]);
+  }, [accountCurrent, projects]);
 
   // `projectId` is the DB identifier passed from the sidebar's delete flow
   // after the migration away from folder-derived project names.

@@ -68,7 +68,7 @@ export default function WorkspaceTitle({
         )}
       </div>
 
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1" title={selectedProject.displayPath || selectedProject.fullPath}>
         {activeTab === 'chat' && selectedSession ? (
           <div className="min-w-0">
             <h2 title={getSessionTitle(selectedSession)} className="truncate text-sm font-semibold leading-tight text-foreground">
@@ -84,7 +84,7 @@ export default function WorkspaceTitle({
         ) : (
           <div className="min-w-0">
             <h2 className="text-sm font-semibold leading-tight text-foreground">
-              {getTabTitle(activeTab, shouldShowTasksTab, t, pluginDisplayName)}
+              {selectedProject.sourceMode === 'ssh' && activeTab === 'shell' ? 'Windows 命令' : getTabTitle(activeTab, shouldShowTasksTab, t, pluginDisplayName)}
             </h2>
             <div className="truncate text-[11px] leading-tight text-muted-foreground">{selectedProject.displayName}</div>
           </div>

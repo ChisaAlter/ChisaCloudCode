@@ -111,18 +111,8 @@ func loadStore(dir string) *Store {
 	if s.Cfg.SSHUser == "" {
 		s.Cfg.SSHUser = "root"
 	}
-	for _, m := range s.Mappings {
-		if m == nil {
-			log.Fatal("state.json 包含无效的工作区记录")
-		}
-		if m.BindingEpoch == "" {
-			m.BindingEpoch = randHex(16)
-		}
-		// Existing state used a single server; persist that ownership before switching.
-		if m.ServerID == "" {
-			m.ServerID = serverIdentity(s.Cfg)
-		}
-	}
+	// Retired mappings are inert history. Never synthesize missing ownership or
+	// epochs: cleanup may act only on identity the old app actually persisted.
 	if err = s.flush(); err != nil {
 		log.Fatal("连接配置保存失败：", err)
 	}
@@ -141,6 +131,9 @@ func (s *Store) mappings() []*Mapping {
 	defer s.mu.Unlock()
 	items := make([]*Mapping, 0, len(s.Mappings))
 	for _, m := range s.Mappings {
+		if m == nil {
+			continue
+		}
 		copy := *m
 		items = append(items, &copy)
 	}

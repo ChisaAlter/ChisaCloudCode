@@ -10,6 +10,11 @@ const readScopes = new AsyncLocalStorage<boolean>();
 /** Git command adapter uses the route's explicit inspection/mutation classification. */
 export function gitOperationReadOnly(): boolean { return readScopes.getStore() === true; }
 
+/** Commit-message collection uses the same read classification and reservation as other Git inspections. */
+export function withGitReadOperation<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
+  return withWorkspaceGitReadOperation(cwd, () => readScopes.run(true, operation));
+}
+
 /** Git routes keep responses pending until the operation's synchronization and cleanup finish. */
 export function createGitOperationHandlers(resolveProjectPath: (projectId: string) => Promise<string>) {
   function wrap(readOnly: boolean, handler: RequestHandler, nativeBranch = false): RequestHandler {
@@ -30,7 +35,7 @@ export function createGitOperationHandlers(resolveProjectPath: (projectId: strin
         const run = async () => { await readScopes.run(readOnly, () => handler(request, buffered, next)); };
         if (!nativeBranch && typeof project === 'string' && project) {
           const cwd = await resolveProjectPath(project);
-          await (readOnly ? withWorkspaceGitReadOperation(cwd, run) : withWorkspaceWriteOperation(cwd, run));
+          await (readOnly ? withGitReadOperation(cwd, run) : withWorkspaceWriteOperation(cwd, run));
         } else await run();
         if (replied && !response.destroyed) response.status(status).json(body);
       } catch (error) {
@@ -51,5 +56,7 @@ export function createGitOperationHandlers(resolveProjectPath: (projectId: strin
     read: (handler: RequestHandler) => wrap(true, handler),
     write: (handler: RequestHandler) => wrap(false, handler),
     branch: (handler: RequestHandler) => wrap(false, handler, true),
+    // Multi-phase workflows own their reservations and retain the shared response/error boundary.
+    workflow: (handler: RequestHandler) => wrap(false, handler, true),
   };
 }

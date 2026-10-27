@@ -253,8 +253,6 @@
     "forkFromHere": "從此處分支"
   },
   "composer": {
-    "reloadModels": "重新載入模型",
-    "modelsLoadFailed": "模型載入失敗，請點擊右側重新載入按鈕重試。",
     "lastUsedModel": "上次實際使用：{{model}}",
     "editing": {
       "title": "正在取代先前的訊息",

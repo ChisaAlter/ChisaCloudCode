@@ -7,8 +7,7 @@ import type {
 import { createCompleteMessage, readObjectRecord } from '@/shared/utils.js';
 
 type ChatSessionWriterOptions = {
-  /** Session-owned audience shared by consecutive interactive and queued runs. */
-  connections: Set<RealtimeClientConnection>;
+  connection: RealtimeClientConnection | null;
   userId: string | number | null;
   provider: LLMProvider;
   /** Provider-native id when resuming an existing session, otherwise null. */
@@ -40,7 +39,7 @@ type ChatSessionWriterOptions = {
  * - `session_created` events are swallowed and turned into a provider-id
  *   mapping; the frontend never learns provider-native ids.
  * - every other event gets `sessionId` remapped to the app session id and a
- *   per-session `seq` assigned before being forwarded.
+ *   per-run `seq` assigned before being forwarded.
  * - `setSessionId(...)` calls (used by runtimes to label captured ids) are
  *   intercepted and recorded as the provider-id mapping as well.
  */
@@ -53,8 +52,17 @@ export class ChatSessionWriter {
   isWebSocketWriter = true;
 
   private readonly options: ChatSessionWriterOptions;
-  /** The registry keeps this audience alive between runs, including while idle. */
-  private readonly connections: Set<RealtimeClientConnection>;
+  /**
+   * Every socket currently watching this run, not just the one that started
+   * it. A session can legitimately be open in more than one place — a second
+   * browser tab, a phone alongside a laptop, the desktop app beside the web
+   * app — and each of those subscribes through `attachConnection`.
+   *
+   * Holding a single connection here meant the newest subscriber took the
+   * stream away from everyone before it, so a second tab silently froze
+   * mid-run and only caught up on the next REST history refresh.
+   */
+  private readonly connections = new Set<RealtimeClientConnection>();
   /**
    * The provider-native session id as the runtime knows it. Kept locally
    * (besides the registry) because runtimes read it back via `getSessionId()`
@@ -65,7 +73,12 @@ export class ChatSessionWriter {
 
   constructor(options: ChatSessionWriterOptions) {
     this.options = options;
-    this.connections = options.connections;
+    // A run started by a timer has no audience yet. Everything still goes
+    // through `decorateOutboundEvent` into the run's replay buffer, so a
+    // client that subscribes mid-run catches up from the beginning.
+    if (options.connection) {
+      this.connections.add(options.connection);
+    }
     this.userId = options.userId;
     this.providerSessionId = options.providerSessionId;
   }

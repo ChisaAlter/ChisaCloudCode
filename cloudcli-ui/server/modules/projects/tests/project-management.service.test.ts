@@ -3,7 +3,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { createProject } from '@/modules/projects/services/project-management.service.js';
-import { AppError } from '@/shared/utils.js';
+import { AppError, WORKSPACES_ROOT } from '@/shared/index.js';
 
 const projectRow = {
   project_id: 'project-1',
@@ -67,6 +67,39 @@ test('createProject throws conflict when active project path already exists', as
       return true;
     },
   );
+});
+
+test('configured Linux cloud accounts reject their container root before creating or registering a project', async () => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  const previous = process.env.WORKSPACES_ROOT;
+  let mutated = false;
+  try {
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+    process.env.WORKSPACES_ROOT = WORKSPACES_ROOT;
+    await assert.rejects(createProject({ projectPath: WORKSPACES_ROOT }, {
+      validatePath: async () => ({ valid: true, resolvedPath: WORKSPACES_ROOT }),
+      ensureWorkspaceDirectory: async () => { mutated = true; },
+      persistProjectPath: () => { mutated = true; return { outcome: 'created', project: projectRow }; },
+      getProjectByPath: () => projectRow,
+    }), { code: 'PROJECT_ROOT_REQUIRED', statusCode: 400 });
+    assert.equal(mutated, false);
+  } finally {
+    Object.defineProperty(process, 'platform', platform);
+    if (previous === undefined) delete process.env.WORKSPACES_ROOT;
+    else process.env.WORKSPACES_ROOT = previous;
+  }
+});
+
+test('cloud project creation rejects the reserved SSH metadata tree before mutation', async () => {
+  const reserved = path.join(WORKSPACES_ROOT, '.chisa-ssh-projects', 'metadata-id');
+  let mutated = false;
+  await assert.rejects(createProject({ projectPath: reserved }, {
+    validatePath: async () => ({ valid: true, resolvedPath: reserved }),
+    ensureWorkspaceDirectory: async () => { mutated = true; },
+    persistProjectPath: () => { mutated = true; return { outcome: 'created', project: projectRow }; },
+    getProjectByPath: () => projectRow,
+  }), { code: 'SSH_ANCHOR_RESERVED', statusCode: 400 });
+  assert.equal(mutated, false);
 });
 
 test('createProject falls back to directory name when custom name is not provided', async () => {

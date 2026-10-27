@@ -1,21 +1,25 @@
-import React, { useCallback, useEffect, type Dispatch, type SetStateAction } from 'react';
+import React, { useCallback, useEffect, useMemo, useState, type Dispatch, type SetStateAction } from 'react';
 
 import { ChatInterface } from '@/modules/chat';
 import { FileTree } from '@/modules/file-tree';
 import { StandaloneShell } from '@/modules/standalone-shell';
 import { GitPanel } from '@/modules/git-panel';
 import { PluginTabContent } from '@/modules/plugins';
+import { SshAgentStatus, useSshAgent } from '@/modules/ssh-workspaces';
 import { BrowserUsePanel, useBrowserUseEnabled } from '@/modules/browser-use';
 import { usePaletteOpsRegister } from '@/modules/command-palette';
 import { TaskMasterPanel, useTaskMasterProjectSync, useTasksSettings } from '@/modules/task-master';
-import type { AppTab, Project, ProjectSession, SessionEstablishedContext, SessionNavigationOptions, SettingsMainTab } from '@/shared/types';
+import type { AppTab, CodeEditorDiffInfo, Project, ProjectSession, SessionEstablishedContext, SessionNavigationOptions, SettingsMainTab, WorkspaceDescriptor } from '@/shared/types';
 import { useUiPreferences } from '@/shared/context/UiPreferencesContext';
 import { useFileOpenResolver } from '@/modules/project-workspace/hooks/useFileOpenResolver';
 import { EditorSidebar, useEditorSidebar } from '@/modules/code-editor';
 import WorkspaceHeader from '@/modules/project-workspace/WorkspaceHeader';
 import WorkspaceStateView from '@/modules/project-workspace/WorkspaceStateView';
 import WorkspaceErrorBoundary from '@/modules/project-workspace/WorkspaceErrorBoundary';
-import { WorkspaceSyncBar } from '@/modules/project-workspace/WorkspaceSyncBar';
+import { WorkspaceExecutionContext, WorkspaceScopeContext } from '@/shared/context/WorkspaceScopeContext';
+import { useWorkspaceResolution } from '@/modules/project-workspace/hooks/useWorkspaceResolution';
+import { WorkspaceScopeBar } from '@/modules/project-workspace/WorkspaceScopeBar';
+import ProjectCommandPalette from '@/modules/project-workspace/ProjectCommandPalette';
 
 type WorkspaceMainProps = {
   projects: Project[];
@@ -65,10 +69,26 @@ function WorkspaceMain({
   const { tasksEnabled, isTaskMasterInstalled } = useTasksSettings();
   const browserUseEnabled = useBrowserUseEnabled();
 
-  useTaskMasterProjectSync(selectedProject);
+  useTaskMasterProjectSync(selectedProject?.sourceMode === 'ssh' ? null : selectedProject);
 
-  const shouldShowTasksTab = Boolean(tasksEnabled && isTaskMasterInstalled);
-  const shouldShowBrowserTab = browserUseEnabled;
+  const sshProject = selectedProject?.sourceMode === 'ssh';
+  const shouldShowTasksTab = Boolean(!sshProject && tasksEnabled && isTaskMasterInstalled);
+  const shouldShowBrowserTab = !sshProject && browserUseEnabled;
+  const agent = useSshAgent();
+  const workspaceState = useWorkspaceResolution(selectedProject?.projectId, selectedSession?.id, agent?.revision);
+  useEffect(() => {
+    if (sshProject && selectedProject?.sshConnectionId) void agent?.activate(selectedProject.sshConnectionId);
+  }, [sshProject, selectedProject?.sshConnectionId, agent?.activate]);
+  // The user's choice survives polling; a new conversation defaults to its execution workspace.
+  const selectionKey = JSON.stringify([selectedProject?.projectId, selectedSession?.id]);
+  const [scopeChoice, setScopeChoice] = useState<{ key: string; kind: WorkspaceDescriptor['kind'] } | null>(null);
+  const workspaceKind = sshProject ? 'cloudReplica' : scopeChoice?.key === selectionKey ? scopeChoice.kind : selectedSession ? 'session' : 'cloudReplica';
+  const activeWorkspace = workspaceState.resolution?.[workspaceKind] ?? null;
+  const sessionWorkspace = workspaceState.resolution?.session ?? (sshProject ? workspaceState.resolution?.cloudReplica ?? null : null);
+  // A running task can revoke writes temporarily without replacing its own mounted observers.
+  const scopeKey = JSON.stringify([activeWorkspace?.projectId, activeWorkspace?.kind, activeWorkspace?.sessionId, activeWorkspace?.workspaceId, activeWorkspace?.generation, activeWorkspace?.sourceMode]);
+  const scopedProject = useMemo(() => selectedProject && activeWorkspace
+    ? { ...selectedProject, fullPath: activeWorkspace.rootPath, path: activeWorkspace.rootPath, sourceMode: activeWorkspace.sourceMode ?? selectedProject.sourceMode, displayPath: activeWorkspace.displayPath ?? selectedProject.displayPath } : null, [selectedProject, activeWorkspace]);
 
   const {
     editingFile,
@@ -88,7 +108,14 @@ function WorkspaceMain({
 
   // Resolves bare/partial file references (e.g. links inside chat messages) to
   // real project files before opening them in the in-app editor.
-  const resolvedFileOpen = useFileOpenResolver(selectedProject, handleFileOpen);
+  const openWorkspaceFile = useCallback((path: string, diffInfo?: CodeEditorDiffInfo | null) => {
+    handleFileOpen(path, diffInfo, activeWorkspace);
+  }, [handleFileOpen, activeWorkspace]);
+  const openSessionFile = useCallback((path: string, diffInfo?: CodeEditorDiffInfo | null) => {
+    handleFileOpen(path, diffInfo, sessionWorkspace);
+  }, [handleFileOpen, sessionWorkspace]);
+  const resolvedFileOpen = useFileOpenResolver(selectedProject, openWorkspaceFile, activeWorkspace);
+  const resolvedSessionFileOpen = useFileOpenResolver(selectedProject, openSessionFile, sessionWorkspace);
 
   useEffect(() => {
     if (!shouldShowTasksTab && activeTab === 'tasks') {
@@ -97,10 +124,10 @@ function WorkspaceMain({
   }, [shouldShowTasksTab, activeTab, setActiveTab]);
 
   useEffect(() => {
-    if (!shouldShowBrowserTab && activeTab === 'browser') {
+    if ((!shouldShowBrowserTab && activeTab === 'browser') || (sshProject && activeTab.startsWith('plugin:'))) {
       setActiveTab('chat');
     }
-  }, [shouldShowBrowserTab, activeTab, setActiveTab]);
+  }, [shouldShowBrowserTab, sshProject, activeTab, setActiveTab]);
 
   // Stable so React.memo(ChatInterface) can bail out: an inline arrow here made
   // every WorkspaceMain render re-render the whole chat tree, including during
@@ -111,8 +138,8 @@ function WorkspaceMain({
 
   const openFile = useCallback((filePath: string) => {
     setActiveTab('files');
-    handleFileOpen(filePath);
-  }, [handleFileOpen, setActiveTab]);
+    openWorkspaceFile(filePath);
+  }, [openWorkspaceFile, setActiveTab]);
 
   // Opens the editor side panel in place, keeping the current tab (e.g. chat).
   const openFileInEditor = useCallback((filePath: string) => {
@@ -124,16 +151,34 @@ function WorkspaceMain({
   usePaletteOpsRegister({ openFile, openFileInEditor });
 
   if (isLoading) {
-    return <WorkspaceStateView mode="loading" isMobile={isMobile} onMenuClick={onMenuClick} />;
+    return <WorkspaceScopeContext.Provider value={null}><WorkspaceStateView mode="loading" isMobile={isMobile} onMenuClick={onMenuClick} /><ProjectCommandPalette /></WorkspaceScopeContext.Provider>;
   }
 
   if (!selectedProject) {
-    return <WorkspaceStateView mode="empty" isMobile={isMobile} onMenuClick={onMenuClick} />;
+    return <WorkspaceScopeContext.Provider value={null}><WorkspaceStateView mode="empty" isMobile={isMobile} onMenuClick={onMenuClick} /><ProjectCommandPalette /></WorkspaceScopeContext.Provider>;
   }
 
+  const workspaceControl = <WorkspaceScopeBar
+    key={selectionKey}
+    selectionKey={selectionKey}
+    workspace={activeWorkspace}
+    session={sessionWorkspace}
+    kind={workspaceKind}
+    hasSession={Boolean(selectedSession)}
+    loading={workspaceState.loading}
+    error={workspaceState.error}
+    onSelect={kind => setScopeChoice({ key: selectionKey, kind })}
+    onRefresh={workspaceState.refresh}
+    sourceMode={selectedProject.sourceMode}
+    displayPath={selectedProject.displayPath || selectedProject.remotePath}
+    agentStatus={sshProject && selectedProject.sshConnectionId && (agent?.errors.$profiles || agent?.profiles.some(profile => profile.id === selectedProject.sshConnectionId && profile.mode === 'agent')) ? <SshAgentStatus profileId={selectedProject.sshConnectionId} /> : undefined}
+  />;
+
   return (
+    <WorkspaceScopeContext.Provider value={activeWorkspace}>
     <div className="flex h-full flex-col">
       <WorkspaceHeader
+        key={scopeKey}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         selectedProject={selectedProject}
@@ -142,21 +187,24 @@ function WorkspaceMain({
         shouldShowBrowserTab={shouldShowBrowserTab}
         isMobile={isMobile}
         onMenuClick={onMenuClick}
+        statusControl={sshProject ? workspaceControl : undefined}
       />
 
-      <WorkspaceSyncBar key={selectedProject.fullPath} serverPath={selectedProject.fullPath} />
+      {!sshProject && workspaceControl}
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
         <div className={`flex min-h-0 min-w-[200px] flex-col overflow-hidden ${editorExpanded ? 'hidden' : ''} flex-1`}>
           <div className={`h-full ${activeTab === 'chat' ? 'block' : 'hidden'}`}>
             <WorkspaceErrorBoundary showDetails>
+              <WorkspaceScopeContext.Provider value={sessionWorkspace}>
+              <WorkspaceExecutionContext.Provider value={sessionWorkspace ?? workspaceState.resolution?.cloudReplica ?? null}>
               <ChatInterface
                 isActive={activeTab === 'chat'}
                 selectedProject={selectedProject}
                 selectedSession={selectedSession}
                 ws={ws}
                 sendMessage={sendMessage}
-                onFileOpen={handleFileOpen}
+                onFileOpen={resolvedSessionFileOpen}
                 onNavigateToSession={onNavigateToSession}
                 onSessionEstablished={onSessionEstablished}
                 onShowSettings={onShowSettings}
@@ -165,38 +213,45 @@ function WorkspaceMain({
                 sendByCtrlEnter={sendByCtrlEnter}
                 externalMessageUpdate={externalMessageUpdate}
                 newSessionTrigger={newSessionTrigger}
-                onShowAllTasks={tasksEnabled ? showAllTasks : null}
+                onShowAllTasks={shouldShowTasksTab ? showAllTasks : null}
               />
+              </WorkspaceExecutionContext.Provider>
+              </WorkspaceScopeContext.Provider>
             </WorkspaceErrorBoundary>
           </div>
 
-          {activeTab === 'files' && (
-            <div className="h-full overflow-hidden">
-              <FileTree selectedProject={selectedProject} onFileOpen={handleFileOpen} />
+          {activeTab === 'files' && activeWorkspace?.capabilities.read && (
+            <div key={scopeKey} className="h-full overflow-hidden">
+              <FileTree selectedProject={scopedProject} onFileOpen={openWorkspaceFile} />
             </div>
           )}
 
-          {activeTab === 'shell' && (
-            <div className="h-full w-full overflow-hidden">
+          {activeTab === 'shell' && activeWorkspace?.capabilities.shell && (
+            <div key={scopeKey} className="h-full w-full overflow-hidden">
               <StandaloneShell
-                project={selectedProject}
-                session={selectedSession}
+                project={scopedProject}
+                session={activeWorkspace.kind === 'session' ? selectedSession : null}
                 showHeader={false}
                 isActive={activeTab === 'shell'}
+                isPlainShell={sshProject ? true : null}
               />
             </div>
           )}
 
-          {activeTab === 'git' && (
-            <div className="h-full overflow-hidden">
+          {activeTab === 'git' && activeWorkspace?.capabilities.git && (
+            <div key={scopeKey} className="h-full overflow-hidden">
               <GitPanel
-                selectedProject={selectedProject}
+                selectedProject={scopedProject}
                 isMobile={isMobile}
-                onFileOpen={handleFileOpen}
+                onFileOpen={openWorkspaceFile}
                 onProjectSelect={onProjectSelect}
                 onProjectsRefresh={onProjectsRefresh}
               />
             </div>
+          )}
+
+          {((activeTab === 'files' && !activeWorkspace?.capabilities.read) || (activeTab === 'git' && !activeWorkspace?.capabilities.git) || (activeTab === 'shell' && !activeWorkspace?.capabilities.shell)) && (
+            <div role="status" className="p-6 text-sm text-muted-foreground">当前工作区暂不支持此操作。请刷新工作区状态，或选择主工作区。</div>
           )}
 
           {shouldShowTasksTab && <TaskMasterPanel isVisible={activeTab === 'tasks'} />}
@@ -207,11 +262,11 @@ function WorkspaceMain({
             </div>
           )}
 
-          {activeTab.startsWith('plugin:') && (
-            <div className="h-full overflow-hidden">
+          {activeTab.startsWith('plugin:') && !sshProject && activeWorkspace && (
+            <div key={scopeKey} className="h-full overflow-hidden">
               <PluginTabContent
                 pluginName={activeTab.replace('plugin:', '')}
-                selectedProject={selectedProject}
+                selectedProject={scopedProject}
                 selectedSession={selectedSession}
               />
             </div>
@@ -228,11 +283,13 @@ function WorkspaceMain({
           onResizeStart={handleResizeStart}
           onCloseEditor={handleCloseEditor}
           onToggleEditorExpand={handleToggleEditorExpand}
-          projectPath={selectedProject.path}
+          projectPath={editingFile?.workspace?.rootPath ?? selectedProject.path}
           fillSpace={activeTab === 'files'}
         />
       </div>
     </div>
+    <ProjectCommandPalette key={scopeKey} />
+    </WorkspaceScopeContext.Provider>
   );
 }
 

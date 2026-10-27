@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api } from '@/shared/api';
-import type { ProviderSkill, ProviderSkillCreateEntryPayload, SkillsProject, SkillsProvider, SkillsScope } from '@/shared/types';
+import { api, readApiJson } from '@/shared/api';
+import { getAuthSessionVersion } from '@/shared/authToken';
+import { getServerConnectionVersion } from '@/shared/chisa';
+import type { ProviderSkill, ProviderSkillCreateEntryPayload, SkillsProject, SkillsProvider, SkillsScope, WorkspaceResolution, WorkspaceSelector } from '@/shared/types';
 
 type ProviderSkillCreatePayload = {
   entries: ProviderSkillCreateEntryPayload[];
@@ -183,9 +185,23 @@ const mergeSkills = (
 const fetchProviderSkills = async (
   provider: SkillsProvider,
   project?: ProjectTarget,
+  signal?: AbortSignal,
 ): Promise<ProviderSkill[]> => {
-  const response = await api.providers.skills(provider, { workspacePath: project?.path });
+  signal?.throwIfAborted();
+  let selector: (WorkspaceSelector & { projectId: string }) | undefined;
+  if (project) {
+    const resolution = await readApiJson<WorkspaceResolution>(await api.workspaces.resolve(project.projectId, undefined, { signal }));
+    const replica = resolution.cloudReplica;
+    if (!replica || replica.kind !== 'cloudReplica' || replica.projectId !== project.projectId
+      || !replica.workspaceId || !replica.generation || replica.capabilities.read !== true) {
+      throw new Error('项目工作区暂不可用，请刷新后重试');
+    }
+    selector = { projectId: replica.projectId, workspaceId: replica.workspaceId, generation: replica.generation };
+  }
+  signal?.throwIfAborted();
+  const response = await api.providers.skills(provider, selector, { signal });
   const data = await toResponseJson<ApiResponse<ProviderSkillsResponse>>(response);
+  signal?.throwIfAborted();
   if (!response.ok || !data.success) {
     throw new Error(getApiErrorMessage(data, `Failed to load ${provider} skills`));
   }
@@ -231,17 +247,25 @@ export function useProviderSkills({ selectedProvider, currentProjects }: UseProv
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<'success' | 'error' | null>(null);
   const activeLoadIdRef = useRef(0);
+  const loadRequest = useRef<AbortController | null>(null);
+  const authVersion = getAuthSessionVersion();
+  const serverVersion = getServerConnectionVersion();
 
   const serializedProjectTargets = JSON.stringify(createProjectTargets(currentProjects));
   const projectTargets = useMemo<ProjectTarget[]>(
     () => JSON.parse(serializedProjectTargets) as ProjectTarget[],
     [serializedProjectTargets],
   );
-  const cacheKey = useMemo(() => getCacheKey(selectedProvider, projectTargets), [projectTargets, selectedProvider]);
+  // The module cache must never reuse another login or server's catalogue.
+  const cacheKey = useMemo(() => `${getCacheKey(selectedProvider, projectTargets)}:${authVersion}:${serverVersion}`, [authVersion, projectTargets, selectedProvider, serverVersion]);
 
   const refreshSkills = useCallback(async (options: { force?: boolean } = {}) => {
-    const loadId = activeLoadIdRef.current + 1;
-    activeLoadIdRef.current = loadId;
+    loadRequest.current?.abort();
+    const controller = new AbortController();
+    loadRequest.current = controller;
+    const loadId = ++activeLoadIdRef.current;
+    const current = () => !controller.signal.aborted && activeLoadIdRef.current === loadId && authVersion === getAuthSessionVersion() && serverVersion === getServerConnectionVersion();
+    if (!current()) return;
 
     const cachedEntry = skillsCache.get(cacheKey);
     const canUseCache = !options.force && cachedEntry && Date.now() - cachedEntry.updatedAt < SKILLS_CACHE_TTL_MS;
@@ -267,8 +291,8 @@ export function useProviderSkills({ selectedProvider, currentProjects }: UseProv
     let firstError: string | null = null;
 
     try {
-      const globalSkills = await fetchProviderSkills(selectedProvider);
-      if (activeLoadIdRef.current !== loadId) {
+      const globalSkills = await fetchProviderSkills(selectedProvider, undefined, controller.signal);
+      if (!current()) {
         return;
       }
 
@@ -278,7 +302,7 @@ export function useProviderSkills({ selectedProvider, currentProjects }: UseProv
       firstError = error instanceof Error ? error.message : 'Failed to load skills';
     }
 
-    if (activeLoadIdRef.current !== loadId) {
+    if (!current()) {
       return;
     }
 
@@ -296,8 +320,8 @@ export function useProviderSkills({ selectedProvider, currentProjects }: UseProv
 
     await Promise.all(projectTargets.map(async (project) => {
       try {
-        const projectSkills = await fetchProviderSkills(selectedProvider, project);
-        if (activeLoadIdRef.current !== loadId) {
+        const projectSkills = await fetchProviderSkills(selectedProvider, project, controller.signal);
+        if (!current()) {
           return;
         }
 
@@ -308,7 +332,7 @@ export function useProviderSkills({ selectedProvider, currentProjects }: UseProv
       }
     }));
 
-    if (activeLoadIdRef.current !== loadId) {
+    if (!current()) {
       return;
     }
 
@@ -317,7 +341,7 @@ export function useProviderSkills({ selectedProvider, currentProjects }: UseProv
     setSkills(finalSkills);
     setLoadError(firstError);
     setIsLoadingProjectScopes(false);
-  }, [cacheKey, projectTargets, selectedProvider]);
+  }, [authVersion, cacheKey, projectTargets, selectedProvider, serverVersion]);
 
   const addSkills = useCallback(async (payload: ProviderSkillCreatePayload) => {
     try {
@@ -337,6 +361,7 @@ export function useProviderSkills({ selectedProvider, currentProjects }: UseProv
 
     return () => {
       activeLoadIdRef.current += 1;
+      loadRequest.current?.abort();
     };
   }, [refreshSkills]);
 

@@ -5,6 +5,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 
 import { sessionsDb } from '@/modules/database/index.js';
+import { resolveProviderHome } from '@/modules/providers/services/provider-state.service.js';
 import type { IProviderModels } from '@/shared/interfaces.js';
 import type {
   ProviderCurrentActiveModel,
@@ -433,7 +434,7 @@ export class OpenCodeProviderModels implements IProviderModels {
     const providerSessionId = sessionsDb.getSessionById(sessionId)?.provider_session_id ?? sessionId;
 
     try {
-      const dbPath = getOpenCodeDatabasePath();
+      const dbPath = path.join(resolveProviderHome('opencode', sessionId), '.local', 'share', 'opencode', 'opencode.db');
       const db = new Database(dbPath, { readonly: true, fileMustExist: true });
 
       try {

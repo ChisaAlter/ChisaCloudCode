@@ -253,8 +253,8 @@ const markdownComponents = {
 };
 
 /**
- * Used by chat's MessageComponent, ToolErrorDisplay and MarkdownContent and by
- * local-agent to render model-authored markdown with the same prose styling,
+ * Used by chat's MessageComponent, ToolErrorDisplay and MarkdownContent
+ * to render model-authored markdown with the same prose styling,
  * code highlighting and table rules.
  */
 function MarkdownBodyRenderer({ children, breaks = false, disableFileLinks = false, projectId }: Omit<MarkdownProps, 'className'>) {
@@ -344,7 +344,7 @@ function MarkdownBodyRenderer({ children, breaks = false, disableFileLinks = fal
  */
 export const MarkdownBody = memo(MarkdownBodyRenderer);
 
-/** Used by chat and local-agent for prose, code and tables; native file links can remain private text. */
+/** Used by chat for prose, code and tables; callers can disable interactive file links. */
 export const Markdown = memo(function Markdown({ children, className, breaks, disableFileLinks, projectId }: MarkdownProps) {
   return (
     <div className={className}>

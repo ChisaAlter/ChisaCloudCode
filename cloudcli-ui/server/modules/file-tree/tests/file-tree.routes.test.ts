@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
 
 import express, { type RequestHandler } from 'express';
+import multer from 'multer';
 
 import { createFileTreeRouter } from '@/modules/file-tree/file-tree.routes.js';
+import { workspaceRequestSignal } from '@/modules/workspace-bridge/index.js';
 import type { FileTreeServices } from '@/shared/types.js';
 import { AppError } from '@/shared/utils.js';
 
@@ -31,17 +34,49 @@ function createFakeServices(overrides: Partial<FileTreeServices> = {}): FileTree
 
 const passUploadRequest: RequestHandler = (_request, _response, next) => next();
 
+test('multipart upload route retains selection and request cancellation contexts through multer', async () => {
+  const selections = new AsyncLocalStorage<string>();
+  let serviceCalls = 0;
+  const services = createFakeServices({
+    storeUploadedFiles: async input => {
+      serviceCalls += 1;
+      assert.equal(selections.getStore(), 'workspace-1');
+      assert.ok(workspaceRequestSignal() instanceof AbortSignal);
+      assert.equal(workspaceRequestSignal()?.aborted, false);
+      assert.equal(input.projectId, 'project-1');
+      assert.equal(input.files.length, 1);
+      assert.equal(input.files[0].originalName, 'uploaded.txt');
+      return { success: true, uploadedCount: 1, requestedFileCount: 1, files: [], targetPath: '/selected-root', message: 'uploaded' };
+    },
+  });
+  await withFileTreeServer(services, async baseUrl => {
+    const body = new FormData();
+    body.append('files', new Blob(['content']), 'uploaded.txt');
+    const response = await fetch(`${baseUrl}/api/file-tree/projects/project-1/files/upload`, { method: 'POST', body });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json() as { uploadedCount: number }).uploadedCount, 1);
+  }, {
+    selectionScope: (_request, _response, next) => selections.run('workspace-1', next),
+    uploadMiddleware: multer({ storage: multer.memoryStorage() }).array('files'),
+  });
+  assert.equal(serviceCalls, 1);
+  assert.equal(selections.getStore(), undefined);
+  assert.equal(workspaceRequestSignal(), undefined);
+});
+
 async function withFileTreeServer(
   services: FileTreeServices,
   run: (baseUrl: string) => Promise<void>,
+  options: { selectionScope?: RequestHandler; uploadMiddleware?: RequestHandler } = {},
 ): Promise<void> {
   const app = express();
   app.use(express.json());
   app.use('/api/file-tree', createFileTreeRouter(
     services,
-    passUploadRequest,
+    options.uploadMiddleware ?? passUploadRequest,
     { maximumFileSizeMegabytes: 200, maximumFileCount: 20 },
     { error: () => undefined },
+    options.selectionScope,
   ));
 
   const server = app.listen(0, '127.0.0.1');
@@ -121,7 +156,7 @@ test('project files route preserves workspace unavailable status and message', a
   await withFileTreeServer(services, async (baseUrl) => {
     const response = await fetch(`${baseUrl}/api/file-tree/projects/project-1/files`);
     assert.equal(response.status, 503);
-    assert.deepEqual(await response.json(), { error: 'Workspace connection unavailable' });
+    assert.deepEqual(await response.json(), { error: 'Workspace connection unavailable', code: 'WORKSPACE_UNAVAILABLE' });
   });
 });
 

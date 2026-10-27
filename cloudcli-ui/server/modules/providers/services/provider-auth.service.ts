@@ -1,4 +1,5 @@
 import { claudeConnectionsService } from '@/modules/providers/services/claude-connections.service.js';
+import { claudeAccountsService } from '@/modules/providers/services/claude-accounts.service.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import type { LLMProvider, ProviderAuthStatus } from '@/shared/types.js';
 import { normalizeConnectionUserId } from '@/shared/utils.js';
@@ -16,9 +17,13 @@ export const providerAuthService = {
       if (id) {
         const settings = claudeConnectionsService.getSettings(id);
         const activeConnection = settings.connections.find(connection => connection.id === settings.activeId);
-        // Saved endpoints also make managed routing available without changing the ordinary run selection.
-        const connection = activeConnection ?? (!status.authenticated ? settings.connections[0] : undefined);
-        if (connection) return { ...status, authenticated: true, email: connection.name, method: 'model_connection', error: undefined };
+        if (activeConnection) return { ...status, authenticated: true, email: activeConnection.name, method: 'model_connection', error: undefined };
+        // Selected subscription auth belongs to the caller, never the service's global credential file.
+        const selected = await claudeAccountsService.getSelectedAuthStatus(id);
+        if (selected?.authenticated) return { ...status, ...selected };
+        // Saved endpoints can supply the explicitly selected HiRoute model even before choosing an ordinary endpoint.
+        if (settings.connections[0]) return { ...status, authenticated: true, email: settings.connections[0].name, method: 'model_connection', error: undefined };
+        if (selected) return { ...status, ...selected };
       }
     }
     return status;

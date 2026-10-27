@@ -53,11 +53,8 @@ export default function ActivityIndicator({ activity, onAbort, isInputFocused = 
   if (!renderedActivity) return null;
 
   const fallbackLabel = t('claudeStatus.actions.thinking', { defaultValue: 'Thinking' });
-  const isWorkspaceFinalizing = renderedActivity.statusText === 'workspace_finalizing' || renderedActivity.modelStopped;
-  const statusText = renderedActivity.modelStopped
-    ? t('claudeStatus.actions.modelStopped', { defaultValue: '已停止，正在交还工作区' })
-    : isWorkspaceFinalizing
-    ? t('claudeStatus.actions.workspaceFinalizing', { defaultValue: '正在收尾并交还工作区' })
+  const statusText = renderedActivity.statusText === 'workspace_finalizing'
+    ? t('claudeStatus.actions.workspaceFinalizing', { defaultValue: '正在完成云端工作区操作' })
     : renderedActivity.statusText === 'background_work'
       ? t('claudeStatus.actions.backgroundWork', { defaultValue: '后台任务仍在执行' })
       : renderedActivity.statusText;
@@ -69,9 +66,6 @@ export default function ActivityIndicator({ activity, onAbort, isInputFocused = 
     : minutes < 1
       ? t('claudeStatus.elapsed.seconds', { count: seconds, defaultValue: '{{count}}s' })
       : t('claudeStatus.elapsed.minutesSeconds', { minutes, seconds, defaultValue: '{{minutes}}m {{seconds}}s' });
-  const elapsedText = elapsedLabel && isWorkspaceFinalizing
-    ? t('claudeStatus.elapsed.turnTotal', { time: elapsedLabel, defaultValue: '本轮用时 {{time}}' })
-    : elapsedLabel;
 
   return (
     <div className={isExiting ? 'chat-activity-exit' : 'chat-activity-enter'}>
@@ -80,7 +74,7 @@ export default function ActivityIndicator({ activity, onAbort, isInputFocused = 
       }`}>
         <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-[#ef73b0]" aria-hidden />
         <Shimmer className="font-medium">{label}</Shimmer>
-        {elapsedText && <span className="tabular-nums text-muted-foreground">{elapsedText}</span>}
+        {elapsedLabel && <span className="tabular-nums text-muted-foreground">{elapsedLabel}</span>}
         <span className="flex-1" />
         {renderedActivity.canInterrupt && onAbort && (
           <button

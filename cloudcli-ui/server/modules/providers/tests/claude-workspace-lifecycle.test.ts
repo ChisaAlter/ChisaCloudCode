@@ -1,19 +1,17 @@
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
 import { promises as fs } from 'node:fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:http';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test, { mock } from 'node:test';
 
 import { createSdkMcpServer, tool, type Options } from '@anthropic-ai/claude-agent-sdk';
 
+import { sessionsDb, sshProjectTargetsDb, userDb } from '@/modules/database/index.js';
 import { claudeConnectionsService } from '@/modules/providers/services/claude-connections.service.js';
-import { ClaudeSessionsProvider } from '@/modules/providers/list/claude/claude-sessions.provider.js';
-import type { ProviderRuntimeContext } from '@/shared/index.js';
-import type { HiRouteConnection, NormalizedMessage } from '@/shared/types.js';
 import { WORKSPACES_ROOT } from '@/shared/index.js';
+import type { ProviderRuntimeContext, SshProjectTarget, SshSessionTarget } from '@/shared/index.js';
+import type { ClaudeAccountLaunchSnapshot, HiRouteConnection, NormalizedMessage } from '@/shared/types.js';
 
 function gate() {
   let resolve!: () => void;
@@ -21,39 +19,70 @@ function gate() {
   return { promise, resolve };
 }
 
+const sshAnchor = path.join(WORKSPACES_ROOT, '.chisa-ssh-projects', 'claude-owner-fixture');
+let sshTarget: SshProjectTarget = { projectId: 'ssh-project', ownerId: '42', connectionId: 'windows', connectionLabel: 'Fixture',
+  rootPath: 'D:\\Code\\App', rootIdentity: 'physical-root', generation: 'ssh-generation', workspaceId: 'ssh-workspace', anchorPath: sshAnchor,
+  phase: 'idle', activeRunId: null, pendingJobId: null };
+let sshProbes = 0;
+let sshOperations = 0;
+let sshPreflightRequests: Array<Record<string, unknown>> = [];
+mock.module('@/modules/ssh-workspaces/index.js', { namedExports: {
+  probeSshWorkspace: async () => { sshProbes++; return { rootIdentity: sshTarget.rootIdentity, rootPath: sshTarget.rootPath }; },
+  executeSshWorkspace: async (input: { request: Record<string, unknown>; userId: string; generation: string; expectedRootIdentity: string }) => {
+    sshOperations++;
+    assert.equal(input.userId, sshTarget.ownerId);
+    assert.equal(input.generation, sshTarget.generation);
+    assert.equal(input.expectedRootIdentity, sshTarget.rootIdentity);
+    assert.ok(['lstat', 'list', 'read'].includes(String(input.request.op)), 'only configuration inspection is permitted in this lifecycle fixture');
+    assert.ok(String(input.request.path).startsWith('/workspace/'));
+    sshPreflightRequests.push({ ...input.request });
+    throw Object.assign(new Error('Fixture has no remote project configuration'), { code: 'ENOENT' });
+  },
+} });
+
 let queries = 0;
-let failedNotifications = 0;
-let stoppedNotifications = 0;
 let managedReleases: unknown[] = [];
 let releaseScenario: () => Promise<void> = async () => {};
 let scenario: (input: Parameters<typeof import('@anthropic-ai/claude-agent-sdk').query>[0]) => unknown;
 mock.module('@anthropic-ai/claude-agent-sdk', {
-  namedExports: { tool, createSdkMcpServer, query: (input: Parameters<typeof import('@anthropic-ai/claude-agent-sdk').query>[0]) => { queries++; return scenario(input); } },
+  namedExports: { tool, createSdkMcpServer, query: (input: Parameters<typeof import('@anthropic-ai/claude-agent-sdk').query>[0]) => { queries++; assert.equal('chisaPrepareLaunch' in (input.options ?? {}), false); assert.equal('chisaProjectRuntime' in (input.options ?? {}), false); return scenario(input); } },
 });
 let managedScenario: (userId: unknown, signal?: AbortSignal) => Promise<HiRouteConnection> = async () => { throw new Error('Managed HiRoute must be selected explicitly'); };
 mock.module('@/modules/providers/services/hiroute-managed.service.js', { namedExports: {
   prepareManagedHiRoute: (userId: unknown, signal?: AbortSignal) => managedScenario(userId, signal),
   releaseManagedHiRoute: async (userId: unknown) => { managedReleases.push(userId); await releaseScenario(); },
 } });
+let accountReleases = 0;
+let selectedAccount = 'profile-a';
+let captureAccount: (userId: unknown) => ClaudeAccountLaunchSnapshot | null = () => null;
+let historyCalls: { kind: string; accountId?: string; userId?: number; options: Record<string, unknown> }[] = [];
+mock.module('@/modules/providers/services/claude-accounts.service.js', { namedExports: { claudeAccountsService: {
+  captureLaunch: (userId: unknown) => captureAccount(userId),
+  applyToOptions: (options: Options, snapshot: ClaudeAccountLaunchSnapshot) => { options.env = { ...options.env, CLAUDE_CONFIG_DIR: snapshot.configDir, CLAUDE_SECURESTORAGE_CONFIG_DIR: snapshot.authDir }; },
+} } });
+mock.module('@/modules/providers/services/claude-account-history.service.js', { namedExports: {
+  prepareClaudeAccountHistory: async (snapshot: ClaudeAccountLaunchSnapshot, options: Record<string, unknown> = {}) => { historyCalls.push({ kind: 'account', accountId: snapshot.accountId, options }); },
+  prepareClaudeUserHistory: async (userId: number, options: Record<string, unknown> = {}) => { historyCalls.push({ kind: 'private', userId, options }); return path.join(os.tmpdir(), 'private-history-fixture', String(userId)); },
+} });
 mock.module('@/shared/claude-cli-path.js', { namedExports: { resolveClaudeCodeExecutablePath: () => undefined } });
 mock.module('@/modules/notifications/index.js', { namedExports: {
   createNotificationEvent: (event: unknown) => event,
-  notifyBackgroundWorkCompleted() {},
-  notifyRunFailed() { failedNotifications++; },
-  notifyRunStopped() { stoppedNotifications++; },
-  notifyUserIfEnabled() {},
+  notifyBackgroundWorkCompleted() {}, notifyRunFailed() {}, notifyRunStopped() {}, notifyUserIfEnabled() {},
 } });
-const { queryClaudeSDK, abortClaudeSDKSession, resolveToolApproval } = await import('@/modules/providers/list/claude/claude-runtime.provider.js');
+const { queryClaudeSDK, abortClaudeSDKSession } = await import('@/modules/providers/list/claude/claude-runtime.provider.js');
+const { describeWorkspaceSelection } = await import('@/modules/workspace-bridge/index.js');
 
 async function fixture(run: (cwd: string, context: ProviderRuntimeContext, frames: NormalizedMessage[]) => Promise<void>) {
-  await mkdir(WORKSPACES_ROOT, { recursive: true });
-  const cwd = await mkdtemp(path.join(path.resolve(WORKSPACES_ROOT), 'chisa-sdk-lifecycle-'));
+  const cwd = await mkdtemp(path.join(os.tmpdir(), 'chisa-sdk-lifecycle-'));
   await writeFile(path.join(cwd, 'README.md'), 'fixture');
   const access = fs.access.bind(fs);
   mock.method(fs, 'access', async (candidate: Parameters<typeof fs.access>[0], mode?: number) => {
     if (String(candidate) === path.join(os.homedir(), '.claude.json')) throw Object.assign(new Error('isolated'), { code: 'ENOENT' });
     return access(candidate, mode);
   });
+  mock.method(userDb, 'getActiveUserIds', () => []);
+  mock.method(sessionsDb, 'getSessionById', () => null);
+  mock.method(sessionsDb, 'getSessionByProviderSessionId', () => null);
   const context: ProviderRuntimeContext = {
     resolveProviderSessionId: () => null,
     resolveResumeModel: async () => 'sonnet',
@@ -62,150 +91,230 @@ async function fixture(run: (cwd: string, context: ProviderRuntimeContext, frame
     isProviderInstalled: async () => true,
   };
   queries = 0;
-  failedNotifications = 0;
-  stoppedNotifications = 0;
   managedReleases = [];
+  accountReleases = 0;
+  selectedAccount = 'profile-a';
+  historyCalls = [];
+  captureAccount = (userId: unknown) => {
+    if (Number(userId) !== 42) return null;
+    const accountId = selectedAccount;
+    let released = false;
+    return { userId: 42, accountId, configDir: path.join(cwd, accountId), authDir: path.join(cwd, accountId), email: `${accountId}@fixture.test`, release: () => { if (!released) { released = true; accountReleases++; } } };
+  };
+  mock.method(claudeConnectionsService, 'getActiveConnection', () => null);
   releaseScenario = async () => {};
   try { await run(cwd, context, []); }
-  finally { mock.restoreAll(); await rm(cwd, { recursive: true, force: true }); }
+  finally {
+    mock.restoreAll();
+    await rm(cwd, { recursive: true, force: true });
+    await rm(cwd + '.chisa-state', { recursive: true, force: true });
+  }
 }
 
-test('bound workspace tools retain default confirmation and native-tool deny/allow policy', { timeout: 5000 }, async () => {
-  await fixture(async (cwd, context, frames) => {
-    await writeFile(path.join(cwd, '.chisa-bridge.json'), JSON.stringify({ protocol: 1, port: 19081, token: 'fixture', bindingEpoch: 'fixture' }));
-    const cases = [
-      { tool: 'mcp__workspace__write_file', input: { path: '/workspace/new.txt', expectedHash: null }, settings: {}, behavior: 'allow', asks: true },
-      { tool: 'mcp__workspace__run_command', input: { command: 'git status --short', readOnly: true }, settings: {}, behavior: 'allow', asks: true },
-      { tool: 'mcp__workspace__write_file', input: { expectedHash: null }, settings: { allowedTools: ['Write'], disallowedTools: ['Write'] }, behavior: 'deny', asks: false },
-      { tool: 'mcp__workspace__write_file', input: { expectedHash: 'loaded-version' }, settings: { disallowedTools: ['Edit'] }, behavior: 'deny', asks: false },
-      { tool: 'mcp__workspace__run_command', input: { command: 'git status --short' }, settings: { disallowedTools: ['Bash'] }, behavior: 'deny', asks: false },
-      { tool: 'mcp__workspace__write_file', input: { expectedHash: null }, settings: { allowedTools: ['Write'] }, behavior: 'allow', asks: false },
-      { tool: 'mcp__workspace__read_file', input: {}, settings: { allowedTools: ['Read'] }, behavior: 'allow', asks: false },
-      { tool: 'mcp__workspace__list_files', input: {}, settings: { allowedTools: ['Glob'] }, behavior: 'allow', asks: false },
-      { tool: 'mcp__workspace__search_files', input: { content: true }, settings: { allowedTools: ['Grep'] }, behavior: 'allow', asks: false },
-      { tool: 'mcp__workspace__run_command', input: { command: 'git status --short' }, settings: { allowedTools: ['Bash(git status:*)'] }, behavior: 'allow', asks: false },
-      { tool: 'mcp__workspace__write_file', input: { expectedHash: null }, settings: { allowedTools: ['mcp__workspace__write_file'] }, behavior: 'allow', asks: false },
-    ];
-    for (const [index, candidate] of cases.entries()) {
-      frames.length = 0;
-      let behavior: string | undefined;
-      scenario = input => Object.assign((async function* () {
-        assert.equal(input.options?.allowedTools?.some(tool => tool.startsWith('mcp__workspace')), false);
-        const decision = await input.options!.canUseTool!(candidate.tool, candidate.input, { signal: new AbortController().signal } as never);
-        assert.ok(decision);
-        behavior = decision.behavior;
-        yield { type: 'result', subtype: 'success' };
-      })(), { close() {} });
-      await queryClaudeSDK('fixture', { cwd, sessionId: `permission-${index}`, toolsSettings: { allowedTools: [], disallowedTools: [], skipPermissions: false, ...candidate.settings } }, {
-        send: (frame: NormalizedMessage) => {
-          frames.push(frame);
-          if (frame.kind === 'permission_request') queueMicrotask(() => resolveToolApproval(frame.requestId, { allow: true }));
-        },
-      }, context);
-      assert.equal(behavior, candidate.behavior, `${candidate.tool}: ${JSON.stringify(candidate.settings)}`);
-      assert.equal(frames.some(frame => frame.kind === 'permission_request'), candidate.asks);
-    }
+function sshFixture(sessionId = 'ssh-app-session') {
+  sshTarget = { ...sshTarget, phase: 'idle', activeRunId: null, pendingJobId: null };
+  sshProbes = 0;
+  sshOperations = 0;
+  sshPreflightRequests = [];
+  const row = { session_id: sessionId, provider: 'claude', provider_session_id: 'ssh-provider-session', project_path: sshAnchor, workspace_mode: 'shared' } as NonNullable<ReturnType<typeof sessionsDb.getSessionById>>;
+  mock.method(sshProjectTargetsDb, 'getByPath', (candidate: string) => {
+    const absolute = path.resolve(candidate);
+    return absolute === sshAnchor || absolute.startsWith(sshAnchor + path.sep) ? { ...sshTarget } : null;
   });
-});
+  mock.method(sshProjectTargetsDb, 'getByProjectId', () => ({ ...sshTarget }));
+  mock.method(sshProjectTargetsDb, 'getByAnchor', () => ({ ...sshTarget }));
+  mock.method(sshProjectTargetsDb, 'getSessionTarget', (id: string): SshSessionTarget | null => id === sessionId
+    ? { sessionId, projectId: sshTarget.projectId, generation: sshTarget.generation } : null);
+  mock.method(sshProjectTargetsDb, 'pinSession', () => ({ sessionId, projectId: sshTarget.projectId, generation: sshTarget.generation }));
+  mock.method(sshProjectTargetsDb, 'beginRun', (_project: string, runId: string) => {
+    sshTarget = { ...sshTarget, phase: 'running', activeRunId: runId };
+    return { ...sshTarget };
+  });
+  mock.method(sshProjectTargetsDb, 'finishRun', () => {
+    sshTarget = { ...sshTarget, phase: 'idle', activeRunId: null };
+    return { ...sshTarget };
+  });
+  mock.method(sessionsDb, 'getSessionById', (id: string) => id === sessionId ? row : null);
+  mock.method(sessionsDb, 'getSessionByProviderSessionId', (id: string) => id === row.provider_session_id ? row : null);
+  return row;
+}
 
-for (const stopBeforeExit of [true, false]) {
-  test(`Claude reports real process stop before handback completes; cancellation before exit=${stopBeforeExit}`, { timeout: 8000 }, async () => {
-    await fixture(async (cwd, context, frames) => {
-      const iteratorClosed = gate();
-      const launched = gate();
-      const syncing = gate();
-      const synchronized = gate();
-      const operations: string[] = [];
-      let child: import('node:child_process').ChildProcess | undefined;
-      let stoppedAfterExit: boolean | undefined;
-      let childClosed: Promise<unknown> | undefined;
-      const server = createServer((incoming, response) => {
-        void (async () => {
-          const chunks: Buffer[] = [];
-          for await (const chunk of incoming) chunks.push(Buffer.from(chunk));
-          const request = JSON.parse(Buffer.concat(chunks).toString()) as { op: string };
-          operations.push(request.op);
-          if (request.op === 'sync_end') {
-            syncing.resolve(); await synchronized.promise;
-            await rm(cwd + '.chisa-lease', { recursive: true });
+function watchRuntimeSideEffects(context: ProviderRuntimeContext) {
+  const calls = { session: 0, model: 0, catalog: 0, installed: 0, credentials: 0, managed: 0, mcp: 0 };
+  context.resolveProviderSessionId = () => { calls.session++; return 'untrusted-context-session'; };
+  context.resolveResumeModel = async () => { calls.model++; return 'sonnet'; };
+  context.getProviderModels = async () => { calls.catalog++; return {} as never; };
+  context.isProviderInstalled = async () => { calls.installed++; return true; };
+  mock.method(claudeConnectionsService, 'applyToOptions', () => { calls.credentials++; });
+  managedScenario = async () => { calls.managed++; throw new Error('Managed routing must not be selected'); };
+  mock.method(fs, 'access', async () => { calls.mcp++; throw Object.assign(new Error('isolated'), { code: 'ENOENT' }); });
+  return calls;
+}
+
+function assertNoRuntimeSideEffects(calls: ReturnType<typeof watchRuntimeSideEffects>) {
+  assert.deepEqual(calls, { session: 0, model: 0, catalog: 0, installed: 0, credentials: 0, managed: 0, mcp: 0 });
+  assert.equal(queries, 0);
+  assert.equal(sshProbes, 0);
+  assert.equal(sshOperations, 0);
+}
+
+for (const userId of [undefined, null, 'foreign'] as const) {
+  test(`Claude rejects SSH writer ${String(userId)} before any runtime lookup`, async () => {
+    await fixture(async (_cwd, context) => {
+      sshFixture();
+      const calls = watchRuntimeSideEffects(context);
+      for (const location of [{ cwd: sshAnchor }, { projectPath: sshAnchor }]) {
+        for (const sessionId of [undefined, 'ssh-app-session']) {
+          for (const model of ['sonnet', 'hiroute']) {
+            await assert.rejects(queryClaudeSDK('fixture', { ...location, sessionId, model, permissionMode: 'bypassPermissions' }, { userId, send() {} }, context), { code: 'SSH_WORKSPACE_FORBIDDEN' });
           }
-          response.end(JSON.stringify({ ok: true }));
-        })().catch(error => { response.statusCode = 500; response.end(JSON.stringify({ error: String(error) })); });
-      });
-      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
-      const address = server.address();
-      assert.ok(address && typeof address !== 'string');
-      await writeFile(path.join(cwd, '.chisa-bridge.json'), JSON.stringify({ protocol: 2, port: address.port, token: 'fixture', bindingEpoch: 'fixture' }));
-      scenario = input => {
-        child = input.options!.spawnClaudeCodeProcess!({
-          command: process.execPath, args: ['-e', "process.stdin.resume();process.stdin.on('data',data=>{if(data.toString().includes('exit'))process.exit(0)})"],
-          cwd, env: { ...process.env }, signal: new AbortController().signal,
-        } as never) as unknown as import('node:child_process').ChildProcess;
-        launched.resolve();
-        return Object.assign((async function* () { yield { type: 'system', subtype: 'init', session_id: 'real-process' }; await iteratorClosed.promise; })(), { close: () => iteratorClosed.resolve() });
-      };
-      let run: Promise<void> | undefined;
-      let stop: Promise<boolean> | undefined;
-      try {
-        run = queryClaudeSDK('fixture', { cwd, sessionId: 'real-process-fixture' }, {
-          send: (frame: NormalizedMessage) => {
-            if (frame.text === 'model_stopped') stoppedAfterExit = Boolean(child && (child.exitCode !== null || child.signalCode !== null));
-            frames.push(frame);
-          },
-        }, context);
-        await launched.promise;
-        // Linux cancellation kills the owned child immediately; observe close
-        // before cancelling, and never write to that child's closed stdin.
-        childClosed = once(child!, 'close');
-        let stopConfirmed = false;
-        if (stopBeforeExit) {
-          stop = abortClaudeSDKSession('real-process-fixture').then(value => { stopConfirmed = value; return value; });
-          assert.equal(stopConfirmed, false);
-        } else iteratorClosed.resolve();
-        if (!stopBeforeExit || process.platform !== 'linux') child!.stdin!.write('exit\n');
-        await childClosed;
-        await syncing.promise;
-        if (!stopBeforeExit) stop = abortClaudeSDKSession('real-process-fixture').then(value => { stopConfirmed = value; return value; });
-        assert.equal(frames.filter(frame => frame.text === 'model_stopped').length, 1);
-        assert.equal(stoppedAfterExit, true);
-        assert.equal(frames.find(frame => frame.text === 'model_stopped')?.canInterrupt, false);
-        assert.equal(stopConfirmed, false);
-        assert.equal(frames.some(frame => frame.kind === 'complete'), false);
-        await assert.rejects(queryClaudeSDK('must not overlap', { cwd, sessionId: 'real-process-fixture' }, { send() {} }, context), { code: 'RUN_IN_PROGRESS' });
-        synchronized.resolve();
-        assert.equal(await stop, true);
-        await run;
-        assert.deepEqual(operations, ['sync_begin', 'sync_end', 'sync_released']);
-      } finally {
-        synchronized.resolve();
-        iteratorClosed.resolve();
-        if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-        await Promise.allSettled([childClosed, run, stop]);
-        server.closeAllConnections();
-        await new Promise<void>(resolve => server.close(() => resolve()));
-        await rm(cwd + '.chisa-lease', { recursive: true, force: true });
+        }
       }
+      assertNoRuntimeSideEffects(calls);
     });
   });
 }
 
+test('Claude rejects unknown SSH anchors before model and SDK initialization', async () => {
+  await fixture(async (_cwd, context) => {
+    sshFixture();
+    const calls = watchRuntimeSideEffects(context);
+    await assert.rejects(queryClaudeSDK('fixture', { cwd: path.join(WORKSPACES_ROOT, '.chisa-ssh-projects', 'unknown') }, { userId: 42, send() {} }, context), { code: 'SSH_WORKSPACE_NOT_FOUND' });
+    assertNoRuntimeSideEffects(calls);
+  });
+});
+
+test('Claude rejects unmapped, native, foreign, provider-mismatched and stale SSH sessions before lookups', async () => {
+  await fixture(async (cwd, context) => {
+    const row = sshFixture();
+    const calls = watchRuntimeSideEffects(context);
+    for (const sessionId of ['missing-session', 'ssh-provider-session']) {
+      await assert.rejects(queryClaudeSDK('fixture', { cwd: sshAnchor, sessionId }, { userId: 42, send() {} }, context), { code: 'WORKSPACE_SELECTION_MISMATCH' });
+    }
+    mock.method(sessionsDb, 'getSessionById', () => ({ ...row, project_path: cwd }));
+    await assert.rejects(queryClaudeSDK('fixture', { cwd: sshAnchor, sessionId: row.session_id }, { userId: 42, send() {} }, context), { code: 'WORKSPACE_SELECTION_MISMATCH' });
+    const foreignAnchor = path.join(WORKSPACES_ROOT, '.chisa-ssh-projects', 'foreign-project');
+    mock.method(sshProjectTargetsDb, 'getByPath', (candidate: string) => path.resolve(candidate) === foreignAnchor
+      ? { ...sshTarget, projectId: 'foreign-project', ownerId: 'foreign', anchorPath: foreignAnchor } : { ...sshTarget });
+    mock.method(sessionsDb, 'getSessionById', () => ({ ...row, project_path: foreignAnchor }));
+    await assert.rejects(queryClaudeSDK('fixture', { cwd: sshAnchor, sessionId: row.session_id }, { userId: 42, send() {} }, context), { code: 'SSH_WORKSPACE_FORBIDDEN' });
+    mock.method(sessionsDb, 'getSessionById', () => ({ ...row, provider: 'codex' }));
+    await assert.rejects(queryClaudeSDK('fixture', { cwd: sshAnchor, sessionId: row.session_id }, { userId: 42, send() {} }, context), { code: 'WORKSPACE_PROVIDER_UNSUPPORTED' });
+    mock.method(sessionsDb, 'getSessionById', () => row);
+    for (const pin of [null, { sessionId: row.session_id, projectId: 'other-project', generation: sshTarget.generation }]) {
+      mock.method(sshProjectTargetsDb, 'getSessionTarget', () => pin);
+      await assert.rejects(queryClaudeSDK('fixture', { cwd: sshAnchor, sessionId: row.session_id }, { userId: 42, send() {} }, context), { code: 'WORKSPACE_SELECTION_MISMATCH' });
+    }
+    mock.method(sshProjectTargetsDb, 'getSessionTarget', () => ({ sessionId: row.session_id, projectId: sshTarget.projectId, generation: 'stale' }));
+    await assert.rejects(queryClaudeSDK('fixture', { cwd: sshAnchor, sessionId: row.session_id }, { userId: 42, send() {} }, context), { code: 'WORKSPACE_GENERATION_CHANGED' });
+    assertNoRuntimeSideEffects(calls);
+  });
+});
+
+test('Claude cannot resume a known SSH session through a cloud cwd', async () => {
+  await fixture(async (cwd, context) => {
+    const row = sshFixture();
+    const calls = watchRuntimeSideEffects(context);
+    for (const sessionId of [row.session_id, row.provider_session_id]) {
+      await assert.rejects(queryClaudeSDK('fixture', { cwd, sessionId }, { userId: 'foreign', send() {} }, context), { code: 'SSH_WORKSPACE_FORBIDDEN' });
+      await assert.rejects(queryClaudeSDK('fixture', { cwd, sessionId }, { userId: 42, send() {} }, context), { code: 'WORKSPACE_SELECTION_MISMATCH' });
+    }
+    assertNoRuntimeSideEffects(calls);
+  });
+});
+
+test('Claude allows an authenticated SSH owner with the exact pinned session and mapped provider id', async () => {
+  await fixture(async (_cwd, context) => {
+    const row = sshFixture();
+    const calls = watchRuntimeSideEffects(context);
+    scenario = input => {
+      assert.equal(input.options?.cwd, sshAnchor);
+      assert.equal(input.options?.resume, row.provider_session_id);
+      return Object.assign((async function* () { yield { type: 'result', subtype: 'success' }; })(), { close() {} });
+    };
+    await queryClaudeSDK('fixture', { projectPath: sshAnchor, sessionId: row.session_id, permissionMode: 'bypassPermissions' }, { userId: 42, send() {} }, context);
+    assert.equal(queries, 1);
+    assert.equal(calls.session, 0, 'the validated row owns provider resume mapping');
+    assert.equal(calls.model, 1);
+    assert.equal(calls.catalog, 1);
+    assert.equal(calls.credentials, 1);
+    assert.equal(sshProbes, 1);
+    assert.ok(sshOperations > 0, 'authenticated admission reads optional project configuration before query');
+    assert.ok(sshPreflightRequests.some(request => request.op === 'lstat' && request.path === '/workspace/CLAUDE.md'));
+    assert.ok(sshPreflightRequests.every(request => ['lstat', 'list', 'read'].includes(String(request.op))));
+    assert.equal(sshTarget.phase, 'idle');
+  });
+});
+
+test('Claude allows an authenticated direct SSH owner without a session', async () => {
+  await fixture(async (_cwd, context) => {
+    sshFixture();
+    const calls = watchRuntimeSideEffects(context);
+    scenario = input => {
+      assert.equal(input.options?.cwd, sshAnchor);
+      assert.equal(input.options?.resume, undefined);
+      return Object.assign((async function* () { yield { type: 'result', subtype: 'success' }; })(), { close() {} });
+    };
+    await queryClaudeSDK('fixture', { cwd: sshAnchor }, { userId: '42', send() {} }, context);
+    assert.equal(queries, 1);
+    assert.equal(calls.session, 0);
+    assert.equal(sshProbes, 1);
+    assert.ok(sshPreflightRequests.some(request => request.op === 'lstat' && request.path === '/workspace/CLAUDE.md'));
+    assert.ok(sshPreflightRequests.every(request => ['lstat', 'list', 'read'].includes(String(request.op))));
+    assert.equal(sshTarget.phase, 'idle');
+  });
+});
+
 test('Claude streams observed main-session versions without rewriting the pinned SDK model', { timeout: 5000 }, async () => {
   await fixture(async (cwd, context, frames) => {
-    context.resolveResumeModel = async () => 'claude-opus-5-5';
+    context.resolveResumeModel = async () => 'claude-opus-5';
     scenario = input => {
-      assert.equal(input.options?.model, 'claude-opus-5-5');
+      assert.equal(input.options?.model, 'claude-opus-5');
       void (async () => { for await (const _message of input.prompt as AsyncIterable<unknown>) { /* consume held stdin */ } })();
       return Object.assign((async function* () {
-        yield { type: 'system', subtype: 'init', session_id: 'provider-id', model: 'claude-opus-5-5' };
-        yield { type: 'assistant', session_id: 'provider-id', message: { model: 'claude-opus-5-5' } };
+        yield { type: 'system', subtype: 'init', session_id: 'provider-id', model: 'claude-opus-5' };
+        yield { type: 'assistant', session_id: 'provider-id', message: { model: 'claude-opus-5' } };
         yield { type: 'assistant', session_id: 'provider-id', parent_tool_use_id: 'task', message: { model: 'claude-haiku-4-5' } };
         yield { type: 'result', subtype: 'success' };
       })(), { close() {} });
     };
-    await queryClaudeSDK('fixture', { cwd, sessionId: 'version-fixture', model: 'claude-opus-5-5' }, { send: (frame: NormalizedMessage) => frames.push(frame) }, context);
+    await queryClaudeSDK('fixture', { cwd, sessionId: 'version-fixture', model: 'claude-opus-5' }, { send: (frame: NormalizedMessage) => frames.push(frame) }, context);
     const updates = frames.filter(frame => frame.kind === 'status' && frame.text === 'model_resolved');
     assert.equal(updates.length, 1);
-    assert.equal(updates[0].model, 'claude-opus-5-5');
+    assert.equal(updates[0].model, 'claude-opus-5');
+  });
+});
+
+test('Claude carries the selected workspace through admission but strips it from SDK options', { timeout: 5000 }, async () => {
+  await fixture(async (cwd, context) => {
+    const descriptor = describeWorkspaceSelection({ projectId: 'project', sourceRoot: cwd }).cloudReplica;
+    scenario = input => {
+      assert.equal(input.options?.cwd, cwd);
+      assert.equal('chisaWorkspaceDescriptor' in input.options!, false);
+      assert.equal('chisaSessionId' in input.options!, false);
+      return Object.assign((async function* () { yield { type: 'result', subtype: 'success' }; })(), { close() {} });
+    };
+    await queryClaudeSDK('fixture', { cwd, sessionId: 'selected-fixture', workspaceDescriptor: descriptor }, { send() {} }, context);
+    assert.equal(queries, 1);
+    await assert.rejects(queryClaudeSDK('stale', { cwd, sessionId: 'stale-fixture', workspaceDescriptor: { ...descriptor, generation: 'stale-generation' } }, { send() {} }, context), { code: 'WORKSPACE_GENERATION_CHANGED' });
+    assert.equal(queries, 1, 'a stale descriptor must stop before SDK entry');
+  });
+});
+
+test('Claude rechecks selected workspace at a delayed actual process launch', { timeout: 5000 }, async () => {
+  await fixture(async (cwd, context) => {
+    const descriptor = describeWorkspaceSelection({ projectId: 'project', sourceRoot: cwd }).cloudReplica;
+    let spawnChecked = false;
+    scenario = input => Object.assign((async function* () {
+      // Initializing a repository legitimately rotates its catalog generation
+      // after SDK entry, before the SDK invokes the actual process spawn hook.
+      await fs.mkdir(path.join(cwd, '.git'));
+      assert.throws(() => input.options!.spawnClaudeCodeProcess!({ command: 'must-not-execute', args: [], cwd, env: {}, signal: new AbortController().signal }), { code: 'WORKSPACE_GENERATION_CHANGED' });
+      spawnChecked = true;
+      yield { type: 'result', subtype: 'success' };
+    })(), { close() {} });
+    await queryClaudeSDK('fixture', { cwd, sessionId: 'delayed-spawn-fixture', workspaceDescriptor: descriptor }, { send() {} }, context);
+    assert.equal(spawnChecked, true);
   });
 });
 
@@ -291,7 +400,6 @@ test('Claude preserves the original workspace admission failure for the detached
     assert.equal(frames.filter(frame => frame.kind === 'error').length, 1);
     assert.equal(frames.filter(frame => frame.kind === 'complete').length, 1);
     assert.equal(frames.find(frame => frame.kind === 'complete')?.success, false);
-    assert.equal(frames.find(frame => frame.kind === 'complete')?.workspaceAdmissionRejected, true);
   });
 });
 
@@ -349,8 +457,10 @@ test('late successful preparation after cancellation releases its acquired gatew
 test('ordinary Claude selection applies only the saved active connection', { timeout: 5000 }, async () => {
   await fixture(async (cwd, context) => {
     managedScenario = async () => { throw new Error('Ordinary runs must not prepare HiRoute'); };
-    const active = mock.method(claudeConnectionsService, 'applyActiveToOptions', (options: Options, userId: unknown) => {
-      assert.equal(userId, 42);
+    const saved = { id: 'saved-fixture', name: 'Fixture', baseUrl: 'https://fixture.test', apiKey: 'fixture-key', model: 'saved-fixture-model', authType: 'api_key' as const };
+    mock.method(claudeConnectionsService, 'getActiveConnection', () => saved);
+    const active = mock.method(claudeConnectionsService, 'applyToOptions', (options: Options, connection: unknown) => {
+      assert.equal(connection, saved);
       assert.ok(options.abortController);
       options.model = 'saved-fixture-model';
     });
@@ -361,6 +471,42 @@ test('ordinary Claude selection applies only the saved active connection', { tim
     await queryClaudeSDK('fixture', { cwd, sessionId: 'saved-fixture', model: 'sonnet' }, { userId: 42, send() {} }, context);
     assert.equal(active.mock.callCount(), 1);
     assert.equal(queries, 1);
+  });
+});
+
+test('Claude fixes the account before asynchronous preparation and releases it before the next turn', { timeout: 5000 }, async () => {
+  await fixture(async (cwd, context) => {
+    const firstPreparation = gate();
+    const captured = gate();
+    context.resolveResumeModel = async () => { captured.resolve(); await firstPreparation.promise; return 'sonnet'; };
+    const configDirs: string[] = [];
+    scenario = input => {
+      configDirs.push(input.options!.env!.CLAUDE_CONFIG_DIR!);
+      return Object.assign((async function* () { yield { type: 'result', subtype: 'success' }; })(), { close() {} });
+    };
+    const first = queryClaudeSDK('fixture', { cwd, sessionId: 'identity-fixture' }, { userId: 42, send() {} }, context);
+    await captured.promise;
+    selectedAccount = 'profile-b';
+    assert.equal(accountReleases, 0);
+    firstPreparation.resolve();
+    await first;
+    assert.equal(accountReleases, 1);
+    await queryClaudeSDK('fixture', { cwd, sessionId: 'identity-fixture' }, { userId: 42, send() {} }, context);
+    assert.deepEqual(configDirs, [path.join(cwd, 'profile-a'), path.join(cwd, 'profile-b')]);
+    assert.equal(accountReleases, 2);
+    assert.deepEqual(historyCalls.map(call => call.accountId), ['profile-a', 'profile-a', 'profile-b', 'profile-b']);
+    assert.deepEqual(historyCalls.filter(call => call.options.cwd !== undefined).map(call => call.options.cwd), [cwd, cwd]);
+  });
+});
+
+test('Claude cannot fall back to global credentials for a user with no subscription scope', async () => {
+  await fixture(async (cwd, context) => {
+    captureAccount = () => null;
+    const frames: NormalizedMessage[] = [];
+    await assert.rejects(queryClaudeSDK('fixture', { cwd, sessionId: 'unscoped-fixture' }, { userId: 42, send: (frame: NormalizedMessage) => frames.push(frame) }, context), { code: 'CLAUDE_ACCOUNT_REQUIRED' });
+    assert.equal(queries, 0);
+    assert.equal(historyCalls.length, 0);
+    assert.ok(frames.some(frame => frame.kind === 'error'));
   });
 });
 
@@ -440,126 +586,5 @@ test('true background work retains held stdin after result and releases it after
     assert.equal(stdinEnded, true);
     assert.equal(frames.filter(frame => frame.kind === 'complete').length, 1);
     assert.equal(frames.find(frame => frame.kind === 'complete')?.success, true);
-  });
-});
-
-for (const failure of [
-  { name: 'ordinary turn', background: false, subtype: 'success', is_error: true },
-  { name: 'turn with background work', background: true, subtype: 'error_during_execution', is_error: true },
-]) {
-  test(`SDK error result from ${failure.name} closes stdin and completes as failure only after cleanup`, { timeout: 5000 }, async () => {
-    await fixture(async (cwd, context, frames) => {
-      const promptDone = gate();
-      const cleanupDone = gate();
-      scenario = input => {
-        void (async () => {
-          for await (const _message of input.prompt as AsyncIterable<unknown>) { /* consume held stdin */ }
-          promptDone.resolve();
-        })();
-        return Object.assign((async function* () {
-          if (failure.background) {
-            yield { type: 'assistant', message: { role: 'assistant', content: [
-              { type: 'tool_use', id: 'background-task', name: 'Bash', input: { run_in_background: true } },
-            ] } };
-          }
-          // Simulate the SDK result contract, not a real upstream quota response.
-          yield {
-            type: 'result', subtype: failure.subtype, is_error: failure.is_error,
-            result: 'Usage limit reached', errors: ['Usage limit reached'],
-            duration_ms: 1, duration_api_ms: 1, num_turns: 1, stop_reason: null,
-            total_cost_usd: 0, usage: { input_tokens: 0, output_tokens: 0 },
-            modelUsage: {}, permission_denials: [], uuid: 'error-result', session_id: 'sdk-error-session',
-          };
-          await promptDone.promise;
-          await cleanupDone.promise;
-        })(), { close: () => promptDone.resolve() });
-      };
-      const run = queryClaudeSDK('fixture', { cwd, sessionId: 'sdk-error-fixture' }, {
-        send: (frame: NormalizedMessage) => frames.push(frame),
-      }, context);
-      try {
-        await promptDone.promise;
-        assert.equal(frames.find(frame => frame.kind === 'error')?.content, 'Usage limit reached');
-        assert.equal(frames.some(frame => frame.text === 'background_work'), false);
-        assert.equal(frames.filter(frame => frame.kind === 'status').at(-1)?.text, 'workspace_finalizing');
-        assert.equal(frames.some(frame => frame.kind === 'complete'), false);
-        assert.equal(failedNotifications, 0);
-        cleanupDone.resolve();
-        await run;
-        const terminal = frames.filter(frame => frame.kind === 'complete');
-        assert.equal(terminal.length, 1);
-        assert.equal(terminal[0]?.exitCode, 1);
-        assert.equal(terminal[0]?.success, false);
-        assert.equal(failedNotifications, 1);
-        assert.equal(stoppedNotifications, 0);
-      } finally {
-        cleanupDone.resolve();
-        await run;
-      }
-    });
-  });
-}
-
-test('an SDK assistant quota error remains failed until cleanup and admits same-session resend at its terminal', { timeout: 5000 }, async () => {
-  await fixture(async (cwd, context, frames) => {
-    const normalizer = new ClaudeSessionsProvider();
-    context.normalizeMessage = (raw, sessionId) => normalizer.normalizeMessage(raw, sessionId);
-    const promptDone = gate();
-    const cleanupDone = gate();
-    scenario = input => {
-      const first = queries === 1;
-      const inputDone = first ? promptDone : gate();
-      void (async () => { for await (const _message of input.prompt as AsyncIterable<unknown>) { /* consume real held input */ } inputDone.resolve(); })();
-      return Object.assign((async function* () {
-        if (first) {
-          yield { type: 'assistant', uuid: 'quota-error', parent_tool_use_id: null, error: 'rate_limit', message: { role: 'assistant', content: [{ type: 'text', text: 'Usage limit reached (synthetic SDK contract)' }] } };
-        }
-        yield { type: 'result', subtype: 'success', is_error: false };
-        await inputDone.promise;
-        if (first) await cleanupDone.promise;
-      })(), { close: () => inputDone.resolve() });
-    };
-    let next: Promise<void> | undefined;
-    const run = queryClaudeSDK('first', { cwd, sessionId: 'assistant-error-resend' }, {
-      send: (frame: NormalizedMessage) => {
-        frames.push(frame);
-        if (frame.kind === 'complete') next = queryClaudeSDK('resend', { cwd, sessionId: 'assistant-error-resend' }, { send() {} }, context);
-      },
-    }, context);
-    try {
-      await promptDone.promise;
-      assert.equal(frames.some(frame => frame.kind === 'complete'), false);
-      assert.equal(frames.find(frame => frame.kind === 'error')?.code, 'rate_limit');
-      assert.equal(frames.some(frame => frame.kind === 'text'), false, 'the SDK quota error must not be a normal assistant reply');
-      cleanupDone.resolve();
-      await run;
-      await next;
-      assert.equal(queries, 2);
-      assert.equal(frames.filter(frame => frame.kind === 'error').length, 1);
-      const terminal = frames.filter(frame => frame.kind === 'complete');
-      assert.equal(terminal.length, 1);
-      assert.equal(terminal[0].exitCode, 1);
-      assert.equal(terminal[0].success, false);
-      assert.equal(failedNotifications, 1);
-    } finally { cleanupDone.resolve(); await run; await next; }
-  });
-});
-
-test('an SDK rate-limit warning does not turn a successful run into a failure', { timeout: 5000 }, async () => {
-  await fixture(async (cwd, context, frames) => {
-    const inputDone = gate();
-    context.normalizeMessage = (raw, sessionId) => new ClaudeSessionsProvider().normalizeMessage(raw, sessionId);
-    scenario = input => {
-      void (async () => { for await (const _message of input.prompt as AsyncIterable<unknown>) { /* consume held input */ } inputDone.resolve(); })();
-      return Object.assign((async function* () {
-        yield { type: 'rate_limit_event', rate_limit_info: { status: 'allowed_warning', utilization: 0.95 } };
-        yield { type: 'result', subtype: 'success', is_error: false };
-        await inputDone.promise;
-      })(), { close: () => inputDone.resolve() });
-    };
-    await queryClaudeSDK('warning', { cwd, sessionId: 'allowed-warning' }, { send: (frame: NormalizedMessage) => frames.push(frame) }, context);
-    assert.equal(frames.some(frame => frame.kind === 'error'), false);
-    assert.equal(frames.find(frame => frame.kind === 'complete')?.exitCode, 0);
-    assert.equal(failedNotifications, 0);
   });
 });

@@ -68,13 +68,10 @@ async function writeServerPackageJson(stageDir) {
     },
   };
   // The bundle stage is not a git checkout with dev dependencies, so lifecycle
-  // scripts such as Husky prepare must not run there. Dependency install scripts
-  // still run so native modules target the Node.js runtime used by this server.
+  // scripts such as Husky prepare must not run there.
   delete stagedPackageJson.scripts.postinstall;
   delete stagedPackageJson.scripts.prepare;
   delete stagedPackageJson.scripts.prepublishOnly;
-  delete stagedPackageJson.scripts.pretypecheck;
-  delete stagedPackageJson.scripts.pretest;
   await fs.writeFile(
     path.join(stageDir, 'package.json'),
     `${JSON.stringify(stagedPackageJson, null, 2)}\n`,
@@ -94,9 +91,6 @@ function sha256(filePath) {
 
 const platform = mapPlatform(process.env.CLOUDCLI_BUNDLE_PLATFORM || process.platform);
 const arch = mapArch(process.env.CLOUDCLI_BUNDLE_ARCH || process.arch);
-if (platform !== mapPlatform(process.platform) || arch !== mapArch(process.arch)) {
-  throw new Error('Build server bundles on their target platform and architecture so native dependencies match.');
-}
 const version = packageJson.version;
 const bundleName = `chisacloudcode-local-server-${version}-${platform}-${arch}.tar.gz`;
 const bundleRoot = path.join(rootDir, 'release', 'local-server');
@@ -111,11 +105,8 @@ await copyRequired(stageDir, 'dist');
 await copyRequired(stageDir, 'dist-server');
 await copyRequired(stageDir, 'public');
 await copyRequired(stageDir, 'shared');
-await copyRequired(stageDir, 'server/modules/workspace-sync/transport');
-await copyRequired(stageDir, 'scripts/install-workspace-sync.sh');
 await copyRequired(stageDir, 'package-lock.json');
 await copyIfExists(stageDir, 'scripts/fix-node-pty.js');
-await copyRequired(stageDir, 'scripts/promote-dist-server.mjs');
 await writeServerPackageJson(stageDir);
 
 console.log('Installing production server dependencies into bundle stage...');

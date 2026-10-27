@@ -1,6 +1,5 @@
+import { isIP } from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import type { ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import {
   access,
@@ -14,7 +13,6 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import os from 'node:os';
-import { isIP } from 'node:net';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -35,6 +33,38 @@ import type {
   WorkspacePathValidationResult,
 } from '@/shared/types.js';
 
+//----------------- CLAUDE CONNECTION VALIDATION ------------
+/** Providers runtime resolves only authenticated positive integer identities; missing identities select no override. */
+export function normalizeConnectionUserId(value: unknown): number | null {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+/** Providers settings operations require an authenticated identity, never an id supplied in request data. */
+export function requireConnectionUserId(value: unknown): number {
+  const id = normalizeConnectionUserId(value);
+  if (!id) throw new AppError('Authentication is required.', { code: 'UNAUTHORIZED', statusCode: 401 });
+  return id;
+}
+
+/** Normalize a Messages-compatible base URL while allowing provider prefix paths; rejects API suffixes and embedded secrets. */
+export function normalizeClaudeEndpointUrl(value: string): string {
+  try {
+    if (/[\s?#]/.test(value)) throw new Error('Invalid URL');
+    const url = new URL(value);
+    const pathname = decodeURIComponent(url.pathname).replace(/\/+$/, '');
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash
+      || /\/v1(?:\/messages)?$/i.test(pathname)) throw new Error('Invalid URL');
+    return url.toString().replace(/\/+$/, '');
+  } catch {
+    throw new AppError('Use an HTTP(S) base URL without credentials, query, fragment, /v1 or /v1/messages.', {
+      code: 'INVALID_CONNECTION_URL', statusCode: 400,
+    });
+  }
+}
+
+// ---------------------------
 //----------------- ENVIRONMENT UTILITIES ------------
 /**
  * Indicates whether the backend is running in hosted Platform mode rather than
@@ -45,9 +75,20 @@ import type {
 export const IS_PLATFORM = process.env.VITE_IS_PLATFORM === 'true';
 
 // ---------------------------
-//----------------- ACCOUNT WORKSPACE CALLBACK ADDRESSES ------------
+//----------------- ACCOUNT WORKSPACE TRANSPORT REGISTRY ------------
 const workspaceSyncTransportHosts = new Set<string>();
 const workspaceSyncNetworks = new Map<string, string>();
+const workspaceRuntimeOwners = new Map<string, string>();
+
+/** Workspace-runtime registers a verified account network without granting desktop callback access or clearing recovery barriers. */
+export function registerWorkspaceRuntimeNetwork(root: string, network: string, owner: string): void {
+  if (!path.isAbsolute(root) || !/^chisa-workspace-network-[a-f0-9]{24}$/.test(network) || !owner) throw new Error('Invalid workspace runtime network');
+  const canonical = path.resolve(root);
+  const previous = workspaceRuntimeOwners.get(canonical);
+  if (previous && previous !== owner) throw new Error('Workspace runtime belongs to another account');
+  workspaceRuntimeOwners.set(canonical, owner);
+  workspaceSyncNetworks.set(canonical, network);
+}
 const workspaceSyncRecoveryRoots = new Set<string>();
 
 /**
@@ -99,63 +140,6 @@ export function isWorkspaceSyncRecoveryOnly(candidate: string): boolean {
     const parent = path.dirname(root);
     if (parent === root) return false;
     root = parent;
-  }
-}
-
-// ---------------------------
-//----------------- PROVIDER PROCESS CANCELLATION ------------
-/** Cursor and OpenCode use this for their own spawned CLI process groups; callers spawn detached groups on POSIX. Completion means the CLI has actually closed, not merely received a signal. */
-export async function terminateProviderProcess(child: ChildProcess): Promise<void> {
-  if (!child.pid) return;
-  const pid = child.pid;
-  let closed = child.exitCode !== null || child.signalCode !== null;
-  const exited = closed ? Promise.resolve() : new Promise<void>(resolve => child.once('close', () => { closed = true; resolve(); }));
-  if (process.platform === 'win32') {
-    if (closed) return;
-    await new Promise<void>((resolve, reject) => {
-      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, error => {
-        if (error && !closed && child.exitCode === null && child.signalCode === null) reject(error);
-        else resolve();
-      });
-    });
-    await exited;
-    return;
-  }
-  const signalGroup = (signal: NodeJS.Signals) => {
-    try { process.kill(-pid, signal); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
-  };
-  if (!closed) {
-    signalGroup('SIGTERM');
-    let rejectTermination!: (error: unknown) => void;
-    const terminationFailure = new Promise<never>((_resolve, reject) => { rejectTermination = reject; });
-    const killTimer = setTimeout(() => { try { signalGroup('SIGKILL'); } catch (error) { rejectTermination(error); } }, 5_000);
-    killTimer.unref();
-    try { await Promise.race([exited, terminationFailure]); }
-    finally { clearTimeout(killTimer); }
-  }
-  // The CLI may exit before an invoked tool; stop any remaining members of its own group.
-  signalGroup('SIGKILL');
-  const groupAlive = async () => {
-    if (process.platform !== 'linux') {
-      try { process.kill(-pid, 0); return true; }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false; throw error; }
-    }
-    // Dead children can remain as zombies until PID 1 reaps them; they cannot execute or write.
-    for (const entry of await readdir('/proc')) {
-      if (!/^\d+$/.test(entry)) continue;
-      let value: string;
-      try { value = await readFile(`/proc/${entry}/stat`, 'utf8'); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ESRCH') continue; throw error; }
-      const fields = value.slice(value.lastIndexOf(')') + 2).trim().split(/\s+/);
-      if (Number(fields[2]) === pid && fields[0] !== 'Z' && fields[0] !== 'X') return true;
-    }
-    return false;
-  };
-  const deadline = Date.now() + 5_000;
-  while (await groupAlive()) {
-    if (Date.now() >= deadline) throw new Error('Provider process group termination was not confirmed');
-    await new Promise<void>(resolve => setTimeout(resolve, 25));
   }
 }
 
@@ -1345,40 +1329,3 @@ export const extractClaudeResolvedModel = (event: ClaudeModelEvent): string | nu
     && !['default', 'best', 'fable', 'sonnet', 'sonnet[1m]', 'opus', 'opus[1m]', 'haiku', 'opusplan'].includes(normalized)
     ? normalized : null;
 };
-
-
-
-//----------------- CLAUDE CONNECTION VALIDATION ------------
-/** Providers runtime resolves only authenticated positive integer identities; missing identities select no override. */
-export function normalizeConnectionUserId(value: unknown): number | null {
-  if (typeof value !== 'number' && typeof value !== 'string') return null;
-  const id = Number(value);
-  return Number.isSafeInteger(id) && id > 0 ? id : null;
-}
-
-
-
-/** Providers settings operations require an authenticated identity, never an id supplied in request data. */
-export function requireConnectionUserId(value: unknown): number {
-  const id = normalizeConnectionUserId(value);
-  if (!id) throw new AppError('Authentication is required.', { code: 'UNAUTHORIZED', statusCode: 401 });
-  return id;
-}
-
-
-
-/** Providers normalizes Messages base URLs while rejecting credentials, query secrets, and API suffixes. */
-export function normalizeClaudeEndpointUrl(value: string): string {
-  try {
-    if (/[\s?#]/.test(value)) throw new Error('Invalid URL');
-    const url = new URL(value);
-    const pathname = decodeURIComponent(url.pathname).replace(/\/+$/, '');
-    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash
-      || /\/v1(?:\/messages)?$/i.test(pathname)) throw new Error('Invalid URL');
-    return url.toString().replace(/\/+$/, '');
-  } catch {
-    throw new AppError('Use an HTTP(S) base URL without credentials, query, fragment, /v1 or /v1/messages.', {
-      code: 'INVALID_CONNECTION_URL', statusCode: 400,
-    });
-  }
-}

@@ -1,146 +1,5 @@
 @tailwind base;
 @tailwind components;
-
-/* Global touch rules stay outside class layers so important variants cannot clone their media groups. */
-/* Mobile touch optimization and safe areas */
-@media (max-width: 768px) {
-  * {
-    touch-action: manipulation;
-    -webkit-tap-highlight-color: transparent;
-  }
-
-  /* Allow vertical scrolling in scroll containers */
-  .overflow-y-auto, [data-scroll-container] {
-    touch-action: pan-y;
-    -webkit-overflow-scrolling: touch;
-  }
-
-  /* Preserve checkbox visibility */
-  input[type="checkbox"] {
-    -webkit-tap-highlight-color: rgba(0, 0, 0, 0.1);
-    opacity: 1 !important;
-  }
-
-  button,
-  [role="button"],
-  .clickable,
-  a,
-  .cursor-pointer {
-    -webkit-tap-highlight-color: transparent;
-    user-select: none;
-    -webkit-user-select: none;
-    touch-action: manipulation;
-  }
-
-  /* Better mobile touch targets */
-  .mobile-touch-target {
-    @apply min-h-[44px] min-w-[44px];
-  }
-
-  /* Chat message improvements */
-  .chat-message.user {
-    @apply justify-end;
-  }
-
-  .chat-message.user > div {
-    @apply max-w-[85%];
-  }
-
-  .chat-message.assistant > div,
-  .chat-message.error > div {
-    @apply w-full sm:max-w-[95%];
-  }
-
-  /* Session name truncation on mobile */
-  .session-name-mobile {
-    @apply truncate;
-    max-width: calc(100vw - 120px); /* Account for sidebar padding and buttons */
-  }
-
-  /* Enable text selection on mobile for terminal */
-  .xterm,
-  .xterm .xterm-viewport {
-    -webkit-user-select: text !important;
-    user-select: text !important;
-    -webkit-touch-callout: default !important;
-  }
-
-  /* Fix mobile scrolling */
-  .overflow-y-auto {
-    touch-action: pan-y;
-    -webkit-overflow-scrolling: touch;
-  }
-
-  .chat-message {
-    touch-action: pan-y;
-  }
-
-  /* Fix hover states on mobile */
-  .group:active .group-hover\:opacity-100,
-  .group .group-hover\:opacity-100 {
-    opacity: 1 !important;
-  }
-
-  @media (hover: none) and (pointer: coarse) {
-    .group-hover\:opacity-100 {
-      opacity: 1 !important;
-    }
-
-    .hover\:bg-gray-50:hover,
-    .hover\:bg-gray-100:hover,
-    .hover\:bg-red-200:hover,
-    .dark\:hover\:bg-gray-700:hover,
-    .dark\:hover\:bg-red-900\/50:hover {
-      background-color: inherit;
-    }
-  }
-}
-
-/* Touch device optimizations for all screen sizes */
-@media (hover: none) and (pointer: coarse) {
-  .touch\:opacity-100 {
-    opacity: 1 !important;
-  }
-
-  /* Completely disable hover states on touch devices */
-  * {
-    -webkit-tap-highlight-color: transparent !important;
-  }
-
-  /* Preserve checkbox visibility on touch devices */
-  input[type="checkbox"] {
-    -webkit-tap-highlight-color: rgba(0, 0, 0, 0.1) !important;
-    opacity: 1 !important;
-  }
-
-  /* Only disable hover states for interactive elements, not containers */
-  button:hover,
-  [role="button"]:hover,
-  .cursor-pointer:hover,
-  a:hover,
-  .hover\:bg-gray-50:hover,
-  .hover\:bg-gray-100:hover,
-  .hover\:text-gray-900:hover,
-  .hover\:opacity-100:hover {
-    background-color: inherit !important;
-    color: inherit !important;
-    opacity: inherit !important;
-    transform: inherit !important;
-  }
-
-  /* Force buttons to be immediately clickable */
-  button, [role="button"], .cursor-pointer {
-    cursor: pointer !important;
-    pointer-events: auto !important;
-  }
-
-  /* Keep active states for immediate feedback */
-  .active\:scale-\[0\.98\]:active,
-  .active\:scale-95:active {
-    transform: scale(0.98) !important;
-  }
-}
-
 @tailwind utilities;
 
 /* Global spinner animation - defined early to ensure it loads */
@@ -185,6 +44,8 @@
     --ring: 18 45% 47%;
     --sidebar-background: 45 20% 93%;
     --radius: 0.5rem;
+    /* UI and conversation text share bundled Latin/CJK faces; code keeps its mono stack. */
+    --font-ui: "Chisa Sans", "Chisa CJK", "Inter", "Noto Sans SC", "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
 
     /* Nav design tokens */
     --nav-glass-bg: 44 22% 96% / 0.7;
@@ -269,10 +130,18 @@
     transition: none;
   }
   
+  html {
+    font-family: var(--font-ui);
+  }
+
+  button, input, optgroup, select, textarea {
+    font-family: inherit;
+  }
+
   body {
     @apply bg-background text-foreground;
 
-    font-family: "Encode Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-family: var(--font-ui);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     margin: 0;
@@ -747,6 +616,150 @@
     contain-intrinsic-size: auto 96px;
   }
 
+}
+
+/* Global touch rules must stay outside Tailwind's utilities layer: generating
+   important variants of mixed universal/class selectors produces invalid CSS. */
+  /* Mobile touch optimization and safe areas */
+  @media (max-width: 768px) {
+    * {
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+    }
+    
+    /* Allow vertical scrolling in scroll containers */
+    .overflow-y-auto, [data-scroll-container] {
+      touch-action: pan-y;
+      -webkit-overflow-scrolling: touch;
+    }
+    
+    /* Preserve checkbox visibility */
+    input[type="checkbox"] {
+      -webkit-tap-highlight-color: rgba(0, 0, 0, 0.1);
+      opacity: 1 !important;
+    }
+    
+    button, 
+    [role="button"],
+    .clickable,
+    a,
+    .cursor-pointer {
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: manipulation;
+    }
+    
+    /* Better mobile touch targets */
+    .mobile-touch-target {
+      @apply min-h-[44px] min-w-[44px];
+    }
+    
+    /* Chat message improvements */
+    .chat-message.user {
+      @apply justify-end;
+    }
+    
+    .chat-message.user > div {
+      @apply max-w-[85%];
+    }
+    
+    .chat-message.assistant > div,
+    .chat-message.error > div {
+      @apply w-full sm:max-w-[95%];
+    }
+    
+    /* Session name truncation on mobile */
+    .session-name-mobile {
+      @apply truncate;
+      max-width: calc(100vw - 120px); /* Account for sidebar padding and buttons */
+    }
+    
+    /* Enable text selection on mobile for terminal */
+    .xterm,
+    .xterm .xterm-viewport {
+      -webkit-user-select: text !important;
+      user-select: text !important;
+      -webkit-touch-callout: default !important;
+    }
+    
+    /* Fix mobile scrolling */
+    .overflow-y-auto {
+      touch-action: pan-y;
+      -webkit-overflow-scrolling: touch;
+    }
+    
+    .chat-message {
+      touch-action: pan-y;
+    }
+    
+    /* Fix hover states on mobile */
+    .group:active .group-hover\:opacity-100,
+    .group .group-hover\:opacity-100 {
+      opacity: 1 !important;
+    }
+    
+    @media (hover: none) and (pointer: coarse) {
+      .group-hover\:opacity-100 {
+        opacity: 1 !important;
+      }
+      
+      .hover\:bg-gray-50:hover,
+      .hover\:bg-gray-100:hover,
+      .hover\:bg-red-200:hover,
+      .dark\:hover\:bg-gray-700:hover,
+      .dark\:hover\:bg-red-900\/50:hover {
+        background-color: inherit;
+      }
+    }
+  }
+  
+  /* Touch device optimizations for all screen sizes */
+  @media (hover: none) and (pointer: coarse) {
+    .touch\:opacity-100 {
+      opacity: 1 !important;
+    }
+    
+    /* Completely disable hover states on touch devices */
+    * {
+      -webkit-tap-highlight-color: transparent !important;
+    }
+    
+    /* Preserve checkbox visibility on touch devices */
+    input[type="checkbox"] {
+      -webkit-tap-highlight-color: rgba(0, 0, 0, 0.1) !important;
+      opacity: 1 !important;
+    }
+    
+    /* Only disable hover states for interactive elements, not containers */
+    button:hover,
+    [role="button"]:hover,
+    .cursor-pointer:hover,
+    a:hover,
+    .hover\:bg-gray-50:hover,
+    .hover\:bg-gray-100:hover,
+    .hover\:text-gray-900:hover,
+    .hover\:opacity-100:hover {
+      background-color: inherit !important;
+      color: inherit !important;
+      opacity: inherit !important;
+      transform: inherit !important;
+    }
+    
+    /* Force buttons to be immediately clickable */
+    button, [role="button"], .cursor-pointer {
+      cursor: pointer !important;
+      pointer-events: auto !important;
+    }
+    
+    /* Keep active states for immediate feedback */
+    .active\:scale-\[0\.98\]:active,
+    .active\:scale-95:active {
+      transform: scale(0.98) !important;
+    }
+  }
+  
+@layer utilities {
   /* Safe area support for iOS devices */
   .ios-bottom-safe {
     padding-bottom: env(safe-area-inset-bottom);

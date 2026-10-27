@@ -5,6 +5,8 @@ import os from 'node:os';
 import spawn from 'cross-spawn';
 
 import { projectsDb } from '@/modules/database/index.js';
+import { resolveSshProjectTarget } from '@/modules/workspace-bridge/index.js';
+import { AppError } from '@/shared/index.js';
 
 import { createTaskmasterRouter } from './taskmaster.routes.js';
 import { createTaskmasterService } from './taskmaster.service.js';
@@ -19,6 +21,10 @@ export const taskmasterRoutes = createTaskmasterRouter({
   fileSystem: fs,
   fileSystemPromises: fsPromises,
   spawnProcess: spawn,
-  resolveProjectPathById: (projectId) => projectsDb.getProjectPathById(projectId),
+  resolveProjectPathById: (projectId) => {
+    const root = projectsDb.getProjectPathById(projectId);
+    if (root && resolveSshProjectTarget(root)) throw new AppError('SSH 本地项目暂不支持 TaskMaster。', { code: 'SSH_WORKSPACE_UNSUPPORTED', statusCode: 409 });
+    return root;
+  },
   taskmasterService,
 });

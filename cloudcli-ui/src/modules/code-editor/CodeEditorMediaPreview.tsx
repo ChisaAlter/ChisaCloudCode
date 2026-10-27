@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 
-import { api } from '@/shared/api';
+import { useEditorWorkspaceApi } from '@/shared/context/WorkspaceScopeContext';
 import type { CodeEditorFile,PreviewKind } from '@/shared/types';
 import { getPreviewMimeType } from '@/modules/code-editor/utils/previewableFile';
 
@@ -45,6 +45,7 @@ export default function CodeEditorMediaPreview({
   onToggleFullscreen,
   labels,
 }: CodeEditorMediaPreviewProps) {
+  const api = useEditorWorkspaceApi(file);
   const [url, setUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -52,7 +53,7 @@ export default function CodeEditorMediaPreview({
   // this so a blob from a previously-opened file can never show under the new
   // file (the editor reuses this component instance across files).
   const [loadedKey, setLoadedKey] = useState<string | null>(null);
-  const sourceKey = `${projectId ?? ''}:${file.path}:${kind}`;
+  const sourceKey = JSON.stringify([projectId, file.path, kind, file.workspace?.workspaceId, file.workspace?.generation, file.workspace === null]);
 
   useEffect(() => {
     if (!projectId) {
@@ -136,7 +137,7 @@ export default function CodeEditorMediaPreview({
         URL.revokeObjectURL(objectUrl);
       }
     };
-  }, [file.path, file.name, projectId, kind, sourceKey, labels.error]);
+  }, [api, file.path, file.name, projectId, kind, sourceKey, labels.error]);
 
   // Only expose the blob once it matches the file currently being shown, so a
   // stale URL from the previous file is never rendered during a switch.

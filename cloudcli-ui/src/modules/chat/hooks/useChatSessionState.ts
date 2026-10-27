@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { MutableRefObject } from 'react';
 
 import { api } from '@/shared/api';
-import type { ChatReplayCursor, MarkSessionIdle, SessionActivityMap,Project,ProjectSession,LLMProvider,NormalizedMessage,ChatMessage,DiffCalculator } from '@/shared/types';
+import type { MarkSessionIdle, SessionActivityMap,Project,ProjectSession,LLMProvider,NormalizedMessage,ChatMessage,DiffCalculator } from '@/shared/types';
 import type { SessionStore } from '@/modules/chat/hooks/useSessionStore';
 import { SESSION_MESSAGES_PAGE_SIZE } from '@/modules/chat/utils/sessionMessagePagination';
 import { createMessageHistoryRefreshCoordinator } from '@/modules/chat/utils/messageHistoryRefreshCoordinator';
@@ -90,8 +90,9 @@ type UseChatSessionStateArgs = {
   onSessionIdle?: MarkSessionIdle;
   /** When each session's `chat.subscribe` was last sent; guards stale idle acks. */
   statusCheckSentAtRef: MutableRefObject<Map<string, number>>;
-  /** Channel replay progress carries its epoch independently of the current execution run. */
-  replayCursorsRef: MutableRefObject<Map<string, ChatReplayCursor>>;
+  /** Highest observed seq in each session's current run; sent with its run id. */
+  lastSeqRef: MutableRefObject<Map<string, number>>;
+  cursorRunIdRef: MutableRefObject<Map<string, string>>;
   sessionStore: SessionStore;
 };
 
@@ -188,20 +189,11 @@ export function useChatSessionState({
   processingSessions,
   onSessionIdle,
   statusCheckSentAtRef,
-  replayCursorsRef,
+  lastSeqRef,
+  cursorRunIdRef,
   sessionStore,
 }: UseChatSessionStateArgs) {
-  // The temporary id of a newly allocated session is valid only in its owning project.
-  const [currentSession, setCurrentSession] = useState<{ id: string; projectId: string } | null>(
-    selectedSession && selectedProject ? { id: selectedSession.id, projectId: selectedProject.projectId } : null,
-  );
-  const currentProjectIdRef = useRef(selectedProject?.projectId ?? null);
-  currentProjectIdRef.current = selectedProject?.projectId ?? null;
-  const currentSessionId = currentSession?.projectId === selectedProject?.projectId ? currentSession?.id ?? null : null;
-  const setCurrentSessionId = useCallback((id: string | null) => {
-    const projectId = currentProjectIdRef.current;
-    setCurrentSession(id && projectId ? { id, projectId } : null);
-  }, []);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(selectedSession?.id || null);
   const [isLoadingSessionMessages, setIsLoadingSessionMessages] = useState(false);
   const [isLoadingMoreMessages, setIsLoadingMoreMessages] = useState(false);
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
@@ -677,10 +669,8 @@ export function useChatSessionState({
         type: 'chat.subscribe',
         sessions: [{
           sessionId: selectedSession.id,
-          lastSeq: replayCursorsRef.current.get(selectedSession.id)?.seq ?? 0,
-          ...(replayCursorsRef.current.get(selectedSession.id)?.replayEpoch
-            ? { replayEpoch: replayCursorsRef.current.get(selectedSession.id)?.replayEpoch } : {}),
-          runId: replayCursorsRef.current.get(selectedSession.id)?.runId,
+          lastSeq: lastSeqRef.current.get(selectedSession.id) ?? 0,
+          runId: cursorRunIdRef.current.get(selectedSession.id) ?? null,
         }],
       });
     } catch (error) {
@@ -688,7 +678,7 @@ export function useChatSessionState({
       // or reinterpret the last known task as idle.
       console.warn('Chat subscription deferred until reconnect:', error);
     }
-  }, [replayCursorsRef, selectedProject, selectedSession, sendMessage, statusCheckSentAtRef, ws]);
+  }, [cursorRunIdRef, lastSeqRef, selectedProject, selectedSession, sendMessage, statusCheckSentAtRef, ws]);
 
   // Main session loading effect — store-based.
   //
@@ -773,7 +763,7 @@ export function useChatSessionState({
         && activeSessionIdRef.current === selectedSessionId
       ),
     }).then(slot => {
-      if (slot && activeSessionIdRef.current === selectedSessionId) {
+      if (slot) {
         setHasMoreMessages(slot.hasMore);
         setTotalMessages(slot.total);
         messagesOffsetRef.current = slot.offset;
@@ -781,9 +771,9 @@ export function useChatSessionState({
           setTokenBudget((slot.tokenUsage as Record<string, unknown> | null) ?? null);
         }
       }
-      if (activeSessionIdRef.current === selectedSessionId) setIsLoadingSessionMessages(false);
+      setIsLoadingSessionMessages(false);
     }).catch(() => {
-      if (activeSessionIdRef.current === selectedSessionId) setIsLoadingSessionMessages(false);
+      setIsLoadingSessionMessages(false);
     });
   }, [
     isActive,

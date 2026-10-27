@@ -11,13 +11,9 @@
  * - codexRuntime.abort(sessionId) - Cancel an active session
  */
 
-import { AsyncLocalStorage } from 'node:async_hooks';
-import type { ChildProcess } from 'node:child_process';
-import { channel } from 'node:diagnostics_channel';
+import type { ModelReasoningEffort, ThreadOptions } from '@openai/codex-sdk';
 
-import { Codex } from '@openai/codex-sdk';
-import type { ModelReasoningEffort, Thread, ThreadEvent, ThreadOptions } from '@openai/codex-sdk';
-
+import { runProviderProcess } from '@/modules/providers/services/provider-process.service.js';
 import {
   appendFilesInputTag,
   buildCodexInputItems,
@@ -29,38 +25,14 @@ import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index
 import type { AnyRecord, ProviderRuntimeContext, ProviderRuntimeWriter } from '@/shared/index.js';
 
 type ActiveCodexSession = {
-  status: 'running' | 'stopping' | 'completed';
+  status: 'running' | 'aborted' | 'completed';
   abortController: AbortController;
-  abortRequested: boolean;
-  processes: ChildProcess[];
-  done: Promise<void>;
+  completion: Promise<void>;
+  cleanupError?: unknown;
+  startedAt: string;
 };
 
 const activeCodexSessions = new Map<string, ActiveCodexSession>();
-const codexSpawnScope = new AsyncLocalStorage<ActiveCodexSession>();
-
-// The SDK exposes no spawn callback. Node's public channel observes only the
-// child created while advancing this run's SDK iterator, without replacing spawn.
-channel('child_process').subscribe((message) => {
-  const session = codexSpawnScope.getStore();
-  if (session) session.processes.push((message as { process: ChildProcess }).process);
-});
-
-async function waitForCodexProcesses(session: ActiveCodexSession): Promise<void> {
-  await Promise.all(session.processes.map(async (child) => {
-    // SDK cleanup removes every listener, so attach this waiter only after its
-    // iterator has settled. An exit code/signal already proves OS process exit;
-    // a missing pid means spawn failed before a process was created.
-    if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
-    await new Promise<void>((resolve) => {
-      const onClose = () => { child.off('error', onError); resolve(); };
-      // A failed signal is not exit: retain the close barrier and its run.
-      const onError = (error: Error) => { console.error('[Codex] Process did not confirm exit:', error); };
-      child.once('close', onClose);
-      child.on('error', onError);
-    });
-  }));
-}
 
 /**
  * Item types whose in-flight updates are worth showing. These are the ones a
@@ -253,6 +225,8 @@ function transformCodexEvent(event: AnyRecord): AnyRecord {
  */
 function mapPermissionModeToCodexOptions(permissionMode: string): Pick<ThreadOptions, 'sandboxMode' | 'approvalPolicy'> {
   switch (permissionMode) {
+    case 'plan':
+      return { sandboxMode: 'read-only', approvalPolicy: 'never' };
     case 'acceptEdits':
       return {
         sandboxMode: 'workspace-write',
@@ -285,6 +259,7 @@ async function queryCodex(
   options: AnyRecord = {},
   ws: ProviderRuntimeWriter,
   context: ProviderRuntimeContext,
+  runProcess: typeof runProviderProcess,
 ) {
   const {
     sessionId,
@@ -302,11 +277,19 @@ async function queryCodex(
   // provider-native id recorded on the session row.
   const providerSessionId = context.resolveProviderSessionId(sessionId);
 
+  const resolvedModel = await context.resolveResumeModel(sessionId, model);
+
   const workingDirectory = cwd || projectPath || process.cwd();
   const { sandboxMode, approvalPolicy } = mapPermissionModeToCodexOptions(permissionMode);
+  const catalog = await context.getProviderModels();
+  const selectedModel = catalog.OPTIONS.find((option) => option.value === resolvedModel) || null;
+  const allowedEfforts = selectedModel?.effort?.values?.map((value) => value.value) || [];
+  const resolvedEffort = typeof effort === 'string' && effort !== 'default' && allowedEfforts.includes(effort)
+    ? effort as ModelReasoningEffort
+    : undefined;
 
-  let thread: Thread | null = null;
-  let events: AsyncGenerator<ThreadEvent> | null = null;
+  let resolveCompletion!: () => void;
+  const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
   // Provider-native thread id (starts as the resume id, or is captured from
   // the stream for brand-new sessions).
   let capturedSessionId = providerSessionId;
@@ -319,62 +302,16 @@ async function queryCodex(
   // when the stream already reported the failure.
   let errorSurfaced = false;
   const abortController = new AbortController();
-  let finishRun!: () => void;
-  const lifecycle: ActiveCodexSession = {
-    status: 'running',
-    abortController,
-    abortRequested: false,
-    processes: [],
-    done: new Promise<void>((resolve) => { finishRun = resolve; }),
-  };
+  const externalSignal = options.abortSignal as AbortSignal | undefined;
+  const cancel = () => abortController.abort(externalSignal?.reason);
+  externalSignal?.addEventListener('abort', cancel, { once: true });
+  if (externalSignal?.aborted) cancel();
   // Session-map key: the app session id when the caller supplied one, else
   // the provider-native thread id once captured (legacy/direct API callers).
   const sessionKey = () => sessionId || capturedSessionId || null;
-  const registerSession = () => {
-    const key = sessionKey();
-    if (!key) return;
-    const previous = activeCodexSessions.get(key);
-    if (previous && previous !== lifecycle && previous.status !== 'completed') {
-      throw new Error(`Codex session "${key}" is still running or stopping.`);
-    }
-    activeCodexSessions.set(key, lifecycle);
-  };
-  registerSession();
-  const callerSignal = options.abortSignal as AbortSignal | undefined;
-  const cancelFromCaller = () => {
-    lifecycle.status = 'stopping';
-    abortController.abort(callerSignal?.reason);
-  };
-  if (callerSignal?.aborted) cancelFromCaller();
-  else callerSignal?.addEventListener('abort', cancelFromCaller, { once: true });
-
-  let stoppedExecution: Promise<Error | null> | null = null;
-  const settleExecution = () => stoppedExecution ??= (async () => {
-    let iteratorError: Error | null = null;
-    try {
-      if (events) await codexSpawnScope.run(lifecycle, () => events!.return(undefined));
-    } catch (error) {
-      // Iterator rejection (including AbortError) is separate from process
-      // exit. Preserve it as a run result, not a rejected cleanup barrier.
-      iteratorError = error instanceof Error ? error : new Error(String(error));
-    }
-    await waitForCodexProcesses(lifecycle);
-    return iteratorError;
-  })();
 
   try {
     abortController.signal.throwIfAborted();
-    const resolvedModel = await context.resolveResumeModel(sessionId, model);
-    abortController.signal.throwIfAborted();
-    const catalog = await context.getProviderModels();
-    abortController.signal.throwIfAborted();
-    const selectedModel = catalog.OPTIONS.find((option) => option.value === resolvedModel) || null;
-    const allowedEfforts = selectedModel?.effort?.values?.map((value) => value.value) || [];
-    const resolvedEffort = typeof effort === 'string' && effort !== 'default' && allowedEfforts.includes(effort)
-      ? effort as ModelReasoningEffort
-      : undefined;
-    const codex = new Codex();
-
     const threadOptions: ThreadOptions = {
       workingDirectory,
       skipGitRepoCheck: true,
@@ -384,10 +321,20 @@ async function queryCodex(
       modelReasoningEffort: resolvedEffort,
     };
 
-    if (providerSessionId) {
-      thread = codex.resumeThread(providerSessionId, threadOptions);
-    } else {
-      thread = codex.startThread(threadOptions);
+    const registerSession = (id: string | null) => {
+      if (!id) {
+        return;
+      }
+      activeCodexSessions.set(id, {
+        status: 'running',
+        abortController,
+        completion,
+        startedAt: new Date().toISOString()
+      });
+    };
+
+    if (sessionKey()) {
+      registerSession(sessionKey());
     }
 
     // Execute with streaming. Turns with image attachments send structured
@@ -396,25 +343,18 @@ async function queryCodex(
     const turnInput = normalizeImageDescriptors(images).length > 0
       ? buildCodexInputItems(promptWithFiles, images, workingDirectory)
       : promptWithFiles;
-    const streamedTurn = await thread.runStreamed(turnInput, {
-      signal: abortController.signal
-    });
-    events = streamedTurn.events;
-    abortController.signal.throwIfAborted();
-
-    for (;;) {
-      const next = await codexSpawnScope.run(lifecycle, () => events!.next());
-      if (next.done) break;
-      const event = next.value;
+    const result = await (context.runProcess ?? runProcess)({
+      kind: 'codex', providerSessionId, threadOptions, input: turnInput,
+    }, { event(event) {
       // Capture thread/session id lazily from the stream (Codex emits this asynchronously).
       if (event.type === 'thread.started') {
         const discoveredSessionId = event.thread_id || null;
         if (discoveredSessionId && !capturedSessionId) {
           capturedSessionId = discoveredSessionId;
-          registerSession();
+          registerSession(sessionKey());
 
           if (ws.setSessionId && typeof ws.setSessionId === 'function') {
-            ws.setSessionId(capturedSessionId);
+            ws.setSessionId(discoveredSessionId);
           }
 
           if (!providerSessionId && !sessionCreatedSent) {
@@ -424,10 +364,11 @@ async function queryCodex(
         }
       }
 
-      // Drain the SDK after cancellation instead of returning from its iterator
-      // early: cancellation is not confirmed until the real process also exits.
-      if (abortController.signal.aborted) {
-        continue;
+      // Check if session was aborted
+      if (abortController.signal.aborted) return;
+      if (sessionKey()) {
+        const session = activeCodexSessions.get(sessionKey() || '');
+        if (session?.status === 'aborted') return;
       }
 
       // Progress events used to be dropped, so a long shell command or a
@@ -440,7 +381,7 @@ async function queryCodex(
         (event.type === 'item.started' || event.type === 'item.updated')
         && !PROGRESSIVE_CODEX_ITEM_TYPES.has(event.item?.type)
       ) {
-        continue;
+        return;
       }
 
       const transformed = transformCodexEvent(event);
@@ -451,8 +392,8 @@ async function queryCodex(
       // Normalize the transformed event into NormalizedMessage(s) via adapter
       const normalizedMsgs = context.normalizeMessage(transformed, capturedSessionId || sessionId || null);
       for (const msg of normalizedMsgs) {
-        // turn.completed is a protocol event, not OS process exit. The runtime
-        // emits its one terminal complete only after the SDK/child settle.
+        // turn.completed can precede CLI/tool exit. Only the terminal below is
+        // allowed to finish the run after the supervisor has reaped its tree.
         if (msg.kind !== 'complete') sendMessage(ws, msg);
       }
 
@@ -476,18 +417,19 @@ async function queryCodex(
           sendMessage(ws, createNormalizedMessage({ kind: 'status', text: 'token_budget', tokenBudget, sessionId: capturedSessionId || sessionId || null, provider: 'codex' }));
         }
       }
-    }
+    } }, abortController.signal);
+    if (result.error) throw Object.assign(new Error(result.error.message), { name: result.error.name });
+    if (result.code !== 0) throw new Error(`Codex worker exited with code ${result.code}`);
 
-    // The gateway owns aborted completion and awaits this run's done barrier.
-    const iteratorError = await settleExecution();
-    if (iteratorError && !abortController.signal.aborted) throw iteratorError;
-    lifecycle.status = 'completed';
-    const runAborted = abortController.signal.aborted;
+    // Send the terminal completion event — skipped for aborted runs, whose
+    // terminal `complete` (aborted: true) was already sent by abort-session.
+    const runSession = activeCodexSessions.get(sessionKey() || '');
+    const runAborted = runSession?.status === 'aborted' || abortController.signal.aborted;
     if (!runAborted) {
       sendMessage(ws, createCompleteMessage({
         provider: 'codex',
         sessionId: capturedSessionId || sessionId || null,
-        actualSessionId: capturedSessionId || thread?.id || sessionId || null,
+        actualSessionId: capturedSessionId || sessionId || null,
         exitCode: terminalFailure ? 1 : 0,
       }));
       if (!terminalFailure) {
@@ -502,10 +444,18 @@ async function queryCodex(
     }
 
   } catch (error) {
+    const session = activeCodexSessions.get(sessionKey() || '');
     const runError = error instanceof Error ? error : new Error(String(error));
-    await settleExecution();
-    lifecycle.status = 'completed';
-    const wasAborted = abortController.signal.aborted;
+    // A failed teardown must retain workspace ownership and be visible to the
+    // dispatcher. It is never an ordinary provider/model error or safe abort.
+    if ((error as { processTeardownError?: boolean })?.processTeardownError) {
+      if (session) session.cleanupError = error;
+      throw error;
+    }
+    const wasAborted =
+      session?.status === 'aborted' ||
+      runError.name === 'AbortError' ||
+      runError.message.toLowerCase().includes('aborted');
 
     if (!wasAborted) {
       console.error('[Codex] Error:', error);
@@ -536,25 +486,22 @@ async function queryCodex(
     }
 
   } finally {
-    await settleExecution();
-    lifecycle.status = 'completed';
-    if (abortController.signal.aborted) {
-      sendMessage(ws, createNormalizedMessage({
-        kind: 'status', text: 'model_stopped', canInterrupt: false,
-        provider: 'codex', sessionId: capturedSessionId || sessionId || null,
-      }));
+    externalSignal?.removeEventListener('abort', cancel);
+    resolveCompletion();
+    // Update session status
+    if (sessionKey()) {
+      const session = activeCodexSessions.get(sessionKey() || '');
+      if (session) {
+        session.status = session.status === 'aborted' ? 'aborted' : 'completed';
+      }
     }
-    callerSignal?.removeEventListener('abort', cancelFromCaller);
-    const key = sessionKey();
-    if (key && activeCodexSessions.get(key) === lifecycle) activeCodexSessions.delete(key);
-    finishRun();
   }
 }
 
 /**
  * Abort an active Codex session
  * @param {string} sessionId - Session ID to abort
- * Resolves true only after this run's SDK iterator and CLI have exited.
+ * @returns {boolean} - Whether abort was successful
  */
 async function abortCodexSession(sessionId: string) {
   const session = activeCodexSessions.get(sessionId);
@@ -563,28 +510,28 @@ async function abortCodexSession(sessionId: string) {
     return false;
   }
 
-  session.status = 'stopping';
-  const retryRequested = session.abortRequested;
-  session.abortRequested = true;
-  session.abortController.abort();
-  if (retryRequested) {
-    // AbortController only dispatches once. A later explicit stop must still
-    // be able to target a CLI that has not exited after the earlier request.
-    for (const child of session.processes) {
-      if (child.pid && child.exitCode === null && child.signalCode === null && !child.kill('SIGTERM')) {
-        throw new Error('Codex CLI did not accept the cancellation signal; the task is still reserved.');
-      }
-    }
+  session.status = 'aborted';
+  try {
+    session.abortController?.abort();
+  } catch (error) {
+    console.warn(`[Codex] Failed to abort session ${sessionId}:`, error);
   }
-  await session.done;
+
+  await session.completion;
+  if (session.cleanupError) throw session.cleanupError;
   return true;
 }
 
+/** Providers tests inject owned process events without invoking the SDK/model. */
+export function createCodexRuntime(runProcess: typeof runProviderProcess = runProviderProcess) {
+  return {
+    run: (command: string, options: AnyRecord, writer: ProviderRuntimeWriter, context: ProviderRuntimeContext) => queryCodex(command, options, writer, context, runProcess),
+    abort: abortCodexSession,
+  };
+}
+
 /** Used by the providers module's CodexProvider to run and abort SDK turns. */
-export const codexRuntime = {
-  run: queryCodex,
-  abort: abortCodexSession,
-};
+export const codexRuntime = createCodexRuntime();
 
 /**
  * Helper to send message via WebSocket or writer
@@ -604,3 +551,22 @@ function sendMessage(ws: ProviderRuntimeWriter, data: unknown) {
     console.error('[Codex] Error sending message:', error);
   }
 }
+
+// Clean up old completed sessions periodically
+const completedSessionCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  const maxAge = 30 * 60 * 1000; // 30 minutes
+
+  for (const [id, session] of activeCodexSessions.entries()) {
+    if (session.status !== 'running') {
+      const startedAt = new Date(session.startedAt).getTime();
+      if (now - startedAt > maxAge) {
+        activeCodexSessions.delete(id);
+      }
+    }
+  }
+}, 5 * 60 * 1000); // Every 5 minutes
+
+// Runtime cleanup should not keep focused tests or one-off scripts alive after
+// their provider work has completed.
+completedSessionCleanupTimer.unref?.();

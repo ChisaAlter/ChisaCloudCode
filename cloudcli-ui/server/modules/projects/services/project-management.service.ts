@@ -7,7 +7,7 @@ import type {
   ProjectRepositoryRow,
   WorkspacePathValidationResult,
 } from '@/shared/types.js';
-import { AppError, normalizeProjectPath, validateWorkspacePath } from '@/shared/utils.js';
+import { AppError, WORKSPACES_ROOT, normalizeProjectPath, validateWorkspacePath } from '@/shared/index.js';
 
 type CreateProjectInput = {
   projectPath: string;
@@ -107,6 +107,15 @@ export async function createProject(
   }
 
   const resolvedProjectPath = normalizeProjectPath(pathValidation.resolvedPath);
+  const reservedAnchors = path.resolve(WORKSPACES_ROOT, '.chisa-ssh-projects');
+  const resolvedPath = path.resolve(resolvedProjectPath);
+  if (resolvedPath === reservedAnchors || resolvedPath.startsWith(reservedAnchors + path.sep)) {
+    throw new AppError('SSH metadata anchors cannot be registered as cloud project sources', { code: 'SSH_ANCHOR_RESERVED', statusCode: 400 });
+  }
+  if (process.platform === 'linux' && process.env.WORKSPACES_ROOT
+    && path.resolve(resolvedProjectPath) === path.resolve(WORKSPACES_ROOT)) {
+    throw new AppError('请选择账号工作目录下的项目子目录', { code: 'PROJECT_ROOT_REQUIRED', statusCode: 400 });
+  }
   await dependencies.ensureWorkspaceDirectory(resolvedProjectPath);
 
   const normalizedCustomName = resolveDisplayName(input.customName ?? null, resolvedProjectPath);

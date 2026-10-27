@@ -13,7 +13,7 @@ const MENU_GAP = 8;
  * upward and leftward without measuring itself first, so it never paints in the
  * wrong spot for a frame. The same anchor works on phones because `maxWidth`
  * shrinks the menu instead of letting it run off the left edge.
- * Shared by chat and local-agent so both input areas use the same popup placement and dismissal.
+ * Chat uses this hook for consistent model, permission and scheduling popup placement.
  */
 export function useComposerMenuAnchor(
   isOpen: boolean,

@@ -31,6 +31,17 @@ mock.module('@/modules/providers/services/hiroute-host.service.js', { namedExpor
     };
   },
 } });
+let profileReleases = 0;
+mock.module('@/modules/providers/services/claude-accounts.service.js', { namedExports: { claudeAccountsService: {
+  captureLaunch: (userId: number) => ({ userId, accountId: 'fixture-account', configDir: '/fixture/account', authDir: '/fixture/account', email: 'fixture@example.test', release: () => { profileReleases++; } }),
+  readSubscription: async () => {
+    let oauth: Json = {};
+    try { oauth = JSON.parse(await credentialRead()).claudeAiOauth ?? {}; } catch { /* absent fixture */ }
+    const environmentToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    const accessToken = environmentToken || oauth.accessToken;
+    return accessToken ? { accountId: 'fixture-account', accessToken, expiresAt: environmentToken ? null : oauth.expiresAt ?? null, subscriptionType: oauth.subscriptionType } : null;
+  },
+} } });
 const { prepareManagedHiRoute, releaseManagedHiRoute } = await import('@/modules/providers/services/hiroute-managed.service.js');
 
 const saved = (id: string, model = 'model-a'): ClaudeModelConnectionSecret => ({ id, name: 'Shared label', baseUrl: 'https://fixture.example/anthropic', model, authType: 'api_key', apiKey: 'fixture-private-key' });
@@ -47,7 +58,7 @@ async function fixture(run: () => Promise<void>) {
   const keys = ['CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CONFIG_DIR', 'CLAUDE_SECURESTORAGE_CONFIG_DIR'];
   const environment = keys.map(key => [key, process.env[key]] as const);
   for (const key of keys) delete process.env[key];
-  connections = []; commands = []; bridged = undefined; hostCreations = 0; hostDisposals = 0;
+  connections = []; commands = []; bridged = undefined; hostCreations = 0; hostDisposals = 0; profileReleases = 0;
   credentialRead = async () => { throw absent(); };
   bridgeScenario = async () => {};
   commandScenario = async command => connected(command);
@@ -63,6 +74,7 @@ test('managed HiRoute fails before host creation when no saved or native source 
   await fixture(async () => {
     await assert.rejects(prepareManagedHiRoute(42), { code: 'HIROUTE_PREPARATION_FAILED' });
     assert.equal(hostCreations, 0);
+    assert.equal(profileReleases, 1, 'a preparation failure releases the captured subscription');
   });
 });
 
@@ -75,6 +87,9 @@ test('environment-only OAuth works without a credentials file and bridges no ref
     assert.equal(bridge.claudeAiOauth.refreshToken, undefined);
     assert.ok(bridge.claudeAiOauth.expiresAt > Date.now());
     assert.deepEqual(result, { enabled: true, baseUrl: 'http://127.0.0.1:46559', routeModel: 'plan/fixture', authToken: 'fixture-gateway-grant' });
+    assert.equal(profileReleases, 0, 'the subscription cannot be removed while the gateway uses it');
+    await releaseManagedHiRoute(42);
+    assert.equal(profileReleases, 1);
   });
 });
 

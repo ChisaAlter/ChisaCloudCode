@@ -1,3 +1,5 @@
+import { normalizeClaudeQuota } from '../../../../shared/claude-quota.js';
+
 export interface LiveLimit {
   kind: string;
   label: string;
@@ -32,31 +34,15 @@ export function parseCredentials(json: unknown, nowMs: number): Credentials | nu
   };
 }
 
-const KIND_LABELS: Record<string, string> = {
-  session: 'Session (5h)',
-  weekly_all: 'Weekly (all models)',
-  weekly_scoped: 'Weekly',
-};
-
-/** Defensive mapping of the (unofficial) usage endpoint response. */
+/** Share the account service's defensive mapper for both usage response families. */
 export function normalizeUsage(raw: unknown, plan: string | null, tier: string | null): LiveData {
-  const limits: LiveLimit[] = [];
-  const rawLimits = (raw as any)?.limits;
-  if (Array.isArray(rawLimits)) {
-    for (const l of rawLimits) {
-      if (typeof l?.kind !== 'string' || typeof l?.percent !== 'number') continue;
-      const rawModel = l.scope?.model?.display_name;
-      const model: string | null = typeof rawModel === 'string' && rawModel !== '' ? rawModel : null;
-      const base = KIND_LABELS[l.kind] ?? l.kind;
-      limits.push({
-        kind: l.kind,
-        label: model ? `${base} — ${model}` : base,
-        percent: l.percent,
-        severity: typeof l.severity === 'string' ? l.severity : 'normal',
-        resetsAt: typeof l.resets_at === 'string' ? l.resets_at : null,
-        model,
-      });
-    }
-  }
+  const limits: LiveLimit[] = normalizeClaudeQuota(raw).map((window) => ({
+    kind: window.kind,
+    label: window.label,
+    percent: window.usedPercent,
+    severity: window.usedPercent >= 90 ? 'danger' : window.usedPercent >= 70 ? 'warning' : 'normal',
+    resetsAt: window.resetsAt === null ? null : new Date(window.resetsAt).toISOString(),
+    model: window.model,
+  }));
   return { plan, tier, limits };
 }

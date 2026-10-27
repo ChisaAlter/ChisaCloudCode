@@ -20,8 +20,6 @@ type RunningSessionApiItem = {
   startedAt?: unknown;
   statusText?: unknown;
   canInterrupt?: unknown;
-  runId?: unknown;
-  modelStopped?: unknown;
 };
 
 type RunningSessionsApiPayload = {
@@ -86,12 +84,10 @@ export function SessionProtectionProvider({ children }: { children: ReactNode })
     markSessionIdle,
     syncProcessingSessions,
     isSessionProcessing,
-    getActivityRevision,
   } = useSessionProtection();
 
   const refreshRunningSessions = useCallback(async () => {
     const snapshotRequestedAt = performance.now();
-    const activityRevision = getActivityRevision();
     try {
       const response = await api.runningSessions();
       if (!response.ok) {
@@ -111,24 +107,16 @@ export function SessionProtectionProvider({ children }: { children: ReactNode })
           startedAt: parseStartedAt(session.startedAt),
           statusText: typeof session.statusText === 'string' ? session.statusText : undefined,
           canInterrupt: typeof session.canInterrupt === 'boolean' ? session.canInterrupt : undefined,
-          runId: typeof session.runId === 'string' ? session.runId : undefined,
-          modelStopped: typeof session.modelStopped === 'boolean' ? session.modelStopped : undefined,
         });
       }
       if (snapshotRequestedAt <= lastAppliedSnapshotRef.current) return;
-      // A slow HTTP reply can describe an older run than a socket frame already applied.
-      // Reject it before either the activity map or pending-stop acknowledgement changes.
-      if (activityRevision !== getActivityRevision()) return;
-      if (!reconcileRunningSessions(
-        new Set(snapshots.map(session => session.sessionId)), snapshotRequestedAt,
-        new Set(snapshots.filter(session => session.modelStopped).map(session => session.sessionId)),
-      )) return;
+      if (!reconcileRunningSessions(new Set(snapshots.map(session => session.sessionId)), snapshotRequestedAt)) return;
       lastAppliedSnapshotRef.current = snapshotRequestedAt;
       syncProcessingSessions(snapshots);
     } catch (error) {
       console.error('[SessionProtection] Failed to sync running sessions:', error);
     }
-  }, [getActivityRevision, syncProcessingSessions, reconcileRunningSessions]);
+  }, [syncProcessingSessions, reconcileRunningSessions]);
 
   useEffect(() => {
     void refreshRunningSessions();

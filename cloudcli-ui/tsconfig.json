@@ -6,7 +6,6 @@
     "module": "ESNext",
     "baseUrl": ".",
     "paths": {
-      "@builtin-plugins/*": ["vendor/builtin-plugins/*"],
       // The frontend keeps "@" mapped to /src.
       // The backend gets its own "@" mapping in server/tsconfig.json so both sides can use
       // the same alias name without sharing one compiler configuration.

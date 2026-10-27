@@ -2,12 +2,13 @@ import { Check, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { Button } from '@/shared/ui';
-import type { WizardStep } from '@/shared/types';
+import type { SshExistingProject, WizardStep } from '@/shared/types';
 
 type WizardFooterProps = {
   step: WizardStep;
   isCreating: boolean;
   isCloneWorkflow: boolean;
+  existingProject?: SshExistingProject;
   onClose: () => void;
   onBack: () => void;
   onNext: () => void;
@@ -19,6 +20,7 @@ export default function WizardFooter({
   step,
   isCreating,
   isCloneWorkflow,
+  existingProject,
   onClose,
   onBack,
   onNext,
@@ -39,14 +41,16 @@ export default function WizardFooter({
         )}
       </Button>
 
-      <Button onClick={step === 2 ? onCreate : onNext} disabled={isCreating}>
+      <Button onClick={existingProject || step === 2 ? onCreate : onNext} disabled={isCreating}>
         {isCreating ? (
           <>
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            {isCloneWorkflow
+            {existingProject ? (existingProject.isArchived ? '正在恢复并打开…' : '正在打开…') : isCloneWorkflow
               ? t('projectWizard.buttons.cloning', { defaultValue: 'Cloning...' })
               : t('projectWizard.buttons.creating')}
           </>
+        ) : existingProject ? (
+          <>{existingProject.isArchived ? '恢复并打开项目' : '打开已有项目'}</>
         ) : step === 2 ? (
           <>
             <Check className="mr-1 h-4 w-4" />

@@ -9,16 +9,8 @@ import type { GitCommitSummary, GitPanelView, Project } from '@/shared/types';
 const calls = vi.hoisted(() => ({
   status: vi.fn(), branches: vi.fn(), remoteStatus: vi.fn(), commits: vi.fn(), commitDiff: vi.fn(),
   checkout: vi.fn(), pull: vi.fn(), fetch: vi.fn(), commit: vi.fn(), revertLocalCommit: vi.fn(),
-  listeners: new Set<(info: { serverPath: string; status: string }) => void>(),
 }));
 vi.mock('@/shared/api', () => ({ api: { git: calls } }));
-vi.mock('@/shared/chisa', () => ({
-  isDesktop: () => true,
-  onWorkspaceSyncStateChanged: (listener: (info: { serverPath: string; status: string }) => void) => {
-    calls.listeners.add(listener);
-    return () => calls.listeners.delete(listener);
-  },
-}));
 vi.mock('@/modules/git-panel/hooks/useSelectedProvider', () => ({ useSelectedProvider: () => 'claude' }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en' } }) }));
 
@@ -35,7 +27,6 @@ async function settle() { await act(async () => {}); }
 
 beforeEach(() => {
   vi.resetAllMocks();
-  calls.listeners.clear();
   calls.status.mockImplementation(async () => response({ branch: 'main', modified: [], staged: [] }));
   calls.branches.mockImplementation(async () => response({ branches: ['main', 'feature'], localBranches: ['main', 'feature'] }));
   calls.remoteStatus.mockImplementation(async () => response({ hasRemote: true, ahead: 1, behind: 1 }));
@@ -58,7 +49,6 @@ test('changes stays lazy through refreshes and mutations; entering history alway
     await hook.result.current.switchBranch('feature');
     await hook.result.current.handlePull();
     await hook.result.current.refreshAll();
-    calls.listeners.forEach(listener => listener({ serverPath: '/a', status: 'ready' }));
     window.dispatchEvent(new Event('focus'));
   });
   expect(calls.commits).not.toHaveBeenCalled();
@@ -74,7 +64,7 @@ test('changes stays lazy through refreshes and mutations; entering history alway
   expect(hook.result.current.recentCommits).toEqual([commit('returned')]);
 });
 
-test.each(['manual', 'branch', 'pull', 'fetch', 'commit', 'ready', 'focus'])(
+test.each(['manual', 'branch', 'pull', 'fetch', 'commit', 'focus'])(
   '%s refresh replaces visible history and invalidates cached commit diffs', async trigger => {
     const hook = renderHook(() => useGitPanelController({ selectedProject: projectA, activeView: 'history' }));
     await settle();
@@ -88,7 +78,6 @@ test.each(['manual', 'branch', 'pull', 'fetch', 'commit', 'ready', 'focus'])(
       if (trigger === 'pull') await hook.result.current.handlePull();
       if (trigger === 'fetch') await hook.result.current.handleFetch();
       if (trigger === 'commit') await hook.result.current.commitChanges('message', ['file.txt']);
-      if (trigger === 'ready') calls.listeners.forEach(listener => listener({ serverPath: '/a', status: 'ready' }));
       if (trigger === 'focus') window.dispatchEvent(new Event('focus'));
     });
     expect(calls.commits).toHaveBeenCalledTimes(2);

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { api } from '@/shared/api';
+import { useWorkspaceApi } from '@/shared/context/WorkspaceScopeContext';
 import type { MergeWorktreeOptions, Project, RemoveWorktreeOptions, WorktreeInfo } from '@/shared/types';
 
 // ---------------------------------------------------------------------------
@@ -55,6 +55,7 @@ export function useWorktreesController({
   onProjectSelect,
   onProjectsRefresh,
 }: UseWorktreesControllerOptions) {
+  const api = useWorkspaceApi();
   const [worktreeData, setWorktreeData] = useState<WorktreeListData | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [hasLoaded, setHasLoaded] = useState(false);
@@ -70,7 +71,7 @@ export function useWorktreesController({
   const selectedProjectIdRef = useRef<string | null>(selectedProject?.projectId ?? null);
   useEffect(() => {
     selectedProjectIdRef.current = selectedProject?.projectId ?? null;
-  }, [selectedProject]);
+  }, [api, selectedProject]);
 
   const fetchWorktrees = useCallback(async () => {
     if (!selectedProject) {
@@ -106,7 +107,7 @@ export function useWorktreesController({
         setHasLoaded(true);
       }
     }
-  }, [selectedProject]);
+  }, [api, selectedProject]);
 
   useEffect(() => {
     setWorktreeData(null);
@@ -157,7 +158,7 @@ export function useWorktreesController({
         setIsCreatingWorktree(false);
       }
     },
-    [fetchWorktrees, onProjectSelect, onProjectsRefresh, selectedProject],
+    [api, fetchWorktrees, onProjectSelect, onProjectsRefresh, selectedProject],
   );
 
   const openWorktree = useCallback(
@@ -199,7 +200,7 @@ export function useWorktreesController({
         }
       }
     },
-    [onProjectSelect, onProjectsRefresh, selectedProject],
+    [api, onProjectSelect, onProjectsRefresh, selectedProject],
   );
 
   const mergeWorktree = useCallback(
@@ -238,7 +239,7 @@ export function useWorktreesController({
         }
       }
     },
-    [fetchWorktrees, onProjectsRefresh, selectedProject],
+    [api, fetchWorktrees, onProjectsRefresh, selectedProject],
   );
 
   const removeWorktree = useCallback(
@@ -276,7 +277,7 @@ export function useWorktreesController({
         }
       }
     },
-    [fetchWorktrees, onProjectsRefresh, selectedProject],
+    [api, fetchWorktrees, onProjectsRefresh, selectedProject],
   );
 
   return {

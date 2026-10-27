@@ -1,11 +1,13 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+import { projectsDb, sessionsDb, sshProjectTargetsDb } from '@/modules/database/index.js';
 import { sessionSynchronizerService } from '@/modules/providers/index.js';
-import { WS_OPEN_STATE, connectedClients } from '@/modules/websocket/index.js';
+import { WS_OPEN_STATE, connectedClients, getConnectedClientUserId } from '@/modules/websocket/index.js';
 import type { RealtimeClientConnection } from '@/shared/types.js';
 import { AppError } from '@/shared/utils.js';
+
+import { canReadProject, assertProjectSshAccess } from './project-ssh-access.service.js';
 
 type SessionSummary = {
   id: string;
@@ -28,6 +30,10 @@ export type ProjectListItem = {
   path: string;
   displayName: string;
   fullPath: string;
+  sourceMode?: 'ssh';
+  displayPath?: string;
+  connectionLabel?: string;
+  sshConnectionId?: string;
   isStarred: boolean;
   sessions: SessionSummary[];
   sessionMeta: {
@@ -48,12 +54,15 @@ type ProgressUpdate = {
 };
 
 type GetProjectsWithSessionsOptions = {
+  /** Routes pass the authenticated owner; undefined is reserved for trusted instance-internal callers. */
+  userId?: string;
   skipSynchronization?: boolean;
   sessionsLimit?: number;
   sessionsOffset?: number;
 };
 
 type SessionPaginationOptions = {
+  userId?: string;
   limit?: number;
   offset?: number;
 };
@@ -66,12 +75,21 @@ type ProjectSessionsPageResult = {
 
 export type ProjectSessionsPageApiView = {
   projectId: string;
+  sourceMode?: 'ssh';
+  displayPath?: string;
+  connectionLabel?: string;
+  sshConnectionId?: string;
   sessions: SessionSummary[];
   sessionMeta: {
     hasMore: boolean;
     total: number;
   };
 };
+
+function sshDisplayMetadata(projectId: string): Pick<ProjectListItem, 'sourceMode' | 'displayPath' | 'connectionLabel' | 'sshConnectionId'> {
+  const target = sshProjectTargetsDb.getByProjectId(projectId);
+  return target ? { sourceMode: 'ssh', displayPath: target.rootPath, connectionLabel: target.connectionLabel, sshConnectionId: target.connectionId } : {};
+}
 
 const DEFAULT_PROJECT_SESSIONS_PAGE_SIZE = 20;
 const MAX_PROJECT_SESSIONS_PAGE_SIZE = 200;
@@ -159,16 +177,15 @@ function readProjectSessionsPageByPath(
   };
 }
 
-// Broadcast progress to all connected WebSocket clients.
-// Uses the unified `kind` envelope like every other websocket frame.
-function broadcastProgress(progress: ProgressUpdate) {
+// Requests never publish another account's project path through loading events.
+function broadcastProgress(progress: ProgressUpdate, sshOwnerId?: string) {
   const message = JSON.stringify({
     kind: 'loading_progress',
     ...progress,
   });
 
   connectedClients.forEach((client: RealtimeClientConnection) => {
-    if (client.readyState === WS_OPEN_STATE) {
+    if (client.readyState === WS_OPEN_STATE && (sshOwnerId === undefined || getConnectedClientUserId(client) === sshOwnerId)) {
       client.send(message);
     }
   });
@@ -184,12 +201,14 @@ export async function getProjectsWithSessions(
     await sessionSynchronizerService.synchronizeSessions();
   }
 
-  const projectRows = projectsDb.getProjectPaths() as Array<{
+  const projectRows = (projectsDb.getProjectPaths() as Array<{
     project_id: string;
     project_path: string;
     custom_project_name?: string | null;
     isStarred?: number;
-  }>;
+  }>).filter(row => {
+    return options.userId === undefined || canReadProject(row.project_id, options.userId);
+  });
   const totalProjects = projectRows.length;
   const projects: ProjectListItem[] = [];
   let processedProjects = 0;
@@ -199,18 +218,21 @@ export async function getProjectsWithSessions(
 
     const projectId = row.project_id;
     const projectPath = row.project_path;
+    const source = sshDisplayMetadata(projectId);
 
     broadcastProgress({
       phase: 'loading',
       current: processedProjects,
       total: totalProjects,
-      currentProject: projectPath,
-    });
+      currentProject: source.displayPath ?? projectPath,
+    }, options.userId ?? sshProjectTargetsDb.getByProjectId(projectId)?.ownerId);
 
     const displayName =
       row.custom_project_name && row.custom_project_name.trim().length > 0
         ? row.custom_project_name
-        : await generateDisplayName(path.basename(projectPath) || projectPath, projectPath);
+        : source.displayPath
+          ? path.win32.basename(source.displayPath) || source.displayPath
+          : await generateDisplayName(path.basename(projectPath) || projectPath, projectPath);
 
     const sessionsPage = readProjectSessionsPageByPath(projectPath, {
       limit: options.sessionsLimit,
@@ -222,6 +244,7 @@ export async function getProjectsWithSessions(
       path: projectPath,
       displayName,
       fullPath: projectPath,
+      ...source,
       isStarred: Boolean(row.isStarred),
       sessions: sessionsPage.sessions,
       sessionMeta: {
@@ -235,7 +258,7 @@ export async function getProjectsWithSessions(
     phase: 'complete',
     current: totalProjects,
     total: totalProjects,
-  });
+  }, options.userId);
 
   return projects;
 }
@@ -246,26 +269,31 @@ export async function getProjectsWithSessions(
  * conversation history in the archive view regardless of each session's flag.
  */
 export async function getArchivedProjectsWithSessions(
-  options: Pick<GetProjectsWithSessionsOptions, 'skipSynchronization'> = {},
+  options: Pick<GetProjectsWithSessionsOptions, 'skipSynchronization' | 'userId'> = {},
 ): Promise<ArchivedProjectListItem[]> {
   if (!options.skipSynchronization) {
     await sessionSynchronizerService.synchronizeSessions();
   }
 
-  const projectRows = projectsDb.getArchivedProjectPaths() as Array<{
+  const projectRows = (projectsDb.getArchivedProjectPaths() as Array<{
     project_id: string;
     project_path: string;
     custom_project_name?: string | null;
     isStarred?: number;
-  }>;
+  }>).filter(row => {
+    return options.userId === undefined || canReadProject(row.project_id, options.userId);
+  });
 
   const archivedProjects: ArchivedProjectListItem[] = [];
 
   for (const row of projectRows) {
+    const source = sshDisplayMetadata(row.project_id);
     const displayName =
       row.custom_project_name && row.custom_project_name.trim().length > 0
         ? row.custom_project_name
-        : await generateDisplayName(path.basename(row.project_path) || row.project_path, row.project_path);
+        : source.displayPath
+          ? path.win32.basename(source.displayPath) || source.displayPath
+          : await generateDisplayName(path.basename(row.project_path) || row.project_path, row.project_path);
 
     const sessionsPage = readProjectSessionsIncludingArchived(row.project_path);
 
@@ -274,6 +302,7 @@ export async function getArchivedProjectsWithSessions(
       path: row.project_path,
       displayName,
       fullPath: row.project_path,
+      ...source,
       isStarred: Boolean(row.isStarred),
       isArchived: true,
       sessions: sessionsPage.sessions,
@@ -302,9 +331,11 @@ export async function getProjectSessionsPage(
     });
   }
 
+  if (options.userId !== undefined) assertProjectSshAccess(projectId, options.userId);
   const sessionsPage = readProjectSessionsPageByPath(projectRow.project_path, options);
   return {
     projectId: projectRow.project_id,
+    ...sshDisplayMetadata(projectRow.project_id),
     sessions: sessionsPage.sessions,
     sessionMeta: {
       hasMore: sessionsPage.hasMore,

@@ -91,10 +91,10 @@ func TestAccountTransportRetiresGatewayIdleConnectionWithoutReplay(t *testing.T)
 }
 
 func TestAccountHTTPSLoginWithoutSSHAndRestore(t *testing.T) {
-	previousStore, previousConnection, previousTunnel, previousDefaults := store, apiConnection, tunnel, serviceConfiguration
+	previousStore, previousConnection, previousDefaults := store, apiConnection, serviceConfiguration
 	t.Setenv("APPDATA", t.TempDir())
 	store = loadStore(dataDir())
-	tunnel = nil
+
 	paths := []string{}
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
@@ -127,7 +127,7 @@ func TestAccountHTTPSLoginWithoutSSHAndRestore(t *testing.T) {
 		if apiConnection != nil {
 			apiConnection.cancel()
 		}
-		store, apiConnection, tunnel, serviceConfiguration = previousStore, previousConnection, previousTunnel, previousDefaults
+		store, apiConnection, serviceConfiguration = previousStore, previousConnection, previousDefaults
 	}()
 	if err := initializeServerConnection(); err != nil {
 		t.Fatal(err)
@@ -138,12 +138,10 @@ func TestAccountHTTPSLoginWithoutSSHAndRestore(t *testing.T) {
 		raw, _ := base64.StdEncoding.DecodeString(response.BodyB64)
 		t.Fatalf("login failed: %d %s", response.Status, raw)
 	}
-	if apiConnection.baseURL != upstream.URL+"/instances/second" || !apiConnection.authenticated || tunnel != nil {
+	if apiConnection.baseURL != upstream.URL+"/instances/second" || !apiConnection.authenticated {
 		t.Fatal("login used SSH or the wrong instance")
 	}
-	if workspaceConnectionMatchesSession() {
-		t.Fatal("another account inherited an unrelated workspace")
-	}
+
 	version := apiConnection.version
 	bridge.EndServerSession(version - 1)
 	if !apiConnection.authenticated {
@@ -184,8 +182,8 @@ func TestAccountTransportRejectsUntrustedCertificateAndPlaintext(t *testing.T) {
 }
 
 func TestAccountWebSocketProxyUsesHTTPSWithoutTunnel(t *testing.T) {
-	previousConnection, previousTunnel, previousDefaults := apiConnection, tunnel, serviceConfiguration
-	tunnel = nil
+	previousConnection, previousDefaults := apiConnection, serviceConfiguration
+
 	remoteClosed := make(chan struct{})
 	continueStream := make(chan struct{})
 	var upstream *httptest.Server
@@ -234,7 +232,7 @@ func TestAccountWebSocketProxyUsesHTTPSWithoutTunnel(t *testing.T) {
 	apiConnection = connection
 	defer func() {
 		connection.cancel()
-		apiConnection, tunnel, serviceConfiguration = previousConnection, previousTunnel, previousDefaults
+		apiConnection, serviceConfiguration = previousConnection, previousDefaults
 	}()
 	if err := StartAPIProxy(); err != nil {
 		t.Fatal(err)

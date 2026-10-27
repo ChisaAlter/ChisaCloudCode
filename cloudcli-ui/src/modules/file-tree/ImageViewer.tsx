@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
 
 import { Button } from '@/shared/ui';
-import { api } from '@/shared/api';
+import { useWorkspaceApi } from '@/shared/context/WorkspaceScopeContext';
 import type { FileTreeImageSelection } from '@/shared/types';
 
 type ImageViewerProps = {
@@ -12,6 +12,7 @@ type ImageViewerProps = {
 
 /** Rendered by FileTree to preview an image file picked in the tree. */
 export default function ImageViewer({ file, onClose }: ImageViewerProps) {
+  const api = useWorkspaceApi();
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -35,16 +36,17 @@ export default function ImageViewer({ file, onClose }: ImageViewerProps) {
         }
 
         const blob = await response.blob();
+        if (controller.signal.aborted) return;
         objectUrl = URL.createObjectURL(blob);
         setImageUrl(objectUrl);
       } catch (loadError: unknown) {
-        if (loadError instanceof Error && loadError.name === 'AbortError') {
+        if (controller.signal.aborted || (loadError instanceof Error && loadError.name === 'AbortError')) {
           return;
         }
         console.error('Error loading image:', loadError);
         setError('Unable to load image');
       } finally {
-        setLoading(false);
+        if (!controller.signal.aborted) setLoading(false);
       }
     };
 
@@ -56,7 +58,7 @@ export default function ImageViewer({ file, onClose }: ImageViewerProps) {
         URL.revokeObjectURL(objectUrl);
       }
     };
-  }, [file.projectId, file.path]);
+  }, [api, file.projectId, file.path]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">

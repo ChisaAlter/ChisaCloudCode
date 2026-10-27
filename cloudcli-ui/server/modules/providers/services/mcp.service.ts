@@ -1,7 +1,19 @@
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import type { LLMProvider, McpScope, ProviderMcpServer, UpsertProviderMcpServerInput } from '@/shared/types.js';
 import { AppError } from '@/shared/utils.js';
+import { withWorkspaceWriteOperation } from '@/modules/workspace-bridge/index.js';
 
+import { currentClaudeProjectConfigScope, withClaudeProjectConfigScope } from './claude-project-config-scope.service.js';
+
+
+async function scoped<T>(providerName: string, context: { userId?: unknown; workspacePath?: string; projectId?: string; workspaceId?: string; generation?: string; sessionId?: string }, mutateProject: boolean, operation: () => Promise<T>): Promise<T> {
+  if (providerName !== 'claude') return operation();
+  return withClaudeProjectConfigScope(context, async () => {
+    const scope = currentClaudeProjectConfigScope();
+    if (mutateProject && scope?.descriptor) return withWorkspaceWriteOperation(scope.descriptor.rootPath, operation);
+    return operation();
+  });
+}
 
 export const providerMcpService = {
   /**
@@ -9,10 +21,10 @@ export const providerMcpService = {
    */
   async listProviderMcpServers(
     providerName: string,
-    options?: { workspacePath?: string },
+    options?: { userId?: unknown; workspacePath?: string; projectId?: string; workspaceId?: string; generation?: string; sessionId?: string },
   ): Promise<Record<McpScope, ProviderMcpServer[]>> {
     const provider = providerRegistry.resolveProvider(providerName);
-    return provider.mcp.listServers(options);
+    return scoped(providerName, options ?? {}, false, () => provider.mcp.listServers(options));
   },
 
   /**
@@ -21,10 +33,10 @@ export const providerMcpService = {
   async listProviderMcpServersForScope(
     providerName: string,
     scope: McpScope,
-    options?: { workspacePath?: string },
+    options?: { userId?: unknown; workspacePath?: string; projectId?: string; workspaceId?: string; generation?: string; sessionId?: string },
   ): Promise<ProviderMcpServer[]> {
     const provider = providerRegistry.resolveProvider(providerName);
-    return provider.mcp.listServersForScope(scope, options);
+    return scoped(providerName, options ?? {}, false, () => provider.mcp.listServersForScope(scope, options));
   },
 
   /**
@@ -33,9 +45,10 @@ export const providerMcpService = {
   async upsertProviderMcpServer(
     providerName: string,
     input: UpsertProviderMcpServerInput,
+    context: { userId?: unknown; projectId?: string; workspaceId?: string; generation?: string; sessionId?: string } = {},
   ): Promise<ProviderMcpServer> {
     const provider = providerRegistry.resolveProvider(providerName);
-    return provider.mcp.upsertServer(input);
+    return scoped(providerName, { ...context, workspacePath: input.workspacePath }, (input.scope ?? 'project') === 'project', () => provider.mcp.upsertServer(input));
   },
 
   /**
@@ -44,9 +57,10 @@ export const providerMcpService = {
   async removeProviderMcpServer(
     providerName: string,
     input: { name: string; scope?: McpScope; workspacePath?: string },
+    context: { userId?: unknown; projectId?: string; workspaceId?: string; generation?: string; sessionId?: string } = {},
   ): Promise<{ removed: boolean; provider: LLMProvider; name: string; scope: McpScope }> {
     const provider = providerRegistry.resolveProvider(providerName);
-    return provider.mcp.removeServer(input);
+    return scoped(providerName, { ...context, workspacePath: input.workspacePath }, (input.scope ?? 'project') === 'project', () => provider.mcp.removeServer(input));
   },
 
   /**
@@ -54,6 +68,7 @@ export const providerMcpService = {
    */
   async addMcpServerToAllProviders(
     input: Omit<UpsertProviderMcpServerInput, 'scope'> & { scope?: Exclude<McpScope, 'local'> },
+    context: { userId?: unknown; projectId?: string; workspaceId?: string; generation?: string; sessionId?: string } = {},
   ): Promise<Array<{ provider: LLMProvider; created: boolean; error?: string }>> {
     if (input.transport !== 'stdio' && input.transport !== 'http') {
       throw new AppError('Global MCP add supports only "stdio" and "http".', {
@@ -67,7 +82,7 @@ export const providerMcpService = {
     const providers = providerRegistry.listProviders();
     for (const provider of providers) {
       try {
-        await provider.mcp.upsertServer({ ...input, scope });
+        await this.upsertProviderMcpServer(provider.id, { ...input, scope }, context);
         results.push({ provider: provider.id, created: true });
       } catch (error) {
         results.push({
@@ -88,12 +103,13 @@ export const providerMcpService = {
    */
   async removeMcpServerFromAllProviders(
     input: { name: string; scope?: McpScope; workspacePath?: string },
+    context: { userId?: unknown; projectId?: string; workspaceId?: string; generation?: string; sessionId?: string } = {},
   ): Promise<Array<{ provider: LLMProvider; removed: boolean; error?: string }>> {
     const results: Array<{ provider: LLMProvider; removed: boolean; error?: string }> = [];
     const providers = providerRegistry.listProviders();
     for (const provider of providers) {
       try {
-        const result = await provider.mcp.removeServer(input);
+        const result = await this.removeProviderMcpServer(provider.id, input, context);
         results.push({ provider: provider.id, removed: result.removed });
       } catch (error) {
         results.push({

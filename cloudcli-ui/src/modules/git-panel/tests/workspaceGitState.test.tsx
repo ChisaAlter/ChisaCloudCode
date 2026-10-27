@@ -9,17 +9,10 @@ import type { Project } from '@/shared/types';
 const calls = vi.hoisted(() => ({
   status: vi.fn(), branches: vi.fn(), remoteStatus: vi.fn(), diff: vi.fn(),
   checkout: vi.fn(), createBranch: vi.fn(), deleteBranch: vi.fn(), commit: vi.fn(),
-  isDesktop: vi.fn(),
-  listeners: new Set<(info: { serverPath: string; status: string }) => void>(),
+  nativeSubscribe: vi.fn(),
 }));
 vi.mock('@/shared/api', () => ({ api: { git: calls } }));
-vi.mock('@/shared/chisa', () => ({
-  isDesktop: calls.isDesktop,
-  onWorkspaceSyncStateChanged: (listener: (info: { serverPath: string; status: string }) => void) => {
-    calls.listeners.add(listener);
-    return () => calls.listeners.delete(listener);
-  },
-}));
+vi.mock('mygo-runtime', () => ({ on: calls.nativeSubscribe, call: vi.fn() }));
 vi.mock('@/modules/git-panel/hooks/useSelectedProvider', () => ({ useSelectedProvider: () => 'claude' }));
 
 const projectA: Project = { projectId: 'a', fullPath: '/a', displayName: 'A' };
@@ -34,8 +27,6 @@ async function settle() { await act(async () => {}); }
 
 beforeEach(() => {
   vi.resetAllMocks();
-  calls.listeners.clear();
-  calls.isDesktop.mockReturnValue(true);
   calls.status.mockImplementation(async (id: string) => response({ branch: id, modified: ['first.txt', 'second.txt'] }));
   calls.branches.mockImplementation(async (id: string) => response({ branches: [id], localBranches: [id] }));
   calls.remoteStatus.mockImplementation(async () => response({ hasRemote: false }));
@@ -53,7 +44,7 @@ test('a project status read never eagerly fetches file diffs', async () => {
   expect(hook.result.current.gitDiff).toEqual({ 'first.txt': '' });
 });
 
-test('ready refreshes only the selected workspace and replaces pre-recovery repository state', async () => {
+test('focus refreshes the selected cloud workspace and replaces stale repository state', async () => {
   calls.status.mockResolvedValueOnce(response({ branch: 'main', modified: ['old.txt'] }));
   calls.branches.mockResolvedValueOnce(response({ branches: ['main'], localBranches: ['main'] }));
   const hook = renderHook(() => useGitPanelController({ selectedProject: projectA, activeView: 'changes' }));
@@ -62,8 +53,7 @@ test('ready refreshes only the selected workspace and replaces pre-recovery repo
   expect(hook.result.current.gitDiff).toEqual({ 'old.txt': '' });
 
   act(() => {
-    calls.listeners.forEach(listener => listener({ serverPath: '/b', status: 'ready' }));
-    calls.listeners.forEach(listener => listener({ serverPath: '/a', status: 'syncing' }));
+    window.dispatchEvent(new CustomEvent('chisa:workspace-sync-state', { detail: { serverPath: '/a', status: 'ready' } }));
   });
   await settle();
   expect(calls.status).toHaveBeenCalledTimes(1);
@@ -73,7 +63,7 @@ test('ready refreshes only the selected workspace and replaces pre-recovery repo
   calls.status.mockResolvedValueOnce(response({ branch: 'feature/desktop-check', modified: [] }));
   calls.branches.mockResolvedValueOnce(response({ branches: ['main', 'feature/desktop-check'], localBranches: ['main', 'feature/desktop-check'] }));
   calls.remoteStatus.mockResolvedValueOnce(response({ hasRemote: true, remoteName: 'origin' }));
-  act(() => calls.listeners.forEach(listener => listener({ serverPath: '/a', status: 'ready' })));
+  act(() => window.dispatchEvent(new Event('focus')));
   await settle();
 
   expect(calls.status).toHaveBeenCalledTimes(2);
@@ -88,7 +78,7 @@ test('ready refreshes only the selected workspace and replaces pre-recovery repo
   expect(hook.result.current.isLoading).toBe(false);
 });
 
-test('ready aborts all pre-recovery reads and ignores their late responses', async () => {
+test('focus aborts old cloud reads and ignores their late responses', async () => {
   const status = deferred<Response>();
   const branch = deferred<Response>();
   const remote = deferred<Response>();
@@ -100,7 +90,7 @@ test('ready aborts all pre-recovery reads and ignores their late responses', asy
   expect(calls.branches.mock.calls[0][1].signal).toBe(staleSignal);
   expect(calls.remoteStatus.mock.calls[0][1].signal).toBe(staleSignal);
 
-  act(() => calls.listeners.forEach(listener => listener({ serverPath: '/a', status: 'ready' })));
+  act(() => window.dispatchEvent(new Event('focus')));
   await settle();
   const recoveredSignal = calls.status.mock.calls[1][1].signal as AbortSignal;
   expect(staleSignal.aborted).toBe(true);
@@ -120,12 +110,12 @@ test('ready aborts all pre-recovery reads and ignores their late responses', asy
   expect(hook.result.current.isLoading).toBe(false);
 });
 
-test('manual refresh supersedes a recovery refresh without accepting its stale response', async () => {
+test('manual refresh supersedes a focus refresh without accepting its stale response', async () => {
   const stale = deferred<Response>();
   const hook = renderHook(() => useGitPanelController({ selectedProject: projectA, activeView: 'changes' }));
   await settle();
   calls.status.mockReturnValueOnce(stale.promise);
-  act(() => calls.listeners.forEach(listener => listener({ serverPath: '/a', status: 'ready' })));
+  act(() => window.dispatchEvent(new Event('focus')));
   const recoverySignal = calls.status.mock.calls[1][1].signal as AbortSignal;
   calls.status.mockResolvedValueOnce(response({ branch: 'latest', modified: [] }));
   await act(async () => { hook.result.current.refreshAll(); });
@@ -142,7 +132,6 @@ test('visible focus refreshes all repository reads while hidden focus waits', as
   await settle();
   visibility.mockReturnValue('hidden');
   act(() => {
-    calls.listeners.forEach(listener => listener({ serverPath: '/a', status: 'ready' }));
     window.dispatchEvent(new Event('focus'));
   });
   await settle();
@@ -159,40 +148,10 @@ test('visible focus refreshes all repository reads while hidden focus waits', as
   expect(hook.result.current.gitStatus?.modified).toEqual([]);
 });
 
-test('recovery subscriptions and requests follow project selection and stop on unmount', async () => {
-  const hook = renderHook(({ project }) => useGitPanelController({ selectedProject: project, activeView: 'changes' }), { initialProps: { project: projectA } });
-  await settle();
-  const oldSignal = calls.status.mock.calls[0][1].signal as AbortSignal;
-  const oldListener = [...calls.listeners][0];
-  hook.rerender({ project: projectB });
-  await settle();
-  expect(oldSignal.aborted).toBe(true);
-  expect(calls.listeners.size).toBe(1);
-  expect(calls.listeners.has(oldListener)).toBe(false);
-  act(() => {
-    oldListener({ serverPath: '/a', status: 'ready' });
-    calls.listeners.forEach(listener => listener({ serverPath: '/a', status: 'ready' }));
-  });
-  await settle();
-  expect(calls.status).toHaveBeenCalledTimes(2);
-  act(() => calls.listeners.forEach(listener => listener({ serverPath: '/b', status: 'ready' })));
-  await settle();
-  expect(calls.status).toHaveBeenCalledTimes(3);
-  expect(calls.status.mock.calls[2][0]).toBe('b');
-  expect(hook.result.current.currentBranch).toBe('b');
-  const recoverySignal = calls.status.mock.calls[2][1].signal as AbortSignal;
-  hook.unmount();
-  expect(recoverySignal.aborted).toBe(true);
-  expect(calls.listeners.size).toBe(0);
-  act(() => window.dispatchEvent(new Event('focus')));
-  expect(calls.status).toHaveBeenCalledTimes(3);
-});
-
-test('browser-only panels refresh on focus without subscribing to a native bridge', async () => {
-  calls.isDesktop.mockReturnValue(false);
+test('cloud panels refresh on focus without subscribing to a native bridge', async () => {
   const hook = renderHook(() => useGitPanelController({ selectedProject: projectA, activeView: 'changes' }));
   await settle();
-  expect(calls.listeners.size).toBe(0);
+  expect(calls.nativeSubscribe).not.toHaveBeenCalled();
   act(() => window.dispatchEvent(new Event('focus')));
   await settle();
   expect(calls.status).toHaveBeenCalledTimes(2);
@@ -244,17 +203,17 @@ test('branch writes show server failures, reject double submission, and await fr
   expect(hook.result.current.isBranchBusy).toBe(false);
 });
 
-test('the desktop branch entry rejects stale observations and refreshes after an in-flight sync', async () => {
+test('the cloud branch entry rejects stale observations and refreshes after an in-flight focus', async () => {
   const first = deferred<Response>();
-  calls.status.mockReturnValueOnce(first.promise).mockResolvedValueOnce(response({ branch: 'after-sync' }));
-  const view = render(<GitWorkspaceButton projectId="a" serverPath="/a" active={false} onClick={() => {}} />);
-  act(() => calls.listeners.forEach(listener => listener({ serverPath: '/a', status: 'ready' })));
+  calls.status.mockReturnValueOnce(first.promise).mockResolvedValueOnce(response({ branch: 'after-focus' }));
+  const view = render(<GitWorkspaceButton projectId="a" active={false} onClick={() => {}} />);
+  act(() => window.dispatchEvent(new Event('focus')));
   await act(async () => { first.resolve(response({ branch: 'stale' })); });
   expect(calls.status).toHaveBeenCalledTimes(2);
-  expect(screen.getByRole('button', { name: 'Git' }).title).toBe('Git · after-sync');
+  expect(screen.getByRole('button', { name: 'Git' }).title).toBe('Git · after-focus');
   act(() => window.dispatchEvent(new CustomEvent(GIT_STATUS_OBSERVED_EVENT, { detail: { projectId: 'a', status: { branch: 'observed' } } })));
   expect(screen.getByRole('button', { name: 'Git' }).title).toBe('Git · observed');
-  view.rerender(<GitWorkspaceButton projectId="b" serverPath="/b" active onClick={() => {}} />);
+  view.rerender(<GitWorkspaceButton projectId="b" active onClick={() => {}} />);
   expect(screen.getByRole('button', { name: 'Git' }).title).toBe('Git');
   await settle();
   expect(screen.getByRole('button', { name: 'Git' }).title).toBe('Git · b');

@@ -14,7 +14,7 @@ import { PaperclipIcon, SlashIcon, XIcon, Loader2, ArrowUpIcon, PencilIcon, Plus
 
 import { useVoiceInput } from '@/modules/chat/hooks/useVoiceInput';
 import { useVoiceAvailable } from '@/modules/chat/hooks/useVoiceAvailable';
-import type { ComposerDraftAttachment, QueuedDraft, ScheduledMessage, SlashCommand,SessionActivity,PendingPermissionRequest,PermissionMode,ProviderModelOption } from '@/shared/types';
+import type { QueuedDraft, ScheduledMessage, SlashCommand,SessionActivity,PendingPermissionRequest,PermissionMode,ProviderModelOption } from '@/shared/types';
 import {
   ActionMenu,
   PromptInput,
@@ -65,23 +65,14 @@ type ChatComposerProps = {
   availableModelOptions: ProviderModelOption[];
   onSelectModel: (model: string) => void;
   modelsLoading: boolean;
-  modelsError?: boolean;
-  modelsErrorMessage?: string;
-  onReloadModels?: () => void;
-  sendOptionsReady?: boolean;
-  /** Supplied by the command resolver shared with the submit handler; scheduling still needs model options. */
-  canSubmitWithoutModelOptions?: boolean;
+  /** New conversations supply the full cross-provider picker in the existing model slot. */
+  modelControl?: ReactNode;
   onToggleCommandMenu: () => void;
   hasInput: boolean;
   onClearInput: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement> | MouseEvent<HTMLButtonElement> | TouchEvent<HTMLButtonElement>) => void;
   isDragActive: boolean;
   queuedDraft: QueuedDraft | null;
-  workspacePendingDraft?: QueuedDraft | null;
-  workspacePendingNotice?: string;
-  isWaitingForWorkspace?: boolean;
-  onCancelWorkspaceSend?: () => void;
-  onEditWorkspaceSend?: () => void;
   /** Set while the composer is replacing an already-sent message. */
   isEditingSentMessage: boolean;
   onCancelEditMessage: () => void;
@@ -91,8 +82,7 @@ type ChatComposerProps = {
   onCancelScheduledMessage: (id: string) => void;
   onEditQueuedDraft: () => void;
   onDeleteQueuedDraft: () => void;
-  draftAttachments?: ComposerDraftAttachment[];
-  attachedFiles?: File[];
+  attachedFiles: File[];
   onRemoveAttachment: (index: number) => void;
   fileErrors: Map<string, string>;
   showFileDropdown: boolean;
@@ -151,22 +141,13 @@ export default function ChatComposer({
   availableModelOptions,
   onSelectModel,
   modelsLoading,
-  modelsError,
-  modelsErrorMessage,
-  onReloadModels,
-  sendOptionsReady = true,
-  canSubmitWithoutModelOptions = false,
+  modelControl,
   onToggleCommandMenu,
   hasInput,
   onClearInput,
   onSubmit,
   isDragActive,
   queuedDraft,
-  workspacePendingDraft,
-  workspacePendingNotice,
-  isWaitingForWorkspace = false,
-  onCancelWorkspaceSend,
-  onEditWorkspaceSend,
   isEditingSentMessage,
   onCancelEditMessage,
   scheduledMessages,
@@ -174,8 +155,7 @@ export default function ChatComposer({
   onCancelScheduledMessage,
   onEditQueuedDraft,
   onDeleteQueuedDraft,
-  draftAttachments: suppliedDraftAttachments,
-  attachedFiles = [],
+  attachedFiles,
   onRemoveAttachment,
   fileErrors,
   showFileDropdown,
@@ -208,8 +188,6 @@ export default function ChatComposer({
   isTextareaExpanded,
   sendByCtrlEnter,
 }: ChatComposerProps) {
-  const draftAttachments: ComposerDraftAttachment[] = suppliedDraftAttachments ?? attachedFiles.map(file => ({ file }));
-  const submitOptionsReady = sendOptionsReady || canSubmitWithoutModelOptions;
   const { t } = useTranslation('chat');
   const fileDropdownRef = useRef<HTMLDivElement | null>(null);
   const selectedFileRef = useRef<HTMLDivElement | null>(null);
@@ -273,25 +251,17 @@ export default function ChatComposer({
   // Hide the thinking/status bar while any permission request is pending
   const hasPendingPermissions = pendingPermissionRequests.length > 0;
 
-  const visibleQueuedDraft = queuedDraft?.claimRevision && isLoading ? null : queuedDraft;
-  const hasQueuedDraft = Boolean(visibleQueuedDraft);
-  const hasManualDraft = visibleQueuedDraft?.autoSend === false;
-  const canQueueDraft = isLoading && Boolean(input.trim() || draftAttachments.length > 0 || hasManualDraft);
-  const submitAriaLabel = !submitOptionsReady && (!isLoading || canQueueDraft)
-    ? modelsErrorMessage || t('composer.restoringSessionOptions', { defaultValue: '正在恢复会话模型设置' })
-    : isPreparingSend
+  const hasQueuedDraft = Boolean(queuedDraft);
+  const canQueueDraft = isLoading && Boolean(input.trim() || attachedFiles.length > 0);
+  const submitAriaLabel = isPreparingSend
     ? t('input.preparing', { defaultValue: '正在准备发送…' })
-    : isWaitingForWorkspace
-    ? '待发送：同步完成后自动发送'
     : canQueueDraft
     ? hasQueuedDraft
       ? t('input.queue.update', { defaultValue: 'Update queued message' })
       : t('input.queue.sendNext', { defaultValue: 'Queue next message' })
     : isLoading
       ? t('input.stop')
-      : hasManualDraft && !input.trim() && draftAttachments.length === 0
-        ? '发送保留的排队消息'
-        : t('input.send');
+      : t('input.send');
 
   return (
     <div className="chat-composer-shell relative flex-shrink-0 px-2 pb-2 pt-0 sm:px-4 sm:pb-4 md:px-4 md:pb-6">
@@ -334,29 +304,14 @@ export default function ChatComposer({
         </div>
       )}
 
-      {visibleQueuedDraft && (
+      {queuedDraft && (
         <QueuedMessageCard
-          content={visibleQueuedDraft.content}
-          label={hasManualDraft ? '发送已暂停' : undefined}
-          notice={hasManualDraft ? '点编辑恢复完整消息后发送，或直接发送保留的消息。' : undefined}
+          content={queuedDraft.content}
           attachmentCount={
-            visibleQueuedDraft.uploadedAttachments?.length ?? visibleQueuedDraft.attachments.length
+            queuedDraft.uploadedAttachments?.length ?? queuedDraft.attachments.length
           }
           onEdit={onEditQueuedDraft}
           onDelete={onDeleteQueuedDraft}
-        />
-      )}
-
-      {workspacePendingDraft && (
-        <QueuedMessageCard
-          content={workspacePendingDraft.content}
-          attachmentCount={workspacePendingDraft.uploadedAttachments?.length || workspacePendingDraft.attachments.length}
-          label={isWaitingForWorkspace ? '待发送' : '发送已暂停'}
-          notice={workspacePendingNotice}
-          deleteLabel="取消自动发送，保留草稿"
-          editLabel="编辑消息并取消自动发送"
-          onEdit={onEditWorkspaceSend ?? (() => {})}
-          onDelete={onCancelWorkspaceSend ?? (() => {})}
         />
       )}
 
@@ -427,16 +382,16 @@ export default function ChatComposer({
             </div>
           )}
 
-          {draftAttachments.length > 0 && (
+          {attachedFiles.length > 0 && (
             <PromptInputHeader>
               <div className="rounded-xl bg-muted/40 p-2">
                 <div className="flex flex-wrap gap-2">
-                  {draftAttachments.map((attachment, index) => (
+                  {attachedFiles.map((file, index) => (
                     <ComposerAttachment
-                      key={`${attachment.file?.name || attachment.uploaded?.path}-${index}`}
-                      attachment={attachment}
+                      key={`${file.name}-${file.lastModified}-${index}`}
+                      file={file}
                       onRemove={() => onRemoveAttachment(index)}
-                      error={fileErrors.get(attachment.file?.name || attachment.uploaded?.name || '')}
+                      error={fileErrors.get(file.name)}
                     />
                   ))}
                 </div>
@@ -495,13 +450,13 @@ export default function ChatComposer({
           </PromptInputTools>
 
           <div className="ml-auto flex min-w-0 items-center gap-1">
-            {isPreparingSend && <span role="status" className="text-xs text-muted-foreground">{t('input.preparing', { defaultValue: '正在准备发送…' })}</span>}
+            {isPreparingSend && <span role="status" className="text-xs text-muted-foreground">{submitAriaLabel}</span>}
             {hasInput && <ScheduleMessagePopover
-              disabled={!input.trim() || !sendOptionsReady}
+              disabled={!input.trim()}
               onSchedule={onScheduleMessage}
             />}
 
-            <ComposerModelMenu
+            {modelControl ?? <ComposerModelMenu
               effort={effort}
               effortOptions={availableEffortOptions}
               onSelectEffort={onSelectEffort}
@@ -510,10 +465,7 @@ export default function ChatComposer({
               modelOptions={availableModelOptions}
               onSelectModel={onSelectModel}
               modelsLoading={modelsLoading}
-              modelsError={modelsError}
-              modelsErrorMessage={modelsErrorMessage}
-              onReloadModels={onReloadModels}
-            />
+            />}
 
             {onVoiceTranscript && voiceAvailable && (
               <VoiceInputButton state={voiceState} onToggle={voiceToggle} errorMsg={voiceError} />
@@ -536,23 +488,20 @@ export default function ChatComposer({
                       : undefined
               }
               disabled={
-                isPreparingSend ? true : !submitOptionsReady && (!isLoading || canQueueDraft) ? true
-                  : isWaitingForWorkspace
-                  ? true
-                  : isLoading
-                  ? !canQueueDraft && activity?.canInterrupt === false
+                isPreparingSend ? true : isLoading
+                  ? false
                   : isRecording
                     ? false
                     : isTranscribing
                       ? true
-                      : !input.trim() && draftAttachments.length === 0 && !hasManualDraft
+                      : !input.trim() && attachedFiles.length === 0
               }
               aria-label={submitAriaLabel}
               title={submitAriaLabel}
               className="h-7 w-7 rounded-full bg-primary text-primary-foreground shadow-sm hover:bg-primary/90 disabled:opacity-50"
               aria-description={sendByCtrlEnter ? t('input.hintText.ctrlEnter') : t('input.hintText.enter')}
             >
-              {isPreparingSend || isWaitingForWorkspace || isTranscribing || (!submitOptionsReady && !modelsErrorMessage && (!isLoading || canQueueDraft)) ? (
+              {isPreparingSend || isTranscribing ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
               ) : canQueueDraft ? (
                 <ArrowUpIcon className="h-4 w-4" />

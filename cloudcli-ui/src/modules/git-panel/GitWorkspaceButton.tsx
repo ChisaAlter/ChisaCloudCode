@@ -1,23 +1,27 @@
 import { GitBranch } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
-import { api } from '@/shared/api';
-import { onWorkspaceSyncStateChanged } from '@/shared/chisa';
+import { useWorkspaceGitApi, useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
 import type { GitStatusResponse } from '@/shared/types';
 import { GIT_STATUS_OBSERVED_EVENT } from '@/shared/constants';
 
 /** The project-workspace header uses this entry to keep source control and the current branch visible. */
-export function GitWorkspaceButton({ projectId, serverPath, active, onClick }: {
+export function GitWorkspaceButton({ projectId, active, onClick }: {
   projectId?: string;
-  serverPath?: string;
   active: boolean;
   onClick: () => void;
 }) {
+  const git = useWorkspaceGitApi();
+  const workspace = useWorkspaceScope();
+  const unavailable = workspace === null || workspace?.capabilities.git === false;
+  const workspaceId = workspace?.workspaceId;
+  const generation = workspace?.generation;
   // This small observation is scoped to the selected project, independent of whether its Git panel is open.
   const [observation, setObservation] = useState<{ projectId: string; branch: string } | null>(null);
 
   useEffect(() => {
-    if (!projectId) return;
+    setObservation(null);
+    if (!projectId || unavailable) return;
     let disposed = false;
     let pending = false;
     let refreshAgain = false;
@@ -33,7 +37,7 @@ export function GitWorkspaceButton({ projectId, serverPath, active, onClick }: {
       pending = true;
       refreshAgain = false;
       try {
-        const response = await api.git.status(projectId, { signal: controller.signal });
+        const response = await git.status(projectId, { signal: controller.signal });
         const status = await response.json() as GitStatusResponse;
         if (!disposed && requestedRevision === revision) {
           setObservation({ projectId, branch: response.ok && !status.error ? status.branch ?? '' : '' });
@@ -47,29 +51,25 @@ export function GitWorkspaceButton({ projectId, serverPath, active, onClick }: {
       }
     };
     const acceptStatus = (event: Event) => {
-      const detail = (event as CustomEvent<{ projectId: string; status: GitStatusResponse }>).detail;
-      if (detail.projectId !== projectId) return;
+      const detail = (event as CustomEvent<{ projectId: string; workspaceId?: string; generation?: string; status: GitStatusResponse }>).detail;
+      if (detail.projectId !== projectId || detail.workspaceId !== workspaceId || detail.generation !== generation) return;
       revision++;
       setObservation({ projectId, branch: detail.status.error ? '' : detail.status.branch ?? '' });
     };
-    const unsubscribe = onWorkspaceSyncStateChanged(info => {
-      if (info.serverPath === serverPath && info.status === 'ready') void refresh();
-    });
     void refresh();
     window.addEventListener('focus', refresh);
     window.addEventListener(GIT_STATUS_OBSERVED_EVENT, acceptStatus);
     return () => {
       disposed = true;
       controller.abort();
-      unsubscribe();
       window.removeEventListener('focus', refresh);
       window.removeEventListener(GIT_STATUS_OBSERVED_EVENT, acceptStatus);
     };
-  }, [projectId, serverPath]);
+  }, [git, projectId, unavailable, workspaceId, generation]);
 
   const branch = observation?.projectId === projectId ? observation?.branch : '';
   return (
-    <button type="button" aria-label="Git" aria-pressed={active} onClick={onClick}
+    <button type="button" aria-label="Git" aria-pressed={active} onClick={onClick} disabled={unavailable}
       title={branch ? `Git · ${branch}` : 'Git'} className="workspace-view-button min-w-0">
       <GitBranch aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
       <span>Git</span>

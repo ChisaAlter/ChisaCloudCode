@@ -6,8 +6,8 @@ import {
 } from '@/shared/authToken';
 import { IS_PLATFORM } from '@/shared/utils';
 import { readVoiceConfig, voiceConfigHeaders } from '@/shared/voiceConfig';
-import type { BridgeResponse } from '@/shared/types';
-import { assertServerRequestAllowed, desktopHttpUrl, desktopWebSocketUrl, FrontendBridge, getServerConnectionVersion } from '@/shared/chisa';
+import type { BridgeResponse, WorkspaceDescriptor, WorkspaceSelector } from '@/shared/types';
+import { desktopHttpUrl, desktopWebSocketUrl, FrontendBridge, getServerConnectionVersion } from '@/shared/chisa';
 
 /** Auth distinguishes an actionable native service-connection failure from rejected credentials. */
 export class ServiceConnectionError extends Error {}
@@ -19,7 +19,7 @@ export type ApiRequestOptions = Omit<RequestInit, 'headers'> & {
 };
 
 // Utility function for authenticated API calls
-// Desktop account APIs use the native verified HTTPS client, independently of file synchronization.
+// Desktop APIs use the native verified HTTPS client to reach cloud services.
 const isChisaDesktop = (): boolean => {
   try {
     return typeof globalThis !== 'undefined' && (globalThis as any).mygo !== undefined;
@@ -95,6 +95,17 @@ const bridgeToResponse = (br: { status: number; headers: Record<string, string>;
   return new Response([204, 205, 304].includes(status) ? null : bytes, { status, headers: h });
 };
 
+// Native lookups/reservations cannot consume AbortSignal; deadlines still release their JS caller.
+function awaitNative<T>(operation: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+  if (!signal) return operation;
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => { signal.removeEventListener('abort', abort); reject(signal.reason ?? new DOMException('Request canceled', 'AbortError')); };
+    signal.addEventListener('abort', abort, { once: true });
+    operation.then(value => { signal.removeEventListener('abort', abort); resolve(value); }, error => { signal.removeEventListener('abort', abort); reject(error); });
+  });
+}
+
 const chisaServerRequest = async (
   url: string,
   options: ApiRequestOptions,
@@ -102,12 +113,11 @@ const chisaServerRequest = async (
   options.signal?.throwIfAborted();
   const token = getStoredAuthToken();
   const authSessionVersion = getAuthSessionVersion();
-  const anonymous = url === '/api/auth/login' || url === '/api/auth/status';
-  // Capture the destination before native metadata can wait for a replacement connection.
   const connectionVersion = getServerConnectionVersion();
+  const headers: Record<string, string> = { ...(options.headers || {}) };
+  if (token) headers['Authorization'] = `Bearer ${token}`;
   const assertCurrent = () => {
     options.signal?.throwIfAborted();
-    assertServerRequestAllowed(anonymous);
     if (connectionVersion !== getServerConnectionVersion()) {
       throw new DOMException('Server connection changed', 'AbortError');
     }
@@ -115,20 +125,17 @@ const chisaServerRequest = async (
       throw new DOMException('Account session changed', 'AbortError');
     }
   };
-  assertCurrent();
-  const connection = await FrontendBridge.getApiConnection();
+  const connection = await awaitNative(FrontendBridge.getApiConnection(), options.signal);
   assertCurrent();
   if (!connection.configured) throw new ServiceConnectionError('尚未设置账号服务，请打开账户设置填写 HTTPS 服务地址');
-  const headers: Record<string, string> = { ...(options.headers || {}) };
-  if (anonymous) {
-    for (const name of Object.keys(headers)) {
-      if (name.toLowerCase() === 'authorization') delete headers[name];
-    }
-  } else if (token) headers['Authorization'] = `Bearer ${token}`;
-  const { b64, contentType } = await toBridgeBody(options.body);
+  const { b64, contentType } = await awaitNative(toBridgeBody(options.body), options.signal);
   assertCurrent();
   if (contentType && !headers['Content-Type']) headers['Content-Type'] = contentType;
-  const requestId = await FrontendBridge.beginServerRequest();
+  const reservation = FrontendBridge.beginServerRequest().then(id => {
+    if (id && (options.signal?.aborted || connectionVersion !== getServerConnectionVersion() || authSessionVersion !== getAuthSessionVersion())) void FrontendBridge.cancelServerRequest(id).catch(() => {});
+    return id;
+  });
+  const requestId = await awaitNative(reservation, options.signal);
   if (!requestId) throw new ServiceConnectionError('账号服务连接已断开，请重新连接服务');
   const cancel = () => { void FrontendBridge.cancelServerRequest(requestId).catch(() => {}); };
   try {
@@ -268,21 +275,27 @@ export async function readApiJson<T>(response: Response): Promise<T> {
   }
   return data as T;
 }
-const get = (url: string, options: ApiRequestOptions = {}) => authenticatedFetch(url, options);
 
-const withBody =
-  (method: string) =>
-    (url: string, body?: unknown, options: ApiRequestOptions = {}) =>
-      authenticatedFetch(url, {
-        method,
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        ...options,
-      });
+const PROVIDER_CONNECTION_CHANGED_EVENT = 'chisa:provider-connection-changed';
 
-const post = withBody('POST');
-const put = withBody('PUT');
-const patch = withBody('PATCH');
-const del = withBody('DELETE');
+/** Account quota and model settings reread metadata after either surface changes the effective Claude route. */
+export function subscribeToProviderConnectionChanges(listener: (source: 'connections' | 'accounts') => void): () => void {
+  const handler = (event: Event) => listener((event as CustomEvent<'connections' | 'accounts'>).detail);
+  window.addEventListener(PROVIDER_CONNECTION_CHANGED_EVENT, handler);
+  return () => window.removeEventListener(PROVIDER_CONNECTION_CHANGED_EVENT, handler);
+}
+
+async function providerConnectionMutation(request: () => Promise<Response>, source: 'connections' | 'accounts'): Promise<Response> {
+  const authVersion = getAuthSessionVersion();
+  const serverVersion = getServerConnectionVersion();
+  const response = await request();
+  if (response.ok && authVersion === getAuthSessionVersion() && serverVersion === getServerConnectionVersion()) {
+    // Inspect a clone so endpoint callers still own the original response and its normal error handling.
+    const result = await response.clone().json().catch(() => null);
+    if (result?.success === true) window.dispatchEvent(new CustomEvent(PROVIDER_CONNECTION_CHANGED_EVENT, { detail: source }));
+  }
+  return response;
+}
 
 // ─── URL builders ───────────────────────────────────────────────────────────
 // Exported for the consumers that cannot go through `authenticatedFetch`:
@@ -315,17 +328,72 @@ const streamingApiUrl = (path: string): string => isChisaDesktop() ? desktopHttp
 // Every `/api/...` path the frontend talks to is declared here; components
 // import a named method instead of assembling URLs of their own.
 
-export const api = {
+/** Creates an immutable API bound to one workspace; null explicitly refuses workspace requests. */
+export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projectId' | 'workspaceId' | 'generation' | 'kind' | 'sessionId' | 'sourceMode'> & { capabilities: Pick<WorkspaceDescriptor['capabilities'], 'read' | 'write' | 'git'> } | null) {
+  const isWorkspaceUrl = (url: string) => /^\/api\/(?:file-tree\/projects\/|git(?:\/|\?)|worktrees(?:\/|\?|$))/.test(url);
+  const requireWorkspace = (url: string, method = 'GET') => {
+    if (!isWorkspaceUrl(url) || workspace === undefined) return;
+    if (!workspace) throw new Error('会话工作区尚未准备好，请刷新工作区状态');
+    if (url.startsWith('/api/worktrees') && workspace.sourceMode === 'ssh') throw new Error('SSH 本地项目暂不支持独立工作树');
+    if (url.startsWith('/api/worktrees') && workspace.kind !== 'cloudReplica') throw new Error('请切换到主工作区管理工作树');
+    const capability = url.startsWith('/api/git') || url.startsWith('/api/worktrees') ? 'git' : method === 'GET' ? 'read' : 'write';
+    if (!workspace.capabilities[capability]) throw new Error('当前工作区暂不允许此操作，请刷新状态');
+  };
+  const scopedUrl = (url: string) => {
+    if (!workspace || !isWorkspaceUrl(url)) return url;
+    const suffix = query({ workspaceId: workspace.workspaceId, generation: workspace.generation });
+    return url + (url.includes('?') ? '&' + suffix.slice(1) : suffix);
+  };
+  const get = (url: string, options: ApiRequestOptions = {}) => {
+    try { requireWorkspace(url); } catch (error) { return Promise.reject(error); }
+    return authenticatedFetch(scopedUrl(url), options);
+  };
+  const withBody = (method: string) => (url: string, body?: unknown, options: ApiRequestOptions = {}) => {
+    try { requireWorkspace(url, method); } catch (error) { return Promise.reject(error); }
+    const scopedBody = workspace && isWorkspaceUrl(url)
+      ? { ...(body as Record<string, unknown>), workspaceId: workspace.workspaceId, generation: workspace.generation }
+      : body;
+    return authenticatedFetch(scopedUrl(url), { method, ...(scopedBody === undefined ? {} : { body: JSON.stringify(scopedBody) }), ...options });
+  };
+  const post = withBody('POST');
+  const put = withBody('PUT');
+  const patch = withBody('PATCH');
+  const del = withBody('DELETE');
+  return {
+  sshWorkspaces: {
+    connections: (options: ApiRequestOptions = {}) => get('/api/ssh-workspaces/connections', options),
+    probe: (body: { connectionId: string; rootPath: string }, options: ApiRequestOptions = {}) => post('/api/ssh-workspaces/probe', body, options),
+    recover: (body: { projectId: string; generation: string; cancel?: boolean }, options: ApiRequestOptions = {}) => post('/api/ssh-workspaces/recover', body, options),
+  },
+  workspaces: {
+    resolve: (projectId: string, sessionId?: string, options: ApiRequestOptions = {}) =>
+      get(`/api/workspaces/resolve${query({ projectId, sessionId })}`, options),
+    recoverIntegration: (scope: { projectId: string; workspaceId: string; generation: string }, options: ApiRequestOptions = {}) =>
+      post('/api/workspaces/integration/recover', scope, options),
+    previewIntegration: (scope: { projectId: string; workspaceId: string; generation: string }, options: ApiRequestOptions = {}) =>
+      post('/api/workspaces/integration/preview', scope, options),
+    applyIntegration: (body: { projectId: string; workspaceId: string; generation: string; previewId: string; expectedSourceRevision: string; expectedTargetRevision: string; operationId: string }, options: ApiRequestOptions = {}) =>
+      post('/api/workspaces/integration/apply', body, options),
+    runProjectAction: (body: {
+      projectId: string;
+      actionId: string;
+      workspaceId?: string;
+      generation?: string;
+      sessionId?: string;
+    }, options: ApiRequestOptions = {}) =>
+      post('/api/workspaces/actions/run', body, options),
+  },
+  readArtifact: (url: string, options: ApiRequestOptions = {}) => get(url, options),
   // Auth endpoints (no token required)
   auth: {
-    status: () => desktopAwareFetch('/api/auth/status'),
+    status: () => desktopAwareFetch('/api/auth/status', { signal: AbortSignal.timeout(15000) }),
     login: (username: string, password: string) => desktopAwareFetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     }),
     refresh: () => post('/api/auth/refresh'),
-    user: () => get('/api/auth/user'),
+    user: () => get('/api/auth/user', { signal: AbortSignal.timeout(15000) }),
     updateProfile: (displayName: string, avatarDataUrl: string | null) => authenticatedFetch('/api/auth/profile', {
       method: 'PATCH',
       body: JSON.stringify({ displayName, avatarDataUrl }),
@@ -349,6 +417,26 @@ export const api = {
     ),
   projectTaskmaster: (projectId: string) =>
     get(`/api/projects/${encodeURIComponent(projectId)}/taskmaster`),
+  projectSettings: (projectId: string) =>
+    get(`/api/projects/${encodeURIComponent(projectId)}/settings`),
+  projectContext: (projectId: string, options: ApiRequestOptions = {}) =>
+    get(`/api/projects/${encodeURIComponent(projectId)}/context`, options),
+  projectMemory: (projectId: string, options: ApiRequestOptions = {}) =>
+    get(`/api/projects/${encodeURIComponent(projectId)}/memory`, options),
+  saveProjectMemory: (projectId: string, body: { content: string; expectedHash: string }, options: ApiRequestOptions = {}) =>
+    put(`/api/projects/${encodeURIComponent(projectId)}/memory`, body, options),
+  projectActions: (projectId: string) =>
+    get(`/api/projects/${encodeURIComponent(projectId)}/actions`),
+  createProjectAction: (projectId: string, action: unknown) =>
+    post(`/api/projects/${encodeURIComponent(projectId)}/actions`, action),
+  updateProjectAction: (projectId: string, actionId: string, action: unknown) =>
+    put(`/api/projects/${encodeURIComponent(projectId)}/actions/${encodeURIComponent(actionId)}`, action),
+  deleteProjectAction: (projectId: string, actionId: string) =>
+    del(`/api/projects/${encodeURIComponent(projectId)}/actions/${encodeURIComponent(actionId)}`),
+  saveProjectSettings: (projectId: string, settings: unknown) =>
+    put(`/api/projects/${encodeURIComponent(projectId)}/settings`, settings),
+  clearProjectSettings: (projectId: string) =>
+    del(`/api/projects/${encodeURIComponent(projectId)}/settings`),
   renameProject: (projectId: string, displayName: string) =>
     put(`/api/projects/${projectId}/rename`, { displayName }),
   restoreProject: (projectId: string) =>
@@ -377,8 +465,8 @@ export const api = {
   // Session deletion mirrors project deletion:
   // - default: archive only (`isArchived = 1`)
   // - hardDelete: remove the row and, by default, its persisted transcript file
-  deleteSession: (sessionId: string, hardDelete = false) =>
-    del(`/api/providers/sessions/${sessionId}${query({ force: hardDelete })}`),
+  deleteSession: (sessionId: string, hardDelete = false, options: ApiRequestOptions = {}) =>
+    del(`/api/providers/sessions/${encodeURIComponent(sessionId)}${query({ force: hardDelete })}`, undefined, options),
   getArchivedSessions: () => get('/api/providers/sessions/archived'),
   // Resolves one session (by app id or provider-native id) to its metadata and
   // owning project — used when a /session/<id> URL isn't in loaded payloads.
@@ -433,8 +521,11 @@ export const api = {
     del(`/api/file-tree/projects/${projectId}/files`, { path, type }),
 
   // Uploads with a progress bar go through XMLHttpRequest, which needs the URL.
-  uploadFilesUrl: (projectId: string) =>
-    streamingApiUrl(`/api/file-tree/projects/${encodeURIComponent(projectId)}/files/upload`),
+  uploadFilesUrl: (projectId: string) => {
+    const url = `/api/file-tree/projects/${encodeURIComponent(projectId)}/files/upload`;
+    requireWorkspace(url, 'POST');
+    return streamingApiUrl(scopedUrl(url));
+  },
 
   // Browse filesystem for project suggestions
   browseFilesystem: (dirPath: string | null = null) =>
@@ -512,12 +603,32 @@ export const api = {
 
   // Provider (coding agent) endpoints — models, capabilities, sessions, MCP, skills.
   providers: {
+    // Claude account management is owned by the execution server; responses never contain login tokens.
+    claudeAccounts: {
+      state: (options: ApiRequestOptions = {}) => get('/api/providers/claude/accounts', options),
+      login: (input: { accountId?: string; name?: string } = {}, options: ApiRequestOptions = {}) =>
+        post('/api/providers/claude/accounts/login', input, options),
+      loginStatus: (id: string, options: ApiRequestOptions = {}) =>
+        get(`/api/providers/claude/accounts/login/${encodeURIComponent(id)}`, options),
+      submitCode: (id: string, code: string, options: ApiRequestOptions = {}) =>
+        post(`/api/providers/claude/accounts/login/${encodeURIComponent(id)}/code`, { code }, options),
+      cancelLogin: (id: string, options: ApiRequestOptions = {}) =>
+        del(`/api/providers/claude/accounts/login/${encodeURIComponent(id)}`, undefined, options),
+      activate: (id: string | null, options: ApiRequestOptions = {}) =>
+        providerConnectionMutation(() => put('/api/providers/claude/accounts/active', { id }, options), 'accounts'),
+      rename: (id: string, name: string, options: ApiRequestOptions = {}) =>
+        put(`/api/providers/claude/accounts/${encodeURIComponent(id)}`, { name }, options),
+      remove: (id: string, options: ApiRequestOptions = {}) =>
+        del(`/api/providers/claude/accounts/${encodeURIComponent(id)}`, undefined, options),
+      refresh: (input: { id?: string | null; all?: boolean } = {}, options: ApiRequestOptions = {}) =>
+        post('/api/providers/claude/accounts/refresh', input, options),
+    },
     connections: {
       list: (options: ApiRequestOptions = {}) => get('/api/providers/claude/connections', options),
-      create: (input: unknown, options: ApiRequestOptions = {}) => post('/api/providers/claude/connections', input, options),
-      update: (id: string, input: unknown, options: ApiRequestOptions = {}) => put(`/api/providers/claude/connections/${encodeURIComponent(id)}`, input, options),
-      remove: (id: string, options: ApiRequestOptions = {}) => del(`/api/providers/claude/connections/${encodeURIComponent(id)}`, undefined, options),
-      activate: (id: string | null, options: ApiRequestOptions = {}) => put('/api/providers/claude/connections/active', { id }, options),
+      create: (input: unknown, options: ApiRequestOptions = {}) => providerConnectionMutation(() => post('/api/providers/claude/connections', input, options), 'connections'),
+      update: (id: string, input: unknown, options: ApiRequestOptions = {}) => providerConnectionMutation(() => put(`/api/providers/claude/connections/${encodeURIComponent(id)}`, input, options), 'connections'),
+      remove: (id: string, options: ApiRequestOptions = {}) => providerConnectionMutation(() => del(`/api/providers/claude/connections/${encodeURIComponent(id)}`, undefined, options), 'connections'),
+      activate: (id: string | null, options: ApiRequestOptions = {}) => providerConnectionMutation(() => put('/api/providers/claude/connections/active', { id }, options), 'connections'),
     },
     hiroute: {
       settings: (options: ApiRequestOptions = {}) => get('/api/providers/claude/hiroute', options),
@@ -528,7 +639,7 @@ export const api = {
     authStatus: (provider: string) =>
       get(`/api/providers/${encodeURIComponent(provider)}/auth/status`),
 
-    models: (provider: string, options: ApiRequestOptions = {}) => get(`/api/providers/${provider}/models`, options),
+    models: (provider: string) => get(`/api/providers/${provider}/models`),
     createModel: (provider: string, input: unknown) =>
       post(`/api/providers/${provider}/models`, input),
     updateModel: (provider: string, recordId: string | number, input: unknown) =>
@@ -540,6 +651,8 @@ export const api = {
       provider: string;
       projectPath: string;
       initialMessage?: unknown;
+      /** Explicit project default; omitted keeps the backend's isolated default. */
+      workspaceMode?: 'isolated' | 'shared';
     }) => post('/api/providers/sessions', payload),
     sessionMessages: (
       sessionId: string,
@@ -575,8 +688,8 @@ export const api = {
       ),
     saveGlobalMcpServer: (payload: unknown) => post('/api/providers/mcp/servers/global', payload),
 
-    skills: (provider: string, { workspacePath }: { workspacePath?: string } = {}) =>
-      get(`/api/providers/${encodeURIComponent(provider)}/skills${query({ workspacePath })}`),
+    skills: (provider: string, options: { workspacePath?: string; projectId?: string; workspaceId?: string; generation?: string; sessionId?: string } = {}, requestOptions: ApiRequestOptions = {}) =>
+      get(`/api/providers/${encodeURIComponent(provider)}/skills${query(options)}`, requestOptions),
     saveSkills: (provider: string, payload: unknown) =>
       post(`/api/providers/${provider}/skills`, payload),
   },
@@ -585,7 +698,8 @@ export const api = {
   commands: {
     // `projectPath` stays optional: a workspace without a resolved path omits
     // the field entirely, which is what the server expects.
-    list: (projectPath: string | undefined) => post('/api/commands/list', { projectPath }),
+    list: (projectPath: string | undefined, workspace?: WorkspaceSelector & { projectId: string; sessionId?: string }, options: ApiRequestOptions = {}) =>
+      post('/api/commands/list', { projectPath, ...workspace }, options),
     execute: (payload: unknown) => post('/api/commands/execute', payload),
   },
 
@@ -624,7 +738,7 @@ export const api = {
     gitConfig: () => get('/api/user/git-config'),
     updateGitConfig: (gitName: string, gitEmail: string) =>
       post('/api/user/git-config', { gitName, gitEmail }),
-    onboardingStatus: () => get('/api/user/onboarding-status'),
+    onboardingStatus: () => get('/api/user/onboarding-status', { signal: AbortSignal.timeout(15000) }),
     completeOnboarding: () => post('/api/user/complete-onboarding'),
 
     // Preferences and chat drafts live server-side so they follow the user
@@ -722,10 +836,12 @@ export const api = {
   },
 
   system: {
-    version: () => authenticatedFetch('/api/system/version'),
     update: () => post('/api/system/update'),
   },
-};
+  };
+}
+
+export const api = createWorkspaceApi();
 
 // ---------------------------
 

@@ -1,5 +1,5 @@
 import { type ReactNode } from 'react';
-import { Activity, Archive, Folder, MessageSquare, RotateCcw, Search, Trash2 } from 'lucide-react';
+import { Activity, Archive, Folder, MessageSquare, RotateCcw, Search, Trash2, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
 
 import { LLMProviderLogo, ScrollArea } from '@/shared/ui';
@@ -94,11 +94,14 @@ type SidebarContentProps = {
   archivedSessionsCount: number;
   isArchivedSessionsLoading: boolean;
   recentConversations: RecentConversationListItem[];
+  pinnedConversations: RecentConversationListItem[];
   recentConversationsTotal: number;
   recentConversationsHasMore: boolean;
   isRecentConversationsLoading: boolean;
   isLoadingMoreRecentConversations: boolean;
   recentConversationsError: boolean;
+  sidebarError?: string | null;
+  onDismissSidebarError?: () => void;
   searchFilter: string;
   onSearchFilterChange: (value: string) => void;
   onClearSearchFilter: () => void;
@@ -137,11 +140,14 @@ export default function SidebarContent({
   archivedSessionsCount,
   isArchivedSessionsLoading,
   recentConversations,
+  pinnedConversations,
   recentConversationsTotal,
   recentConversationsHasMore,
   isRecentConversationsLoading,
   isLoadingMoreRecentConversations,
   recentConversationsError,
+  sidebarError = null,
+  onDismissSidebarError,
   searchFilter,
   onSearchFilterChange,
   onClearSearchFilter,
@@ -199,6 +205,10 @@ export default function SidebarContent({
         t={t}
       />
 
+      {sidebarError && <div className="mx-3 my-2 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive" role="alert">
+        <p className="min-w-0 flex-1 break-words">{sidebarError}</p>
+        {onDismissSidebarError && <button type="button" className="shrink-0 rounded p-0.5 hover:bg-accent" aria-label={t('actions.close', 'Close')} onClick={onDismissSidebarError}><X className="h-4 w-4" /></button>}
+      </div>}
       <ScrollArea className="flex-1 overflow-y-auto overscroll-contain md:px-1.5 md:py-2">
         {showConversationSearch ? (
           isSearching && !conversationResults ? (
@@ -367,7 +377,9 @@ export default function SidebarContent({
           ) : null
         ) : searchMode === 'conversations' ? (
           <SidebarRecentConversations
+            isMobile={isMobile}
             conversations={recentConversations}
+            pinnedConversations={pinnedConversations}
             total={recentConversationsTotal}
             hasMore={recentConversationsHasMore}
             isLoading={isRecentConversationsLoading}

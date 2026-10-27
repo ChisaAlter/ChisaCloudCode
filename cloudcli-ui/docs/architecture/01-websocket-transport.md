@@ -28,7 +28,7 @@ Nine rules. If you can predict what these say about a change, you can predict wh
 does.
 
 1. **One server, one socket per tab, four paths.** `/ws` (chat), `/shell` (terminals),
-   `/desktop-notifications` (the Electron main process), `/plugin-ws/:name` (a passthrough
+   `/desktop-notifications` (the MyGo host), `/plugin-ws/:name` (a passthrough
    proxy). Routing is a pathname comparison in one `connection` handler.
 2. **Authentication happens at the upgrade, once, for every path.** If a handler is
    running, the connection is authenticated. No handler re-checks a token, and no frame
@@ -109,11 +109,10 @@ Two things that are easy to assume and wrong:
 
 - **`/plugin-ws` has no in-repo client.** The route exists for plugin-authored frontend
   code. Nothing under `src/` opens it.
-- **The `/desktop-notifications` client is the Electron *main* process**, not a renderer.
-  It uses the Node `ws` package and authenticates with an `Authorization` header
-  (`electron/desktopNotifications.js:202`, headers built at `:280-290`) — something a
-  browser `WebSocket` cannot do, which is the whole reason the browser paths use a query
-  parameter instead.
+- **The `/desktop-notifications` client is the MyGo host**, not a browser renderer.
+  It may use the native host's WebSocket client and an `Authorization` header. Browser
+  WebSocket clients use the query parameter path described below because browser APIs do
+  not expose a general header option during construction.
 
 ## Authentication at the upgrade
 
@@ -581,7 +580,7 @@ an upstream error closes the client with 4502 (`:53-58`). No `kind`, no `seq`, n
 interpretation.
 
 **`/desktop-notifications`** (`desktop-notifications-websocket.service.ts:42`) is how the
-Electron main process registers a device. A connection with no authenticated user is closed
+MyGo host registers a device. A connection with no authenticated user is closed
 with 1008 (`:47-50`); the client then sends one `register` frame carrying `deviceId`
 (`:65-99`), gets `registered` back, and `notification_ack` frames are accepted and ignored
 (`:61-63`). The socket-to-device registry itself lives in

@@ -33,11 +33,10 @@ func TestAccountLiveGatewayNoSSH(t *testing.T) {
 	if err = json.Unmarshal(raw, &credentials); err != nil {
 		t.Fatal(err)
 	}
-	previousStore, previousConnection, previousTunnel := store, apiConnection, tunnel
+	previousStore, previousConnection := store, apiConnection
 	t.Setenv("APPDATA", t.TempDir())
 	store = loadStore(dataDir())
 	store.Cfg.LoginURL = serviceURL
-	tunnel = nil
 	if err := initializeServerConnection(); err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +44,7 @@ func TestAccountLiveGatewayNoSSH(t *testing.T) {
 		if apiConnection != nil {
 			apiConnection.cancel()
 		}
-		store, apiConnection, tunnel = previousStore, previousConnection, previousTunnel
+		store, apiConnection = previousStore, previousConnection
 	}()
 	bridge := FrontendBridge{}
 	body, _ := json.Marshal(credentials)
@@ -67,7 +66,7 @@ func TestAccountLiveGatewayNoSSH(t *testing.T) {
 	if expectedInstance == "" {
 		expectedInstance = "user2"
 	}
-	if apiConnection.baseURL != serviceURL+"/instances/"+expectedInstance || tunnel != nil {
+	if apiConnection.baseURL != serviceURL+"/instances/"+expectedInstance {
 		t.Fatal("account routing depended on SSH or selected the wrong instance")
 	}
 	for _, endpoint := range []string{"/api/auth/user", "/api/projects"} {

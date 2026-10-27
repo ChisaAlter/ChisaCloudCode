@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
-import { projectsDb, sessionsDb } from '@/modules/database/index.js';
-import { broadcastSessionUpserted, chatRunRegistry } from '@/modules/websocket/index.js';
+import { projectsDb, sessionsDb, sshProjectTargetsDb } from '@/modules/database/index.js';
+import { broadcastSessionUpserted, chatRunRegistry, isChatRunInFlight } from '@/modules/websocket/index.js';
 import { providerRegistry } from '@/modules/providers/provider.registry.js';
 import { sessionHistoryCache } from '@/modules/providers/services/session-history-cache.service.js';
 import type {
@@ -41,8 +41,12 @@ type RecentSessionListItem = Pick<
   'sessionId' | 'provider' | 'projectId' | 'projectDisplayName' | 'sessionTitle' | 'lastActivity'
 >;
 
+type RecentSessionRow = ReturnType<typeof sessionsDb.getRecentSessionsPage>['sessions'][number];
+
 type RecentSessionsPage = {
   conversations: RecentSessionListItem[];
+  /** Every visible pinned conversation, independent of the requested page. */
+  pinned: RecentSessionListItem[];
   total: number;
   hasMore: boolean;
 };
@@ -63,6 +67,11 @@ type SessionDetails = {
     displayName: string;
     isStarred: boolean;
     isArchived: boolean;
+    sourceMode?: 'ssh';
+    displayPath?: string;
+    remotePath?: string;
+    sshConnectionId?: string;
+    connectionLabel?: string;
   } | null;
 };
 
@@ -134,11 +143,9 @@ export const sessionsService = {
    */
   listRunningSessions(): Array<{
     sessionId: string;
-    runId: string;
     provider: LLMProvider;
     startedAt: number;
     lastSeq: number;
-    modelStopped: boolean;
   }> {
     return chatRunRegistry.listRunningRuns();
   },
@@ -146,10 +153,21 @@ export const sessionsService = {
   /**
    * Returns the active conversation feed in true global activity order.
    */
-  listRecentSessions(limit: number, offset: number): RecentSessionsPage {
-    const page = sessionsDb.getRecentSessionsPage(limit, offset);
+  listRecentSessions(
+    limit: number,
+    offset: number,
+    canRead?: (sessionId: string) => boolean,
+    pinnedSessionIds: readonly string[] = [],
+  ): RecentSessionsPage {
+    let page = sessionsDb.getRecentSessionsPage(limit, offset);
+    if (canRead) {
+      // Filter before slicing so hidden local sessions do not leak totals or
+      // leave empty pages in the current account's conversation feed.
+      const all = sessionsDb.getRecentSessionsPage(-1, 0).sessions.filter(session => canRead(session.session_id));
+      page = { sessions: all.slice(offset, offset + limit), total: all.length };
+    }
     const projectCache = new Map<string, ReturnType<typeof projectsDb.getProjectPath>>();
-    const conversations = page.sessions.map((session) => {
+    const toConversation = (session: RecentSessionRow): RecentSessionListItem => {
       const projectPath = session.project_path?.trim() ? session.project_path : null;
       let project = null;
 
@@ -168,10 +186,17 @@ export const sessionsService = {
         sessionTitle: session.custom_name?.trim() || session.session_id,
         lastActivity: session.updated_at ?? session.created_at ?? null,
       };
-    });
+    };
+    const conversations = page.sessions.map(toConversation);
+    // Pinned rows are resolved independently of the page so a pin that has not
+    // changed recently remains visible above the paginated feed.
+    const pinned = (pinnedSessionIds.length > 0 ? sessionsDb.getSessionsByIds(pinnedSessionIds) : [])
+      .filter(session => !canRead || canRead(session.session_id))
+      .map(toConversation);
 
     return {
       conversations,
+      pinned,
       total: page.total,
       hasMore: offset + conversations.length < page.total,
     };
@@ -465,6 +490,7 @@ export const sessionsService = {
         offset: 0,
         projectPath,
         providerSessionId,
+        providerProfilePath: session.provider_profile_path,
       }),
     });
 
@@ -486,6 +512,7 @@ export const sessionsService = {
         offset: requestedOffset,
         projectPath,
         providerSessionId,
+        providerProfilePath: session.provider_profile_path,
       });
     }
 
@@ -519,6 +546,7 @@ export const sessionsService = {
 
     const projectPath = session.project_path?.trim() ? session.project_path : null;
     const project = projectPath ? projectsDb.getProjectPath(projectPath) : null;
+    const ssh = project ? sshProjectTargetsDb.getByProjectId(project.project_id) : null;
 
     return {
       sessionId: session.session_id,
@@ -536,6 +564,7 @@ export const sessionsService = {
             displayName: resolveProjectDisplayName(projectPath, project.custom_project_name),
             isStarred: Boolean(project.isStarred),
             isArchived: Boolean(project.isArchived),
+            ...(ssh ? { sourceMode: 'ssh' as const, displayPath: ssh.rootPath, remotePath: ssh.rootPath, sshConnectionId: ssh.connectionId, connectionLabel: ssh.connectionLabel } : {}),
           }
         : null,
     };
@@ -596,6 +625,10 @@ export const sessionsService = {
         statusCode: 404,
       });
     }
+
+    const project = session.project_path ? projectsDb.getProjectPath(session.project_path) : null;
+    const ssh = project ? sshProjectTargetsDb.getByProjectId(project.project_id) : null;
+    if (ssh && (ssh.phase !== 'idle' || isChatRunInFlight(sessionId))) throw new AppError('请先停止 SSH 任务并确认清理，再删除会话。', { code: 'WORKSPACE_BUSY', statusCode: 409 });
 
     if (!options.force) {
       sessionsDb.updateSessionIsArchived(sessionId, true);

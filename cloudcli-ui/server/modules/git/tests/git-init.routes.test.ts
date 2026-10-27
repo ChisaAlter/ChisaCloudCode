@@ -9,12 +9,17 @@ import { createServer, request as httpRequest } from 'node:http';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { PassThrough } from 'node:stream';
-import test from 'node:test';
+import test, { mock } from 'node:test';
 
 import express from 'express';
 
-import { createGitRouter } from '@/modules/git/git.routes.js';
-import { bridgeGitFileSystem } from '@/modules/workspace-bridge/index.js';
+// Route fixtures do not restore an account cloud runtime.
+mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
+  ensureCloudWorkspaceBinding() {}, excludeCloudWorkspaceMetadata() {}, getWorkspaceRuntimeIdentity() { return undefined; },
+  executeWorkspaceRuntimePreview() { assert.fail('unexpected preview'); }, createWorkspaceRuntimeService() { assert.fail('unexpected restore'); },
+} });
+const { createGitRouter } = await import('../git.routes.js');
+const { bridgeGitFileSystem } = await import('@/modules/workspace-bridge/index.js');
 import { WORKSPACES_ROOT } from '@/shared/index.js';
 
 test('commit preserves a partially staged file and commits the existing index only', async () => {
@@ -264,7 +269,7 @@ test('delete branch rejects a non-boolean force value before running Git', async
   }
 });
 
-test('initial commit preserves an authoritative workspace failure instead of treating it as missing HEAD', async () => {
+test('initial commit rejects retired local bindings before host Git or callback transport', async () => {
   const root = await mkdtemp(path.join(path.resolve(WORKSPACES_ROOT), 'git-authoritative-'));
   const calls: Array<Record<string, unknown>> = [];
   const control = createServer(async (incoming, outgoing) => {
@@ -294,10 +299,11 @@ test('initial commit preserves an authoritative workspace failure instead of tre
   await once(server, 'listening');
   try {
     const response = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/initial-commit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project: 'fixture' }) });
-    assert.equal(response.status, 503);
-    assert.match((await response.json() as { error: string }).error, /workspace unavailable/);
-    assert.equal(calls.filter(call => call.op === 'exec').length, 3);
-    assert.equal(calls.some(call => (call.argv as string[] | undefined)?.includes('add')), false);
+    assert.equal(response.status, 409);
+    const body = await response.json() as { code: string; error: string };
+    assert.equal(body.code, 'LOCAL_WORKSPACE_REMOVED');
+    assert.match(body.error, /removed/i);
+    assert.deepEqual(calls, []);
   } finally {
     for (const listener of [server, control]) { listener.closeAllConnections(); await new Promise<void>(resolve => listener.close(() => resolve())); }
     assert.equal(path.dirname(root), path.resolve(WORKSPACES_ROOT));

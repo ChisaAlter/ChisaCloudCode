@@ -279,8 +279,10 @@ i18n
     },
   });
 
-// Save language preference when it changes
+// Keep script fallback and accessibility language aligned with the selected UI locale.
+if (typeof document !== 'undefined') document.documentElement.lang = i18n.resolvedLanguage || i18n.language;
 i18n.on('languageChanged', (lng: string) => {
+  if (typeof document !== 'undefined') document.documentElement.lang = lng;
   writeUserPreference('userLanguage', lng);
 });
 

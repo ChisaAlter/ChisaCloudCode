@@ -1,8 +1,10 @@
 import crypto from 'node:crypto';
+import { lstat, readdir, realpath } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import { parseFilesInputTag, parseImagesInputTag } from '@/shared/image-attachments.js';
+import { resolveProviderHome } from '@/modules/providers/services/provider-state.service.js';
 import type { IProviderSessions } from '@/shared/interfaces.js';
 import type { AnyRecord, FetchHistoryOptions, FetchHistoryResult, NormalizedMessage } from '@/shared/types.js';
 import {
@@ -229,21 +231,46 @@ export class CursorSessionsProvider implements IProviderSessions {
    * Loads Cursor's SQLite blob DAG and returns message blobs in conversation
    * order. Cursor history is stored as content-addressed blobs rather than JSONL.
    */
-  private async loadCursorBlobs(sessionId: string, projectPath: string): Promise<CursorMessageBlob[]> {
+  private async loadCursorBlobs(sessionId: string, projectPath: string, home: string): Promise<CursorMessageBlob[]> {
     // Lazy-import better-sqlite3 so the module doesn't fail if it's unavailable
     const { default: Database } = await import('better-sqlite3');
 
     const cwdId = crypto.createHash('md5').update(projectPath || process.cwd()).digest('hex');
     const safeSessionId = sanitizeLeafDirectoryName(sessionId, 'cursor session id');
-    const baseChatsPath = path.join(os.homedir(), '.cursor', 'chats', cwdId);
+    const baseChatsPath = path.join(home, '.cursor', 'chats', cwdId);
     const storeDbPath = path.join(baseChatsPath, safeSessionId, 'store.db');
     const resolvedBaseChatsPath = path.resolve(baseChatsPath);
-    const resolvedStoreDbPath = path.resolve(storeDbPath);
+    let resolvedStoreDbPath = path.resolve(storeDbPath);
     const relativeStorePath = path.relative(resolvedBaseChatsPath, resolvedStoreDbPath);
     if (relativeStorePath.startsWith('..') || path.isAbsolute(relativeStorePath)) {
       throw new Error(`Invalid cursor session path for "${sessionId}".`);
     }
 
+    try { await lstat(resolvedStoreDbPath); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      // An isolated CLI hashes its execution cwd, while the app retains the
+      // original source project. Locate only this native session ID under the
+      // one-level cwd hashes; never traverse another project or follow links.
+      const chatsRoot = path.join(home, '.cursor', 'chats');
+      const entries = await readdir(chatsRoot, { withFileTypes: true });
+      if (entries.length > 10_000) throw new Error('Cursor history contains too many workspace directories to resolve an isolated session safely.');
+      const matches: string[] = [];
+      for (const entry of entries) {
+        if (!entry.isDirectory() || !/^[a-f0-9]{32}$/i.test(entry.name)) continue;
+        const candidate = path.join(chatsRoot, entry.name, safeSessionId, 'store.db');
+        try {
+          const directory = await lstat(path.dirname(candidate));
+          const stats = await lstat(candidate);
+          if (!directory.isDirectory() || directory.isSymbolicLink() || !stats.isFile() || stats.isSymbolicLink() || await realpath(candidate) !== candidate) continue;
+          matches.push(candidate);
+          if (matches.length > 1) throw new Error('Cursor native session history is ambiguous across workspace directories.');
+        } catch (failure) {
+          if ((failure as NodeJS.ErrnoException).code !== 'ENOENT') throw failure;
+        }
+      }
+      if (matches.length === 1) resolvedStoreDbPath = matches[0];
+    }
     const db = new Database(resolvedStoreDbPath, { readonly: true, fileMustExist: true });
 
     try {
@@ -410,7 +437,7 @@ export class CursorSessionsProvider implements IProviderSessions {
     const providerSessionId = options.providerSessionId ?? sessionId;
 
     try {
-      const blobs = await this.loadCursorBlobs(providerSessionId, projectPath);
+      const blobs = await this.loadCursorBlobs(providerSessionId, projectPath, options.providerProfilePath ? resolveProviderHome('cursor', sessionId, options.providerProfilePath) : os.homedir());
       const allNormalized = this.normalizeCursorBlobs(blobs, sessionId);
       const renderableMessages = allNormalized.filter((msg) => msg.kind !== 'tool_result');
       const total = renderableMessages.length;

@@ -87,11 +87,11 @@ const storedCodeEditorSettings = (): Record<string, unknown> | undefined => {
  */
 const loadPreferenceStore = () => import('@/shared/userSettings');
 
-const renderSettings = async (initialTab = 'appearance') => {
+const renderSettings = async () => {
   const { useSettingsController } = await import(
     '@/modules/settings/hooks/useSettingsController'
   );
-  return renderHook(() => useSettingsController({ isOpen: true, initialTab }));
+  return renderHook(() => useSettingsController({ isOpen: true, initialTab: 'appearance' }));
 };
 
 beforeEach(() => {
@@ -103,14 +103,6 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.resetModules();
-});
-
-test('opening sync settings selects the requested chisa tab', async () => {
-  const { result } = await renderSettings('chisa');
-
-  await waitFor(() => {
-    assert.equal(result.current.activeTab, 'chisa');
-  });
 });
 
 test('opening settings writes no code-editor preference for a user who never set one', async () => {

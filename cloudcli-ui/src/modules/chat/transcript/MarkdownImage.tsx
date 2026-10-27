@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { api, authenticatedFetch } from '@/shared/api';
+import { useWorkspaceApi, useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
 import { ImageLightbox } from '@/modules/chat/transcript/ChatMessageImages';
 
 type MarkdownImageProps = {
@@ -52,7 +52,9 @@ function resolveImageSource(src: string, projectId?: string | null, disableFileL
 /** Used by chat's Markdown renderer to show authenticated workspace images and expand their previews. */
 export default function MarkdownImage({ src = '', alt = '', title, projectId, disableFileLinks = false }: MarkdownImageProps) {
   const { t } = useTranslation();
-  const sourceKey = JSON.stringify([src, projectId ?? null, disableFileLinks]);
+  const api = useWorkspaceApi();
+  const workspace = useWorkspaceScope();
+  const sourceKey = JSON.stringify([src, projectId ?? null, disableFileLinks, workspace?.workspaceId, workspace?.generation, workspace === null]);
   const source = useMemo(() => resolveImageSource(src, projectId, disableFileLinks), [src, projectId, disableFileLinks]);
   // A fetched blob must retain its source identity so a project/path change cannot display old bytes.
   const [loaded, setLoaded] = useState<ImageLoadState | null>(null);
@@ -72,7 +74,7 @@ export default function MarkdownImage({ src = '', alt = '', title, projectId, di
     const load = async () => {
       try {
         const response = source.kind === 'api'
-          ? await authenticatedFetch(source.path, { signal: controller.signal })
+          ? await api.readArtifact(source.path, { signal: controller.signal })
           : await api.readFileBlob(source.projectId, source.path, { signal: controller.signal });
         if (!response.ok) throw new Error(`Image request failed (${response.status})`);
         const blob = await response.blob();
@@ -89,7 +91,7 @@ export default function MarkdownImage({ src = '', alt = '', title, projectId, di
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [source, sourceKey]);
+  }, [api, source, sourceKey]);
 
   const currentLoad = loaded?.sourceKey === sourceKey ? loaded : null;
   const displaySrc = source?.kind === 'direct' ? source.url : currentLoad?.url;

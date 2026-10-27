@@ -26,8 +26,8 @@ test('a workspace transport failure explains the cause and offers a retry', () =
     />,
   );
 
-  assert.ok(screen.getByText('工作区未连接到这台电脑'));
-  assert.ok(screen.getByText(/请确认账号服务在线、该项目已绑定本地目录/));
+  assert.ok(screen.getByText('云端工作区暂不可用'));
+  assert.ok(screen.getByText(/请确认账号服务在线，并刷新云端工作区状态后重试/));
 
   fireEvent.click(screen.getByRole('button', { name: '重试' }));
   assert.equal(retry.mock.calls.length, 1);
@@ -37,5 +37,5 @@ test('an unrelated git failure keeps its own message', () => {
   render(<GitRepositoryErrorState error="Git request failed (HTTP 500)" />);
 
   assert.ok(screen.getByText('Git request failed (HTTP 500)'));
-  assert.equal(screen.queryByText('工作区未连接到这台电脑'), null);
+  assert.equal(screen.queryByText('云端工作区暂不可用'), null);
 });

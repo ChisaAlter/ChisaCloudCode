@@ -7,7 +7,7 @@ import { afterEach, beforeEach, test, vi } from 'vitest';
 import { useChatRealtimeHandlers } from '@/modules/chat/hooks/useChatRealtimeHandlers';
 import { useSessionStore } from '@/modules/chat/hooks/useSessionStore';
 import { useSessionProtection } from '@/shared/hooks/useSessionProtection';
-import type { ChatReplayCursor, ChatStreamBuffer, LLMProvider, ProjectSession, ServerEvent } from '@/shared/types';
+import type { LLMProvider, ProjectSession, ServerEvent } from '@/shared/types';
 
 vi.mock('@/shared/utils', () => ({
   playChatCompletionSound: vi.fn(),
@@ -34,8 +34,8 @@ const renderHandlers = () => {
   const view = renderHook(({ sessionId }) => {
     const sessionStore = useSessionStore();
     const sessionProtection = useSessionProtection();
-    const replayCursorsRef = useRef(new Map<string, ChatReplayCursor>());
-    const streamBuffersRef = useRef(new Map<string, ChatStreamBuffer>());
+    const lastSeqRef = useRef(new Map<string, number>());
+    const cursorRunIdRef = useRef(new Map<string, string>());
     const statusCheckSentAtRef = useRef(statusCheckSentAt);
     sessionStore.setActiveSession(sessionId);
     useChatRealtimeHandlers({
@@ -47,8 +47,8 @@ const renderHandlers = () => {
       setTokenBudget: () => {},
       pendingPermissionRequests: [],
       setPendingPermissionRequests: () => {},
-      replayCursorsRef,
-      streamBuffersRef,
+      lastSeqRef,
+      cursorRunIdRef,
       statusCheckSentAtRef,
       onSessionProcessing: sessionProtection.markSessionProcessing,
       onSessionIdle: (id, options) => {
@@ -59,7 +59,7 @@ const renderHandlers = () => {
       requestLatestMessages,
       sessionStore,
     });
-    return { ...sessionStore, ...sessionProtection, cursors: replayCursorsRef.current };
+    return { ...sessionStore, ...sessionProtection, lastSeq: lastSeqRef.current, cursorRunId: cursorRunIdRef.current };
   }, { initialProps: { sessionId: 'viewed-session' } });
 
   const dispatch = (event: ServerEvent) => act(() => listener?.(event));
@@ -199,8 +199,8 @@ test('a stale idle acknowledgement preserves a newer run cursor before its first
   view.dispatch({ kind: 'chat_subscribed', sessionId: 'viewed-session', runId: 'old-run', isProcessing: false });
 
   assert.equal(view.result.current.isSessionProcessing('viewed-session'), true);
-  assert.equal(view.result.current.cursors.get('viewed-session')?.seq, 1);
-  assert.equal(view.result.current.cursors.get('viewed-session')?.runId, 'new-run');
+  assert.equal(view.result.current.lastSeq.get('viewed-session'), 1);
+  assert.equal(view.result.current.cursorRunId.get('viewed-session'), 'new-run');
 });
 
 test('a stale idle acknowledgement preserves a newer active stream', () => {
@@ -210,8 +210,8 @@ test('a stale idle acknowledgement preserves a newer active stream', () => {
   view.dispatch({ kind: 'status', sessionId: 'viewed-session', runId: 'new-run', text: 'working', seq: 1 });
   view.dispatch({ ...delta('viewed-session', 'New '), runId: 'new-run', seq: 2 });
   view.dispatch({ kind: 'chat_subscribed', sessionId: 'viewed-session', runId: 'old-run', isProcessing: false });
-  assert.equal(view.result.current.cursors.get('viewed-session')?.seq, 2);
-  assert.equal(view.result.current.cursors.get('viewed-session')?.runId, 'new-run');
+  assert.equal(view.result.current.lastSeq.get('viewed-session'), 2);
+  assert.equal(view.result.current.cursorRunId.get('viewed-session'), 'new-run');
   view.dispatch(delta('viewed-session', 'reply'));
   act(() => vi.advanceTimersByTime(100));
 
@@ -237,7 +237,7 @@ for (const terminal of [{ kind: 'complete', success: false }, { kind: 'complete'
 }
 
 for (const kind of ['chat_run_status', 'chat_subscribed']) {
-  test(`a new run announced by ${kind} preserves its channel watermark`, () => {
+  test(`a new run announced by ${kind} resets only that session's replay cursor`, () => {
     const view = renderHandlers();
     view.dispatch({ kind: 'chat_run_status', sessionId: 'viewed-session', runId: 'old-run', phase: 'running' });
     view.dispatch({ kind: 'complete', sessionId: 'viewed-session', seq: 100, success: true });
@@ -245,11 +245,11 @@ for (const kind of ['chat_run_status', 'chat_subscribed']) {
     view.dispatch({ kind, sessionId: 'viewed-session', runId: 'next-run', phase: 'running', isProcessing: true, lastSeq: 5 });
 
     // Only actually observed provider frames count; server lastSeq is not a cursor.
-    assert.equal(view.result.current.cursors.get('viewed-session')?.seq, 100);
-    assert.equal(view.result.current.cursors.get('background-session')?.seq, 42);
-    view.dispatch({ ...delta('viewed-session', 'Next reply'), seq: 101 });
+    assert.equal(view.result.current.lastSeq.get('viewed-session'), 0);
+    assert.equal(view.result.current.lastSeq.get('background-session'), 42);
+    view.dispatch({ ...delta('viewed-session', 'Next reply'), seq: 1 });
     view.reconnect('viewed-session');
-    assert.equal(view.result.current.cursors.get('viewed-session')?.seq, 101);
+    assert.equal(view.result.current.lastSeq.get('viewed-session'), 1);
   });
 }
 
@@ -260,13 +260,13 @@ test('a changed run on reconnect retires the missing terminal buffer before its 
   view.dispatch({ ...delta('background-session', 'Other reply'), seq: 42 });
   view.reconnect('viewed-session');
   view.dispatch({ kind: 'chat_subscribed', sessionId: 'viewed-session', runId: 'next-run', isProcessing: true, lastSeq: 5 });
-  assert.equal(view.result.current.cursors.get('viewed-session')?.seq, 100);
-  assert.equal(view.result.current.cursors.get('viewed-session')?.runId, 'next-run');
-  view.dispatch({ ...delta('viewed-session', 'Next reply'), seq: 101 });
+  assert.equal(view.result.current.lastSeq.get('viewed-session'), 0);
+  assert.equal(view.result.current.cursorRunId.get('viewed-session'), 'next-run');
+  view.dispatch({ ...delta('viewed-session', 'Next reply'), seq: 1 });
   act(() => vi.advanceTimersByTime(100));
 
-  assert.equal(view.result.current.cursors.get('viewed-session')?.seq, 101);
-  assert.equal(view.result.current.cursors.get('background-session')?.seq, 42);
+  assert.equal(view.result.current.lastSeq.get('viewed-session'), 1);
+  assert.equal(view.result.current.lastSeq.get('background-session'), 42);
   assert.deepEqual(view.contents('viewed-session'), ['Previous reply', 'Next reply']);
   assert.deepEqual(view.contents('background-session'), ['Other reply']);
 });
@@ -274,11 +274,11 @@ test('a changed run on reconnect retires the missing terminal buffer before its 
 test('provider events with runId can establish a new run when lifecycle frames were missed', () => {
   const view = renderHandlers();
   view.dispatch({ ...delta('viewed-session', 'Previous reply'), seq: 100, runId: 'previous-run' });
-  view.dispatch({ ...delta('viewed-session', 'Next reply'), seq: 101, runId: 'next-run' });
+  view.dispatch({ ...delta('viewed-session', 'Next reply'), seq: 1, runId: 'next-run' });
   act(() => vi.advanceTimersByTime(100));
 
-  assert.equal(view.result.current.cursors.get('viewed-session')?.seq, 101);
-  assert.equal(view.result.current.cursors.get('viewed-session')?.runId, 'next-run');
+  assert.equal(view.result.current.lastSeq.get('viewed-session'), 1);
+  assert.equal(view.result.current.cursorRunId.get('viewed-session'), 'next-run');
   assert.deepEqual(view.contents('viewed-session'), ['Previous reply', 'Next reply']);
 });
 
@@ -291,13 +291,13 @@ test('a same-run reconnect snapshot keeps observed replay progress and ignores s
   view.dispatch({ kind: 'chat_run_status', sessionId: 'viewed-session', runId: 'active-run', phase: 'running', lastSeq: 10 });
   view.dispatch({ ...delta('viewed-session', 'reply'), seq: 5 });
 
-  assert.equal(view.result.current.cursors.get('viewed-session')?.seq, 5);
+  assert.equal(view.result.current.lastSeq.get('viewed-session'), 5);
   act(() => vi.advanceTimersByTime(100));
   assert.deepEqual(view.contents('viewed-session'), ['Running reply']);
 });
 
 for (const acknowledgedRunId of ['old-run', 'another-offline-run']) {
-  test(`an idle acknowledgement for ${acknowledgedRunId} finalizes the previous buffer while preserving its channel cursor`, () => {
+  test(`an idle acknowledgement for ${acknowledgedRunId} retires the previous run cursor and buffer`, () => {
     const view = renderHandlers();
     view.dispatch({ kind: 'chat_run_status', sessionId: 'viewed-session', runId: 'old-run', phase: 'running' });
     view.dispatch({ ...delta('viewed-session', 'Offline reply'), seq: 100 });
@@ -305,29 +305,29 @@ for (const acknowledgedRunId of ['old-run', 'another-offline-run']) {
     view.reconnect('viewed-session');
     view.dispatch({ kind: 'chat_subscribed', sessionId: 'viewed-session', runId: acknowledgedRunId, isProcessing: false, lastSeq: 105 });
 
-    assert.equal(view.result.current.cursors.get('viewed-session')?.seq, 100);
-    assert.equal(view.result.current.cursors.get('viewed-session')?.runId, acknowledgedRunId);
-    view.dispatch({ ...delta('viewed-session', 'Next reply'), seq: 101 });
+    assert.equal(view.result.current.lastSeq.get('viewed-session') ?? 0, 0);
+    assert.equal(view.result.current.cursorRunId.has('viewed-session'), false);
+    view.dispatch({ ...delta('viewed-session', 'Next reply'), seq: 1 });
     act(() => vi.advanceTimersByTime(100));
     assert.deepEqual(view.contents('viewed-session'), ['Offline reply', 'Next reply']);
   });
 }
 
-test('sequenced events without runId remain monotonic after completion and reject duplicate replay', () => {
+test('legacy sequenced events without runId start fresh after completion without resetting on replay', () => {
   const view = renderHandlers();
   view.dispatch({ kind: 'complete', sessionId: 'viewed-session', seq: 100, success: true });
-  view.dispatch({ ...delta('viewed-session', 'Next reply'), seq: 101 });
-  assert.equal(view.result.current.cursors.get('viewed-session')?.seq, 101);
-  view.dispatch({ ...delta('viewed-session', '!'), seq: 104 });
-  view.dispatch({ kind: 'status', sessionId: 'viewed-session', text: 'working', seq: 102 });
-  assert.equal(view.result.current.cursors.get('viewed-session')?.seq, 104);
+  view.dispatch({ ...delta('viewed-session', 'Next reply'), seq: 1 });
+  assert.equal(view.result.current.lastSeq.get('viewed-session'), 1);
+  view.dispatch({ ...delta('viewed-session', '!'), seq: 4 });
+  view.dispatch({ kind: 'status', sessionId: 'viewed-session', text: 'working', seq: 2 });
+  assert.equal(view.result.current.lastSeq.get('viewed-session'), 4);
 });
 
 test('learning an active runId after anonymous events retains its existing replay cursor', () => {
   const view = renderHandlers();
   view.dispatch({ ...delta('viewed-session', 'Running reply'), seq: 4 });
   view.dispatch({ kind: 'chat_subscribed', sessionId: 'viewed-session', runId: 'active-run', isProcessing: true, lastSeq: 10 });
-  assert.equal(view.result.current.cursors.get('viewed-session')?.seq, 4);
+  assert.equal(view.result.current.lastSeq.get('viewed-session'), 4);
 });
 
 for (const code of ['RUN_IN_PROGRESS', 'CHAT_ABORT_FAILED']) {

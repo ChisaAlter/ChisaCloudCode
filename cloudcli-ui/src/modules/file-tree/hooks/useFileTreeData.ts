@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { api } from '@/shared/api';
+import { useWorkspaceApi } from '@/shared/context/WorkspaceScopeContext';
 import type { Project,FileTreeNode } from '@/shared/types';
 
 type UseFileTreeDataResult = {
@@ -53,6 +53,7 @@ function readResponseErrorMessage(responseBody: string): string | null {
 }
 
 export function useFileTreeData(selectedProject: Project | null): UseFileTreeDataResult {
+  const api = useWorkspaceApi();
   const [files, setFiles] = useState<FileTreeNode[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -151,7 +152,7 @@ export function useFileTreeData(selectedProject: Project | null): UseFileTreeDat
       isActive = false;
       abortController.abort();
     };
-  }, [selectedProject?.projectId, refreshKey]);
+  }, [api, selectedProject?.projectId, refreshKey]);
 
   const loadDirectory = useCallback(async (path: string) => {
     const projectId = selectedProject?.projectId;
@@ -189,7 +190,7 @@ export function useFileTreeData(selectedProject: Project | null): UseFileTreeDat
         setLoadingDirectoryCount(directoryRequestsRef.current.size);
       }
     }
-  }, [selectedProject?.projectId]);
+  }, [api, selectedProject?.projectId]);
 
   return {
     files,

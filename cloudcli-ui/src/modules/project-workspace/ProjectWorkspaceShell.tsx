@@ -1,9 +1,9 @@
 import { memo } from 'react';
 
 import { QuickSettingsPanel } from '@/modules/quick-settings-panel';
+import { isDesktop } from '@/shared/chisa';
 import ProjectEffects from '@/modules/project-workspace/controllers/ProjectEffects';
 import type { ProjectWorkspaceShellProps } from '@/shared/types';
-import ProjectCommandPalette from '@/modules/project-workspace/ProjectCommandPalette';
 import ProjectMainRegion from '@/modules/project-workspace/ProjectMainRegion';
 import ProjectSidebarRegion from '@/modules/project-workspace/ProjectSidebarRegion';
 
@@ -31,8 +31,7 @@ function ProjectWorkspaceShell({
         />
       </div>
 
-      <ProjectCommandPalette />
-      <QuickSettingsPanel />
+      {!isDesktop() && <QuickSettingsPanel />}
     </div>
   );
 }

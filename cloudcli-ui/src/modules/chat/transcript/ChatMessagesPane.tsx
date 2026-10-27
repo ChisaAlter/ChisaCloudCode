@@ -74,6 +74,8 @@ type ChatMessagesPaneProps = {
   onForkFromMessage?: (message: ChatMessage) => void;
   /** Fetches the whole transcript for an export, which otherwise only sees the loaded page. */
   onLoadFullTranscript?: () => Promise<ChatMessage[]>;
+  /** Keeps token usage in the same quiet conversation menu as transcript exports. */
+  onShowTokenUsage?: () => void;
 };
 
 /**
@@ -118,6 +120,7 @@ function ChatMessagesPane({
   onEditMessage,
   onForkFromMessage,
   onLoadFullTranscript,
+  onShowTokenUsage,
   onFileOpen,
   onShowSettings,
   onGrantToolPermission,
@@ -173,7 +176,7 @@ function ChatMessagesPane({
       className="chat-messages-pane relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden pt-3 pb-3 sm:pt-4 sm:pb-4"
     >
       {chatMessages.length > 0 && (
-        <div className="pointer-events-none sticky right-4 top-3 z-10 mb-2 flex justify-end sm:px-4">
+        <div className="chat-transcript-actions pointer-events-none sticky right-4 top-2 z-10 mx-auto flex w-full max-w-[49rem] justify-end px-4">
           <div className="pointer-events-auto">
             <ChatExportMenu
               messages={chatMessages}
@@ -182,6 +185,7 @@ function ChatMessagesPane({
               selectedProject={selectedProject}
               createDiff={createDiff}
               onLoadFullTranscript={onLoadFullTranscript}
+              onShowTokenUsage={onShowTokenUsage}
             />
           </div>
         </div>

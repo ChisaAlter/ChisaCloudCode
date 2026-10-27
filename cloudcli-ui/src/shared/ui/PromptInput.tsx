@@ -30,7 +30,7 @@ export type PromptInputProps = {
   status?: PromptInputStatus;
 } & React.FormHTMLAttributes<HTMLFormElement>;
 
-/** Form shell used by chat and local-agent to keep their message inputs visually consistent. */
+/** Form shell used by the chat composer for a consistent message input. */
 export const PromptInput = React.forwardRef<HTMLFormElement, PromptInputProps>(
   ({ className, status = 'ready', children, ...props }, ref) => {
     const contextValue = React.useMemo(() => ({ status }), [status]);
@@ -56,7 +56,7 @@ PromptInput.displayName = 'PromptInput';
 
 /* ─── PromptInputHeader ──────────────────────────────────────────── */
 
-/** Attachment/queue row above the textarea, used by chat and local-agent composers. */
+/** Attachment/queue row above the textarea, used by the chat composer. */
 export const PromptInputHeader = React.forwardRef<
   HTMLDivElement,
   React.HTMLAttributes<HTMLDivElement>
@@ -72,7 +72,7 @@ PromptInputHeader.displayName = 'PromptInputHeader';
 
 /* ─── PromptInputBody ────────────────────────────────────────────── */
 
-/** Textarea wrapper used by the chat and local-agent message composers. */
+/** Textarea wrapper used by the chat composer. */
 export const PromptInputBody = React.forwardRef<
   HTMLDivElement,
   React.HTMLAttributes<HTMLDivElement>
@@ -88,7 +88,7 @@ PromptInputBody.displayName = 'PromptInputBody';
 
 /* ─── PromptInputTextarea ────────────────────────────────────────── */
 
-/** Message textarea used by chat and local-agent with their own input and resizing handlers. */
+/** Message textarea used by the chat composer with its input and resizing handlers. */
 export const PromptInputTextarea = React.forwardRef<
   HTMLTextAreaElement,
   React.TextareaHTMLAttributes<HTMLTextAreaElement>
@@ -107,7 +107,7 @@ PromptInputTextarea.displayName = 'PromptInputTextarea';
 
 /* ─── PromptInputFooter ──────────────────────────────────────────── */
 
-/** Footer row used by the chat and local-agent message composers. */
+/** Footer row used by the chat composer. */
 export const PromptInputFooter = React.forwardRef<
   HTMLDivElement,
   React.HTMLAttributes<HTMLDivElement>
@@ -123,7 +123,7 @@ PromptInputFooter.displayName = 'PromptInputFooter';
 
 /* ─── PromptInputTools ───────────────────────────────────────────── */
 
-/** Tool cluster used by the chat and local-agent message composers. */
+/** Tool cluster used by the chat composer. */
 export const PromptInputTools = React.forwardRef<
   HTMLDivElement,
   React.HTMLAttributes<HTMLDivElement>
@@ -149,7 +149,7 @@ export type PromptInputButtonProps = {
   tooltip?: PromptInputButtonTooltip;
 } & React.ButtonHTMLAttributes<HTMLButtonElement>;
 
-/** Composer icon button used by chat, including voice input, and local-agent. */
+/** Composer icon button used by chat, including voice input. */
 export const PromptInputButton = React.forwardRef<HTMLButtonElement, PromptInputButtonProps>(
   ({ className, tooltip, children, ...props }, ref) => {
     const button = (
@@ -194,7 +194,7 @@ PromptInputButton.displayName = 'PromptInputButton';
 
 export type PromptInputSubmitProps = React.ButtonHTMLAttributes<HTMLButtonElement>;
 
-/** Send/stop button used by chat and local-agent; each composer owns its click behavior. */
+/** Send/stop button used by chat, which owns its click behavior. */
 export const PromptInputSubmit = React.forwardRef<HTMLButtonElement, PromptInputSubmitProps>(
   ({ className, children, ...props }, ref) => {
     // The status comes from the PromptInput root, which is the only place it is set.

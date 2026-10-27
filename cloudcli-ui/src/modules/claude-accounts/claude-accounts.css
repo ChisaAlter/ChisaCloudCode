@@ -1,0 +1,89 @@
+/* The dialog and settings share one account switcher. All colors follow the application's theme. */
+.claude-accounts-dialog[role="dialog"] { display: flex; width: calc(100vw - 40px); max-width: 520px; max-height: min(88dvh, 780px); flex-direction: column; overflow: hidden; padding: 0; border-radius: 16px; }
+.claude-accounts-dialog-header { display: flex; flex-shrink: 0; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 22px 24px 18px; }
+.claude-accounts-dialog-title { margin: 0; font-size: 16px; font-weight: 600; line-height: 24px; letter-spacing: -0.015em; }
+.claude-accounts-dialog-subtitle { margin: 5px 0 0; font-size: 12px; line-height: 18px; color: hsl(var(--muted-foreground)); }
+.claude-accounts-dialog-header > button { margin: -4px -8px 0 0; color: hsl(var(--muted-foreground)); }
+.claude-accounts-dialog-body { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 0 24px 20px; scrollbar-width: thin; }
+.claude-accounts-panel { min-width: 0; font-size: 13px; line-height: 1.5; }
+.claude-accounts-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
+.claude-accounts-toolbar h3 { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 500; color: hsl(var(--muted-foreground)); }
+.claude-accounts-count { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 5px; font-size: 10px; font-variant-numeric: tabular-nums; background: hsl(var(--foreground) / 0.05); }
+.claude-accounts-panel .claude-accounts-refresh { height: 28px; gap: 5px; padding: 0 6px; font-size: 12px; color: hsl(var(--muted-foreground)); }
+.claude-accounts-panel .claude-accounts-refresh svg { width: 13px; height: 13px; }
+.claude-accounts-list { display: grid; gap: 12px; list-style: none; margin: 0; padding: 0; }
+.claude-account-row { position: relative; min-width: 0; padding: 16px; border: 1px solid hsl(var(--border) / 0.85); border-radius: 12px; background: hsl(var(--background)); }
+.claude-account-row--selected { border-color: hsl(var(--primary) / 0.4); background: hsl(var(--primary) / 0.035); }
+.claude-account-identity { display: flex; align-items: center; gap: 10px; }
+.claude-account-monogram { display: inline-flex; width: 34px; height: 34px; align-items: center; justify-content: center; flex-shrink: 0; border: 1px solid hsl(var(--border) / 0.5); border-radius: 10px; background: hsl(var(--foreground) / 0.04); color: hsl(var(--foreground) / 0.65); font-size: 13px; font-weight: 500; }
+.claude-account-row--selected .claude-account-monogram { color: hsl(var(--primary)); background: hsl(var(--primary) / 0.09); border-color: hsl(var(--primary) / 0.1); }
+.claude-account-identity-text { min-width: 0; flex: 1; }
+.claude-account-name { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; line-height: 21px; letter-spacing: -0.015em; }
+.claude-account-meta { display: flex; align-items: center; gap: 6px; min-height: 18px; margin-top: 2px; color: hsl(var(--muted-foreground)); font-size: 11px; line-height: 17px; }
+.claude-account-plan { flex-shrink: 0; padding: 0 5px; border: 1px solid hsl(var(--border) / 0.8); border-radius: 4px; background: hsl(var(--background) / 0.6); color: hsl(var(--foreground) / 0.7); font-size: 10px; text-transform: capitalize; }
+.claude-account-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.claude-account-identity-actions { display: flex; flex-direction: row; flex-shrink: 0; align-items: center; gap: 3px; }
+.claude-accounts-panel .claude-account-selected, .claude-accounts-panel .claude-account-switch { height: 28px; padding: 0 9px; gap: 4px; font-size: 11px; box-shadow: none; }
+.claude-accounts-panel .claude-account-selected { opacity: 1; color: hsl(var(--primary)); font-weight: 500; }
+.claude-account-selected svg { width: 12px; height: 12px; }
+.claude-accounts-panel .claude-account-menu-trigger { width: 26px; height: 28px; color: hsl(var(--muted-foreground)); }
+.claude-account-menu-trigger svg { width: 16px; height: 16px; }
+.claude-account-menu { min-width: 160px; max-width: 220px; }
+.claude-account-menu [role="menuitem"] { padding: 7px 9px; font-size: 12px; }
+.claude-quota-overview { margin-top: 16px; }
+.claude-quota-overview .claude-quota-windows { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 20px; }
+.claude-quota-window { min-width: 0; }
+.claude-quota-window-heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 3px 6px; margin-bottom: 7px; }
+.claude-quota-overview .claude-quota-window-label { margin: 0; font-size: 11px; color: hsl(var(--muted-foreground)); }
+.claude-quota-overview .claude-quota-value { display: flex; align-items: baseline; gap: 3px; margin-bottom: 0; }
+.claude-quota-percent { font-size: 18px; font-weight: 500; letter-spacing: -0.035em; line-height: 24px; font-variant-numeric: tabular-nums; }
+.claude-quota-percent-sign { margin-left: 1px; font-size: 12px; }
+.claude-quota-used { font-size: 10px; color: hsl(var(--muted-foreground)); }
+.claude-quota-track { height: 5px; overflow: hidden; border-radius: 99px; background: hsl(var(--foreground) / 0.08); }
+.claude-quota-fill { height: 100%; border-radius: inherit; background: hsl(var(--primary) / 0.8); }
+.claude-quota-fill--high { background: hsl(var(--destructive)); }
+.claude-quota-reset { margin-top: 6px; font-size: 10px; line-height: 16px; color: hsl(var(--muted-foreground)); font-variant-numeric: tabular-nums; }
+.claude-quota-updated { margin-top: 10px; font-size: 10px; line-height: 16px; color: hsl(var(--muted-foreground) / 0.85); font-variant-numeric: tabular-nums; }
+.claude-quota-notice { margin-top: 8px; font-size: 11px; color: hsl(var(--muted-foreground)); overflow-wrap: anywhere; }
+.claude-quota-error { color: hsl(var(--destructive)); }
+.claude-quota-unavailable { padding: 8px 0; font-size: 12px; color: hsl(var(--muted-foreground)); }
+.claude-account-details { margin-top: 12px; padding-top: 12px; border-top: 1px solid hsl(var(--border) / 0.7); }
+.claude-account-details > p { margin-top: 6px; font-size: 11px; line-height: 1.7; color: hsl(var(--muted-foreground)); overflow-wrap: anywhere; }
+.claude-account-info-heading { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 500; }
+.claude-account-info-heading > button { height: 24px; padding: 0 6px; font-size: 11px; font-weight: 400; color: hsl(var(--muted-foreground)); }
+.claude-account-edit-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.claude-accounts-panel .claude-account-edit-actions button { height: 28px; padding: 0 10px; font-size: 12px; }
+.claude-account-signin-warning { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; font-size: 11px; color: hsl(var(--destructive)); }
+.claude-account-signin-warning > button { height: 24px; padding: 0 6px; font-size: 11px; }
+.claude-accounts-footer { display: block; margin-top: 18px; padding-top: 16px; border-top: 1px solid hsl(var(--border) / 0.7); }
+.claude-accounts-footer-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.claude-accounts-switch-note { margin-top: 12px; font-size: 11px; line-height: 17px; color: hsl(var(--muted-foreground)); }
+.claude-accounts-panel .claude-accounts-add { height: 30px; padding: 0 10px; font-size: 12px; gap: 6px; box-shadow: none; }
+.claude-accounts-panel .claude-accounts-help-toggle { height: 28px; padding: 0 4px; font-size: 11px; gap: 5px; color: hsl(var(--muted-foreground)); }
+.claude-accounts-add svg, .claude-accounts-help-toggle svg { width: 13px; height: 13px; }
+.claude-accounts-help { display: grid; gap: 8px; padding: 14px 0 0; color: hsl(var(--muted-foreground)); font-size: 12px; line-height: 1.7; }
+.claude-accounts-login { margin-top: 14px; padding: 16px; border: 1px solid hsl(var(--border)); border-radius: 12px; background: hsl(var(--foreground) / 0.025); }
+.claude-accounts-login > p { margin-bottom: 12px; font-size: 12px; color: hsl(var(--muted-foreground)); line-height: 1.7; }
+.claude-accounts-login form > label { font-size: 12px; }
+.claude-accounts-login form > button { margin-top: 10px; height: 30px; font-size: 12px; }
+.claude-accounts-route { margin-bottom: 14px; padding: 10px 12px; border: 1px solid hsl(var(--border)); border-radius: 8px; background: hsl(var(--foreground) / 0.025); }
+.claude-accounts-route-label { font-size: 12px; font-weight: 500; overflow-wrap: anywhere; }
+.claude-accounts-route-note { margin-top: 4px; font-size: 11px; color: hsl(var(--muted-foreground)); line-height: 1.7; }
+.claude-accounts-empty { padding: 16px 0; font-size: 13px; color: hsl(var(--muted-foreground)); line-height: 1.7; }
+.claude-accounts-empty-state { display: grid; justify-items: center; gap: 10px; padding: 28px 12px; text-align: center; }
+.claude-accounts-empty-state > svg { width: 28px; height: 28px; color: hsl(var(--muted-foreground)); }
+.claude-accounts-empty-state > p { max-width: 320px; font-size: 13px; }
+.claude-accounts-empty-state > span { max-width: 340px; font-size: 11px; line-height: 1.7; color: hsl(var(--muted-foreground)); }
+.claude-accounts-error { margin: 10px 0; font-size: 12px; color: hsl(var(--destructive)); overflow-wrap: anywhere; }
+@media (max-width: 420px) {
+  .claude-accounts-dialog[role="dialog"] { width: calc(100vw - 20px); max-height: calc(100dvh - 24px); border-radius: 14px; }
+  .claude-accounts-dialog-header { padding: 18px 16px 14px; }
+  .claude-accounts-dialog-body { padding: 0 16px 16px; }
+  .claude-account-row { padding: 13px 12px; }
+  .claude-account-identity { gap: 8px; }
+  .claude-account-monogram { width: 30px; height: 30px; border-radius: 9px; }
+  .claude-account-name { font-size: 12px; }
+  .claude-account-identity-actions { gap: 0; }
+  .claude-accounts-panel .claude-account-switch, .claude-accounts-panel .claude-account-selected { padding: 0 6px; font-size: 10px; }
+  .claude-quota-overview .claude-quota-windows { gap: 14px; }
+}

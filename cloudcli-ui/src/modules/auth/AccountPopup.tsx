@@ -1,4 +1,4 @@
-import { useId } from 'react';
+import { useId, useState } from 'react';
 import { X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
@@ -7,6 +7,7 @@ import LoginForm from '@/modules/auth/LoginForm';
 import { AccountProfileEditor } from '@/modules/auth/AccountProfileEditor';
 import { AccountServerConnection } from '@/modules/auth/AccountServerConnection';
 import { ClaudeUsageContent } from '@/modules/plugins';
+import { ClaudeAccountsPanel } from '@/modules/claude-accounts';
 import { Dialog, DialogContent, DialogTitle } from '@/shared/ui';
 import type { AccountPopupSection } from '@/shared/types';
 
@@ -15,6 +16,8 @@ export function AccountPopup({ isOpen, onClose, section = 'account' }: { isOpen:
   const { user } = useAuth();
   const { t } = useTranslation('auth');
   const titleId = useId();
+  // The larger transcript history is mounted only after explicitly opening its disclosure.
+  const [showHistory, setShowHistory] = useState(false);
   const title = section === 'quota' ? t('accountMenu.usage') : section === 'settings' ? t('accountMenu.settings') : user ? t('accountMenu.profile') : t('login.submit');
   return (
     <Dialog open={isOpen} onOpenChange={(open) => { if (!open) onClose(); }}>
@@ -28,7 +31,7 @@ export function AccountPopup({ isOpen, onClose, section = 'account' }: { isOpen:
             <div className="space-y-4"><p className="text-sm text-muted-foreground">{t('accountMenu.loginDescription')}</p><LoginForm embedded /></div>
           ))}
           {isOpen && section === 'settings' && <AccountServerConnection />}
-          {isOpen && section === 'quota' && (user ? <ClaudeUsageContent /> : <p className="text-sm text-muted-foreground">{t('accountMenu.loginForUsage')}</p>)}
+          {isOpen && section === 'quota' && (user ? <div className="space-y-4"><ClaudeAccountsPanel onOpenHistory={() => setShowHistory(value => !value)} />{showHistory && <ClaudeUsageContent />}</div> : <p className="text-sm text-muted-foreground">{t('accountMenu.loginForUsage')}</p>)}
         </div>
       </DialogContent>
     </Dialog>

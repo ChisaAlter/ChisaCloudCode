@@ -92,7 +92,8 @@ function SidebarProjectItem({
         <button type="button" className="flex h-8 min-w-0 flex-1 items-center gap-2 text-left" aria-expanded={isExpanded}
           onClick={() => { if (!isSelected) onProjectSelect(project); onToggleProject(project.projectId); }}>
           {isExpanded ? <FolderOpen className="h-4 w-4 shrink-0 text-muted-foreground" /> : <Folder className="h-4 w-4 shrink-0 text-muted-foreground" />}
-          {!isEditing && <span className="min-w-0 flex-1 truncate text-[13px] font-normal" title={project.fullPath}>{project.displayName}</span>}
+          {!isEditing && <span className="min-w-0 flex-1 truncate text-[13px] font-normal" title={project.displayPath || project.remotePath || project.fullPath}>{project.displayName}</span>}
+          {project.sourceMode === 'ssh' && <span className="shrink-0 text-[10px] text-muted-foreground" title={project.connectionLabel || 'SSH 本地'}>SSH</span>}
           {isStarred && <Star className="h-3 w-3 shrink-0 fill-current text-muted-foreground" />}
         </button>
         {isEditing ? (

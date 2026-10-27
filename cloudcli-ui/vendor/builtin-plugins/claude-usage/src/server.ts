@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -16,22 +17,37 @@ const LIVE_CACHE_MS = 30_000;
 
 // ── /live ──────────────────────────────────────────────────────────────
 
-let liveCache: { at: number; data: LiveData } | null = null;
+const liveCache = new Map<string, { at: number; fingerprint: string; data: LiveData }>();
 
-async function getLive(): Promise<LiveData> {
-  if (liveCache && Date.now() - liveCache.at < LIVE_CACHE_MS) return liveCache.data;
-
+function readLiveCredentials(credentialDir: string) {
+  let contents: string;
   let credsJson: unknown;
   try {
-    credsJson = JSON.parse(fs.readFileSync(path.join(CREDENTIAL_DIR, '.credentials.json'), 'utf-8'));
+    contents = fs.readFileSync(path.join(credentialDir, '.credentials.json'), 'utf-8');
+    credsJson = JSON.parse(contents);
   } catch {
+    liveCache.delete(credentialDir);
     throw Object.assign(new Error('No Claude Code credentials found — sign in with the claude CLI first.'), { status: 404 });
   }
   const creds = parseCredentials(credsJson, Date.now());
-  if (!creds) throw Object.assign(new Error('Unrecognized credentials file format.'), { status: 500 });
+  if (!creds) {
+    liveCache.delete(credentialDir);
+    throw Object.assign(new Error('Unrecognized credentials file format.'), { status: 500 });
+  }
   if (creds.expired) {
+    liveCache.delete(credentialDir);
     throw Object.assign(new Error('OAuth token expired — run claude to refresh it, then retry.'), { status: 401 });
   }
+  // Hash the entire credential payload so token, identity and plan changes invalidate old figures.
+  // Only this digest is cached; raw credentials live solely in the current read/request stack.
+  return { creds, fingerprint: createHash('sha256').update(contents!).digest('hex') };
+}
+
+async function getLive(credentialDir: string): Promise<LiveData> {
+  const { creds, fingerprint } = readLiveCredentials(credentialDir);
+  const cached = liveCache.get(credentialDir);
+  if (cached?.fingerprint === fingerprint && Date.now() - cached.at < LIVE_CACHE_MS) return cached.data;
+  if (cached && cached.fingerprint !== fingerprint) liveCache.delete(credentialDir);
 
   const res = await fetch(USAGE_URL, {
     headers: {
@@ -45,7 +61,15 @@ async function getLive(): Promise<LiveData> {
     throw Object.assign(new Error(`Usage endpoint returned HTTP ${res.status}.`), { status: res.status === 429 ? 429 : 502 });
   }
   const data = normalizeUsage(await res.json(), creds.plan, creds.tier);
-  liveCache = { at: Date.now(), data };
+  let unchanged = false;
+  try { unchanged = readLiveCredentials(credentialDir).fingerprint === fingerprint; }
+  catch { /* Removed, malformed or expired credentials also invalidate the pending result. */ }
+  if (!unchanged) {
+    liveCache.delete(credentialDir);
+    throw Object.assign(new Error('Claude account changed during the usage request — refresh to read the current account.'), { status: 409 });
+  }
+  if (liveCache.size >= 128) liveCache.delete(liveCache.keys().next().value!);
+  liveCache.set(credentialDir, { at: Date.now(), fingerprint, data });
   return data;
 }
 
@@ -67,8 +91,8 @@ function readSessionFile(file: string): UsageEntry[] {
   return entries;
 }
 
-function getHistory(days: number) {
-  const projectsDir = path.join(CLAUDE_DIR, 'projects');
+function getHistory(days: number, configDir: string) {
+  const projectsDir = path.join(configDir, 'projects');
   const sessions: SessionEntries[] = [];
   let dirs: fs.Dirent[] = [];
   try {
@@ -98,17 +122,29 @@ function getHistory(days: number) {
 
 // ── HTTP wiring ────────────────────────────────────────────────────────
 
+function requestScope(req: http.IncomingMessage, header: string, fallback: string): string {
+  const value = req.headers[header];
+  if (typeof value === 'string') {
+    const decoded = Buffer.from(value, 'base64').toString('utf8');
+    if (path.isAbsolute(decoded) && !decoded.includes('\0')) return decoded;
+  }
+  // The shipped host must provide a scope on every request. Standalone upstream
+  // use keeps its environment fallback, but a host upgrade may never leak it.
+  if (process.env.PLUGIN_NAME === 'claude-usage') throw Object.assign(new Error('Authenticated usage scope is required.'), { status: 403 });
+  return fallback;
+}
+
 const server = http.createServer(async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   try {
     const url = new URL(req.url ?? '/', 'http://localhost');
     if (req.method === 'GET' && url.pathname === '/live') {
-      res.end(JSON.stringify(await getLive()));
+      res.end(JSON.stringify(await getLive(requestScope(req, 'x-chisa-claude-auth-dir', CREDENTIAL_DIR))));
       return;
     }
     if (req.method === 'GET' && url.pathname === '/history') {
       const days = Math.min(Math.max(Number(url.searchParams.get('days')) || 30, 1), 365);
-      res.end(JSON.stringify(getHistory(days)));
+      res.end(JSON.stringify(getHistory(days, requestScope(req, 'x-chisa-claude-config-dir', CLAUDE_DIR))));
       return;
     }
     res.writeHead(404);

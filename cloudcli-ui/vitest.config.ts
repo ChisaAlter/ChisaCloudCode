@@ -7,7 +7,6 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   resolve: {
     alias: {
-      '@builtin-plugins': fileURLToPath(new URL('./vendor/builtin-plugins', import.meta.url)),
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },

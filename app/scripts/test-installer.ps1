@@ -29,14 +29,11 @@ try {
 } finally { $env:MAKENSIS = $previousMakensis }
 $installer = Join-Path $fixtureApp "build/windows-amd64/$product Setup 0.0.0.exe"
 
-foreach ($lockedRelative in @($exeName, 'payload/resource.dat', 'mutagen.exe')) {
+foreach ($lockedRelative in @($exeName, 'payload/resource.dat')) {
     $destination = Join-Path $testRoot ([guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path "$destination/payload" -Force | Out-Null
     [IO.File]::WriteAllText("$destination/$exeName", 'original application')
     [IO.File]::WriteAllText("$destination/payload/resource.dat", 'original resource')
-    # An invalid local fixture executable exercises daemon-stop failure without
-    # contacting or stopping any real Mutagen daemon.
-    if ($lockedRelative -eq 'mutagen.exe') { [IO.File]::WriteAllText("$destination/mutagen.exe", 'unavailable daemon fixture') }
     $locked = [IO.File]::Open((Join-Path $destination $lockedRelative), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
         $process = Start-Process -FilePath $installer -ArgumentList "/S /D=$destination" -WindowStyle Hidden -Wait -PassThru
@@ -64,7 +61,6 @@ New-Item -ItemType Directory -Path $custom -Force | Out-Null
 $key = $registry.CreateSubKey($registryPath)
 $key.SetValue('InstallLocation', $custom)
 $key.Dispose()
-$resident = $null
 try {
     $locked = [IO.File]::Open("$custom/$exeName", [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
@@ -95,41 +91,6 @@ try {
         Write-Output 'PASS: busy uninstall exits 32 before removing payload or registration'
     } finally { $locked.Dispose() }
 
-    # A private fake daemon exercises the real stop/wait path without opening
-    # the user's Mutagen data directory or stopping a real synchronization task.
-    $helperSource = Join-Path $testRoot 'FakeDaemon.cs'
-    @'
-using System;
-using System.IO;
-using System.Threading;
-class FakeDaemon {
-    static int Main(string[] args) {
-        string executable = System.Reflection.Assembly.GetExecutingAssembly().Location;
-        if (args.Length == 2 && args[0] == "daemon" && args[1] == "stop") {
-            File.WriteAllText(executable + ".data", Environment.GetEnvironmentVariable("MUTAGEN_DATA_DIRECTORY") ?? "");
-            File.WriteAllText(executable + ".stop", "stop");
-            return 0;
-        }
-        File.WriteAllText(executable + ".ready", "ready");
-        for (int i = 0; i < 300; i++) {
-            if (File.Exists(executable + ".stop")) return 0;
-            Thread.Sleep(100);
-        }
-        return 3;
-    }
-}
-'@ | Set-Content -LiteralPath $helperSource -Encoding utf8
-    $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
-    & $compiler /nologo /target:exe "/out:$destination/mutagen.exe" $helperSource
-    if ($LASTEXITCODE -ne 0) { throw "Fake daemon compilation failed: $LASTEXITCODE" }
-    $resident = Start-Process -FilePath "$destination/mutagen.exe" -ArgumentList 'hold' -WindowStyle Hidden -PassThru
-    $waiting = [Diagnostics.Stopwatch]::StartNew()
-    while (-not (Test-Path -LiteralPath "$destination/mutagen.exe.ready") -and $waiting.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 50 }
-    if (-not (Test-Path -LiteralPath "$destination/mutagen.exe.ready")) {
-        if (-not $resident.HasExited) { $resident.Kill(); $resident.WaitForExit() }
-        throw 'Fake daemon did not become ready'
-    }
-
     # The existing reader allows write access (preflight passes) but not deletion.
     # This reaches the generated Delete error path without a timing race.
     $locked = [IO.File]::Open("$destination/payload/resource.dat", [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
@@ -140,14 +101,10 @@ class FakeDaemon {
         try { if (-not $key -or $key.GetValue('UninstallString') -notlike '*Uninstall.exe*') { throw 'Failed uninstall lost its registered retry entry' } } finally { if ($key) { $key.Dispose() } }
         if (-not (Test-Path -LiteralPath "$destination/Uninstall.exe") -or
             [IO.File]::ReadAllText("$destination/payload/resource.dat") -ne 'replacement') { throw 'Delete failure lost retry executable or locked payload' }
-        if (-not $resident.WaitForExit(5000) -or $resident.ExitCode -ne 0) { throw 'Uninstall did not stop its private resident daemon' }
-        $expectedDataDirectory = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'ChisaCloudCode/mutagen'
-        if ([IO.File]::ReadAllText("$destination/mutagen.exe.data") -ne $expectedDataDirectory) { throw 'Daemon stop used the wrong application-specific data directory' }
-        Write-Output 'PASS: uninstall stops only its private fake resident daemon and waits for its image to unlock'
         Write-Output 'PASS: payload delete failure exits 1 and retains the original registered uninstall entry'
     } finally {
         $locked.Dispose()
-        if (-not $resident.HasExited) { $resident.Kill(); $resident.WaitForExit() }
+
     }
 
     $process = Start-Process -FilePath "$destination/Uninstall.exe" -ArgumentList "/S _?=$destination" -WindowStyle Hidden -Wait -PassThru
@@ -162,7 +119,7 @@ class FakeDaemon {
     if ($process.ExitCode -ne 0) { throw "Normal-path fixture install failed: $($process.ExitCode)" }
     $process = Start-Process -FilePath "$normal/Uninstall.exe" -ArgumentList '/S' -WindowStyle Hidden -Wait -PassThru
     if ($process.ExitCode -ne 0) { throw "Normal copied uninstaller launch failed: $($process.ExitCode)" }
-    $waiting.Restart()
+    $waiting = [Diagnostics.Stopwatch]::StartNew()
     do {
         $key = $registry.OpenSubKey($registryPath)
         $registered = $null -ne $key
@@ -174,10 +131,6 @@ class FakeDaemon {
     if ($registered -or $retainedPayload) { throw 'Normal copied uninstaller did not finish payload and registration cleanup' }
     Write-Output 'PASS: normal /S copied-uninstaller path removes payload, original uninstaller and registration'
 } finally {
-    if ($resident) {
-        if (-not $resident.HasExited) { $resident.Kill(); $resident.WaitForExit() }
-        $resident.Dispose()
-    }
     $registry.DeleteSubKeyTree($registryPath, $false)
     $registry.Dispose()
     foreach ($folder in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'))) {

@@ -124,6 +124,8 @@ export const DialogContent = React.forwardRef<HTMLDivElement, DialogContentProps
 
       const handleKeyDown = (e: KeyboardEvent) => {
         if (e.key === 'Escape') {
+          // An open child menu owns the first Escape; let its keyboard handler close it and restore focus.
+          if (contentRef.current?.querySelector('[role="menu"]')) return;
           e.stopPropagation();
           onEscapeKeyDown?.();
           onOpenChange(false);

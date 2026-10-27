@@ -30,9 +30,7 @@ export function createDesktopGateway(configuration: GatewayConfiguration) {
   }
 
   function resolveRoute(rawUrl: string) {
-    let url: URL;
-    try { url = new URL(rawUrl, 'https://gateway.invalid'); }
-    catch { return null; }
+    const url = new URL(rawUrl, 'https://gateway.invalid');
     const match = /^\/instances\/([a-zA-Z0-9_-]+)(\/.*)$/.exec(url.pathname);
     const id = match?.[1] ?? configuration.defaultInstance;
     const pathname = match?.[2] ?? url.pathname;
@@ -93,22 +91,6 @@ export function createDesktopGateway(configuration: GatewayConfiguration) {
     if (!route || !route.path.startsWith('/api/')) { sendError(response, 404, 'Unknown service path'); return; }
     const upstream = httpRequest({ hostname: '127.0.0.1', port: route.instance.port, path: route.path,
       method: request.method, headers: { ...request.headers, host: `127.0.0.1:${route.instance.port}` } }, incoming => {
-      if (incoming.statusCode === 200 && route.path.split('?')[0] === '/api/workspace-sync/enroll') {
-        const chunks: Buffer[] = [];
-        incoming.on('data', (chunk: Buffer) => chunks.push(chunk));
-        incoming.on('error', () => response.destroy());
-        incoming.on('end', () => {
-          try {
-            const payload = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
-            payload.workspaceServerUrl = route.instance.workspaceServerUrl;
-            payload.sshHost = new URL(route.instance.workspaceServerUrl).hostname;
-            const body = Buffer.from(JSON.stringify(payload));
-            response.writeHead(200, { ...incoming.headers, 'content-length': body.length });
-            response.end(body);
-          } catch { sendError(response, 502, 'File synchronization service returned an invalid response'); }
-        });
-        return;
-      }
       if (incoming.statusCode === 200 && route.path.split('?')[0] === '/api/auth/user') {
         incoming.headers['x-chisa-instance-path'] = `/instances/${route.id}`;
         incoming.headers['x-chisa-workspace-server-url'] = route.instance.workspaceServerUrl;

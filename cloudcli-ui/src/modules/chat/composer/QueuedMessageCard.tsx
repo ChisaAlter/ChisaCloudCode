@@ -13,8 +13,8 @@ type QueuedMessageCardProps = {
 };
 
 /**
- * Rendered by chat's ChatComposer for a server queue or local synchronization
- * wait, with edit and cancel actions before the message is auto-sent.
+ * Rendered by chat's ChatComposer for its durable server queue, with edit and
+ * cancel actions before the message is auto-sent.
  */
 export default function QueuedMessageCard({
   content,

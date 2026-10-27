@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import * as nodeCrypto from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
 import type { AddressInfo } from 'node:net';
+import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
@@ -29,6 +30,7 @@ function createDependencies(
     apiKeys: { validateApiKey: () => undefined },
     githubTokens: { getActiveGithubToken: () => null },
     projects: { createProjectPath: () => ({ outcome: 'created' }) },
+    resolveProjectTarget: ({ projectPath }) => ({ projectPath: path.resolve(String(projectPath)), sourceMode: 'cloud' }),
     models: {} as AgentDependencies['models'],
     queryClaude: unexpectedProviderCall as AgentDependencies['queryClaude'],
     queryCursor: unexpectedProviderCall as AgentDependencies['queryCursor'],
@@ -68,6 +70,69 @@ test('Agent route rejects missing project input before invoking provider depende
     assert.equal(response.status, 400);
     assert.equal(body.error, 'Either githubUrl or projectPath is required');
   });
+});
+
+test('Agent route rejects unauthorized SSH targets before filesystem, tokens, clone, registration and runtime work', async () => {
+  const sideEffects: string[] = [];
+  const forbidden = (name: string) => { sideEffects.push(name); throw new Error(`Unexpected ${name}`); };
+  const received: unknown[] = [];
+  await withAgentServer(createDependencies({
+    resolveProjectTarget: input => {
+      received.push(input);
+      throw Object.assign(new Error('Foreign SSH owner'), { code: 'SSH_WORKSPACE_FORBIDDEN', statusCode: 403 });
+    },
+    fileSystem: new Proxy({}, { get: () => () => forbidden('filesystem') }) as AgentDependencies['fileSystem'],
+    githubTokens: { getActiveGithubToken: () => forbidden('token') },
+    projects: { createProjectPath: () => forbidden('registration') },
+    models: { getProviderModels: () => forbidden('catalog') } as unknown as AgentDependencies['models'],
+    spawnProcess: (() => forbidden('clone')) as unknown as AgentDependencies['spawnProcess'],
+    queryClaude: (async () => forbidden('runtime')) as AgentDependencies['queryClaude'],
+  }), async baseUrl => {
+    for (const stream of [true, false]) {
+      const response = await fetch(`${baseUrl}/api/agent`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ projectPath: '/opt/work/.chisa-ssh-projects/foreign', githubUrl: 'https://github.com/owner/repo', message: 'Run', stream }),
+      });
+      assert.equal(response.status, 403);
+      assert.equal(response.headers.get('content-type')?.includes('application/json'), true);
+      assert.equal((await response.json() as { code: string }).code, 'SSH_WORKSPACE_FORBIDDEN');
+    }
+  });
+  assert.deepEqual(sideEffects, []);
+  assert.deepEqual(received, [true, false].map(() => ({ projectPath: '/opt/work/.chisa-ssh-projects/foreign', provider: 'claude', userId: 1, cloneRepository: true, manageGit: false })));
+});
+
+test('Agent route sends an owned SSH target directly to Claude with the authenticated writer', async () => {
+  let runtimeCalls = 0;
+  const anchor = '/opt/work/.chisa-ssh-projects/owned';
+  await withAgentServer(createDependencies({
+    resolveProjectTarget: input => {
+      assert.equal(input.userId, 1);
+      assert.equal(input.provider, 'claude');
+      return { projectPath: anchor, sourceMode: 'ssh' };
+    },
+    fileSystem: {} as AgentDependencies['fileSystem'],
+    projects: { createProjectPath: () => { throw new Error('SSH anchor must not be registered'); } },
+    models: { getProviderModels: () => { throw new Error('Claude must authorize its session before any catalog lookup'); } } as unknown as AgentDependencies['models'],
+    queryClaude: (async (_prompt, options, writer) => {
+      runtimeCalls++;
+      assert.equal(options.cwd, anchor);
+      assert.equal(options.projectPath, anchor);
+      assert.equal(options.sessionId, 'owned-app-session');
+      assert.equal(options.permissionMode, 'bypassPermissions');
+      assert.equal(writer.userId, 1);
+    }) as AgentDependencies['queryClaude'],
+  }), async baseUrl => {
+    for (const stream of [true, false]) {
+      const response = await fetch(`${baseUrl}/api/agent`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ projectPath: anchor, message: 'Run', sessionId: 'owned-app-session', stream }),
+      });
+      assert.equal(response.status, 200);
+      await response.text();
+    }
+  });
+  assert.equal(runtimeCalls, 2);
 });
 
 test('Agent route validates API keys through the injected repository', async () => {

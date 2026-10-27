@@ -118,6 +118,7 @@ export function TaskMasterProvider({ children }: { children: React.ReactNode }) 
   const currentProjectIdRef = useRef<string | null>(null);
   const projectTaskMasterRef = useRef<TaskMasterProjectInfo | null>(null);
   const taskMasterRequestSeqRef = useRef(0);
+  const tasksRequestSeqRef = useRef(0);
 
   useEffect(() => {
     currentProjectIdRef.current = currentProject?.projectId ?? null;
@@ -155,7 +156,7 @@ export function TaskMasterProvider({ children }: { children: React.ReactNode }) 
 
   const refreshCurrentProjectTaskMaster = useCallback(
     async (projectId: string) => {
-      if (!projectId || !user || !token) {
+      if (!projectId || currentProjectIdRef.current !== projectId || !user || !token) {
         return;
       }
 
@@ -194,7 +195,12 @@ export function TaskMasterProvider({ children }: { children: React.ReactNode }) 
 
   const setCurrentProject = useCallback(
     (project: TaskMasterProjectInput) => {
-      const normalizedProject = project ? enrichProject(project as TaskMasterProject) : null;
+      // SSH has no TaskMaster workspace. Invalidate pending cloud reads before changing selection.
+      const normalizedProject = project && project.sourceMode !== 'ssh' ? enrichProject(project as TaskMasterProject) : null;
+      taskMasterRequestSeqRef.current += 1;
+      tasksRequestSeqRef.current += 1;
+      currentProjectIdRef.current = normalizedProject?.projectId ?? null;
+      setIsLoadingTasks(false);
       setCurrentProjectState(normalizedProject);
       setProjectTaskMaster(normalizedProject?.taskmaster ?? null);
 
@@ -204,7 +210,6 @@ export function TaskMasterProvider({ children }: { children: React.ReactNode }) 
 
       // `projectId` is the DB primary key used for every TaskMaster API call.
       if (!normalizedProject?.projectId) {
-        taskMasterRequestSeqRef.current += 1;
         return;
       }
 
@@ -236,12 +241,14 @@ export function TaskMasterProvider({ children }: { children: React.ReactNode }) 
     // TaskMaster tasks endpoint now lives under /api/taskmaster/tasks/:projectId.
     const projectId = currentProject?.projectId;
 
-    if (!projectId || !user || !token) {
+    if (!projectId || currentProjectIdRef.current !== projectId || !user || !token) {
       setTasks([]);
       setNextTask(null);
       return;
     }
 
+    const requestSequence = ++tasksRequestSeqRef.current;
+    const isCurrent = () => requestSequence === tasksRequestSeqRef.current && currentProjectIdRef.current === projectId;
     try {
       setIsLoadingTasks(true);
       clearError();
@@ -254,15 +261,17 @@ export function TaskMasterProvider({ children }: { children: React.ReactNode }) 
 
       const data = (await response.json()) as { tasks?: TaskMasterTask[] };
       const loadedTasks = Array.isArray(data.tasks) ? data.tasks : [];
+      if (!isCurrent()) return;
 
       setTasks(loadedTasks);
       setNextTask(getNextTask(loadedTasks));
     } catch (caughtError) {
+      if (!isCurrent()) return;
       handleError('load tasks', caughtError);
       setTasks([]);
       setNextTask(null);
     } finally {
-      setIsLoadingTasks(false);
+      if (isCurrent()) setIsLoadingTasks(false);
     }
   }, [clearError, currentProject?.projectId, handleError, token, user]);
 

@@ -8,7 +8,7 @@ import type { ComposerMenuAnchor } from '@/shared/types';
  * Shared shell for the composer popovers (model/effort and permissions) so both
  * menus share one surface, one heading style and one row style.
  *
- * Used by chat's model, permission and schedule menus and local-agent's model configuration popup.
+ * Used by chat's model, permission and schedule menus for consistent popup controls.
  */
 export function ComposerMenuSurface({
   anchor,

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn as realSpawn } from 'node:child_process';
 import * as childProcess from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,11 +11,42 @@ import test, { mock } from 'node:test';
 
 const fixture = await mkdtemp(path.join(os.tmpdir(), 'chisa-worker-admission-'));
 process.env.WORKSPACES_ROOT = fixture;
+// Internal sandbox coverage uses explicit cloud fixtures, not account restoration.
+mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
+  ensureCloudWorkspaceBinding() {}, excludeCloudWorkspaceMetadata() {}, getWorkspaceRuntimeIdentity() { return undefined; },
+  executeWorkspaceRuntimePreview() { assert.fail('unexpected preview'); },
+} });
 
 type FakeChild = EventEmitter & { stdout: PassThrough; stderr: PassThrough; stdin: PassThrough; kill(): void };
 let commands: string[][] = [];
 let onRun: ((child: FakeChild, args: string[]) => void) | undefined;
+let onCleanup: ((child: FakeChild, args: string[]) => void) | undefined;
 let cleanupFails = false;
+let gateEnabled = false;
+let failGateReleaseOnce = false;
+let gateReleases = 0;
+let gateGeneration = 'complete';
+const realGate = await import('../workspace-writer-gate.service.js');
+mock.module('../workspace-writer-gate.service.js', { namedExports: {
+  ...realGate,
+  cloudWriterGateAvailable: (root: string, bindingEpoch: string) => gateEnabled || realGate.cloudWriterGateAvailable(root, bindingEpoch),
+  claimCloudWriterLease: (root: string, lease: Parameters<typeof realGate.claimCloudWriterLease>[1]) => {
+    if (!gateEnabled) return realGate.claimCloudWriterLease(root, lease);
+    mkdirSync(root + '.chisa-lease');
+    gateGeneration = 'dirty';
+    writeFileSync(path.join(root + '.chisa-lease', 'state.json'), JSON.stringify(lease));
+    return true;
+  },
+  releaseCloudWriterLease: (root: string, lease: Parameters<typeof realGate.releaseCloudWriterLease>[1]) => {
+    if (!gateEnabled) return realGate.releaseCloudWriterLease(root, lease);
+    if (failGateReleaseOnce) { failGateReleaseOnce = false; throw new Error('transient writer gate release'); }
+    const expected = path.resolve(root + '.chisa-lease');
+    assert.equal(expected.startsWith(fixture + path.sep), true);
+    assert.equal(JSON.parse(readFileSync(path.join(expected, 'state.json'), 'utf8')).id, lease.id);
+    gateReleases++; gateGeneration = 'complete';
+    rmSync(expected, { recursive: true });
+  },
+} });
 const finish = (child: FakeChild, code = 0, output = '') => queueMicrotask(() => {
   if (output) child.stdout.write(output);
   child.emit('close', code);
@@ -31,16 +62,17 @@ mock.module('node:child_process', { namedExports: {
       if (onRun) onRun(child, args);
       else finish(child, 0, JSON.stringify({ ok: true, stdout: 'completed', exitCode: 0 }));
     });
+    else if (onCleanup) queueMicrotask(() => onCleanup!(child, args));
     else finish(child, cleanupFails ? 1 : 0);
     return child as unknown as ReturnType<typeof realSpawn>;
   },
 } });
-const { executeSyncTransportWorker, prepareSyncTransportPreview, workspaceQuery, isActiveWorkspaceLease } = await import('@/modules/workspace-bridge/index.js');
-const { registerWorkspaceSyncNetwork } = await import('@/shared/index.js');
+const { admitWorkspaceExecution, executeSyncTransportWorker, prepareSyncTransportPreview, workspaceQuery, isActiveWorkspaceLease } = await import('@/modules/workspace-bridge/index.js');
+const { registerWorkspaceRuntimeNetwork } = await import('@/shared/index.js');
 const network = 'chisa-workspace-network-' + 'a'.repeat(24);
-registerWorkspaceSyncNetwork(fixture, network, '172.18.0.2');
+registerWorkspaceRuntimeNetwork(fixture, network, 'prepared-worker-fixture');
 
-type Lease = { id: string; epoch: string; owner: string; pid?: number; mayWrite?: boolean; cleanupPending?: string[] };
+type Lease = { id: string; epoch: string; owner: string; pid?: number; mayWrite?: boolean; cleanupPending?: string[]; previews?: string[] };
 const epoch = 'current-binding';
 const leasePath = (root: string) => root + '.chisa-lease';
 const statePath = (root: string) => path.join(leasePath(root), 'state.json');
@@ -52,9 +84,13 @@ const saveLease = async (root: string, lease: Lease) => {
 async function withWorkspace(run: (root: string) => Promise<void>) {
   commands = [];
   onRun = undefined;
+  onCleanup = undefined;
   cleanupFails = false;
+  gateEnabled = false;
+  failGateReleaseOnce = false;
+  gateReleases = 0; gateGeneration = 'complete';
   const root = await mkdtemp(path.join(fixture, 'project-'));
-  await writeFile(path.join(root, '.chisa-bridge.json'), JSON.stringify({ protocol: 2, port: 18082, token: 'fixture', bindingEpoch: epoch }));
+  await writeFile(path.join(root, '.chisa-bridge.json'), JSON.stringify({ protocol: 3, root, owner: 'cloud-sandbox-fixture', bindingEpoch: epoch }));
   try { await run(root); }
   finally {
     await rm(leasePath(root), { recursive: true, force: true });
@@ -62,6 +98,21 @@ async function withWorkspace(run: (root: string) => Promise<void>) {
   }
 }
 test.after(() => rm(fixture, { recursive: true, force: true }));
+
+test('protocol-3 admitted close publishes its cloud writer gate before releasing ownership', async () => {
+  await withWorkspace(async root => {
+    gateEnabled = true;
+    const run = await admitWorkspaceExecution({ cwd: root, workspaceMode: 'shared', readOnly: true });
+    const captured = readLease(root);
+    assert.equal(gateGeneration, 'dirty'); assert.equal(gateReleases, 0);
+    assert.equal(isActiveWorkspaceLease(root, captured.id, epoch), true);
+    await run.close(); await run.close();
+    assert.equal(gateReleases, 1); assert.equal(gateGeneration, 'complete');
+    assert.equal(existsSync(leasePath(root)), false);
+    assert.equal(isActiveWorkspaceLease(root, captured.id, epoch), false);
+    assert.equal(commands.length, 0);
+  });
+});
 
 for (const owner of ['pi', 'sync', 'sync-needed']) {
   test(`prepared worker rejects ${owner} without spawning Docker or changing ownership`, async () => {
@@ -184,6 +235,146 @@ test('another preview and worker cannot borrow an idle preview startup reservati
     assert.equal(commands.length, 0);
     await preview.finish(true);
     assert.equal(existsSync(leasePath(root)), false);
+  });
+});
+
+test('a delivered preview keeps its exact writer until its retained container is confirmed removed', async () => {
+  await withWorkspace(async root => {
+    const preview = prepareSyncTransportPreview(root, epoch);
+    const container = 'chisa-account-preview-retained';
+    preview.retain(container, async () => { await preview.release(container, true); });
+    const retained = readLease(root);
+    assert.deepEqual(retained.previews, [container]);
+    await preview.finish(true);
+    assert.deepEqual(readLease(root), retained);
+    assert.equal(isActiveWorkspaceLease(root, retained.id, epoch), true);
+    assert.throws(() => prepareSyncTransportPreview(root, epoch), { code: 'WORKSPACE_BUSY' });
+    await assert.rejects(executeSyncTransportWorker(root, epoch, { op: 'write' }), { code: 'WORKSPACE_BUSY' });
+    await assert.rejects(workspaceQuery({ prompt: 'must not overlap preview', options: { cwd: root } }).next(), { code: 'WORKSPACE_BUSY' });
+    await assert.rejects(preview.release('another-container', true), { code: 'WORKSPACE_CLEANUP_FAILED' });
+    assert.deepEqual(readLease(root), retained);
+    await preview.release(container, true);
+    assert.equal(existsSync(leasePath(root)), false);
+    assert.equal(isActiveWorkspaceLease(root, retained.id, epoch), false);
+    assert.equal(commands.length, 0);
+  });
+});
+
+test('unconfirmed preview cleanup preserves the captured Claude owner and exact container until retry succeeds', async () => {
+  await withWorkspace(async root => {
+    const preview = prepareSyncTransportPreview(root, epoch);
+    const container = 'chisa-account-preview-cleanup-retry';
+    preview.retain(container, async () => { await preview.release(container, true); });
+    const retained = readLease(root);
+    await preview.finish(true);
+    await preview.release(container, false);
+    assert.deepEqual(readLease(root), { ...retained, cleanupPending: [container] });
+    assert.equal(readLease(root).owner, 'claude');
+    await assert.rejects(executeSyncTransportWorker(root, epoch, { op: 'write' }), { code: 'WORKSPACE_CLEANUP_FAILED' });
+    await preview.release(container, true);
+    assert.equal(existsSync(leasePath(root)), false);
+  });
+});
+
+test('confirmed preview removal retries a transient final writer-gate release without losing its exact reservation', async () => {
+  await withWorkspace(async root => {
+    gateEnabled = true;
+    const preview = prepareSyncTransportPreview(root, epoch);
+    const container = 'chisa-account-preview-gate-retry';
+    preview.retain(container, async () => { await preview.release(container, true); });
+    const captured = readLease(root);
+    await preview.finish(true);
+    failGateReleaseOnce = true;
+    await assert.rejects(preview.release(container, true), /transient writer gate release/);
+    assert.deepEqual(readLease(root).previews, []);
+    assert.equal(isActiveWorkspaceLease(root, captured.id, epoch), true);
+    assert.throws(() => prepareSyncTransportPreview(root, epoch), { code: 'WORKSPACE_BUSY' });
+    await preview.release(container, true);
+    await preview.release(container, true);
+    assert.equal(existsSync(leasePath(root)), false);
+    assert.equal(isActiveWorkspaceLease(root, captured.id, epoch), false);
+    const next = prepareSyncTransportPreview(root, epoch);
+    await next.finish(true);
+    assert.equal(existsSync(leasePath(root)), false);
+  });
+});
+
+test('preview cleanup removes only its own container and retains the already admitted model lease', async () => {
+  await withWorkspace(async root => {
+    const model = { id: 'running-model', epoch, owner: 'claude', mayWrite: true };
+    await saveLease(root, model);
+    const preview = prepareSyncTransportPreview(root, epoch);
+    const container = 'chisa-account-preview-model';
+    preview.retain(container, async () => { await preview.release(container, true); });
+    await preview.finish(true);
+    assert.deepEqual(readLease(root), { ...model, previews: [container] });
+    await preview.release(container, true);
+    assert.deepEqual(readLease(root), { ...model, previews: [], cleanupPending: [] });
+  });
+});
+
+for (const changed of [
+  { id: 'replacement' },
+  { epoch: 'replacement-binding' },
+  { owner: 'pi' },
+]) test(`preview callbacks cannot release a lease with changed ${Object.keys(changed)[0]}`, async () => {
+  await withWorkspace(async root => {
+    const preview = prepareSyncTransportPreview(root, epoch);
+    const container = 'chisa-account-preview-stale';
+    preview.retain(container, async () => { await preview.release(container, true); });
+    const retained = readLease(root);
+    const replacement = { ...retained, ...changed };
+    await saveLease(root, replacement);
+    await assert.rejects(preview.finish(true), { code: 'WORKSPACE_CLEANUP_FAILED' });
+    await assert.rejects(preview.release(container, true), { code: 'WORKSPACE_CLEANUP_FAILED' });
+    assert.deepEqual(readLease(root), replacement);
+    await saveLease(root, retained);
+    await preview.release(container, true);
+    assert.equal(existsSync(leasePath(root)), false);
+  });
+});
+
+test('Docker auto-removal presence is retried while the exact lease remains held until verified absence', async () => {
+  await withWorkspace(async root => {
+    let container = ''; let queries = 0; let removals = 0;
+    onRun = (child, args) => { container = args[args.indexOf('--name') + 1]!; finish(child, 0, JSON.stringify({ ok: true })); };
+    onCleanup = (child, args) => {
+      assert.deepEqual(readLease(root).cleanupPending, [container]);
+      if (args[0] === 'rm') { assert.equal(args[2], container); removals++; finish(child, 1); }
+      else {
+        assert.equal(args[0], 'ps'); assert.ok(args.includes(`name=^/${container}$`));
+        queries++; finish(child, 0, queries === 1 ? container + '\n' : '');
+      }
+    };
+    await executeSyncTransportWorker(root, epoch, { op: 'write' });
+    assert.equal(removals, 2); assert.equal(queries, 2);
+    assert.equal(existsSync(leasePath(root)), false);
+  });
+});
+
+test('a container that remains present exhausts cleanup budget and retains its exact barrier', { timeout: 15_000 }, async () => {
+  await withWorkspace(async root => {
+    let container = ''; let queries = 0;
+    onRun = (child, args) => { container = args[args.indexOf('--name') + 1]!; finish(child, 0, JSON.stringify({ ok: true })); };
+    onCleanup = (child, args) => {
+      if (args[0] === 'rm') finish(child, 1);
+      else { queries++; finish(child, 0, container + '\n'); }
+    };
+    const start = Date.now();
+    await assert.rejects(executeSyncTransportWorker(root, epoch, { op: 'write' }), { code: 'WORKSPACE_CLEANUP_FAILED' });
+    assert.ok(Date.now() - start < 12_000); assert.ok(queries > 1);
+    assert.deepEqual(readLease(root).cleanupPending, [container]);
+    assert.equal(readLease(root).owner, 'sync-needed');
+  });
+});
+
+for (const query of [{ code: 1, output: '' }, { code: 0, output: 'unexpected-container\n' }]) test(`unconfirmed daemon query never retries cleanup: ${query.code}/${query.output.trim()}`, async () => {
+  await withWorkspace(async root => {
+    onCleanup = (child, args) => finish(child, args[0] === 'rm' ? 1 : query.code, args[0] === 'rm' ? '' : query.output);
+    await assert.rejects(executeSyncTransportWorker(root, epoch, { op: 'write' }), { code: 'WORKSPACE_CLEANUP_FAILED' });
+    assert.equal(commands.filter(args => args[0] === 'rm').length, 1);
+    assert.equal(commands.filter(args => args[0] === 'ps').length, 1);
+    assert.equal(readLease(root).cleanupPending?.length, 1);
   });
 });
 

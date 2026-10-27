@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { FolderOpen, Laptop } from 'lucide-react';
+import { FolderOpen } from 'lucide-react';
 
 import { Button, Input } from '@/shared/ui';
-import { usePaletteOps } from '@/modules/command-palette';
-import { isDesktop } from '@/shared/chisa';
 import { browseFilesystemFolders } from '@/modules/project-creation-wizard/utils/workspaceApi';
 import { getSuggestionRootPath } from '@/modules/project-creation-wizard/utils/pathUtils';
 import type { FolderSuggestion } from '@/shared/types';
@@ -25,37 +23,12 @@ export default function WorkspacePathField({
   onAdvanceToConfirm,
 }: WorkspacePathFieldProps) {
   const { t } = useTranslation();
-  const desktopAvailable = isDesktop();
-  const paletteOps = usePaletteOps();
+  // Server directory suggestions let the user complete an existing or new cloud path.
   const [pathSuggestions, setPathSuggestions] = useState<FolderSuggestion[]>([]);
+  // Keep the suggestion list open only while it is relevant to the current path.
   const [showPathDropdown, setShowPathDropdown] = useState(false);
+  // The server folder browser shares the path field's selection and confirmation flow.
   const [showFolderBrowser, setShowFolderBrowser] = useState(false);
-  const [localSelecting, setLocalSelecting] = useState(false);
-  const [localError, setLocalError] = useState<string | null>(null);
-
-  const handleSelectLocalFolder = useCallback(async () => {
-    setLocalSelecting(true);
-    setLocalError(null);
-    try {
-      const { FrontendBridge, recordLocalSelection } = await import('@/shared/chisa');
-      const result = await FrontendBridge.selectLocalFolder();
-      if (result.action === 'manage-mappings') {
-        paletteOps.openSettings('chisa');
-        return;
-      }
-      if (result.ok && result.serverPath) {
-        recordLocalSelection({ localPath: String(result.localPath || ''), serverPath: String(result.serverPath) });
-        onChange(String(result.serverPath));
-        onAdvanceToConfirm();
-      } else if (!result.canceled && result.error) {
-        setLocalError(String(result.error));
-      }
-    } catch (error) {
-      setLocalError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setLocalSelecting(false);
-    }
-  }, [onAdvanceToConfirm, onChange, paletteOps]);
 
   useEffect(() => {
     if (value.trim().length <= 2) {
@@ -151,14 +124,7 @@ export default function WorkspacePathField({
         >
           <FolderOpen className="h-4 w-4" />
         </Button>
-        {desktopAvailable && (
-          <Button type="button" variant="outline" onClick={() => void handleSelectLocalFolder()} className="px-3" title="选择本机文件夹（自动同步并创建项目）" disabled={disabled || localSelecting}>
-            <Laptop className="h-4 w-4" />
-            {localSelecting ? '…' : '本机'}
-          </Button>
-        )}
       </div>
-      {localError && <p className="mt-1 text-xs text-red-500">本地目录失败：{localError}</p>}
 
       <FolderBrowserModal
         isOpen={showFolderBrowser}

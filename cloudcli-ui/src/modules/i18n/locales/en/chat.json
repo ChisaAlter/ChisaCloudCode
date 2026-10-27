@@ -149,9 +149,6 @@
     }
   },
   "composer": {
-    "reloadModels": "Reload models",
-    "modelsLoadFailed": "Could not load models. Reload to try again.",
-    "restoringSessionOptions": "Restoring session model settings",
     "lastUsedModel": "Last used: {{model}}",
     "add": "Add",
     "thisComputer": "This computer",
@@ -255,9 +252,7 @@
       "analyzing": "Analyzing",
       "working": "Working",
       "computing": "Computing",
-      "reasoning": "Reasoning",
-      "workspaceFinalizing": "Finalizing and handing back the workspace",
-      "modelStopped": "Stopped; handing back the workspace"
+      "reasoning": "Reasoning"
     },
     "state": {
       "live": "Live",
@@ -267,7 +262,6 @@
       "seconds": "{{count}}s",
       "minutesSeconds": "{{minutes}}m {{seconds}}s",
       "label": "{{time}} elapsed",
-      "turnTotal": "Total turn time {{time}}",
       "startingNow": "Starting now"
     },
     "stop": "Stop",

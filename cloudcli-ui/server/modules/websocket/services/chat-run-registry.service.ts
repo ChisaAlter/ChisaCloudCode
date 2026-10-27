@@ -1,6 +1,4 @@
-import { randomUUID } from 'node:crypto';
-
-import { sessionDraftsDb, sessionsDb } from '@/modules/database/index.js';
+import { sessionsDb } from '@/modules/database/index.js';
 import { ChatSessionWriter } from '@/modules/websocket/services/chat-session-writer.service.js';
 import { broadcastSessionUpserted } from '@/modules/websocket/services/session-upsert-broadcast.service.js';
 import type {
@@ -9,15 +7,12 @@ import type {
   RealtimeClientConnection,
 } from '@/shared/types.js';
 
-type ChatRunStatus = 'running' | 'completed';
-type ChatRunPhase = 'accepted' | 'queued' | 'running' | 'completed';
+function createRunId(): string {
+  return `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
-/** The audience and replay cursor belong to the session, not one provider run. */
-type SessionChannel = {
-  connections: Set<RealtimeClientConnection>;
-  lastSeq: number;
-  replayEpoch: string;
-};
+export type ChatRunStatus = 'running' | 'completed';
+export type ChatRunPhase = 'accepted' | 'queued' | 'running' | 'completed';
 
 /**
  * One live (or recently finished) provider run for a single app session.
@@ -33,7 +28,7 @@ type SessionChannel = {
  *   monotonically increasing `seq` and is buffered so a reconnecting client
  *   can replay exactly the events it missed via `chat.subscribe`.
  */
-type ChatRun = {
+export type ChatRun = {
   appSessionId: string;
   provider: LLMProvider;
   providerSessionId: string | null;
@@ -46,8 +41,6 @@ type ChatRun = {
   writer: ChatSessionWriter;
   startedAt: number;
   completedAt: number | null;
-  modelStopped: boolean;
-  admissionRejected?: boolean;
 };
 
 /**
@@ -73,25 +66,12 @@ const MAX_BUFFERED_EVENTS_PER_RUN = 5000;
  * path all consult it instead of asking each provider runtime individually.
  */
 const runs = new Map<string, ChatRun>();
-// Idle subscriptions must survive until a queued turn starts, even after the
-// previous run's replay buffer expires. Closed sockets are removed explicitly.
-const channels = new Map<string, SessionChannel>();
 
-function getChannel(appSessionId: string): SessionChannel {
-  let channel = channels.get(appSessionId);
-  if (!channel) {
-    channel = { connections: new Set(), lastSeq: 0, replayEpoch: randomUUID() };
-    channels.set(appSessionId, channel);
-  }
-  return channel;
-}
-
-function evictRunLater(completedRun: ChatRun): void {
+function evictRunLater(appSessionId: string): void {
   const timer = setTimeout(() => {
-    const appSessionId = completedRun.appSessionId;
-    if (runs.get(appSessionId) === completedRun && completedRun.status === 'completed') {
+    const run = runs.get(appSessionId);
+    if (run && run.status === 'completed') {
       runs.delete(appSessionId);
-      if (!channels.get(appSessionId)?.connections.size) channels.delete(appSessionId);
     }
   }, COMPLETED_RUN_RETENTION_MS);
 
@@ -132,46 +112,32 @@ function emitLifecycle(run: ChatRun): void {
   run.writer.sendGatewayEvent(event);
 }
 
-function decorateAndRecordEvent(run: ChatRun, channel: SessionChannel, message: NormalizedMessage): NormalizedMessage | null {
+function decorateAndRecordEvent(run: ChatRun, message: NormalizedMessage): NormalizedMessage | null {
   // Exactly-one-complete contract: when a run is aborted the chat handler
   // emits the terminal `complete` immediately, but the killed runtime may
   // still emit its own `complete` from its exit handler moments later.
   // Whichever arrives first wins; the duplicate is dropped here.
-  if (run.status === 'completed') {
+  if (message.kind === 'complete' && run.status === 'completed') {
     return null;
   }
 
-  run.lastSeq = ++channel.lastSeq;
+  run.lastSeq += 1;
 
   const outbound: NormalizedMessage = {
     ...message,
     sessionId: run.appSessionId,
     runId: run.runId,
     seq: run.lastSeq,
-    replayEpoch: channel.replayEpoch,
   };
 
-  if (message.kind === 'status' && message.text === 'model_stopped') run.modelStopped = true;
-
   if (message.kind === 'complete') {
-    if (message.workspaceAdmissionRejected === true) run.admissionRejected = true;
-    // Internal retry evidence is not part of the client replay protocol.
-    delete outbound.workspaceAdmissionRejected;
-    // Persist before clients see the terminal: a restart must not auto-send
-    // the unsent queue after this owner failed or was stopped.
-    const failed = message.aborted === true || message.success === false
-      || (typeof message.exitCode === 'number' && message.exitCode !== 0);
-    const userId = Number(run.writer.userId);
-    if (failed && !run.admissionRejected && runs.get(run.appSessionId) === run && Number.isSafeInteger(userId) && userId > 0) {
-      sessionDraftsDb.pauseQueuedMessage(userId, run.appSessionId);
-    }
     // The provider may report its own id here; the frontend only ever knows
     // the app id, so the "actual" id is by definition the app id as well.
     outbound.actualSessionId = run.appSessionId;
     run.status = 'completed';
     run.phase = 'completed';
     run.completedAt = Date.now();
-    evictRunLater(run);
+    evictRunLater(run.appSessionId);
     emitLifecycle(run);
   }
 
@@ -193,9 +159,6 @@ function decorateAndRecordEvent(run: ChatRun, channel: SessionChannel, message: 
  * happens first wins; later calls with the same id are no-ops.
  */
 function recordProviderSessionId(run: ChatRun, providerSessionId: string): void {
-  // Session-owned audiences outlive their writer. A late callback from a
-  // finished run must not replace the provider mapping of its successor.
-  if (runs.get(run.appSessionId) !== run || run.status !== 'running') return;
   if (!providerSessionId || run.providerSessionId === providerSessionId) {
     return;
   }
@@ -231,10 +194,6 @@ function recordProviderSessionId(run: ChatRun, providerSessionId: string): void 
  * regardless of which provider runtime produced them.
  */
 export const chatRunRegistry = {
-  /** Used by the gateway to pair a cursor with this session channel's lifetime. */
-  getReplayEpoch(appSessionId: string): string {
-    return getChannel(appSessionId).replayEpoch;
-  },
   /**
    * Starts tracking a run and returns it, or `null` when a run is already in
    * progress for the session (callers must reject the duplicate send).
@@ -257,34 +216,30 @@ export const chatRunRegistry = {
       return null;
     }
 
-    const channel = getChannel(input.appSessionId);
-    if (input.connection) channel.connections.add(input.connection);
-
     const run: ChatRun = {
-      runId: randomUUID(),
       appSessionId: input.appSessionId,
       provider: input.provider,
       providerSessionId: input.providerSessionId,
+      runId: createRunId(),
       status: 'running',
       phase: 'accepted',
-      lastSeq: channel.lastSeq,
+      lastSeq: 0,
       events: [],
       lifecycleEvents: [],
       writer: null as unknown as ChatSessionWriter,
       startedAt: Date.now(),
       completedAt: null,
-      modelStopped: false,
     };
 
     run.writer = new ChatSessionWriter({
-      connections: channel.connections,
+      connection: input.connection,
       userId: input.userId,
       provider: input.provider,
       providerSessionId: input.providerSessionId,
       onProviderSessionId: (providerSessionId) => {
         recordProviderSessionId(run, providerSessionId);
       },
-      decorateOutboundEvent: (message) => decorateAndRecordEvent(run, channel, message),
+      decorateOutboundEvent: (message) => decorateAndRecordEvent(run, message),
     });
 
     runs.set(input.appSessionId, run);
@@ -310,26 +265,22 @@ export const chatRunRegistry = {
 
   listRunningRuns(): Array<{
     sessionId: string;
-    runId: string;
     provider: LLMProvider;
     startedAt: number;
     lastSeq: number;
-    modelStopped: boolean;
   }> {
     return Array.from(runs.values())
       .filter((run) => run.status === 'running')
       .map((run) => ({
         sessionId: run.appSessionId,
-        runId: run.runId,
         provider: run.provider,
         startedAt: run.startedAt,
         lastSeq: run.lastSeq,
-        modelStopped: run.modelStopped,
       }));
   },
 
   /**
-   * Subscribes a websocket to this session, including its future queued runs.
+   * Adds a websocket connection to a run's live audience.
    *
    * This is the generic replacement for the Claude-only writer reconnect:
    * after a page refresh the new socket subscribes and immediately starts
@@ -342,16 +293,13 @@ export const chatRunRegistry = {
    * `lastSeq` with `chat.subscribe`.
    */
   attachConnection(appSessionId: string, connection: RealtimeClientConnection): boolean {
-    getChannel(appSessionId).connections.add(connection);
-    return true;
-  },
-
-  /** Removes a closed socket from every session it watched without stopping runs. */
-  removeConnection(connection: RealtimeClientConnection): void {
-    for (const [appSessionId, channel] of channels) {
-      channel.connections.delete(connection);
-      if (!channel.connections.size && !runs.has(appSessionId)) channels.delete(appSessionId);
+    const run = runs.get(appSessionId);
+    if (!run) {
+      return false;
     }
+
+    run.writer.updateWebSocket(connection);
+    return true;
   },
 
   /**
@@ -366,9 +314,7 @@ export const chatRunRegistry = {
       return [];
     }
 
-    // A server restart can put an older client's cursor ahead of the new log.
-    const cursor = afterSeq > run.lastSeq ? 0 : afterSeq;
-    return run.events.filter((event) => typeof event.seq === 'number' && event.seq > cursor);
+    return run.events.filter((event) => typeof event.seq === 'number' && event.seq > afterSeq);
   },
 
   lifecycleSnapshot(appSessionId: string): Record<string, unknown> | null {
@@ -411,6 +357,5 @@ export const chatRunRegistry = {
    */
   clearAll(): void {
     runs.clear();
-    channels.clear();
   },
 };

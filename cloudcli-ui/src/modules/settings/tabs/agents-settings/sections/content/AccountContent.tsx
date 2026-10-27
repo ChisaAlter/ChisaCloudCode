@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 
 import { HiRouteSettingsSection } from '@/modules/settings/tabs/agents-settings/sections/content/HiRouteSettingsSection';
 import { Badge, Button, LLMProviderLogo } from '@/shared/ui';
+import { ClaudeAccountsPanel } from '@/modules/claude-accounts';
 import type { AgentProvider, ProviderAuthStatus } from '@/shared/types';
 
 type AccountContentProps = {
@@ -116,7 +117,7 @@ export default function AccountContent({ agent, authStatus, onLogin }: AccountCo
             </div>
           </div>
 
-          {authStatus.method !== 'api_key' && authStatus.method !== 'hiroute' && authStatus.method !== 'model_connection' && (
+          {agent !== 'claude' && authStatus.method !== 'api_key' && authStatus.method !== 'hiroute' && authStatus.method !== 'model_connection' && (
             <div className="border-t border-border/50 pt-4">
               <div className="flex items-center justify-between">
                 <div>
@@ -151,7 +152,7 @@ export default function AccountContent({ agent, authStatus, onLogin }: AccountCo
         </div>
       </div>
 
-      {agent === 'claude' && <HiRouteSettingsSection />}
+      {agent === 'claude' && <><ClaudeAccountsPanel /><HiRouteSettingsSection /></>}
     </div>
   );
 }

@@ -13,6 +13,7 @@ import GitPanelHeader from '@/modules/git-panel/GitPanelHeader';
 import GitRepositoryErrorState from '@/modules/git-panel/GitRepositoryErrorState';
 import GitViewTabs from '@/modules/git-panel/GitViewTabs';
 import ConfirmActionModal from '@/modules/git-panel/modals/ConfirmActionModal';
+import { useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
 
 type GitPanelProps = {
   selectedProject: Project | null;
@@ -33,6 +34,7 @@ export default function GitPanel({
   onProjectsRefresh,
 }: GitPanelProps) {
   const { t } = useTranslation();
+  const workspace = useWorkspaceScope();
   const [activeView, setActiveView] = useState<GitPanelView>('changes');
   const [wrapText, setWrapText] = useState(true);
   const [hasExpandedFiles, setHasExpandedFiles] = useState(false);
@@ -241,7 +243,7 @@ export default function GitPanel({
             />
           )}
 
-          {activeView === 'worktrees' && (
+          {activeView === 'worktrees' && workspace?.sourceMode !== 'ssh' && selectedProject.sourceMode !== 'ssh' && (workspace === undefined || workspace?.kind === 'cloudReplica') && (
             <WorktreesView
               key={selectedProject.fullPath}
               isMobile={isMobile}

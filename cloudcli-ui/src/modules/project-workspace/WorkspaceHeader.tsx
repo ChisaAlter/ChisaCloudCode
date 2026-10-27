@@ -1,5 +1,5 @@
-import { ChevronLeft, ChevronRight } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { ChevronLeft, ChevronRight, Settings2 } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import type { AppTab, Project, ProjectSession } from '@/shared/types';
@@ -8,6 +8,7 @@ import { isDesktop } from '@/shared/chisa';
 import MobileMenuButton from '@/modules/project-workspace/MobileMenuButton';
 import WorkspaceTabs from '@/modules/project-workspace/WorkspaceTabs';
 import WorkspaceTitle from '@/modules/project-workspace/WorkspaceTitle';
+import { ProjectSettingsDialog } from '@/modules/project-settings';
 
 type WorkspaceHeaderProps = {
   activeTab: AppTab;
@@ -18,6 +19,7 @@ type WorkspaceHeaderProps = {
   shouldShowBrowserTab: boolean;
   isMobile: boolean;
   onMenuClick: () => void;
+  statusControl?: ReactNode;
 };
 
 /** Rendered by WorkspaceMain to show the workspace title alongside the scrollable tab bar. */
@@ -30,12 +32,14 @@ export default function WorkspaceHeader({
   shouldShowBrowserTab,
   isMobile,
   onMenuClick,
+  statusControl,
 }: WorkspaceHeaderProps) {
   const { t } = useTranslation();
   const compact = isDesktop() && !isMobile;
   const scrollRef = useRef<HTMLDivElement>(null);
   const [canScrollLeft, setCanScrollLeft] = useState(false);
   const [canScrollRight, setCanScrollRight] = useState(false);
+  const [projectSettingsOpen, setProjectSettingsOpen] = useState(false);
   const hasOverflow = canScrollLeft || canScrollRight;
 
   const updateScrollState = useCallback(() => {
@@ -104,6 +108,16 @@ export default function WorkspaceHeader({
             selectedSession={selectedSession}
             shouldShowTasksTab={shouldShowTasksTab}
           />
+          {statusControl}
+          <button
+            type="button"
+            onClick={() => setProjectSettingsOpen(true)}
+            aria-label="项目默认设置"
+            title="项目默认设置"
+            className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+          >
+            <Settings2 className="h-4 w-4" />
+          </button>
         </div>
 
         {compact ? (
@@ -114,7 +128,7 @@ export default function WorkspaceHeader({
             shouldShowBrowserTab={shouldShowBrowserTab}
             compact
             projectId={selectedProject?.projectId}
-            serverPath={selectedProject?.fullPath ?? selectedProject?.path}
+            sourceMode={selectedProject.sourceMode}
           />
         ) : <div className="-mx-3 min-w-0 sm:mx-0 sm:flex-1">
           <div className="relative ml-auto w-fit max-w-full">
@@ -134,6 +148,7 @@ export default function WorkspaceHeader({
                 setActiveTab={setActiveTab}
                 shouldShowTasksTab={shouldShowTasksTab}
                 shouldShowBrowserTab={shouldShowBrowserTab}
+                sourceMode={selectedProject.sourceMode}
               />
             </div>
             {canScrollRight && (
@@ -163,6 +178,13 @@ export default function WorkspaceHeader({
           </div>
         </div>}
       </div>
+      <ProjectSettingsDialog
+        projectId={selectedProject.projectId}
+        projectName={selectedProject.displayName}
+        sourceMode={selectedProject.sourceMode}
+        open={projectSettingsOpen}
+        onClose={() => setProjectSettingsOpen(false)}
+      />
     </header>
   );
 }

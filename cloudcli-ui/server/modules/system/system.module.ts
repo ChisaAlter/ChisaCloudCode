@@ -3,8 +3,6 @@ import os from 'node:os';
 import spawn from 'cross-spawn';
 import type { Router } from 'express';
 
-import buildIdentity from '../../../shared/build-identity.json' with { type: 'json' };
-
 import { createSystemRouter } from './system.routes.js';
 import { createSystemUpdateService } from './system.service.js';
 
@@ -60,5 +58,5 @@ export function createSystemModule(options: SystemModuleOptions): Router {
     logError: (message, detail) => console.error(message, detail ?? ''),
   });
 
-  return createSystemRouter(systemUpdateService, Object.freeze({ ...buildIdentity }));
+  return createSystemRouter(systemUpdateService);
 }

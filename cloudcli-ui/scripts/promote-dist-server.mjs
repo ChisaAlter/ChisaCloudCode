@@ -29,6 +29,26 @@ if (mode !== 'promote') {
   process.exit(64);
 }
 
+// TypeScript resolves a shared .js/.d.ts pair through the declaration and can
+// omit the JavaScript runtime file. Preserve such source modules in staging so
+// a successful typecheck cannot publish an image with missing shared imports.
+function copyMissingSharedRuntime(directory = 'shared', relative = '') {
+  if (!fs.existsSync(directory)) return;
+  for (const item of fs.readdirSync(directory, { withFileTypes: true })) {
+    const source = `${directory}/${item.name}`;
+    const suffix = relative ? `${relative}/${item.name}` : item.name;
+    if (item.isDirectory()) copyMissingSharedRuntime(source, suffix);
+    else if (item.isFile() && item.name.endsWith('.js')) {
+      const target = `${NEXT}/shared/${suffix}`;
+      if (!fs.existsSync(target)) {
+        fs.mkdirSync(target.slice(0, target.lastIndexOf('/')), { recursive: true });
+        fs.copyFileSync(source, target);
+      }
+    }
+  }
+}
+copyMissingSharedRuntime();
+
 if (!fs.existsSync(`${NEXT}/${ENTRY}`)) {
   console.error(`promote-dist-server: ${NEXT}/${ENTRY} is missing; leaving the current ${LIVE} untouched.`);
   process.exit(1);

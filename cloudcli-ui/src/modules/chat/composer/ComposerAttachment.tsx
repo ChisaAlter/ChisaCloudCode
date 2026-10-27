@@ -2,11 +2,9 @@ import { useEffect, useState } from 'react';
 import { FileIcon, XIcon } from 'lucide-react';
 
 import { ImageLightbox } from '@/modules/chat/transcript/ChatMessageImages';
-import { api } from '@/shared/api';
-import type { ComposerDraftAttachment } from '@/shared/types';
 
 type ComposerAttachmentProps = {
-  attachment: ComposerDraftAttachment;
+  file: File;
   onRemove: () => void;
   error?: string;
 };
@@ -21,54 +19,32 @@ const formatFileSize = (size: number) => {
  * Rendered by chat's ChatComposer for each pending attachment, showing its
  * thumbnail or file chip, upload progress and remove control.
  */
-const ComposerAttachment = ({ attachment, onRemove, error }: ComposerAttachmentProps) => {
+const ComposerAttachment = ({ file, onRemove, error }: ComposerAttachmentProps) => {
   const [preview, setPreview] = useState<string | undefined>(undefined);
   const [expanded, setExpanded] = useState(false);
-  // Failed stored-image previews keep a removable file chip rather than an endless loading thumbnail.
-  const [previewFailed, setPreviewFailed] = useState(false);
-  const file = attachment.file;
-  const uploaded = attachment.uploaded;
-  const name = file?.name || uploaded?.name || 'Attachment';
-  const size = file?.size ?? uploaded?.size;
-  const isImage = (file?.type || uploaded?.mimeType || '').startsWith('image/');
+  const isImage = file.type.startsWith('image/');
 
   useEffect(() => {
-    setPreview(undefined);
-    setPreviewFailed(false);
-    setExpanded(false);
     if (!isImage) {
+      setPreview(undefined);
       return;
     }
-    if (file) {
-      const url = URL.createObjectURL(file);
-      setPreview(url);
-      return () => URL.revokeObjectURL(url);
-    }
-    const filename = uploaded?.path?.split(/[\\/]/).pop();
-    if (!filename) { setPreviewFailed(true); return; }
-    const controller = new AbortController();
-    let objectUrl: string | undefined;
-    void api.assets.image(filename, { signal: controller.signal }).then(async response => {
-      if (!response.ok) throw new Error('Attachment image is unavailable');
-      const blob = await response.blob();
-      if (controller.signal.aborted) return;
-      objectUrl = URL.createObjectURL(blob);
-      setPreview(objectUrl);
-    }).catch(() => { if (!controller.signal.aborted) setPreviewFailed(true); });
-    return () => { controller.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
-  }, [file, isImage, uploaded?.path]);
+    const url = URL.createObjectURL(file);
+    setPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [file, isImage]);
 
   return (
     <div className="group relative max-w-full">
-      {isImage && !previewFailed ? (
+      {isImage ? (
         <button
           type="button"
           onClick={() => preview && setExpanded(true)}
-          aria-label={`Expand ${name}`}
+          aria-label={`Expand ${file.name}`}
           className="block overflow-hidden rounded-xl border border-border/50 shadow-sm focus:outline-none focus:ring-2 focus:ring-primary/60"
         >
           {preview
-            ? <img src={preview} alt={name} className="h-20 w-20 cursor-zoom-in object-cover" />
+            ? <img src={preview} alt={file.name} className="h-20 w-20 cursor-zoom-in object-cover" />
             : <div className="h-20 w-20 animate-pulse bg-muted" />}
         </button>
       ) : (
@@ -77,8 +53,8 @@ const ComposerAttachment = ({ attachment, onRemove, error }: ComposerAttachmentP
             <FileIcon className="h-5 w-5" aria-hidden />
           </div>
           <div className="min-w-0">
-            <p className="truncate text-sm font-medium text-foreground" title={name}>{name}</p>
-            <p className="mt-0.5 text-xs text-muted-foreground">{size === undefined ? '' : formatFileSize(size)}</p>
+            <p className="truncate text-sm font-medium text-foreground" title={file.name}>{file.name}</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">{formatFileSize(file.size)}</p>
           </div>
         </div>
       )}
@@ -93,12 +69,12 @@ const ComposerAttachment = ({ attachment, onRemove, error }: ComposerAttachmentP
         type="button"
         onClick={onRemove}
         className="absolute -right-1.5 -top-1.5 rounded-full border border-border/40 bg-background/90 p-1 text-foreground shadow-sm backdrop-blur transition-opacity hover:bg-background focus:opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
-        aria-label={`Remove ${name}`}
+        aria-label={`Remove ${file.name}`}
       >
         <XIcon className="h-3 w-3" aria-hidden />
       </button>
       {expanded && preview && (
-        <ImageLightbox src={preview} alt={name} onClose={() => setExpanded(false)} />
+        <ImageLightbox src={preview} alt={file.name} onClose={() => setExpanded(false)} />
       )}
     </div>
   );

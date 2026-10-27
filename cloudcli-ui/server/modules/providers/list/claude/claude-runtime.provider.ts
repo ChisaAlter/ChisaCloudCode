@@ -18,10 +18,14 @@ import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { sessionsDb, sshProjectTargetsDb, userDb } from '@/modules/database/index.js';
+import { assertCloudWorkspaceOwner } from '@/modules/workspace-runtime/index.js';
 import { claudeConnectionsService } from '@/modules/providers/services/claude-connections.service.js';
+import { claudeAccountsService } from '@/modules/providers/services/claude-accounts.service.js';
+import { prepareClaudeAccountHistory, prepareClaudeUserHistory } from '@/modules/providers/services/claude-account-history.service.js';
 import { prepareManagedHiRoute, releaseManagedHiRoute } from '@/modules/providers/services/hiroute-managed.service.js';
 import { hirouteService } from '@/modules/providers/services/hiroute.service.js';
-import { workspaceQuery as query } from '@/modules/workspace-bridge/index.js';
+import { assertSshProjectOwner, resolveSshProjectTarget, workspaceQuery as query } from '@/modules/workspace-bridge/index.js';
 import { AppError, extractClaudeResolvedModel } from '@/shared/index.js';
 import {
   appendFilesInputTag,
@@ -33,7 +37,6 @@ import {
   CLAUDE_ULTRACODE_EFFORT
 } from '@/modules/providers/list/claude/claude-models.provider.js';
 import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
-import { withClaudeRootSandboxEnv } from '@/shared/claude-sandbox-env.js';
 import {
   createNotificationEvent,
   notifyBackgroundWorkCompleted,
@@ -41,7 +44,7 @@ import {
   notifyRunStopped,
   notifyUserIfEnabled
 } from '@/modules/notifications/index.js';
-import { createCompleteMessage, createNormalizedMessage } from '@/shared/utils.js';
+import { createCompleteMessage, createNormalizedMessage, normalizeConnectionUserId } from '@/shared/utils.js';
 
 const activeSessions = new Map();
 const pendingToolApprovals = new Map();
@@ -57,12 +60,10 @@ type ClaudeRunLifecycle = {
   controller: AbortController;
   instance: ReturnType<typeof query> | null;
   cancelled: boolean;
-  processExited: boolean;
   failure?: unknown;
   done: Promise<void>;
   finish(): void;
   releaseInput(): void;
-  reportStopped(): void;
 };
 const runLifecycles = new Map<string, ClaudeRunLifecycle>();
 
@@ -212,17 +213,6 @@ function matchesToolPermission(entry, toolName, input) {
     return true;
   }
 
-  // Bound workspaces replace native tools, but keep the user's native-tool policy meaningful.
-  const workspaceName = toolName.startsWith('mcp__workspace__') ? toolName.slice('mcp__workspace__'.length) : null;
-  if (workspaceName) {
-    if (workspaceName === 'read_file') return matchesToolPermission(entry, 'Read', input);
-    if (workspaceName === 'list_files') return matchesToolPermission(entry, 'Glob', input);
-    if (workspaceName === 'search_files') return matchesToolPermission(entry, input?.content ? 'Grep' : 'Glob', input);
-    if (workspaceName === 'write_file') return matchesToolPermission(entry, 'Write', input)
-      || (input?.expectedHash !== null && matchesToolPermission(entry, 'Edit', input));
-    if (workspaceName === 'run_command' || workspaceName === 'start_preview') return matchesToolPermission(entry, 'Bash', input);
-  }
-
   const bashMatch = entry.match(/^Bash\((.+):\*\)$/);
   if (toolName === 'Bash' && bashMatch) {
     const allowedPrefix = bashMatch[1];
@@ -251,12 +241,7 @@ function mapCliOptionsToSDK(options = {}) {
 
   // Forward all host env vars (e.g. ANTHROPIC_BASE_URL) to the subprocess.
   // Since SDK 0.2.113, options.env replaces process.env instead of overlaying it.
-  // When the server runs as root (the production container), Claude Code only
-  // accepts bypassPermissions if IS_SANDBOX=1 is set; the container is the sandbox.
-  sdkOptions.env = withClaudeRootSandboxEnv({
-    ...process.env,
-    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(BG_WAIT_CEILING_MS),
-  });
+  sdkOptions.env = { ...process.env, CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: String(BG_WAIT_CEILING_MS) };
 
   // Resolve the executable eagerly on Windows because the SDK uses raw child_process.spawn,
   // which does not reliably follow npm's shell wrappers like cross-spawn does.
@@ -273,6 +258,7 @@ function mapCliOptionsToSDK(options = {}) {
   // Kept only until workspaceQuery creates the session worktree; it is removed
   // before the object reaches the Claude SDK, which does not consume it.
   if (sessionId) sdkOptions.chisaSessionId = sessionId;
+  if (options.workspaceDescriptor) sdkOptions.chisaWorkspaceDescriptor = options.workspaceDescriptor;
   if (workspaceMode === 'shared' || workspaceMode === 'isolated') sdkOptions.workspaceMode = workspaceMode;
 
   if (permissionMode && permissionMode !== 'default') {
@@ -725,6 +711,42 @@ async function loadMcpConfig(cwd) {
   }
 }
 
+// Every Claude entry point shares this boundary. Do not defer it to workspaceQuery:
+// model/history/credentials and MCP configuration are resolved before SDK admission.
+function resolveClaudeSshAccess(options, writer) {
+  const cwd = options.cwd || options.projectPath;
+  const target = cwd ? resolveSshProjectTarget(cwd) : null;
+  if (target) assertSshProjectOwner(target, writer?.userId);
+  else assertCloudWorkspaceOwner(cwd, writer?.userId, writer?.userId == null ? undefined : userDb.getActiveUserIds());
+
+  const sessionId = options.sessionId;
+  const session = sessionId
+    ? sessionsDb.getSessionById(sessionId) ?? sessionsDb.getSessionByProviderSessionId(sessionId)
+    : null;
+  const sessionTarget = session?.project_path ? resolveSshProjectTarget(session.project_path) : null;
+  if (sessionTarget) assertSshProjectOwner(sessionTarget, writer?.userId);
+  else if (session) assertCloudWorkspaceOwner(session.project_path, writer?.userId, writer?.userId == null ? undefined : userDb.getActiveUserIds());
+  if (!target && !sessionTarget) return null;
+
+  // Authenticated direct Git/API runs may start without a session. Resumes must
+  // use the app id and its existing pin; an unindexed/native id is never trusted.
+  if (target && !sessionId) return { target, session: null };
+  if (!target || !session || session.session_id !== sessionId || session.project_path !== target.anchorPath) {
+    throw new AppError('会话与 SSH 项目不匹配。', { code: 'WORKSPACE_SELECTION_MISMATCH', statusCode: 409 });
+  }
+  if (session.provider !== 'claude') {
+    throw new AppError('SSH 本地项目目前仅支持 VPS Claude Code。', { code: 'WORKSPACE_PROVIDER_UNSUPPORTED', statusCode: 409 });
+  }
+  const pin = sshProjectTargetsDb.getSessionTarget(session.session_id);
+  if (!pin || pin.projectId !== target.projectId) {
+    throw new AppError('会话未绑定到当前 SSH 项目。', { code: 'WORKSPACE_SELECTION_MISMATCH', statusCode: 409 });
+  }
+  if (pin.generation !== target.generation) {
+    throw new AppError('会话的 SSH 项目绑定已改变。', { code: 'WORKSPACE_GENERATION_CHANGED', statusCode: 409 });
+  }
+  return { target, session };
+}
+
 /**
  * Executes a Claude query using the SDK
  * @param {string} command - User prompt/command
@@ -735,8 +757,10 @@ async function loadMcpConfig(cwd) {
  */
 /** Provider runtime and Git/agent runners use this owner-scoped SDK lifecycle. */
 export async function queryClaudeSDK(command, options = {}, ws, context) {
+  const sshAccess = resolveClaudeSshAccess(options, ws);
+  if (sshAccess) options = { ...options, cwd: sshAccess.target.anchorPath };
   const { sessionId, sessionSummary } = options;
-  // Register cancellation before any session, model or workspace initialization.
+  // Register cancellation before asynchronous model or workspace initialization.
   let providerSessionId = null;
   // Provider-native id as the SDK reports it (starts as the resume id, or is
   // captured from the stream for brand-new sessions).
@@ -748,20 +772,14 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
   let lifecycleKey = sessionKey();
   if (lifecycleKey && runLifecycles.has(lifecycleKey)) throw new AppError('The previous task is still completing workspace cleanup', { code: 'RUN_IN_PROGRESS', statusCode: 409 });
   let finishRun!: () => void;
-  let modelStoppedSent = false;
   const lifecycle: ClaudeRunLifecycle = {
-    controller: new AbortController(), instance: null, cancelled: false, processExited: false,
+    controller: new AbortController(), instance: null, cancelled: false,
     done: new Promise<void>(resolve => { finishRun = resolve; }),
     finish: () => finishRun(), releaseInput: () => {},
-    reportStopped: () => {
-      if (!lifecycle.cancelled || !lifecycle.processExited || modelStoppedSent) return;
-      modelStoppedSent = true;
-      ws.send(createNormalizedMessage({ kind: 'status', text: 'model_stopped', canInterrupt: false, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
-    },
   };
   if (lifecycleKey) runLifecycles.set(lifecycleKey, lifecycle);
   const callerSignal = options.abortSignal;
-  const cancelFromCaller = () => { lifecycle.cancelled = true; lifecycle.controller.abort(callerSignal?.reason); lifecycle.releaseInput(); lifecycle.instance?.close(); lifecycle.reportStopped(); };
+  const cancelFromCaller = () => { lifecycle.cancelled = true; lifecycle.controller.abort(callerSignal?.reason); lifecycle.releaseInput(); lifecycle.instance?.close(); };
   callerSignal?.addEventListener('abort', cancelFromCaller, { once: true });
   if (callerSignal?.aborted) cancelFromCaller();
 
@@ -779,8 +797,6 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
   let idleReleaseTimer = null;
   // A result is not terminal while background work or workspace cleanup is live.
   let turnCompleteSent = false;
-  // SDK error results can end the iterator normally; retain failure until cleanup finishes.
-  let resultFailure = null;
   // Set when a turn starts background work, cleared when the next `result`
   // arrives — only turns with work still outstanding hold their process open.
   let backgroundWorkPending = false;
@@ -808,6 +824,8 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
   // Hoisted above the try so the catch's cleanup can tell whether this run
   // still owns the activeSessions entry (or was superseded by a newer run).
   let queryInstance = null;
+  // Each run holds its selected profile until the actual CLI and workspace teardown finish.
+  let accountSnapshot = null;
   let managedLease = false;
   const releaseManagedLease = async () => {
     if (!managedLease) return;
@@ -816,6 +834,8 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
   };
 
   const finishLifecycle = () => {
+    accountSnapshot?.release();
+    accountSnapshot = null;
     if (idleReleaseTimer) { clearTimeout(idleReleaseTimer); idleReleaseTimer = null; }
     releasePromptStream();
     callerSignal?.removeEventListener('abort', cancelFromCaller);
@@ -825,7 +845,15 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
 
   try {
     lifecycle.controller.signal.throwIfAborted();
-    providerSessionId = context.resolveProviderSessionId(sessionId);
+    // Capture before model/catalog awaits: later user selections belong to the next run.
+    const authenticatedId = normalizeConnectionUserId(ws?.userId);
+    const savedConnection = claudeConnectionsService.getActiveConnection(ws?.userId);
+    // Explicit API/HiRoute runs have their own auth; a stale subscription must not block them.
+    accountSnapshot = !savedConnection && options.model !== 'hiroute' ? claudeAccountsService.captureLaunch(ws?.userId) : null;
+    if (authenticatedId && !accountSnapshot && !savedConnection && options.model !== 'hiroute') {
+      throw new AppError('请先添加并选择你自己的 Claude 订阅账号或 API 连接。共享服务器不会使用其他用户的默认登录。', { code: 'CLAUDE_ACCOUNT_REQUIRED', statusCode: 409 });
+    }
+    providerSessionId = sshAccess ? sshAccess.session?.provider_session_id ?? null : context.resolveProviderSessionId(sessionId);
     capturedSessionId = providerSessionId;
     if (!lifecycleKey && capturedSessionId) {
       if (runLifecycles.has(capturedSessionId)) throw new AppError('The previous task is still completing workspace cleanup', { code: 'RUN_IN_PROGRESS', statusCode: 409 });
@@ -848,6 +876,24 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
       effortModels,
     });
     sdkOptions.abortController = lifecycle.controller;
+    const resumeOptions = { sessionId, providerSessionId: options.resumeFromScratch ? null : providerSessionId };
+    if (accountSnapshot) {
+      claudeAccountsService.applyToOptions(sdkOptions, accountSnapshot);
+      // Set up the private home now; only admission knows the cwd Claude will actually use for resume lookup.
+      await prepareClaudeAccountHistory(accountSnapshot);
+      const capturedAccount = accountSnapshot;
+      sdkOptions.chisaPrepareLaunch = async (cwd) => {
+        await prepareClaudeAccountHistory(capturedAccount, { ...resumeOptions, cwd });
+      };
+    } else if (authenticatedId) {
+      // API-only users still need a private transcript home, never the server's shared credentials.
+      const configDir = await prepareClaudeUserHistory(authenticatedId);
+      sdkOptions.env = { ...sdkOptions.env, CLAUDE_CONFIG_DIR: configDir, CLAUDE_SECURESTORAGE_CONFIG_DIR: configDir };
+      sdkOptions.chisaPrepareLaunch = async (cwd) => {
+        await prepareClaudeUserHistory(authenticatedId, { ...resumeOptions, cwd });
+      };
+    }
+    lifecycle.controller.signal.throwIfAborted();
     // Managed routing is an explicit model selection, independent of the saved active endpoint.
     if (options.model === 'hiroute') {
       const connection = await prepareManagedHiRoute(ws?.userId, lifecycle.controller.signal);
@@ -856,10 +902,16 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
       hirouteService.applyToOptions(sdkOptions, connection);
     } else {
       // Bind ordinary runs to the authenticated writer's active saved endpoint.
-      claudeConnectionsService.applyActiveToOptions(sdkOptions, ws?.userId);
+      claudeConnectionsService.applyToOptions(sdkOptions, savedConnection);
     }
 
-    const mcpServers = await loadMcpConfig(options.cwd);
+    if (authenticatedId && sdkOptions.env?.CLAUDE_CONFIG_DIR) {
+      sdkOptions.chisaProjectRuntime = { userId: String(authenticatedId),
+        accountKey: accountSnapshot ? 'subscription:' + accountSnapshot.accountId : savedConnection ? 'api:' + savedConnection.id : options.model === 'hiroute' ? 'hiroute' : 'app',
+        configDir: sdkOptions.env.CLAUDE_CONFIG_DIR, sessionId: options.sessionId, prompt: command };
+    }
+
+    const mcpServers = sdkOptions.chisaProjectRuntime ? null : await loadMcpConfig(options.cwd);
     lifecycle.controller.signal.throwIfAborted();
     if (mcpServers) {
       sdkOptions.mcpServers = mcpServers;
@@ -868,6 +920,7 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
     // Every turn uses streaming input so stdin stays open past the turn's
     // `result`. The message list is reusable, but each query attempt needs its
     // own stream because an async generator cannot be replayed once consumed.
+    if (sshAccess) sdkOptions.chisaAttachments = options.files;
     const promptMessages = await buildPromptMessages(command, options.images, options.files, options.cwd);
     lifecycle.controller.signal.throwIfAborted();
 
@@ -898,27 +951,25 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
     // auto-approves them and the model acts on a generated answer. Move these
     // tools to a PreToolUse hook (runs before the mode check) if we need them
     // to work in those modes.
-    const allowedPermissionEntries = [...(sdkOptions.allowedTools || [])];
-    const disallowedPermissionEntries = [...(sdkOptions.disallowedTools || [])];
     sdkOptions.canUseTool = async (toolName, input, context) => {
       const requiresInteraction = TOOLS_REQUIRING_INTERACTION.has(toolName);
+      const forceAsk = (context as typeof context & { chisaForceAsk?: boolean })?.chisaForceAsk === true;
 
       if (!requiresInteraction) {
-        if (sdkOptions.permissionMode === 'bypassPermissions') {
-          return { behavior: 'allow', updatedInput: input };
-        }
-
-        const isDisallowed = disallowedPermissionEntries.some(entry =>
+        const isDisallowed = (sdkOptions.disallowedTools || []).some(entry =>
           matchesToolPermission(entry, toolName, input)
         );
         if (isDisallowed) {
           return { behavior: 'deny', message: 'Tool disallowed by settings' };
         }
+        if (!forceAsk && sdkOptions.permissionMode === 'bypassPermissions') {
+          return { behavior: 'allow', updatedInput: input };
+        }
 
-        const isAllowed = allowedPermissionEntries.some(entry =>
+        const isAllowed = (sdkOptions.allowedTools || []).some(entry =>
           matchesToolPermission(entry, toolName, input)
         );
-        if (isAllowed) {
+        if (!forceAsk && isAllowed) {
           return { behavior: 'allow', updatedInput: input };
         }
       }
@@ -968,11 +1019,12 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
 
       if (decision.allow) {
         if (decision.rememberEntry && typeof decision.rememberEntry === 'string') {
-          if (!allowedPermissionEntries.includes(decision.rememberEntry)) {
-            allowedPermissionEntries.push(decision.rememberEntry);
+          if (!sdkOptions.allowedTools.includes(decision.rememberEntry)) {
+            sdkOptions.allowedTools.push(decision.rememberEntry);
           }
-          const deniedIndex = disallowedPermissionEntries.indexOf(decision.rememberEntry);
-          if (deniedIndex >= 0) disallowedPermissionEntries.splice(deniedIndex, 1);
+          if (Array.isArray(sdkOptions.disallowedTools)) {
+            sdkOptions.disallowedTools = sdkOptions.disallowedTools.filter(entry => entry !== decision.rememberEntry);
+          }
         }
         return { behavior: 'allow', updatedInput: decision.updatedInput ?? input };
       }
@@ -987,9 +1039,6 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
       queryInstance = query({
         prompt: heldPrompt.stream,
         options: sdkOptions
-      }, () => {
-        lifecycle.processExited = true;
-        lifecycle.reportStopped();
       });
     } catch (hookError) {
       lifecycle.controller.signal.throwIfAborted();
@@ -1004,9 +1053,6 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
       queryInstance = query({
         prompt: heldPrompt.stream,
         options: sdkOptions
-      }, () => {
-        lifecycle.processExited = true;
-        lifecycle.reportStopped();
       });
     }
     lifecycle.instance = queryInstance;
@@ -1062,9 +1108,6 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
         if (isSubagentPromptEcho(msg)) {
           continue;
         }
-        if (message.type === 'assistant' && message.error && !message.parent_tool_use_id && msg.kind === 'error') {
-          resultFailure = new Error(msg.content || message.error);
-        }
         ws.send(msg);
       }
 
@@ -1087,10 +1130,7 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
       if (message.type === 'result') {
         // The model turn ended; process exit and workspace return still own the run.
         const abortPending = sessionKey() ? abortedSessionIds.has(sessionKey()) : false;
-        const resultFailed = message.is_error === true
-          || (typeof message.subtype === 'string' && message.subtype.startsWith('error_'))
-          || Boolean(resultFailure);
-        if (heldForBackgroundWork && !abortPending && !resultFailed) {
+        if (heldForBackgroundWork && !abortPending) {
           // Held background work finished and pushed a follow-up turn.
           notifyBackgroundWorkCompleted({
             userId: ws?.userId || null,
@@ -1099,22 +1139,7 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
             sessionName: sessionSummary
           });
         }
-        if (resultFailed) {
-          const detail = (Array.isArray(message.errors)
-            ? message.errors.filter(error => typeof error === 'string').join('\n') : '')
-            || (typeof message.result === 'string' ? message.result : '');
-          if (!resultFailure) {
-            resultFailure = new Error(detail || `Claude Code ended the task with an error (${message.subtype}).`);
-            ws.send(createNormalizedMessage({ kind: 'error', content: resultFailure.message, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
-          }
-          // A failed turn cannot produce a background follow-up. Close stdin now,
-          // but publish completion only after the iterator's real teardown below.
-          backgroundWorkPending = false;
-          heldForBackgroundWork = false;
-          if (idleReleaseTimer) { clearTimeout(idleReleaseTimer); idleReleaseTimer = null; }
-          releasePromptStream();
-          ws.send(createNormalizedMessage({ kind: 'status', text: 'workspace_finalizing', sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
-        } else if (backgroundWorkPending) {
+        if (backgroundWorkPending) {
           // Work started during this turn is still running. Hold the process
           // open so it can finish and report back in a follow-up turn; the
           // ceiling is only a backstop for work that never reports.
@@ -1154,25 +1179,15 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
     if (!turnCompleteSent && !superseded) {
       turnCompleteSent = true;
       if (!wasAborted) {
-        ws.send(createCompleteMessage({ provider: 'claude', sessionId: capturedSessionId || sessionId || null, exitCode: resultFailure ? 1 : 0 }));
+        ws.send(createCompleteMessage({ provider: 'claude', sessionId: capturedSessionId || sessionId || null, exitCode: 0 }));
       }
-      if (!wasAborted && resultFailure) {
-        notifyRunFailed({
-          userId: ws?.userId || null,
-          provider: 'claude',
-          sessionId: sessionId || capturedSessionId || null,
-          sessionName: sessionSummary,
-          error: resultFailure
-        });
-      } else {
-        notifyRunStopped({
-          userId: ws?.userId || null,
-          provider: 'claude',
-          sessionId: sessionId || capturedSessionId || null,
-          sessionName: sessionSummary,
-          stopReason: wasAborted ? 'aborted' : 'completed'
-        });
-      }
+      notifyRunStopped({
+        userId: ws?.userId || null,
+        provider: 'claude',
+        sessionId: sessionId || capturedSessionId || null,
+        sessionName: sessionSummary,
+        stopReason: wasAborted ? 'aborted' : 'completed'
+      });
     }
     // Complete
 
@@ -1210,10 +1225,7 @@ export async function queryClaudeSDK(command, options = {}, ws, context) {
     // Workspace cleanup errors remain failures, never a successful cancellation.
     ws.send(createNormalizedMessage({ kind: 'error', content: errorContent, sessionId: capturedSessionId || sessionId || null, provider: 'claude' }));
     if (!turnCompleteSent) {
-      const terminal = createCompleteMessage({ provider: 'claude', sessionId: capturedSessionId || sessionId || null, exitCode: 1 });
-      // The registry receives this before the dispatcher catches the error; retain an unsent queue only for confirmed pre-SDK rejection.
-      if (error?.workspaceAdmissionRejected === true && !error?.workspaceCleanupError && !error?.cleanupError) terminal.workspaceAdmissionRejected = true;
-      ws.send(terminal);
+      ws.send(createCompleteMessage({ provider: 'claude', sessionId: capturedSessionId || sessionId || null, exitCode: 1 }));
     }
     notifyRunFailed({
       userId: ws?.userId || null,
@@ -1251,7 +1263,6 @@ export async function abortClaudeSDKSession(sessionId) {
     lifecycle.releaseInput();
     try {
       lifecycle.instance?.close();
-      lifecycle.reportStopped();
       await lifecycle.done;
       if (lifecycle.failure) throw lifecycle.failure;
       return true;
@@ -1363,3 +1374,4 @@ export const claudeRuntime = {
     listPending: getPendingApprovalsForSession,
   },
 };
+

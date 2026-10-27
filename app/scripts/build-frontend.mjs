@@ -1,7 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { frontendRoot, vite } from './frontend.mjs';
-import './build-sync-ssh.mjs';
 
 function runScript(url, args = []) {
   const result = spawnSync(process.execPath, [fileURLToPath(url), ...args], { cwd: frontendRoot, stdio: 'inherit' });

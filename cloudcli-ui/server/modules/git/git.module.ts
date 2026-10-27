@@ -2,7 +2,7 @@ import * as fs from 'node:fs/promises';
 
 import spawn from 'cross-spawn';
 
-import { projectsDb } from '@/modules/database/index.js';
+import { resolveSelectedProjectPath, workspaceSelectionScope } from '@/modules/workspaces/index.js';
 import { bridgeGitFileSystem } from '@/modules/workspace-bridge/index.js';
 
 import { createGitRouter } from './git.routes.js';
@@ -21,7 +21,8 @@ export function createGitModule(externalDependencies: GitExternalDependencies) {
       rm: (p, options) => fs.rm(p, options), unlink: p => fs.unlink(p),
     }),
     spawnProcess: spawn,
-    resolveProjectPathById: (projectId) => projectsDb.getProjectPathById(projectId),
+    resolveProjectPathById: resolveSelectedProjectPath,
+    selectionScope: workspaceSelectionScope,
     ...externalDependencies,
   });
 }
