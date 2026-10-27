@@ -102,8 +102,8 @@
     "cmdk": "^1.1.1",
     "cors": "^2.8.5",
     "cross-spawn": "^7.0.3",
-    "dompurify": "^3.4.7",
-    "express": "^4.18.2",
+    "dompurify": "^3.4.17",
+    "express": "^4.22.3",
     "fuse.js": "^7.0.0",
     "gray-matter": "^4.0.3",
     "i18next": "^25.7.4",
@@ -114,7 +114,7 @@
     "lucide-react": "^0.515.0",
     "mermaid": "^11.16.1",
     "mime-types": "^3.0.1",
-    "multer": "^2.0.1",
+    "multer": "^2.5.0",
     "mygo-runtime": "^0.1.22",
     "node-fetch": "^2.7.0",
     "node-pty": "^1.2.0-beta.12",
@@ -135,7 +135,7 @@
     "tailwind-merge": "^3.3.1",
     "web-push": "^3.6.7",
     "ws": "^8.14.2",
-    "zod": "^4.3.6"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@commitlint/cli": "^20.5.0",
@@ -160,7 +160,7 @@
     "auto-changelog": "^2.5.0",
     "autoprefixer": "^10.4.16",
     "concurrently": "^8.2.2",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.2",
     "eslint": "^9.39.3",
     "eslint-import-resolver-typescript": "^4.4.4",
     "eslint-plugin-boundaries": "^6.0.2",
@@ -174,15 +174,15 @@
     "node-gyp": "^10.0.0",
     "oxlint": "^1.79.0",
     "oxlint-tsgolint": "^7.0.2001",
-    "postcss": "^8.4.32",
+    "postcss": "^8.5.32",
     "release-it": "^19.0.5",
-    "sharp": "^0.34.2",
+    "sharp": "^0.35.5",
     "tailwindcss": "^3.4.0",
     "tsc-alias": "^1.8.16",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
-    "vite": "^7.0.4",
-    "vitest": "^3.2.7"
+    "vite": "^7.3.7",
+    "vitest": "^5.0.5"
   },
   "lint-staged": {
     "src/**/*.{ts,tsx,js,jsx}": "oxlint",
