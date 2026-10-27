@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -16,9 +16,11 @@ async function withIsolatedDatabase(runTest: () => void | Promise<void>): Promis
 
   closeConnection();
   process.env.DATABASE_PATH = databasePath;
-  await initializeDatabase();
 
   try {
+    // An existing empty database bypasses migration of the developer's legacy DB.
+    await writeFile(databasePath, '');
+    await initializeDatabase();
     await runTest();
   } finally {
     closeConnection();

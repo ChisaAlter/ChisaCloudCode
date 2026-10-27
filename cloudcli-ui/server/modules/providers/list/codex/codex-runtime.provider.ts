@@ -493,6 +493,8 @@ async function queryCodex(
       const session = activeCodexSessions.get(sessionKey() || '');
       if (session) {
         session.status = session.status === 'aborted' ? 'aborted' : 'completed';
+        // Finished cancellations must not remain addressable as another active run.
+        if (!session.cleanupError) activeCodexSessions.delete(sessionKey()!);
       }
     }
   }

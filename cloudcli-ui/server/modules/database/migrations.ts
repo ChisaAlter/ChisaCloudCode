@@ -5,12 +5,16 @@ import {
   LAST_SCANNED_AT_SQL,
   NOTIFICATION_CHANNEL_ENDPOINTS_TABLE_SCHEMA_SQL,
   PROJECTS_TABLE_SCHEMA_SQL,
+  PROJECT_SETTINGS_TABLE_SCHEMA_SQL,
+  PROJECT_ACTIONS_TABLE_SCHEMA_SQL,
+  AGENT_WORKSPACE_CONNECTIONS_TABLE_SCHEMA_SQL,
   PROVIDER_MODELS_TABLE_SCHEMA_SQL,
   PUSH_SUBSCRIPTIONS_TABLE_SCHEMA_SQL,
   SESSION_DRAFTS_TABLE_SCHEMA_SQL,
   SUPERSEDED_PROVIDER_SESSIONS_TABLE_SCHEMA_SQL,
   SCHEDULED_MESSAGES_TABLE_SCHEMA_SQL,
   SESSIONS_TABLE_SCHEMA_SQL,
+  SSH_PROJECT_TARGETS_TABLE_SCHEMA_SQL,
   USER_PREFERENCES_TABLE_SCHEMA_SQL,
   USER_NOTIFICATION_PREFERENCES_TABLE_SCHEMA_SQL,
   VAPID_KEYS_TABLE_SCHEMA_SQL,
@@ -558,6 +562,25 @@ const ensureProjectsForSessionPaths = (db: Database): void => {
   `);
 };
 
+const migrateAgentConnectionOwnerKey = (db: Database): void => {
+  const columns = getTableInfo(db, 'agent_workspace_connections');
+  addColumnToTableIfNotExists(db, 'agent_workspace_connections', columns.map(column => column.name), 'token', 'TEXT');
+  addColumnToTableIfNotExists(db, 'agent_workspace_connections', columns.map(column => column.name), 'delivery', "TEXT NOT NULL DEFAULT 'direct' CHECK (delivery IN ('direct', 'relay'))");
+  const primaryKey = columns.filter(column => column.pk > 0).sort((left, right) => left.pk - right.pk).map(column => column.name);
+  if (primaryKey.join(',') === 'owner_id,id') return;
+  // Rebuild atomically: a desktop ID is local to its owner, while tokens and
+  // endpoint timestamps must survive upgrade without rotating credentials.
+  db.transaction(() => {
+    db.exec('ALTER TABLE agent_workspace_connections RENAME TO agent_workspace_connections_legacy');
+    db.exec('DROP INDEX IF EXISTS idx_agent_workspace_connections_owner');
+    db.exec(AGENT_WORKSPACE_CONNECTIONS_TABLE_SCHEMA_SQL);
+    db.exec(`INSERT INTO agent_workspace_connections (id, owner_id, name, port, token, delivery, created_at, updated_at)
+      SELECT id, owner_id, name, port, token, delivery, created_at, updated_at FROM agent_workspace_connections_legacy`);
+    db.exec('DROP TABLE agent_workspace_connections_legacy');
+  })();
+};
+
+/** Database initialization upgrades existing account, project and private endpoint records before serving requests. */
 export const runMigrations = (db: Database) => {
   try {
     const usersTableInfo = db.prepare('PRAGMA table_info(users)').all() as { name: string }[];
@@ -610,6 +633,12 @@ export const runMigrations = (db: Database) => {
     addForkedFromSessionIdColumn(db);
     addSessionWorkspaceModeColumn(db);
     ensureProjectsForSessionPaths(db);
+    // Additive SSH targets never reinterpret existing cloud project paths or sessions.
+    db.exec(SSH_PROJECT_TARGETS_TABLE_SCHEMA_SQL);
+    db.exec(PROJECT_SETTINGS_TABLE_SCHEMA_SQL);
+    db.exec(PROJECT_ACTIONS_TABLE_SCHEMA_SQL);
+    db.exec(AGENT_WORKSPACE_CONNECTIONS_TABLE_SCHEMA_SQL);
+    migrateAgentConnectionOwnerKey(db);
     db.exec(SCHEDULED_MESSAGES_TABLE_SCHEMA_SQL);
 
     db.exec('CREATE INDEX IF NOT EXISTS idx_session_ids_lookup ON sessions(session_id)');

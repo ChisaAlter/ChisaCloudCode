@@ -1,5 +1,6 @@
 import { getConnection } from '@/modules/database/connection.js';
 import { projectsDb } from '@/modules/database/repositories/projects.db.js';
+import { sshProjectTargetsDb } from '@/modules/database/repositories/ssh-project-targets.db.js';
 import type { SessionWorkspaceMode } from '@/shared/types.js';
 import { normalizeProjectPath } from '@/shared/utils.js';
 
@@ -211,12 +212,15 @@ export const sessionsDb = {
     const db = getConnection();
     const normalizedProjectPath = normalizeProjectPathForProvider(provider, projectPath);
 
-    projectsDb.createProjectPath(normalizedProjectPath);
-
-    db.prepare(
-      `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, project_path_owned, jsonl_path, workspace_mode, isArchived, created_at, updated_at)
-       VALUES (?, ?, NULL, ?, ?, 1, NULL, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-    ).run(sessionId, provider, customName ?? null, normalizedProjectPath, workspaceMode);
+    db.transaction(() => {
+      projectsDb.createProjectPath(normalizedProjectPath);
+      const target = sshProjectTargetsDb.getByAnchor(normalizedProjectPath);
+      db.prepare(
+        `INSERT INTO sessions (session_id, provider, provider_session_id, custom_name, project_path, project_path_owned, jsonl_path, workspace_mode, isArchived, created_at, updated_at)
+         VALUES (?, ?, NULL, ?, ?, 1, NULL, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
+      ).run(sessionId, provider, customName ?? null, normalizedProjectPath, target ? 'shared' : workspaceMode);
+      if (target) sshProjectTargetsDb.pinSession(sessionId, target);
+    })();
 
     return sessionId;
   },
@@ -250,6 +254,11 @@ export const sessionsDb = {
     // id is the provider-native one, which is what this row claims, so replace
     // it rather than leaving two sidebar entries for one conversation.
     db.transaction(() => {
+      const target = sshProjectTargetsDb.getByAnchor(normalizedProjectPath);
+      const sourcePin = sshProjectTargetsDb.getSessionTarget(input.forkedFromSessionId);
+      if (sourcePin && (!target || target.projectId !== sourcePin.projectId || target.generation !== sourcePin.generation)) {
+        throw Object.assign(new Error('The source session SSH binding changed before forking.'), { code: 'WORKSPACE_GENERATION_CHANGED', statusCode: 409 });
+      }
       db.prepare('DELETE FROM sessions WHERE session_id = ? AND session_id <> ?')
         .run(input.providerSessionId, input.sessionId);
       db.prepare(
@@ -265,8 +274,9 @@ export const sessionsDb = {
         input.model,
         input.effort,
         input.forkedFromSessionId,
-        input.workspaceMode ?? 'isolated',
+        target ? 'shared' : input.workspaceMode ?? 'isolated',
       );
+      if (target) sshProjectTargetsDb.pinSession(input.sessionId, target);
     })();
 
     return input.sessionId;
@@ -560,6 +570,38 @@ export const sessionsDb = {
          WHERE isArchived = 0`
       )
       .all() as SessionRow[];
+
+    return normalizeSessionRows(rows);
+  },
+
+  /**
+   * Returns visible session rows for an explicit set of ids.
+   *
+   * The recent-conversation feed pages by update time, so a pinned session that
+   * has not changed for a long time may sit beyond the loaded page. The feed
+   * asks for the pinned ids separately and renders them ahead of that page
+   * instead of re-ordering only the rows it happened to load.
+   */
+  getSessionsByIds(ids: readonly string[]): SessionRow[] {
+    const uniqueIds = [...new Set(ids.filter((id) => typeof id === 'string' && id.trim()))];
+    if (uniqueIds.length === 0) {
+      return [];
+    }
+
+    const db = getConnection();
+    const placeholders = uniqueIds.map(() => '?').join(', ');
+    const rows = db
+      .prepare(
+        `SELECT ${SESSION_ROW_COLUMNS.split(', ').map((column) => `sessions.${column}`).join(', ')}
+         FROM sessions
+         LEFT JOIN projects ON projects.project_path = sessions.project_path
+         WHERE sessions.session_id IN (${placeholders})
+           AND sessions.isArchived = 0
+           AND (projects.isArchived IS NULL OR projects.isArchived = 0)
+         ORDER BY julianday(COALESCE(sessions.updated_at, sessions.created_at)) DESC,
+                  sessions.session_id DESC`
+      )
+      .all(...uniqueIds) as SessionRow[];
 
     return normalizeSessionRows(rows);
   },

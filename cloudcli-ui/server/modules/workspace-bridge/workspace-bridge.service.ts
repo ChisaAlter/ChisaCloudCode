@@ -314,7 +314,10 @@ type GitProcessResult = { code: number | null; stdout: string; stderr: string };
 
 function runGit(args: string[], cwd: string, signal?: AbortSignal): Promise<GitProcessResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn('git', ['-c', 'safe.directory=' + path.resolve(cwd), ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'], signal, windowsHide: true });
+    // Workspace Git must not inherit another repository or execute configured hooks.
+    const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.toUpperCase().startsWith('GIT_')));
+    const env = { ...inherited, LC_ALL: 'C', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null' };
+    const child = spawn('git', ['-c', 'safe.directory=' + path.resolve(cwd), '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], signal, windowsHide: true });
     let stdout = '';
     let stderr = '';
     let failure: Error | undefined;
@@ -378,7 +381,12 @@ async function createSessionWorktree(binding: Binding, sessionId: string, assert
   if (existsSync(worktreeRoot)) throw new AppError('Session worktree path already exists; recover it from Worktrees before starting again', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
 
   const repository = await runGit(['rev-parse', '--show-toplevel'], binding.root, signal);
-  if (repository.code !== 0 || !repository.stdout.trim()) return null;
+  if (repository.code !== 0 || !repository.stdout.trim()) {
+    if (repository.code !== 0 && /fatal: not a git repository(?: \(or any of the parent directories\))?:/i.test(repository.stderr)) return null;
+    throw new AppError('Could not inspect the Git repository for an isolated session', {
+      code: 'WORKSPACE_WORKTREE_CREATE_FAILED', statusCode: 503, details: repository.stderr.trim(),
+    });
+  }
   // A marker on a repository subdirectory would make the sibling worktree
   // path ambiguous. Keep that case on the shared-write path until a
   // repository-root-aware worktree mapping is available.
@@ -395,6 +403,7 @@ async function createSessionWorktree(binding: Binding, sessionId: string, assert
   if (head.code !== 0) return null;
   const branch = `chisa/session-private/${sessionWorktreeName(sessionId)}/work`;
   mkdirSync(parent, { recursive: true, mode: 0o700 });
+  if (!lstatSync(parent).isDirectory() || realpathSync(parent) !== parent) throw new AppError('The session worktree directory is not canonical', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
   if (process.platform !== 'win32' && process.getuid?.() === 0) chownSync(parent, 1000, 1000);
   assertPinned();
   const created = await runGit(['worktree', 'add', '--no-checkout', '-b', branch, worktreeRoot, 'HEAD'], binding.root, signal);

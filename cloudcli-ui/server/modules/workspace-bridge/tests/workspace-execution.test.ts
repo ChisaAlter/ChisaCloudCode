@@ -153,6 +153,52 @@ test('a cloud Git repository without an initial commit falls back to its actual 
   }
 });
 
+test('Git inspection errors reject isolated admission instead of silently using the shared root', async () => {
+  await fixture(async root => {
+    await writeFile(path.join(root, '.git', 'config'), '[core\n');
+    await assert.rejects(admitWorkspaceExecution({ cwd: root, sessionId: 'bad-git', workspaceMode: 'isolated' }), { code: 'WORKSPACE_WORKTREE_CREATE_FAILED' });
+    assert.equal(describe(root, 'bad-git').session, null);
+    assert.equal(existsSync(root + '.chisa-lease'), false);
+    assert.equal(existsSync(root + '.chisa-worktrees'), false);
+  });
+});
+
+test('worktree Git ignores inherited repository selectors and disables repository hooks', async () => {
+  await fixture(async root => {
+    const hookMarker = path.join(root, 'hook-ran.txt');
+    await writeFile(path.join(root, '.git', 'hooks', 'post-checkout'), '#!/bin/sh\nprintf unsafe > "' + hookMarker.replaceAll('\\', '/') + '"\n');
+    const observed: Array<{ args: string[]; env: NodeJS.ProcessEnv }> = [];
+    const originalSpawn = childProcess.spawn;
+    const spawn = mock.method(childProcess, 'spawn', (...args: Parameters<typeof childProcess.spawn>) => {
+      const [command, argv, options] = args;
+      if (command === 'git') observed.push({ args: argv as string[], env: (options as { env: NodeJS.ProcessEnv }).env });
+      return originalSpawn(...args);
+    });
+    const previous = process.env.GIT_DIR;
+    process.env.GIT_DIR = path.join(root, 'foreign-git-directory');
+    syncBuiltinESMExports();
+    let run: Awaited<ReturnType<typeof admitWorkspaceExecution>> | undefined;
+    try {
+      run = await admitWorkspaceExecution({ cwd: root, sessionId: 'clean-git-env', workspaceMode: 'isolated' });
+      assert.equal(run.isolated, true);
+      assert.ok(observed.length > 0);
+      for (const invocation of observed) assert.equal(invocation.env.GIT_DIR, undefined);
+      const worktreeCommands = observed.filter(invocation => invocation.args.some(argument => argument.startsWith('safe.directory=')));
+      assert.ok(worktreeCommands.length > 0);
+      for (const invocation of worktreeCommands) {
+        assert.equal(invocation.env.GIT_CONFIG_NOSYSTEM, '1');
+        assert.ok(invocation.args.includes('core.hooksPath=/dev/null'));
+        assert.ok(invocation.args.includes('core.fsmonitor=false'));
+      }
+      assert.equal(existsSync(hookMarker), false);
+    } finally {
+      if (previous === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = previous;
+      spawn.mock.restore(); syncBuiltinESMExports();
+      await run?.close();
+    }
+  });
+});
+
 test('unconfirmed cloud cleanup retains its barrier until exact external recovery', async () => {
   await fixture(async root => {
     const run = await admitWorkspaceExecution({ cwd: root, workspaceMode: 'shared', directExecution: true });

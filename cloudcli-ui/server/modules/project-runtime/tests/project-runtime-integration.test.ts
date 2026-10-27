@@ -109,7 +109,12 @@ function manifest(current: Fixture) {
   return getProjectRuntimeManifest(current.launch.userId, current.descriptor.projectId, { accountKey: current.launch.accountKey, generation: current.descriptor.generation, workspaceId: current.descriptor.workspaceId });
 }
 function prompt(options: Options) {
-  return typeof options.systemPrompt === 'string' ? options.systemPrompt : Array.isArray(options.systemPrompt) ? options.systemPrompt.join('\n') : options.systemPrompt?.append ?? '';
+  const value = options.systemPrompt;
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.join('\n');
+  if (!value) return '';
+  if (value.type === 'preset') return value.append ?? '';
+  return Array.isArray(value.prompt) ? value.prompt.join('\n') : value.prompt;
 }
 
 test('preparation loads remote instructions, selected account policy and cloud memory before query with retained public MCP provenance', async () => fixture({
@@ -163,15 +168,22 @@ test('preparation loads remote instructions, selected account policy and cloud m
   assert.equal(current.options.allowedTools?.includes('mcp__workspace__*'), false, 'a wildcard cannot bypass the narrower ask/deny rules');
   assert.equal(current.options.allowedTools?.includes('mcp__docs__*'), false, 'external MCP wildcard cannot bypass a project/account deny');
   const permission = current.options.canUseTool!;
-  const context = { signal: current.controller.signal, toolUseID: 'tool-1' } as Parameters<NonNullable<Options['canUseTool']>>[2];
-  assert.equal((await permission('mcp__workspace__run_command', {}, context)).behavior, 'deny');
-  assert.equal((await permission('mcp__docs__danger', {}, context)).behavior, 'deny');
+  const context: Parameters<NonNullable<Options['canUseTool']>>[2] = { signal: current.controller.signal, toolUseID: 'tool-1', requestId: 'project-runtime-permission-request' };
+  const commandDecision = await permission('mcp__workspace__run_command', {}, context);
+  assert.ok(commandDecision, 'project deny returns an explicit permission decision');
+  assert.equal(commandDecision.behavior, 'deny');
+  const externalDecision = await permission('mcp__docs__danger', {}, context);
+  assert.ok(externalDecision, 'account deny returns an explicit permission decision');
+  assert.equal(externalDecision.behavior, 'deny');
   assert.equal(prompted, 0, 'project/account deny bypasses approval callback');
-  assert.equal((await permission('mcp__workspace__read_file', {}, context)).behavior, 'deny');
+  const readDecision = await permission('mcp__workspace__read_file', {}, context);
+  assert.ok(readDecision, 'project ask retains the explicit approval decision');
+  assert.equal(readDecision.behavior, 'deny');
   assert.equal(prompted, 1, 'ask reaches the original explicit permission handler');
   assert.equal(permissionContexts[0]?.chisaForceAsk, true, 'project ask overrides the provider callback’s captured bypass options');
   assert.equal(permissionContexts[0]?.signal, context.signal);
   assert.equal(permissionContexts[0]?.toolUseID, context.toolUseID);
+  assert.equal(permissionContexts[0]?.requestId, context.requestId);
   assert.equal(Object.hasOwn(context, 'chisaForceAsk'), false, 'the original SDK context is not mutated');
   assert.match(await runtime.rulesForPath('/workspace/src/main.ts'), /TypeScript scoped rule/);
   assert.equal(await runtime.rulesForPath('/workspace/docs/guide.md'), '');
@@ -337,12 +349,16 @@ test('project dontAsk denies unlisted and ask-scoped tools before an original by
   assert.equal(current.options.allowedTools?.includes('mcp__workspace__read_file'), false);
   assert.equal(current.options.allowedTools?.includes('mcp__workspace__list_files'), true);
   const permission = current.options.canUseTool!;
-  const context = { signal: current.controller.signal, toolUseID: 'dont-ask-tool' } as Parameters<NonNullable<Options['canUseTool']>>[2];
+  const context: Parameters<NonNullable<Options['canUseTool']>>[2] = { signal: current.controller.signal, toolUseID: 'dont-ask-tool', requestId: 'project-runtime-dont-ask-request' };
   for (const name of ['mcp__workspace__run_command', 'mcp__workspace__read_file']) {
-    assert.equal((await permission(name, {}, context)).behavior, 'deny', name);
+    const decision = await permission(name, {}, context);
+    assert.ok(decision, 'dontAsk returns an explicit permission decision for ' + name);
+    assert.equal(decision.behavior, 'deny', name);
     assert.equal(callbackCalls, 0, 'dontAsk rejects without consulting the captured bypass callback');
   }
-  assert.equal((await permission('mcp__workspace__list_files', {}, context)).behavior, 'allow');
+  const listDecision = await permission('mcp__workspace__list_files', {}, context);
+  assert.ok(listDecision, 'the explicitly allowed inspection returns a permission decision');
+  assert.equal(listDecision.behavior, 'allow');
   assert.equal(callbackCalls, 1, 'an explicitly allowed non-ask inspection remains available');
   assert.equal((runtime.server as unknown as MockServer).tools.some(tool => tool.name === 'write_memory'), false);
   runtime.close();

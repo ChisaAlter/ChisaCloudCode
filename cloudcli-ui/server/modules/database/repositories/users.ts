@@ -42,6 +42,12 @@ type CreateUserResult = {
 // ---------------------------------------------------------------------------
 
 export const userDb = {
+  /** Authorization gateways retain unbound imported projects only for the original single-account installation; this query never assigns ownership. */
+  getActiveUserIds(): string[] {
+    return (getConnection().prepare('SELECT id FROM users WHERE is_active = 1 ORDER BY id').all() as { id: number }[])
+      .map(row => String(row.id));
+  },
+
   /** Returns true if at least one user exists in the database. */
   hasUsers(): boolean {
     const db = getConnection();

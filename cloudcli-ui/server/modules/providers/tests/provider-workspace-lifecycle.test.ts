@@ -17,6 +17,7 @@ function makeService(provider: LLMProvider, runtime: IProviderRuntime, admission
     resolveProviderSessionId: () => 'native-session', resolveResumeModel: async () => 'model',
     getProviderModels: async () => ({ OPTIONS: [], DEFAULT: 'model' }),
     getSessionSource: () => ({ project_path: '/source', workspace_mode: 'isolated', provider }),
+    authorizeRun() {},
     admitWorkspaceExecution: admission,
     registerManagedProviderProfile: () => '/fixture/profile',
   });

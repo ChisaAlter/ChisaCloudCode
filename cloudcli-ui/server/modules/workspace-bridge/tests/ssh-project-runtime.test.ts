@@ -111,7 +111,11 @@ async function fixture(files: Record<string, string>, run: (value: {
 
 function prompt(options: Options) {
   const value = options.systemPrompt;
-  return typeof value === 'string' ? value : Array.isArray(value) ? value.join('\n') : value?.append ?? '';
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.join('\n');
+  if (!value) return '';
+  if (value.type === 'preset') return value.append ?? '';
+  return Array.isArray(value.prompt) ? value.prompt.join('\n') : value.prompt;
 }
 
 test('actual SSH query wrapper prepares session-scoped provenance and keeps configured MCP beside workspace tools', async () => fixture({
@@ -161,10 +165,14 @@ test('actual SSH query wrapper preserves project ask against captured bypass and
   onQuery = async input => {
     const options = input.options!;
     assert.equal(options.allowedTools?.includes('mcp__workspace__read_file'), false);
-    const context = { signal: new AbortController().signal, toolUseID: 'wrapper-tool' } as Parameters<NonNullable<Options['canUseTool']>>[2];
-    assert.equal((await options.canUseTool!('mcp__workspace__run_command', {}, context)).behavior, 'deny');
+    const context: Parameters<NonNullable<Options['canUseTool']>>[2] = { signal: new AbortController().signal, toolUseID: 'wrapper-tool', requestId: 'ssh-project-runtime-request' };
+    const commandDecision = await options.canUseTool!('mcp__workspace__run_command', {}, context);
+    assert.ok(commandDecision, 'the SSH wrapper returns the explicit project deny');
+    assert.equal(commandDecision.behavior, 'deny');
     assert.equal(permissionCalls, 0, 'deny wins before the captured bypass callback');
-    assert.equal((await options.canUseTool!('mcp__workspace__read_file', { path: '/workspace/src/index.ts' }, context)).behavior, 'deny');
+    const readDecision = await options.canUseTool!('mcp__workspace__read_file', { path: '/workspace/src/index.ts' }, context);
+    assert.ok(readDecision, 'the SSH wrapper retains the explicit approval decision');
+    assert.equal(readDecision.behavior, 'deny');
     assert.equal(permissionCalls, 1, 'ask crosses both wrapper layers and forces explicit permission');
     const workspace = options.mcpServers!.workspace as unknown as MockServer;
     const read = workspace.tools.find(tool => tool.name === 'read_file')!;

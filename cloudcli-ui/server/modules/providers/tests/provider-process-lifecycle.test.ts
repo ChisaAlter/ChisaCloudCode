@@ -119,6 +119,7 @@ if (process.env.CHISA_TEST_HOLD === '1') { process.on('SIGTERM',()=>{}); setInte
           resolveProviderSessionId: () => null, resolveResumeModel: async () => 'fake-model',
           getProviderModels: async () => ({ OPTIONS: [], DEFAULT: 'fake-model' }),
           getSessionSource: () => ({ project_path: root, workspace_mode: 'isolated', provider }),
+          authorizeRun() {},
           // This fixture uses the real host process-tree supervisor and each
           // adapter's trusted fake executable factory; Docker has a separate
           // actual-admission fixture and must not replace this factory.

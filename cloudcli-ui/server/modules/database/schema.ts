@@ -98,6 +98,88 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 `;
 
+/**
+ * Per-project overrides for the values a new session starts with.
+ *
+ * Every column is nullable on purpose: NULL means "inherit", so deleting a
+ * field restores the account or built-in default instead of freezing a copy of
+ * it. The table is created by migrations after the projects table is rebuilt,
+ * because its foreign key targets the repaired project_id primary key.
+ */
+export const PROJECT_SETTINGS_TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS project_settings (
+    project_id TEXT PRIMARY KEY NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    provider TEXT CHECK (provider IS NULL OR provider IN ('claude', 'cursor', 'codex', 'opencode')),
+    model TEXT,
+    effort TEXT,
+    permission_mode TEXT CHECK (permission_mode IS NULL OR permission_mode IN ('default', 'acceptEdits', 'auto', 'bypassPermissions', 'plan')),
+    workspace_mode TEXT CHECK (workspace_mode IS NULL OR workspace_mode IN ('isolated', 'shared')),
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+`;
+
+/** Desktop-owned loopback endpoints are keyed per account; migrations preserve existing private tokens and timestamps. */
+export const AGENT_WORKSPACE_CONNECTIONS_TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS agent_workspace_connections (
+    id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    port INTEGER NOT NULL CHECK (port BETWEEN 1024 AND 65535),
+    token TEXT,
+    delivery TEXT NOT NULL DEFAULT 'direct' CHECK (delivery IN ('direct', 'relay')),
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (owner_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_workspace_connections_owner ON agent_workspace_connections(owner_id, updated_at);
+`;
+
+/** Explicit project commands (run/test/build/custom) executed in the project workspace. */
+export const PROJECT_ACTIONS_TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS project_actions (
+    id TEXT PRIMARY KEY NOT NULL,
+    project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    command TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'custom' CHECK (kind IN ('run', 'test', 'build', 'custom')),
+    cwd TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_project_actions_project ON project_actions(project_id, sort_order, created_at);
+`;
+
+/** Database migrations create these only after repairing legacy project/session primary keys. */
+export const SSH_PROJECT_TARGETS_TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS ssh_project_targets (
+    project_id TEXT PRIMARY KEY NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    owner_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    connection_label TEXT NOT NULL,
+    root_path TEXT NOT NULL,
+    root_identity TEXT NOT NULL,
+    generation TEXT NOT NULL,
+    workspace_id TEXT NOT NULL UNIQUE,
+    anchor_path TEXT NOT NULL UNIQUE,
+    phase TEXT NOT NULL DEFAULT 'idle' CHECK (phase IN ('idle', 'running', 'recovery')),
+    active_run_id TEXT,
+    pending_job_id TEXT,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (owner_id, connection_id, root_identity),
+    CHECK ((phase = 'idle' AND active_run_id IS NULL AND pending_job_id IS NULL)
+        OR (phase IN ('running', 'recovery') AND active_run_id IS NOT NULL))
+);
+CREATE TABLE IF NOT EXISTS ssh_session_targets (
+    session_id TEXT PRIMARY KEY NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES ssh_project_targets(project_id) ON DELETE CASCADE,
+    generation TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ssh_session_targets_project ON ssh_session_targets(project_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ssh_owner_physical_root ON ssh_project_targets(owner_id, root_identity);
+`;
+
 export const SCHEDULED_MESSAGES_TABLE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS scheduled_messages (
     id TEXT PRIMARY KEY,
@@ -332,6 +414,25 @@ CREATE TABLE IF NOT EXISTS claude_active_connections (
   user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   connection_id TEXT NOT NULL,
   FOREIGN KEY (user_id, connection_id) REFERENCES claude_model_connections(user_id, id) ON DELETE CASCADE
+);
+
+-- Subscription identity and selection are private to the authenticated Chisa user; secrets stay in host-owned profiles.
+CREATE TABLE IF NOT EXISTS claude_subscription_accounts (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  email TEXT,
+  organization_uuid TEXT,
+  organization_name TEXT,
+  plan TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, id)
+);
+CREATE TABLE IF NOT EXISTS claude_active_subscription_accounts (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL,
+  FOREIGN KEY (user_id, account_id) REFERENCES claude_subscription_accounts(user_id, id) ON DELETE CASCADE
 );
 
 ${SESSION_DRAFTS_TABLE_SCHEMA_SQL}
