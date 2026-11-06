@@ -137,6 +137,7 @@ export function SshProjectFields({ connectionId, rootPath, verified, disabled = 
   };
 
   const pickFolder = async () => {
+    if (!selectedNativeAgent) return;
     const key = selectionKey;
     const identity = getAuthSessionVersion();
     const server = getServerConnectionVersion();
@@ -175,7 +176,7 @@ export function SshProjectFields({ connectionId, rootPath, verified, disabled = 
       <label htmlFor="ssh-project-root" className="text-sm font-medium">Windows 项目目录</label>
       <div className="flex gap-2">
         <Input id="ssh-project-root" value={rootPath} onChange={event => onRootPathChange(event.target.value)} placeholder="C:\\work\\my-project" disabled={disabled} className="min-w-0 flex-1 font-mono text-sm" />
-        {isDesktop() && <Button type="button" variant="outline" onClick={() => void pickFolder()} disabled={disabled} aria-label="选择 Windows 项目目录"><FolderOpen className="h-4 w-4" /></Button>}
+        {isDesktop() && selectedNativeAgent && <Button type="button" variant="outline" onClick={() => void pickFolder()} disabled={disabled} aria-label="选择 Windows 项目目录"><FolderOpen className="h-4 w-4" /></Button>}
       </div>
       <p className="text-xs text-muted-foreground">此目录必须已存在，且当前 Windows 账户{builtInConnection ? '' : '或所选 SSH 账户'}有读取和开发权限。云端 Claude 直接使用此目录，不复制仓库。</p>
     </div>

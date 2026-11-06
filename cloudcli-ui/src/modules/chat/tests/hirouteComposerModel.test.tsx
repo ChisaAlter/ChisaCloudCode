@@ -27,6 +27,8 @@ const options: ProviderModelOption[] = [
 const session = { id: 'hiroute-session', __provider: 'claude' } as ProjectSession;
 beforeEach(() => {
   localStorage.clear();
+  vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });
+  Element.prototype.scrollIntoView = vi.fn();
   mocks.models.mockImplementation((provider: string) => ok(provider === 'claude'
     ? { models: { OPTIONS: options, DEFAULT: 'default' } } : null));
   mocks.read.mockImplementation((_provider: string, sessionId: string) => ok({
@@ -36,15 +38,14 @@ beforeEach(() => {
 });
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
 
-test('HiRoute is selectable from the Claude catalog and displays its routing description', () => {
+test('HiRoute remains selectable from the compact Claude menu', async () => {
   const onSelectModel = vi.fn();
   render(<ComposerModelMenu model="default" modelOptions={options} onSelectModel={onSelectModel}
     effort="high" effortOptions={[{ value: 'high' }]} onSelectEffort={vi.fn()} modelsLoading={false} />);
   fireEvent.click(screen.getByRole('button', { name: 'Select model and reasoning effort' }));
-  fireEvent.click(screen.getByRole('menuitem', { name: 'Default' }));
   fireEvent.click(screen.getByRole('menuitemradio', { name: /HiRoute/ }));
   expect(onSelectModel).toHaveBeenCalledWith('hiroute');
-  expect(screen.queryByRole('menu')).toBeNull();
+  await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
 });
 
 test('HiRoute keeps choices directly reachable without Claude effort and labels the last execution separately', () => {
@@ -56,7 +57,7 @@ test('HiRoute keeps choices directly reachable without Claude effort and labels 
   expect(trigger.title).toBe('HiRoute · Last used: Sonnet 4.6');
   fireEvent.click(trigger);
   expect(screen.queryByText('Reasoning')).toBeNull();
-  expect(screen.getByText('Automatically route subscription and configured models')).toBeTruthy();
+  expect(screen.getByRole('menuitemradio', { name: 'HiRoute' }).title).toContain('Automatically route subscription and configured models');
   fireEvent.click(screen.getByRole('menuitemradio', { name: 'Default' }));
   expect(onSelectModel).toHaveBeenCalledWith('default');
 });

@@ -1,14 +1,21 @@
+import { Buffer } from 'node:buffer';
+import { createHmac } from 'node:crypto';
+
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 import ProjectContextPanel from '@/modules/project-settings/ProjectContextPanel';
 import { useProjectContext } from '@/modules/project-settings/hooks/useProjectContext';
 import { api } from '@/shared/api';
-import { clearAuthToken, startAuthSession } from '@/shared/authToken';
+import { acknowledgeAuthSession, clearAuthToken, initializeAuthSession, startAuthSession } from '@/shared/authToken';
+import type * as Chisa from '@/shared/chisa';
 import type { ProjectContextView, ProjectRuntimeManifest } from '@/shared/types';
 
 const service = vi.hoisted(() => ({ version: 0 }));
-vi.mock('@/shared/chisa', () => ({ getServerConnectionVersion: () => service.version }));
+vi.mock('@/shared/chisa', async importOriginal => ({
+  ...await importOriginal<typeof Chisa>(),
+  getServerConnectionVersion: () => service.version,
+}));
 const policy: ProjectContextView = {
   projectId: 'local-project', sourceMode: 'ssh', displayPath: 'C:\\work\\app',
   execution: { provider: 'claude', location: 'vps' }, workspace: { mode: 'bridged', instructionPath: 'CLAUDE.md' },
@@ -18,8 +25,20 @@ const policy: ProjectContextView = {
 };
 const response = (view = policy) => Response.json({ data: view });
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; }
-beforeEach(() => { service.version = 0; startAuthSession('account.payload.signature'); });
-afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); });
+async function authenticateContextAccount(userId = 'context-account-a') {
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const unsigned = `${encode({ alg: 'HS256', typ: 'JWT' })}.${encode({ userId, iat: issuedAt, exp: issuedAt + 3600 })}`;
+  const token = `${unsigned}.${createHmac('sha256', 'project-context-test-key').update(unsigned).digest('base64url')}`;
+  await clearAuthToken(await initializeAuthSession());
+  const session = await startAuthSession(token, await initializeAuthSession());
+  expect(session, 'context fixture login must commit before rendering').not.toBeNull();
+  if (!session) throw new Error('Context fixture login did not commit');
+  acknowledgeAuthSession(session);
+}
+
+beforeEach(async () => { service.version = 0; await authenticateContextAccount(); });
+afterEach(async () => { cleanup(); await clearAuthToken(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 test('policy without an actual run never claims instructions, skills or MCP were loaded', async () => {
   vi.spyOn(api, 'projectContext').mockImplementation(async () => response());
@@ -88,7 +107,7 @@ test.each(['account', 'server', 'project'] as const)('late parsed responses cann
   const { result, rerender } = renderHook(({ id }) => useProjectContext(id), { initialProps: { id: policy.projectId } });
   await waitFor(() => expect(json).toHaveBeenCalled());
   const previousRefresh = result.current.refresh;
-  if (transition === 'account') clearAuthToken();
+  if (transition === 'account') await act(async () => { await authenticateContextAccount('context-account-b'); });
   if (transition === 'server') service.version += 1;
   rerender({ id: nextId });
   await waitFor(() => expect(result.current.view?.displayPath).toBe('C:\\next'));

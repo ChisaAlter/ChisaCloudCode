@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { useWorkspaceApi } from '@/shared/context/WorkspaceScopeContext';
-import type { Project,FileTreeNode } from '@/shared/types';
+import type { Project,FileTreeNode, ServerEvent } from '@/shared/types';
+
+type ServerEventSubscription = (listener: (event: ServerEvent) => void) => () => void;
 
 type UseFileTreeDataResult = {
   files: FileTreeNode[];
@@ -52,7 +54,7 @@ function readResponseErrorMessage(responseBody: string): string | null {
   }
 }
 
-export function useFileTreeData(selectedProject: Project | null): UseFileTreeDataResult {
+export function useFileTreeData(selectedProject: Project | null, subscribe?: ServerEventSubscription): UseFileTreeDataResult {
   const api = useWorkspaceApi();
   const [files, setFiles] = useState<FileTreeNode[]>([]);
   const [loading, setLoading] = useState(false);
@@ -69,6 +71,10 @@ export function useFileTreeData(selectedProject: Project | null): UseFileTreeDat
   // Repeated clicks cannot start duplicate requests for the same unloaded folder.
   const directoryRequestsRef = useRef(new Set<string>());
   const abortControllerRef = useRef<AbortController | null>(null);
+  // Remote change events debounce into one incremental pass per burst.
+  const liveRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // A live pass already running skips further triggers until it settles.
+  const liveRefreshInFlightRef = useRef(false);
 
   const refreshFiles = useCallback(() => {
     setRefreshKey((prev) => prev + 1);
@@ -191,6 +197,102 @@ export function useFileTreeData(selectedProject: Project | null): UseFileTreeDat
       }
     }
   }, [api, selectedProject?.projectId]);
+
+  // Remote filesystem events refetch only the folders the user has already
+  // loaded: expansion state, unloaded branches and the selection all survive.
+  // Each pass merges into the freshly read root, so a folder deleted remotely
+  // disappears while one whose refetch failed keeps its last known children.
+  const refreshLoadedDirectories = useCallback(async () => {
+    const projectId = selectedProject?.projectId;
+    const abortController = abortControllerRef.current;
+    if (!projectId || !abortController || liveRefreshInFlightRef.current) {
+      return;
+    }
+    const loadedDirectories: string[] = [];
+    const collect = (nodes: FileTreeNode[]) => {
+      for (const node of nodes) {
+        if (node.type !== 'directory') continue;
+        if (node.children !== undefined) loadedDirectories.push(node.path);
+        collect(node.children ?? []);
+      }
+    };
+    collect(filesRef.current);
+    liveRefreshInFlightRef.current = true;
+    const scopeVersion = scopeVersionRef.current;
+    try {
+      const rootResponse = await api.getFiles(projectId, { signal: abortController.signal, shallow: true });
+      if (!rootResponse.ok) {
+        return;
+      }
+      const rootNodes = (await rootResponse.json()) as FileTreeNode[];
+      const refreshed = new Map<string, FileTreeNode[]>();
+      await Promise.all(loadedDirectories.map(async (path) => {
+        try {
+          const response = await api.getFiles(projectId, { shallow: true, directoryPath: path, signal: abortController.signal });
+          if (response.ok) {
+            refreshed.set(path, (await response.json()) as FileTreeNode[]);
+          }
+        } catch {
+          // A folder that cannot be reread keeps its previous children this pass.
+        }
+      }));
+      if (scopeVersionRef.current !== scopeVersion || abortController.signal.aborted) {
+        return;
+      }
+      const previousDirectories = new Map<string, FileTreeNode>();
+      const index = (nodes: FileTreeNode[]) => {
+        for (const node of nodes) {
+          if (node.type !== 'directory') continue;
+          previousDirectories.set(node.path, node);
+          index(node.children ?? []);
+        }
+      };
+      index(filesRef.current);
+      const merge = (nodes: FileTreeNode[]): FileTreeNode[] => nodes.map((node) => {
+        if (node.type !== 'directory') return node;
+        const children = refreshed.get(node.path) ?? previousDirectories.get(node.path)?.children;
+        return children !== undefined ? { ...node, children: merge(children) } : node;
+      });
+      const next = merge(rootNodes);
+      if (countNodes(next) > MAX_LOADED_NODES) {
+        return;
+      }
+      filesRef.current = next;
+      setFiles(next);
+    } catch {
+      // Live refresh is advisory; a failed pass leaves the visible tree as-is.
+    } finally {
+      liveRefreshInFlightRef.current = false;
+    }
+  }, [api, selectedProject?.projectId]);
+
+  // One subscription per tree: bursts of remote saves settle into a single
+  // incremental pass shortly after the last event.
+  useEffect(() => {
+    if (!subscribe || !selectedProject?.projectId) {
+      return;
+    }
+    const projectId = selectedProject.projectId;
+    const unsubscribe = subscribe((event) => {
+      if (event.kind !== 'ssh_workspace_changed' || event.projectId !== projectId) {
+        return;
+      }
+      if (liveRefreshTimerRef.current) {
+        clearTimeout(liveRefreshTimerRef.current);
+      }
+      liveRefreshTimerRef.current = setTimeout(() => {
+        liveRefreshTimerRef.current = null;
+        void refreshLoadedDirectories();
+      }, 400);
+    });
+    return () => {
+      unsubscribe();
+      if (liveRefreshTimerRef.current) {
+        clearTimeout(liveRefreshTimerRef.current);
+        liveRefreshTimerRef.current = null;
+      }
+    };
+  }, [subscribe, selectedProject?.projectId, refreshLoadedDirectories]);
 
   return {
     files,

@@ -11,8 +11,8 @@ const target = { connectionId: 'desktop', rootPath: 'D:\\Code\\中文 App', expe
 const success = { ok: true, protocol: 1, platform: 'win32', rootIdentity: target.expectedRootIdentity };
 const endpoint = { id: 'desktop', name: 'Desktop', port: 18765, token };
 const write = { op: 'write', path: '/workspace/file.txt', b64: 'YQ==', expectedHash: null };
-function transport(agentFetch: (url: string, init: RequestInit) => Promise<Response>, requestTimeoutMs = 1000) {
-  return createSshWorkspaceTransport({ env: {}, agentConnections: async () => [endpoint], agentFetch, requestTimeoutMs,
+function transport(agentFetch: (url: string, init: RequestInit) => Promise<Response>, requestTimeoutMs = 1000, cleanupTimeoutMs = 100) {
+  return createSshWorkspaceTransport({ env: {}, agentConnections: async () => [endpoint], agentFetch, requestTimeoutMs, cleanupTimeoutMs,
     spawn() { assert.fail('Agent failure must never use SSH'); } });
 }
 function json(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status }); }
@@ -78,13 +78,19 @@ test('abort from persisted-job callback is typed pre-dispatch and does not send 
 
 test('unknown file outcomes retain one persisted operation ID and are never replayed', async () => {
   for (const failure of ['disconnect', 'abort', 'malformed', 'oversized', 'bootstrap', 'wrong-root', 'duplicate', 'no-root']) {
-    let calls = 0;
+    const calls: string[] = [];
     let saved = '';
     let operationId = '';
     const controller = new AbortController();
     const active = transport(async (url, init) => {
-      calls++;
       const envelope = JSON.parse(String(init.body));
+      calls.push(envelope.request.op);
+      if (envelope.request.op === 'operation_status') {
+        assert.equal(envelope.operationId, undefined);
+        assert.equal(envelope.request.operationId, operationId);
+        assert.equal(init.signal!.aborted, false, 'confirmation is independent of the failed mutation signal');
+        return json({ ...success, operationId, generation: target.generation, rootPath: target.rootPath, state: 'running', cleanupConfirmed: false });
+      }
       operationId = envelope.operationId;
       assert.equal(saved, `operation:${operationId}`, 'receipt must persist before HTTP transmission');
       assert.match(operationId, /^[a-f0-9-]{36}$/);
@@ -107,8 +113,123 @@ test('unknown file outcomes retain one persisted operation ID and are never repl
       assert.equal(error.message.includes(token), false);
       return true;
     });
-    assert.equal(calls, 1, failure);
+    assert.deepEqual(calls, ['write', 'operation_status'], failure);
   }
+});
+
+test('an exact terminal file receipt preserves the original failure without replay or cancellation', async () => {
+  for (const [outcome, state, code, statusCode, message] of [
+    ['disconnect', 'completed', 'SSH_WORKSPACE_UNAVAILABLE', 503, 'The desktop workspace agent is unavailable'],
+    ['malformed', 'cancelled', 'SSH_WORKSPACE_UNAVAILABLE', 502, 'The desktop agent did not return a valid workspace response'],
+    ['abort', 'completed', 'SSH_WORKSPACE_INTERRUPTED', 499, 'Workspace operation interrupted; check its recovery status before retrying'],
+    ['helper', 'cancelled', 'AGENT_HELPER_UNAVAILABLE', 502, 'No final helper receipt'],
+  ] as const) {
+    const calls: string[] = [];
+    const saved: string[] = [];
+    const controller = new AbortController();
+    let operationId = '';
+    let mutationSignal: AbortSignal | null | undefined;
+    const active = transport(async (url, init) => {
+      const envelope = JSON.parse(String(init.body));
+      calls.push(envelope.request.op);
+      assert.equal(envelope.rootPath, target.rootPath);
+      assert.equal(envelope.expectedRootIdentity, target.expectedRootIdentity);
+      assert.equal(envelope.generation, target.generation);
+      if (envelope.request.op === 'write') {
+        operationId = envelope.operationId;
+        mutationSignal = init.signal;
+        assert.deepEqual(saved, [`operation:${operationId}`]);
+        if (outcome === 'disconnect') throw new Error('lost response after mutation');
+        if (outcome === 'malformed') return new Response('partial JSON');
+        if (outcome === 'abort') { queueMicrotask(() => controller.abort()); return abortFetch(url, init); }
+        return json({ ok: false, protocol: 1, platform: 'win32', code, error: message }, statusCode);
+      }
+      assert.deepEqual(envelope.request, { op: 'operation_status', operationId });
+      assert.equal(envelope.operationId, undefined, 'status must not create another mutation receipt');
+      assert.notEqual(init.signal, mutationSignal);
+      assert.equal(init.signal!.aborted, false);
+      return json({ ...success, operationId, generation: target.generation, rootPath: target.rootPath, state, cleanupConfirmed: true });
+    });
+    await assert.rejects(active.executeSshWorkspace({ ...target, signal: controller.signal, request: write,
+      onJobCreated(id) { saved.push(id); } }), error => {
+      assert.ok(error instanceof SshWorkspaceError);
+      assert.equal(error.code, code, outcome);
+      assert.equal(error.statusCode, statusCode, outcome);
+      assert.equal(error.message, message, outcome);
+      assert.deepEqual(error.details, { requestDispatched: true, cleanupConfirmed: true, operationId, jobId: `operation:${operationId}` });
+      return true;
+    });
+    assert.deepEqual(calls, ['write', 'operation_status']);
+    assert.equal(saved.length, 1);
+  }
+});
+
+test('automatic file confirmation rejects missing, active, malformed and mismatched receipts', async () => {
+  for (const patch of [
+    { operationId: randomUUID() }, { generation: 'other' }, { generation: undefined },
+    { rootPath: 'D:\\other' }, { rootIdentity: 'other' }, { state: 'invalid' },
+    { state: 'not_found', cleanupConfirmed: false }, { state: 'unknown', cleanupConfirmed: false },
+    { state: 'running', cleanupConfirmed: false }, { state: 'running', cleanupConfirmed: true },
+    { cleanupConfirmed: false }, { cleanupConfirmed: 'true' }, { cleanupConfirmed: undefined },
+    { protocol: 2 }, { platform: 'linux' },
+  ]) {
+    const calls: string[] = [];
+    let operationId = '';
+    const active = transport(async (_url, init) => {
+      const envelope = JSON.parse(String(init.body));
+      calls.push(envelope.request.op);
+      if (envelope.request.op === 'write') { operationId = envelope.operationId; throw new Error('lost write response'); }
+      assert.deepEqual(envelope.request, { op: 'operation_status', operationId });
+      return json({ ...success, operationId, generation: target.generation, rootPath: target.rootPath,
+        state: 'completed', cleanupConfirmed: true, ...patch });
+    });
+    await assert.rejects(active.executeSshWorkspace({ ...target, request: write }), error => {
+      assert.ok(error instanceof SshWorkspaceError);
+      assert.equal(error.code, 'SSH_OPERATION_UNCONFIRMED', JSON.stringify(patch));
+      assert.deepEqual(error.details, { originalCode: 'SSH_WORKSPACE_UNAVAILABLE', cleanupConfirmed: false, operationId, jobId: `operation:${operationId}` });
+      return true;
+    });
+    assert.deepEqual(calls, ['write', 'operation_status']);
+  }
+});
+
+test('automatic file status has its own bounded timeout and never replaces the original failure', async () => {
+  const calls: string[] = [];
+  const keepAlive = setTimeout(() => {}, 1000);
+  try {
+    const active = transport(async (url, init) => {
+      const envelope = JSON.parse(String(init.body));
+      calls.push(envelope.request.op);
+      if (envelope.request.op === 'write') throw new Error('lost write response');
+      assert.equal(envelope.request.op, 'operation_status');
+      return abortFetch(url, init);
+    }, 1000, 5);
+    await assert.rejects(active.executeSshWorkspace({ ...target, request: write }), error => error instanceof SshWorkspaceError
+      && error.code === 'SSH_OPERATION_UNCONFIRMED' && error.details?.originalCode === 'SSH_WORKSPACE_UNAVAILABLE'
+      && error.details?.cleanupConfirmed === false);
+    assert.deepEqual(calls, ['write', 'operation_status']);
+  } finally { clearTimeout(keepAlive); }
+});
+
+test('a timed out mutation can still confirm cleanup using an independent status budget', async () => {
+  const calls: string[] = [];
+  const keepAlive = setTimeout(() => {}, 1000);
+  let operationId = '';
+  try {
+    const active = transport(async (url, init) => {
+      const envelope = JSON.parse(String(init.body));
+      calls.push(envelope.request.op);
+      if (envelope.request.op === 'write') { operationId = envelope.operationId; return abortFetch(url, init); }
+      assert.deepEqual(envelope.request, { op: 'operation_status', operationId });
+      await new Promise(resolve => setTimeout(resolve, 15));
+      assert.equal(init.signal!.aborted, false, 'status must not inherit the original request timeout');
+      return json({ ...success, operationId, generation: target.generation, rootPath: target.rootPath, state: 'completed', cleanupConfirmed: true });
+    }, 5, 100);
+    await assert.rejects(active.executeSshWorkspace({ ...target, request: write }), error => error instanceof SshWorkspaceError
+      && error.code === 'SSH_WORKSPACE_TIMEOUT' && error.statusCode === 504 && error.details?.cleanupConfirmed === true
+      && error.details?.operationId === operationId && error.details?.jobId === `operation:${operationId}`);
+    assert.deepEqual(calls, ['write', 'operation_status']);
+  } finally { clearTimeout(keepAlive); }
 });
 
 test('typed Agent pre-dispatch refusals do not create uncertain operations or report an online helper', async () => {

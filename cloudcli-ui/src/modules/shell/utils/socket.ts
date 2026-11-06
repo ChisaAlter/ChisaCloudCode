@@ -1,6 +1,6 @@
-import { IS_PLATFORM } from '@/shared/utils';
-import { getStoredAuthToken } from '@/shared/authToken';
-import { desktopWebSocketUrl, isDesktop } from '@/shared/chisa';
+import { getAuthSessionSnapshot, isCurrentAuthSession } from '@/shared/authToken';
+import { getServerTransportVersion } from '@/shared/chisa';
+import { resolveWebSocketAdmissionUrl } from '@/shared/webSocketAdmission';
 
 type ShellInitMessage = {
   type: 'init';
@@ -17,6 +17,9 @@ type ShellInitMessage = {
   isPlainShell: boolean;
   forceRestart?: boolean;
   bypassPermissions?: boolean;
+  // The app theme at launch, so the server can start a CLI in the colour scheme
+  // the terminal is painted in.
+  colorScheme?: 'light' | 'dark';
 };
 
 type ShellResizeMessage = {
@@ -38,24 +41,21 @@ type ShellIncomingMessage =
   // rejected, so this is the only signal that the terminal will never start.
   | { type: 'error'; message?: string }
   | { type: 'auth_url'; url?: string }
+  // The app theme the Claude CLI in the pty was launched for. A running CLI
+  // keeps those colours, including one a reconnect reattaches to.
+  | { type: 'claude_theme'; colorScheme?: string }
   | { type: string; [key: string]: unknown };
 
-export function getShellWebSocketUrl(): string | null {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+/** The shell hook waits for a one-use ticket or the native account capability before constructing its socket. */
+export function getShellWebSocketUrl(): Promise<string> {
+  return resolveWebSocketAdmissionUrl('/shell');
+}
 
-  if (IS_PLATFORM) {
-    return `${protocol}//${window.location.host}/shell`;
-  }
+const shellSocketIdentities = new WeakMap<WebSocket, { session: ReturnType<typeof getAuthSessionSnapshot>; transport: number }>();
 
-  const token = getStoredAuthToken();
-  if (!token) {
-    console.error('No authentication token found for Shell WebSocket connection');
-    return null;
-  }
-
-  if (isDesktop()) return desktopWebSocketUrl('/shell', token);
-
-  return `${protocol}//${window.location.host}/shell?token=${encodeURIComponent(token)}`;
+/** Hook binds every init/input/resize sender to the immutable account and transport that admitted its socket. */
+export function bindShellSocketIdentity(socket: WebSocket): void {
+  shellSocketIdentities.set(socket, { session: getAuthSessionSnapshot(), transport: getServerTransportVersion() });
 }
 
 export function parseShellMessage(payload: string): ShellIncomingMessage | null {
@@ -68,6 +68,9 @@ export function parseShellMessage(payload: string): ShellIncomingMessage | null 
 
 export function sendSocketMessage(ws: WebSocket | null, message: ShellOutgoingMessage): void {
   if (ws && ws.readyState === WebSocket.OPEN) {
+    const identity = shellSocketIdentities.get(ws);
+    if (!identity || !isCurrentAuthSession(identity.session) || getAuthSessionSnapshot().phase !== 'ready'
+      || identity.transport !== getServerTransportVersion()) { ws.close(); return; }
     ws.send(JSON.stringify(message));
   }
 }

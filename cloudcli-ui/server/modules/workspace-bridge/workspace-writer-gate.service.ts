@@ -3,6 +3,8 @@ import os from 'node:os';
 
 import { AppError } from '@/shared/index.js';
 
+import { workspaceBrokerRecoveryPython } from './workspace-broker-recovery.service.js';
+
 // This type stays private: the bridge passes its existing lease structurally.
 type CloudWriterLease = {
   owner: string;
@@ -11,6 +13,12 @@ type CloudWriterLease = {
   pid?: number;
   processStartTime?: string;
   bootId?: string;
+  pidNamespace?: string;
+  brokerLeaseId?: string;
+  brokerSessionId?: string;
+  brokerPreviewProfileId?: string;
+  integrationOperation?: string;
+  integrationPeerChanged?: true;
   mayWrite?: boolean;
   cleanupPending?: string[];
 };
@@ -22,6 +30,7 @@ type GateReply = { ok?: boolean; available?: boolean; released?: boolean; code?:
 // the helper exits. Never remove a guard or roll back a partly persisted claim.
 const writerGateScript = String.raw`
 import datetime, errno, fcntl, json, os, re, secrets, stat, sys
+${workspaceBrokerRecoveryPython}
 
 class GateError(Exception):
     def __init__(self, code, message):
@@ -104,6 +113,10 @@ def text(value):
 def validate_lease(value):
     if not isinstance(value, dict) or value.get('owner') != 'claude' or not text(value.get('id')) or not text(value.get('epoch')) or type(value.get('pid')) is not int or value['pid'] <= 0 or value['pid'] > 2147483647 or not isinstance(value.get('processStartTime'), str) or not re.fullmatch(r'[0-9]+', value['processStartTime']) or not isinstance(value.get('bootId'), str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', value['bootId']):
         fail('WORKSPACE_LEASE_INVALID', 'Cloud writer lease requires the exact owner, run, epoch and Linux process birth identity')
+    if 'pidNamespace' in value and (not isinstance(value['pidNamespace'],str) or not re.fullmatch(r'pid:\[[0-9]+\]',value['pidNamespace'])):
+        fail('WORKSPACE_LEASE_INVALID', 'Cloud writer lease has invalid namespace')
+    if 'integrationPeerChanged' in value and value['integrationPeerChanged'] is not True:
+        fail('WORKSPACE_LEASE_INVALID', 'Cloud writer lease has invalid recovery state')
     if 'mayWrite' in value and type(value['mayWrite']) is not bool:
         fail('WORKSPACE_LEASE_INVALID', 'Cloud writer lease has invalid write state')
     if 'cleanupPending' in value and (not isinstance(value['cleanupPending'], list) or any(not text(item) for item in value['cleanupPending'])):
@@ -125,7 +138,7 @@ def new_generation(root, lease, state):
 
 def operate(q):
     root, epoch, action = q.get('root'), q.get('epoch'), q.get('action')
-    if not isinstance(root, str) or not root.startswith('/') or root == '/' or '\x00' in root or root != os.path.normpath(root) or root != os.path.realpath(root) or not text(epoch) or action not in ('available', 'claim', 'release'):
+    if not isinstance(root, str) or not root.startswith('/') or root == '/' or '\x00' in root or root != os.path.normpath(root) or root != os.path.realpath(root) or not text(epoch) or action not in ('available', 'claim', 'release', 'release-isolated'):
         invalid('Writer gate requires a canonical, symlink-free project root and exact binding epoch')
     # Walk through pinned directory descriptors: no ancestor or final component
     # may redirect these metadata operations through a symlink.
@@ -148,6 +161,31 @@ def operate(q):
         capability_name = base + '.chisa-writer-capability.json'
         generation_name = base + '.chisa-generation.json'
         lease_name = base + '.chisa-lease'
+        if action == 'release-isolated':
+            if exists(parent, capability_name) is not None or exists(parent, generation_name) is not None:
+                invalid('An enrolled generation must use its original writer gate release protocol')
+            bridge = read_json(root_fd, '.chisa-bridge.json')
+            if bridge.get('bindingEpoch') != epoch: invalid('Isolated binding changed before release')
+            # Isolated worktrees have no sync generation, but their original
+            # permanent inodes still serialize exact lease removal. Never let a
+            # JS caller delete a reservation using an API cleanup flag.
+            writer_guard = acquire(parent, base + '.chisa-writer.guard', create=True)
+            opened.append(writer_guard)
+            lease_guard = acquire(parent, base + '.chisa-lease.guard', create=True)
+            opened.append(lease_guard)
+            expected = q.get('lease'); validate_lease(expected)
+            if expected['epoch'] != epoch: invalid('Isolated lease belongs to another binding')
+            lease_fd = directory(lease_name, parent); opened.append(lease_fd)
+            actual = read_json(lease_fd, 'state.json')
+            validate_lease(actual)
+            if any(actual.get(key) != expected.get(key) for key in ('owner','id','epoch','pid','processStartTime','bootId','pidNamespace','brokerLeaseId','brokerSessionId','brokerPreviewProfileId','integrationPeerChanged')) or ((actual.get('integrationPeerChanged') is True or expected.get('integrationOperation') is not None) and actual.get('integrationOperation')!=expected.get('integrationOperation')) or actual.get('cleanupPending') or actual.get('previews') or sorted(os.listdir(lease_fd)) != ['state.json']:
+                fail('WORKSPACE_BUSY', 'Isolated reservation changed or still has unconfirmed work')
+            trusted_workspace_cleanup(root,actual,'integration-writer-release' if actual.get('integrationPeerChanged') is True else 'live-writer-release')
+            check_root()
+            if read_json(lease_fd, 'state.json') != actual or sorted(os.listdir(lease_fd)) != ['state.json']: fail('WORKSPACE_BUSY','Isolated reservation changed during broker cleanup')
+            os.unlink('state.json', dir_fd=lease_fd); os.fsync(lease_fd)
+            os.rmdir(lease_name, dir_fd=parent); os.fsync(parent)
+            return {'ok': True, 'released': True}
         # A never-enrolled workspace is the sole legacy fallback. Losing an
         # installed capability cannot erase the generation or authorize fallback.
         if exists(parent, capability_name) is None:
@@ -205,16 +243,24 @@ def operate(q):
         lease_stat = os.fstat(lease_fd)
         actual = read_json(lease_fd, 'state.json')
         validate_lease(actual)
-        if any(actual[key] != expected[key] for key in ('owner', 'id', 'epoch', 'pid', 'processStartTime', 'bootId')):
+        if any(actual.get(key) != expected.get(key) for key in ('owner', 'id', 'epoch', 'pid', 'processStartTime', 'bootId', 'pidNamespace', 'brokerLeaseId', 'brokerSessionId', 'brokerPreviewProfileId', 'integrationPeerChanged')) or ((actual.get('integrationPeerChanged') is True or expected.get('integrationOperation') is not None) and actual.get('integrationOperation') != expected.get('integrationOperation')):
             fail('WORKSPACE_BUSY', 'Cloud writer reservation changed before release')
-        if actual.get('cleanupPending'):
-            fail('WORKSPACE_CLEANUP_FAILED', 'Cloud writer container cleanup is not confirmed')
+        if actual.get('cleanupPending') or actual.get('previews'):
+            fail('WORKSPACE_CLEANUP_FAILED', 'Cloud writer operation or preview cleanup is not confirmed')
         if exists(lease_fd, 'sync-job.json') is not None:
             fail('WORKSPACE_BUSY', 'Workspace synchronization job is still reserved')
         if sorted(os.listdir(lease_fd)) != ['state.json']:
             fail('WORKSPACE_RECOVERY_REQUIRED', 'Workspace reservation contains unconfirmed state; preserve it')
         if gen['writer'] != 'cloud' or gen.get('bindingEpoch') != epoch or gen.get('leaseId') != expected['id']:
             fail('WORKSPACE_RECOVERY_REQUIRED', 'Workspace generation does not belong to this exact cloud reservation')
+        check_root()
+        check_binding()
+        # The long-lived filesystem gate is independent of API callbacks. Ask
+        # the authenticated broker to permanently fence this exact lease and
+        # verify immutable cleanup while both original guards are still held.
+        trusted_workspace_cleanup(root, actual, 'integration-writer-release' if actual.get('integrationPeerChanged') is True else 'live-writer-release')
+        if read_json(lease_fd, 'state.json') != actual or sorted(os.listdir(lease_fd)) != ['state.json']:
+            fail('WORKSPACE_BUSY', 'Cloud reservation changed while confirming broker quiescence')
         check_root()
         check_binding()
         # Publish completion first. Any interruption still leaves either a live
@@ -240,17 +286,17 @@ try:
     response = operate(request)
 except GateError as error:
     response = {'ok': False, 'code': error.code, 'error': error.message}
-except (OSError, ValueError, TypeError, KeyError) as error:
+except (OSError, ValueError, TypeError, KeyError, RuntimeError, http.client.HTTPException) as error:
     response = {'ok': False, 'code': 'WORKSPACE_WRITER_GATE_INVALID', 'error': 'Writer gate state could not be safely verified; preserve the reservation (' + type(error).__name__ + ')'}
 print(json.dumps(response, separators=(',', ':')))
 `;
 
-function runGate(action: 'available' | 'claim' | 'release', root: string, epoch: string, lease?: CloudWriterLease): GateReply {
+function runGate(action: 'available' | 'claim' | 'release' | 'release-isolated', root: string, epoch: string, lease?: CloudWriterLease): GateReply {
   let reply;
   try {
     reply = spawnSync('python3', ['-I', '-c', writerGateScript], {
       input: JSON.stringify({ action, root, epoch, ...(lease ? { lease } : {}) }),
-      encoding: 'utf8', timeout: 2500, killSignal: 'SIGKILL', maxBuffer: 65_536, windowsHide: true,
+      encoding: 'utf8', timeout: action.startsWith('release') ? 20_000 : 2500, killSignal: 'SIGKILL', maxBuffer: 65_536, windowsHide: true,
     });
   } catch {
     throw new AppError('Cloud writer gate could not run; preserve the workspace reservation', { code: 'WORKSPACE_WRITER_GATE_UNAVAILABLE', statusCode: 503 });
@@ -275,7 +321,7 @@ function runGate(action: 'available' | 'claim' | 'release', root: string, epoch:
       code, statusCode: code === 'WORKSPACE_LEASE_INVALID' ? 400 : code === 'WORKSPACE_WRITER_GATE_INVALID' || code === 'WORKSPACE_CLEANUP_FAILED' ? 503 : 409,
     });
   }
-  if (action === 'release' ? value.released !== true : typeof value.available !== 'boolean') {
+  if (action.startsWith('release') ? value.released !== true : typeof value.available !== 'boolean') {
     throw new AppError('Cloud writer gate did not confirm the requested operation', { code: 'WORKSPACE_WRITER_GATE_UNAVAILABLE', statusCode: 503 });
   }
   return value;
@@ -292,7 +338,7 @@ export function claimCloudWriterLease(root: string, lease: CloudWriterLease): bo
 }
 
 /** The workspace bridge releases its exact cloud lease only after all writers and cleanup have been confirmed stopped. */
-export function releaseCloudWriterLease(root: string, expected: CloudWriterLease): void {
+export function releaseCloudWriterLease(root: string, expected: CloudWriterLease, isolated = false): void {
   if (os.platform() !== 'linux') throw new AppError('Cloud writer gate requires Linux', { code: 'WORKSPACE_WRITER_GATE_UNAVAILABLE', statusCode: 503 });
-  runGate('release', root, expected.epoch, expected);
+  runGate(isolated ? 'release-isolated' : 'release', root, expected.epoch, expected);
 }

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
@@ -180,6 +180,63 @@ test('uses a real private short runtime directory and a pinned official Claude e
   assert.ok(installer.includes("package.getmember('package/claude')"));
   assert.ok(installer.includes('https://registry.npmjs.org/@anthropic-ai/'));
   assert.ok(installer.includes('fcntl.LOCK_EX'));
+});
+
+for (const platform of ['linux', 'win32'] as const) {
+  test(`sets HiRoute attribution after the clean ${platform} environment boundary`, async () => {
+    const fixture = harness([envelope({ agents: [] })]);
+    const host = await fixture.create(7, 'attribution', platform);
+    await host.cli(['agents', 'scan']);
+    const call = fixture.calls[1]!;
+    assert.ok(call.args.includes('-i'));
+    assert.ok(call.args.some(arg => arg.includes('export CLAUDE_CODE_ENTRYPOINT=chisacloudcode')));
+    assert.equal(call.options.env.CLAUDE_CODE_ENTRYPOINT, undefined, 'no ambient provider environment crosses the boundary');
+  });
+}
+
+test('installed Claude wrapper survives a second env clear and replaces legacy symlinks', {
+  skip: process.platform !== 'linux' && !process.env.CHISA_TEST_WSL_DISTRO,
+}, async () => {
+  const fixture = harness(['', envelope({ local_control_ready: true })]);
+  await (await fixture.create()).ensure();
+  const installer = fixture.calls[1]!.args.find(arg => arg.includes('Claude package integrity mismatch'))!;
+  const installWrapper = installer.slice(installer.indexOf('    destination = home.parent /'), installer.indexOf('    localmarker ='));
+  assert.ok(installWrapper.includes('stream.write(wrapper)'));
+  // Execute the production installer fragment in a disposable Linux directory.
+  // The stub reports only fixture data and never launches Claude or accesses the network.
+  const stub = ['#!/bin/sh', '[ "$CLAUDE_CODE_ENTRYPOINT" = chisacloudcode ] || exit 99',
+    'printf "%s\\n" "$CLAUDE_CONFIG_DIR" "$@"', 'exit 23', ''].join('\n');
+  const script = [
+    'import os, pathlib, subprocess, tempfile, textwrap',
+    `compile(${JSON.stringify(installer)}, 'hiroute-installer', 'exec')`,
+    'with tempfile.TemporaryDirectory(prefix="chisa-entrypoint-\'") as root:',
+    "    home = pathlib.Path(root) / 'home'",
+    '    home.mkdir()',
+    "    (home.parent / 'bin').mkdir()",
+    '    binary = pathlib.Path(root) / "official cli\'s stub"',
+    `    binary.write_text(${JSON.stringify(stub)})`,
+    '    binary.chmod(0o700)',
+    "    destination = home.parent / 'bin/claude'",
+    '    destination.symlink_to(binary)',
+    '    for upgrade in range(2):',
+    `        exec(textwrap.dedent(${JSON.stringify(installWrapper)}))`,
+    '        assert not destination.is_symlink()',
+    '        assert destination.resolve() == destination',
+    '        assert destination.stat().st_mode & 0o777 == 0o700',
+    "        for entrypoint in [None, '', 'sdk-cli', 'sdk-ts', 'cli', 'other-client']:",
+    "            environment = {'CLAUDE_CONFIG_DIR': 'fixture-config'}",
+    "            if entrypoint is not None: environment['CLAUDE_CODE_ENTRYPOINT'] = entrypoint",
+    `            result = subprocess.run([str(destination), 'arg with spaces', 'quote" dollar$ semi;'], env=environment, capture_output=True, text=True)`,
+    '            assert result.returncode == 23, (result.returncode, result.stderr)',
+    `            assert result.stdout.splitlines() == ['fixture-config', 'arg with spaces', 'quote" dollar$ semi;'], result.stdout`,
+    "    print('wrapper preserves argv, isolated config and exit code after env clear')",
+    '',
+  ].join('\n');
+  const linux = process.platform === 'linux';
+  const result = spawnSync(linux ? 'python3' : 'wsl.exe', linux ? ['-'] : ['--distribution', process.env.CHISA_TEST_WSL_DISTRO!, '--exec', 'python3', '-'], { input: script, encoding: 'utf8', timeout: 15000 });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /wrapper preserves argv/);
 });
 
 test('cancels CLI operations while allowing shutdown to verify daemon identity and stop it', async () => {

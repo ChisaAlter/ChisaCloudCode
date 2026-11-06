@@ -4,6 +4,9 @@ import { createPortal } from 'react-dom';
 import { ChevronDown, Monitor } from 'lucide-react';
 
 import { api, ApiRequestError, readApiJson } from '@/shared/api';
+import { getAuthSessionVersion } from '@/shared/authToken';
+import { getServerConnectionVersion } from '@/shared/chisa';
+import { useSshJobOutputStream } from '@/shared/hooks/useSshJobOutputStream';
 import type { ProjectSourceMode, WorkspaceDescriptor, WorkspaceSelector } from '@/shared/types';
 
 type IntegrationPreview = {
@@ -49,12 +52,13 @@ function describeChange(change: unknown): string {
   return String(change);
 }
 
-function LocalWorkspaceStatus({ label, warning, children }: { label: string; warning: boolean; children: ReactNode }) {
+function LocalWorkspaceStatus({ label, warning, onOpenChange, children }: { label: string; warning: boolean; onOpenChange?: (open: boolean) => void; children: ReactNode }) {
   // Keep workspace details off the canvas until the user opens this header control.
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const id = useId();
+  useEffect(() => { onOpenChange?.(open); }, [open, onOpenChange]);
   useLayoutEffect(() => {
     if (!open) return;
     const panel = panelRef.current;
@@ -116,19 +120,44 @@ export function WorkspaceScopeBar({ selectionKey, workspace, session, kind, hasS
   const sessionKey = JSON.stringify([session?.workspaceId, session?.generation]);
   const sessionKeyRef = useRef(sessionKey);
   sessionKeyRef.current = sessionKey;
+  const local = workspace ?? session;
+  const localKey = JSON.stringify([getAuthSessionVersion(), getServerConnectionVersion(), selectionKey, local?.projectId, local?.workspaceId, local?.generation]);
+  // A late local recovery may only update the project and generation currently shown in the header.
+  const localKeyRef = useRef(localKey);
+  useLayoutEffect(() => { localKeyRef.current = localKey; }, [localKey]);
   // Keep the reviewed selector and operation through resolution outages, navigation and reloads.
   const [review, setReviewState] = useState<IntegrationReview | null>(() => loadReview(selectionKey));
   // Prevent overlapping integration requests and identify the operation shown as busy.
   const [pending, setPending] = useState<'preview' | 'apply' | 'recover' | null>(null);
   // Retain the last integration outcome or recovery instruction across status refreshes.
   const [integrationMessage, setIntegrationMessage] = useState<string | null>(null);
+  const [statusOpen, setStatusOpen] = useState(false);
+  const [recoveryJob, setRecoveryJob] = useState<{ key: string; jobId: string } | null>(null);
+  const recoveryJobId = recoveryJob?.key === localKey ? recoveryJob.jobId : null;
   const requestRef = useRef(0);
+  // A ref closes the gap before React commits the disabled recovery buttons.
+  const localRequestRef = useRef<number | null>(null);
   const uncertain = review?.uncertain === true;
   const setReview = (value: IntegrationReview | null) => {
     persistReview(selectionKey, value);
     setReviewState(value);
   };
   useEffect(() => () => { ++requestRef.current; }, []);
+  const isSshMode = sourceMode === 'ssh' || workspace?.sourceMode === 'ssh' || session?.sourceMode === 'ssh';
+  const liveJobOutput = useSshJobOutputStream({
+    enabled: Boolean(
+      isSshMode
+      && statusOpen
+      && local
+      && (
+        (recoveryJobId && !recoveryJobId.startsWith('operation:'))
+        || local.phase === 'running'
+      ),
+    ),
+    projectId: local?.projectId,
+    generation: local?.generation,
+    jobId: recoveryJobId && !recoveryJobId.startsWith('operation:') ? recoveryJobId : undefined,
+  });
   const currentReview = uncertain || review?.key === sessionKey ? review : null;
   const canIntegrate = Boolean(session?.capabilities.integrate);
 
@@ -206,35 +235,54 @@ export function WorkspaceScopeBar({ selectionKey, workspace, session, kind, hasS
   };
 
   const recoverLocal = async (cancel = false) => {
-    const local = workspace ?? session;
-    if (!local || pending) return;
+    if (!local || pending || localRequestRef.current !== null) return;
     const request = ++requestRef.current;
+    localRequestRef.current = request;
+    const authVersion = getAuthSessionVersion();
+    const serverVersion = getServerConnectionVersion();
+    const current = () => request === requestRef.current && localKeyRef.current === localKey
+      && authVersion === getAuthSessionVersion() && serverVersion === getServerConnectionVersion();
     setPending('recover');
     setIntegrationMessage(null);
     try {
       const result = await readApiJson<{ status: 'idle' | 'running'; jobId?: string; inspectChanges?: boolean }>(await api.sshWorkspaces.recover({ projectId: local.projectId, generation: local.generation, ...(cancel ? { cancel: true } : {}) }));
-      if (request !== requestRef.current) return;
+      if (!current()) return;
       if (result.status !== 'idle' && result.status !== 'running') throw new Error('未收到有效的本地任务状态。');
+      setRecoveryJob(result.status === 'running' && typeof result.jobId === 'string' ? { key: localKey, jobId: result.jobId } : null);
       setIntegrationMessage(result.status === 'idle' ? result.inspectChanges ? '已恢复连接，请检查上次改动结果后继续。' : '已确认本地任务结束，可以继续操作。' : '原本地任务仍在运行；可以等待，或停止该任务后再继续。');
       onRefresh();
-    } catch (failure) { if (request === requestRef.current) setIntegrationMessage(failure instanceof Error ? failure.message : '无法确认本地任务状态。'); }
-    finally { if (request === requestRef.current) setPending(null); }
+    } catch (failure) { if (current()) setIntegrationMessage(failure instanceof Error ? failure.message : '无法确认本地任务状态。'); }
+    finally {
+      if (localRequestRef.current === request) localRequestRef.current = null;
+      if (request === requestRef.current) setPending(null);
+    }
   };
 
-  if (sourceMode === 'ssh' || workspace?.sourceMode === 'ssh' || session?.sourceMode === 'ssh') {
-    const local = workspace ?? session;
+  if (isSshMode) {
     const connectionLabel = local?.connectionState === 'online' ? '在线' : local?.connectionState === 'recovery' ? '等待恢复' : local?.connectionState === 'offline' ? '离线' : '连接状态未确认';
     const accessLabel = !local ? '工作区尚未确认' : local.phase === 'recovery' || local.connectionState === 'recovery' ? '等待确认上次操作结果，暂时暂停写入' : local.connectionState === 'offline' ? '连接离线，等待桌面恢复' : local.phase === 'running' ? '任务运行或检查占用中，完成后可刷新状态' : !local.capabilities.write ? '只读：服务器未授予写入权限' : '可写';
     const needsRecovery = local?.phase === 'recovery' || local?.connectionState === 'recovery';
     const disconnected = Boolean(error) || local?.connectionState === 'offline';
     const label = needsRecovery ? '需恢复' : disconnected ? '连接断开' : loading ? '检查中' : !local ? '未连接' : local.phase === 'running' ? '运行中' : !local.capabilities.write ? '只读' : local.connectionState === 'online' ? '本地' : '待确认';
-    return <LocalWorkspaceStatus label={label} warning={needsRecovery || disconnected}>
+    return <LocalWorkspaceStatus label={label} warning={needsRecovery || disconnected} onOpenChange={setStatusOpen}>
       <div className="space-y-3 text-sm">
         <div className="flex items-center justify-between gap-3"><span className="font-medium">本地工作区</span><button type="button" className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60" onClick={onRefresh}>刷新状态</button></div>
         <p className="break-all text-xs text-muted-foreground">{local?.displayPath || displayPath || '本地项目目录'}</p>
         <p role={error ? 'alert' : 'status'} className="text-xs text-muted-foreground">{error || (loading ? '正在检查本地工作区…' : `${connectionLabel} · ${accessLabel}`)}</p>
         {needsRecovery && <div className="flex flex-wrap gap-2"><button type="button" className="rounded-md border border-border px-2 py-1.5 text-xs disabled:opacity-50" disabled={Boolean(pending)} onClick={() => void recoverLocal()}>检查原任务</button><button type="button" className="rounded-md border border-border px-2 py-1.5 text-xs disabled:opacity-50" disabled={Boolean(pending)} onClick={() => void recoverLocal(true)}>停止原任务并恢复</button></div>}
         {integrationMessage && <p role="status" className="text-xs">{integrationMessage}</p>}
+        {(liveJobOutput.stdout || liveJobOutput.stderr) && (
+          <div className="space-y-1">
+            <div className="flex items-center justify-between text-xs text-muted-foreground">
+              <span>实时任务输出</span>
+              {liveJobOutput.truncated && <span>输出已截断</span>}
+            </div>
+            <pre aria-label="本地任务实时输出" className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md border border-border bg-muted/30 p-2 font-mono text-xs text-foreground">
+              {liveJobOutput.stdout}
+              {liveJobOutput.stderr ? `${liveJobOutput.stdout ? '\n' : ''}[stderr]\n${liveJobOutput.stderr}` : ''}
+            </pre>
+          </div>
+        )}
         <details className="border-t border-border pt-2"><summary className="cursor-pointer text-xs text-muted-foreground">连接详情</summary><div className="space-y-2 pt-3 text-xs text-muted-foreground"><p>Windows 共享目录 · Claude 在云端运行</p><p>当前仅支持 Claude；本地不提供独立会话工作区、改动集成和云端预览。Windows 命令逐行执行，不保留变量或目录切换。</p>{local?.connectionState !== 'online' && agentStatus}</div></details>
       </div>
     </LocalWorkspaceStatus>;

@@ -22,6 +22,8 @@ test('only database-provisioned accounts can log in; their profile survives SQLi
   const databasePath = path.join(fixtureRoot, 'account.db');
   // A new empty file prevents the production legacy-copy bootstrap from touching real account data.
   fs.writeFileSync(databasePath, '');
+  const previousDatabase = process.env.DATABASE_PATH;
+  const previousPlatform = process.env.VITE_IS_PLATFORM;
   process.env.DATABASE_PATH = databasePath;
   process.env.VITE_IS_PLATFORM = 'false';
   const { initializeDatabase, getConnection, closeConnection, userDb } = await import('@/modules/database/index.js');
@@ -33,7 +35,7 @@ test('only database-provisioned accounts can log in; their profile survives SQLi
     git_email TEXT, has_completed_onboarding BOOLEAN DEFAULT 0
   )`);
   await initializeDatabase();
-  const { authRoutes } = await import('@/modules/auth/index.js');
+  const { authRoutes, verifyAuthToken, authenticateWebSocket, isAuthSessionActive, consumeWebSocketTicket } = await import('@/modules/auth/index.js');
   const { AppError } = await import('@/shared/index.js');
   const app = express();
   app.use(express.json({ limit: '4mb' }));
@@ -73,7 +75,28 @@ test('only database-provisioned accounts can log in; their profile survives SQLi
     assert.equal(session.user.username, credentials.username);
     const refreshed = await request('/refresh', 'POST', undefined, session.token);
     assert.equal(refreshed.status, 200);
-    assert.equal((await request('/user', 'GET', undefined, (await readPayload(refreshed)).token)).status, 200);
+    const refreshedToken = (await readPayload(refreshed)).token;
+    assert.equal((await request('/user', 'GET', undefined, refreshedToken)).status, 200);
+    assert.deepEqual(verifyAuthToken(refreshedToken).session, verifyAuthToken(session.token).session);
+    assert.equal(login.headers.get('cache-control'), 'no-store');
+    assert.ok(authenticateWebSocket(session.token));
+    const proof = verifyAuthToken(session.token).session;
+    assert.equal(isAuthSessionActive(proof.id, proof.userId, proof.version), true);
+    assert.equal((await request('/ws-ticket', 'POST', { path: '/ws' })).status, 401);
+    assert.equal((await request('/ws-ticket', 'POST', { path: '/unknown' }, session.token)).status, 400);
+    const ticketResponse = await request('/ws-ticket', 'POST', { path: '/ws' }, session.token);
+    assert.equal(ticketResponse.status, 200);
+    assert.equal(ticketResponse.headers.get('cache-control'), 'no-store');
+    const ticket = await ticketResponse.json() as { ticket: string; expiresAt: number };
+    assert.equal(consumeWebSocketTicket(ticket.ticket, '/ws')?.sessionId, proof.id);
+    assert.equal(consumeWebSocketTicket(ticket.ticket, '/ws'), null);
+    const outstanding = await (await request('/ws-ticket', 'POST', { path: '/shell' }, session.token)).json() as { ticket: string };
+    const queryResponse = await fetch(`${origin}/api/auth/user?token=${encodeURIComponent(session.token)}`);
+    assert.equal(queryResponse.status, 401);
+    assert.equal(queryResponse.headers.get('x-auth-error'), 'invalid-token');
+    const headerPrecedence = await fetch(`${origin}/api/auth/user?token=${encodeURIComponent(session.token)}`, { headers: { Authorization: 'Basic invalid' } });
+    assert.equal(headerPrecedence.status, 401);
+    assert.equal(headerPrecedence.headers.get('x-auth-error'), 'invalid-token');
     const wrongLogin = await request('/login', 'POST', { ...credentials, password: 'wrong-password' });
     assert.equal(wrongLogin.status, 401);
     assert.equal((await readPayload(wrongLogin)).error.code, 'AUTH_INVALID_CREDENTIALS');
@@ -85,8 +108,19 @@ test('only database-provisioned accounts can log in; their profile survives SQLi
     assert.equal((await readPayload(saved)).user.displayName, '测试昵称');
     assert.equal((await request('/logout', 'POST', undefined, session.token)).status, 200);
     assert.equal((await request('/user')).status, 401);
+    for (const token of [session.token, refreshedToken]) {
+      const refused = await request('/user', 'GET', undefined, token);
+      assert.equal(refused.status, 401);
+      assert.equal(refused.headers.get('x-auth-error'), 'invalid-token');
+      assert.equal((await request('/refresh', 'POST', undefined, token)).status, 401);
+      assert.equal(authenticateWebSocket(token), null);
+    }
+    assert.equal(isAuthSessionActive(proof.id, proof.userId, proof.version), false);
+    assert.equal(consumeWebSocketTicket(outstanding.ticket, '/shell'), null);
+    assert.equal((await request('/ws-ticket', 'POST', { path: '/ws' }, session.token)).status, 401);
 
     closeConnection();
+    assert.equal((await request('/user', 'GET', undefined, session.token)).status, 401);
     const relogin = await request('/login', 'POST', credentials);
     assert.equal(relogin.status, 200);
     const nextSession = await readPayload(relogin);
@@ -104,6 +138,8 @@ test('only database-provisioned accounts can log in; their profile survives SQLi
   } finally {
     await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
     closeConnection();
+    if (previousDatabase === undefined) delete process.env.DATABASE_PATH; else process.env.DATABASE_PATH = previousDatabase;
+    if (previousPlatform === undefined) delete process.env.VITE_IS_PLATFORM; else process.env.VITE_IS_PLATFORM = previousPlatform;
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 });

@@ -39,6 +39,21 @@ function fakeDependencies(overrides: Partial<LegacyProjectRegistrationDependenci
 }
 
 describe('legacy project registration', () => {
+  test('owner policy rejects raw and canonical paths before registration', async () => {
+    const projectPath = path.join(root, 'foreign', 'repo');
+    const { dependencies, persisted, existing } = fakeDependencies();
+    existing.add(projectPath);
+    const denied = () => { throw new Error('foreign owner'); };
+    const direct = await registerExistingProjectPaths([projectPath], dependencies, denied);
+    assert.equal(direct.results[0].outcome, 'rejected');
+    assert.equal(persisted.length, 0);
+    const raw = path.join(root, 'alias', 'repo');
+    dependencies.validatePath = async () => ({ valid: true, resolvedPath: projectPath });
+    const canonical = await registerExistingProjectPaths([raw], dependencies,
+      candidate => { if (candidate === projectPath) denied(); });
+    assert.equal(canonical.results[0].outcome, 'rejected');
+    assert.equal(persisted.length, 0);
+  });
   test('registers an existing workspace path without touching its name or files', async () => {
     const { dependencies, persisted, existing } = fakeDependencies();
     const projectPath = path.join(root, 'local', 'legacy-project');

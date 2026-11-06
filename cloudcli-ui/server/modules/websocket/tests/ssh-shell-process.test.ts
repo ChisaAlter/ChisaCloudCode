@@ -6,15 +6,21 @@ const descriptor: WorkspaceDescriptor = { projectId: 'project', workspaceId: 'wo
   kind: 'cloudReplica', rootPath: '/meta', sourceRoot: '/meta', displayPath: 'D:\\Code', requestedMode: 'shared', effectiveMode: 'shared',
   phase: 'idle', publicationState: 'integrated', capabilities: { read: true, write: true, git: true, shell: true, integrate: false, preview: false, cloudExecutionIndependentOfDesktop: false } };
 let commands: string[] = [];
-let run: (command: string, signal?: AbortSignal) => Promise<unknown>;
+let run: (command: string, signal?: AbortSignal, options?: { onJobCreated?: (jobId: string) => void }) => Promise<unknown>;
+let readOutput: (input: { jobId: string; stream?: 'stdout' | 'stderr'; offset?: number; maxBytes?: number }) => Promise<unknown>;
 mock.module('@/modules/workspace-bridge/index.js', { namedExports: {
   assertWorkspaceDescriptor(value: WorkspaceDescriptor) { assert.equal(value.generation, 'generation'); },
   resolveSshProjectTarget() { return { projectId: 'project' }; },
-  runSshWorkspaceCommand: async (_descriptor: WorkspaceDescriptor, command: string, signal?: AbortSignal) => { commands.push(command); return run(command, signal); },
+  readSshWorkspaceJobOutput: async (_target: unknown, input: { jobId: string; stream?: 'stdout' | 'stderr'; offset?: number; maxBytes?: number }) => readOutput(input),
+  runSshWorkspaceCommand: async (_descriptor: WorkspaceDescriptor, command: string, signal?: AbortSignal, options?: { onJobCreated?: (jobId: string) => void }) => { commands.push(command); return run(command, signal, options); },
 } });
 const { createSshCommandConsole } = await import('../services/ssh-shell-process.service.js');
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
-test.beforeEach(() => { commands = []; run = async () => ({ stdout: 'actual Windows\n', stderr: 'warning\n', exitCode: 7 }); });
+test.beforeEach(() => {
+  commands = [];
+  run = async () => ({ stdout: 'actual Windows\n', stderr: 'warning\n', exitCode: 7 });
+  readOutput = async ({ stream = 'stdout', offset = 0 }) => ({ ok: true, jobId: 'job-1', stream, offset, total: offset, chunk: '', eof: false, state: 'running', truncated: false });
+});
 
 test('Windows console executes entered lines remotely and reports actual status without launching a provider', async () => {
   const terminal = createSshCommandConsole(descriptor);
@@ -27,6 +33,37 @@ test('Windows console executes entered lines remotely and reports actual status 
   assert.match(output, /exit 7/);
   assert.equal(terminal.transport, 'pipe');
   terminal.write('exit\r');
+});
+
+test('Windows console streams incremental job_output chunks before command completion without duplicating final output', async () => {
+  let finishCommand!: (value: unknown) => void;
+  readOutput = async ({ stream = 'stdout', offset = 0 }) => {
+    if (stream === 'stdout' && offset === 0) {
+      return { ok: true, jobId: 'job-stream', stream: 'stdout', offset: 0, total: 6, chunk: Buffer.from('step1\n', 'utf8').toString('base64'), eof: false, state: 'running', truncated: false };
+    }
+    return { ok: true, jobId: 'job-stream', stream, offset, total: offset, chunk: '', eof: false, state: 'running', truncated: false };
+  };
+  run = (_command, _signal, options) => new Promise(resolve => {
+    finishCommand = resolve;
+    options?.onJobCreated?.('job-stream');
+  });
+  const terminal = createSshCommandConsole(descriptor);
+  let output = ''; terminal.onData(text => { output += text; });
+  await tick();
+  terminal.write('cargo test\r');
+  await tick();
+  await tick();
+  // Streamed chunk arrives while the command is still running.
+  assert.match(output, /step1\r\n/);
+  assert.doesNotMatch(output, /step2/);
+  finishCommand({ stdout: 'step1\nstep2\n', stderr: '', exitCode: 0 });
+  await tick();
+  await tick();
+  // Only the un-streamed tail (step2) is appended on completion.
+  assert.equal(output.match(/step1\r\n/g)?.length, 1);
+  assert.match(output, /step1\r\nstep2\r\n/);
+  assert.match(output, /\[exit 0\]/);
+  await terminal.kill();
 });
 
 test('Ctrl+C aborts exact pending task and does not queue input while it is running', async () => {

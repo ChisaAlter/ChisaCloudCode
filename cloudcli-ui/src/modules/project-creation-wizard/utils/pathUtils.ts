@@ -19,6 +19,7 @@ export const getSuggestionRootPath = (inputPath: string): string => {
     return `${trimmedPath.slice(0, 2)}\\`;
   }
 
+  if (lastSeparatorIndex === 0) return trimmedPath[0];
   return lastSeparatorIndex > 0 ? trimmedPath.slice(0, lastSeparatorIndex) : '~';
 };
 

@@ -44,8 +44,10 @@
     --ring: 18 45% 47%;
     --sidebar-background: 45 20% 93%;
     --radius: 0.5rem;
-    /* UI and conversation text share bundled Latin/CJK faces; code keeps its mono stack. */
-    --font-ui: "Chisa Sans", "Chisa CJK", "Inter", "Noto Sans SC", "Segoe UI", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+    /* Whale Isle-style type: Montserrat for UI chrome, Source Serif 4 for prose, with the
+       same bundled CJK faces for Chinese text. */
+    --font-ui: "Montserrat", "Chisa CJK", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    --font-serif: "Source Serif 4", "Chisa CJK", Georgia, "Times New Roman", serif;
 
     /* Nav design tokens */
     --nav-glass-bg: 44 22% 96% / 0.7;
@@ -826,6 +828,30 @@
 .prose code::after {
   content: "" !important;
   display: none !important;
+}
+
+/* Claude-style: serif prose for the reading experience, sans for chrome. */
+.prose,
+.chat-message .prose {
+  font-family: var(--font-serif);
+}
+
+/* Keep code, UI controls and dense metadata in the UI sans face inside prose. */
+.prose code,
+.prose pre,
+.prose kbd,
+.prose samp,
+.prose button,
+.prose input,
+.prose select,
+.prose textarea,
+.prose table,
+.prose .not-prose {
+  font-family: var(--font-ui);
+}
+.prose pre,
+.prose pre code {
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 }
 
 /* Custom spinner animation for mobile compatibility */

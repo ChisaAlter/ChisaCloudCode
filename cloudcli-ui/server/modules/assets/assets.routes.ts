@@ -1,150 +1,79 @@
 import express from 'express';
 import multer from 'multer';
 
-import {
-  buildStoredAttachmentRecords,
-  buildStoredImageRecords,
-  ensureImageAssetsDir,
-  isAllowedImageMimeType,
-  openStoredAttachmentAsset,
-} from '@/modules/assets/services/image-assets.service.js';
+import { AssetError, createImageAssetService, imageAssetService } from './services/image-assets.service.js';
 
-const router = express.Router();
+/** Injectable storage keeps route security tests isolated from the user's real upload directory. */
+export function createAssetsRouter(service: ReturnType<typeof createImageAssetService> = imageAssetService) {
+  const router = express.Router();
+  // Busboy emits partsLimit when the boundary ending that many parts arrives.
+  // Leave one boundary of headroom; the separate file/field limits enforce actual counts.
+  const imagesUpload = multer({ storage: service.uploadStorage,
+    limits: { fileSize: 5 * 1024 * 1024, files: 5, fields: 0, parts: 6 } }).array('images', 5);
+  const filesUpload = multer({ storage: service.uploadStorage,
+    limits: { fileSize: 10 * 1024 * 1024, files: 10, fields: 0, parts: 11 } }).array('files', 10);
 
-// Multer writes uploads straight into the global assets folder; the service
-// owns the folder location and the response record shape.
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    ensureImageAssetsDir()
-      .then((assetsDir) => cb(null, assetsDir))
-      .catch((error) => cb(error as Error, ''));
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-    const sanitizedName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
-    cb(null, `${uniqueSuffix}-${sanitizedName}`);
-  },
-});
+  function owner(request: express.Request) {
+    const userId = (request as express.Request & { user?: { id?: unknown } }).user?.id;
+    return typeof userId === 'string' && /^[0-9]+$/.test(userId) ? Number(userId) : userId;
+  }
 
-const upload = multer({
-  storage,
-  fileFilter: (req, file, cb) => {
-    if (isAllowedImageMimeType(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Invalid file type. Only JPEG, PNG, GIF, WebP, and SVG are allowed.'));
+  function respondError(response: express.Response, error: unknown) {
+    if (response.destroyed || response.headersSent) return;
+    if (error instanceof AssetError) { response.status(error.statusCode).json({ error: error.message }); return; }
+    if (error instanceof multer.MulterError) {
+      response.status(error.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ error: error.message });
+      return;
     }
-  },
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB
-    files: 5,
-  },
-});
+    console.error('[Assets] Storage operation failed:', error instanceof Error ? error.message : 'Unknown error');
+    response.status(500).json({ error: 'Unable to process attachment' });
+  }
 
-const attachmentUpload = multer({
-  storage,
-  limits: {
-    fileSize: 10 * 1024 * 1024,
-    files: 10,
-  },
-});
-
-/**
- * Stores chat image attachments in the global `~/.cloudcli/assets` folder and
- * returns their absolute paths for use in provider prompts and chat history.
- */
-router.post('/images', (req, res) => {
-  upload.array('images', 5)(req, res, (err: unknown) => {
-    if (err) {
-      const message = err instanceof Error ? err.message : 'Upload failed';
-      return res.status(400).json({ error: message });
+  // The parent mount authenticates JWTs. This local guard keeps every router operation fail-closed.
+  router.use((request, response, next) => {
+    const userId = owner(request);
+    if (typeof userId !== 'number' || !Number.isSafeInteger(userId) || userId <= 0) {
+      response.status(401).json({ error: 'Authentication is required' });
+      return;
     }
-
-    const files = Array.isArray(req.files) ? req.files : [];
-    if (files.length === 0) {
-      return res.status(400).json({ error: 'No image files provided' });
-    }
-
-    res.json({ images: buildStoredImageRecords(files) });
+    response.setHeader('Cache-Control', 'private, no-store');
+    response.setHeader('X-Content-Type-Options', 'nosniff');
+    next();
   });
-});
 
-/**
- * Stores provider-neutral chat attachments. Files of any MIME type are
- * accepted because providers inspect them as data through their file-reading
- * tools; uploads are capped at 10 files and 10MB per file.
- */
-router.post('/files', (req, res) => {
-  attachmentUpload.array('files', 10)(req, res, (err: unknown) => {
-    if (err) {
-      const message = err instanceof Error ? err.message : 'Upload failed';
-      return res.status(400).json({ error: message });
-    }
-
-    const files = Array.isArray(req.files) ? req.files : [];
-    if (files.length === 0) {
-      return res.status(400).json({ error: 'No files provided' });
-    }
-
-    res.json({ attachments: buildStoredAttachmentRecords(files) });
-  });
-});
-
-/**
- * Serves one stored image asset by filename. Only files directly inside the
- * global assets folder are reachable; traversal attempts resolve to null.
- */
-router.get('/images/:filename', async (req, res) => {
-  const asset = await openStoredAttachmentAsset(req.params.filename);
-  if (asset.status === 'invalid') {
-    return res.status(400).json({ error: 'Invalid asset filename' });
+  for (const mode of ['images', 'files'] as const) {
+    const upload = mode === 'images' ? imagesUpload : filesUpload;
+    router.post(`/${mode}`, (request, response) => {
+      upload(request, response, error => {
+        if (error) { respondError(response, error); return; }
+        const files = (request.files as Express.Multer.File[] | undefined) ?? [];
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        request.once('aborted', abort);
+        response.once('close', abort);
+        if (request.aborted || response.destroyed) controller.abort();
+        void service.saveUploads(files, owner(request), mode, controller.signal)
+          .then(records => { if (!response.destroyed) response.json({ [mode]: records }); })
+          .catch(failure => respondError(response, failure))
+          .finally(() => { request.removeListener('aborted', abort); response.removeListener('close', abort); });
+      });
+    });
+    router.get(`/${mode}/:filename`, (request, response) => {
+      void service.openStoredAsset(request.params.filename, owner(request), mode).then(asset => {
+        response.setHeader('Content-Type', asset.contentType);
+        response.setHeader('Content-Disposition', asset.contentDisposition);
+        response.setHeader('Content-Length', String(asset.size));
+        response.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+        response.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+        asset.stream.on('error', error => {
+          if (response.headersSent) response.destroy(error); else respondError(response, error);
+        });
+        response.once('close', () => asset.stream.destroy());
+        asset.stream.pipe(response);
+      }).catch(error => respondError(response, error));
+    });
   }
-  if (asset.status === 'missing') {
-    return res.status(404).json({ error: 'Asset not found' });
-  }
+  return router;
+}
 
-  res.setHeader('Content-Type', asset.contentType);
-  // Stored-XSS hardening: never let the browser sniff a different type, and
-  // force SVGs (which can carry scripts when rendered as a document) to
-  // download instead of rendering inline. The chat UI is unaffected — it
-  // fetches assets as blobs and shows them through <img>, where SVG scripts
-  // never execute.
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  if (asset.contentType === 'image/svg+xml') {
-    res.setHeader('Content-Disposition', 'attachment');
-  }
-  asset.stream.pipe(res);
-  asset.stream.on('error', (error) => {
-    console.error('Error streaming image asset:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Error reading asset' });
-    }
-  });
-});
-
-/**
- * Downloads one stored non-image attachment. Content-Disposition prevents
- * uploaded HTML or other active formats from rendering in the application.
- */
-router.get('/files/:filename', async (req, res) => {
-  const asset = await openStoredAttachmentAsset(req.params.filename);
-  if (asset.status === 'invalid') {
-    return res.status(400).json({ error: 'Invalid asset filename' });
-  }
-  if (asset.status === 'missing') {
-    return res.status(404).json({ error: 'Asset not found' });
-  }
-
-  res.setHeader('Content-Type', asset.contentType);
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Content-Disposition', `attachment; filename="${req.params.filename.replace(/["\r\n]/g, '_')}"`);
-  asset.stream.pipe(res);
-  asset.stream.on('error', (error) => {
-    console.error('Error streaming attachment asset:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Error reading asset' });
-    }
-  });
-});
-
-export default router;
+export default createAssetsRouter();

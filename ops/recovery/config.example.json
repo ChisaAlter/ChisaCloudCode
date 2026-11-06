@@ -1,0 +1,78 @@
+{
+  "version": 1,
+  "profile": "production",
+  "spool": "/var/lib/chisa-recovery/spool",
+  "restore_root": "/var/lib/chisa-recovery/isolated-restores",
+  "reserve_bytes": 1073741824,
+  "max_restore_bytes": 107374182400,
+  "max_manifest_bytes": 67108864,
+  "verify_timeout_seconds": 14400,
+  "encryption_timeout_seconds": 7200,
+  "database": {"path": "/opt/chisacloudcode/data/auth.db"},
+  "credentials": {
+    "jwt_source": "environment",
+    "jwt_file": "/opt/chisacloudcode/secrets/api.env",
+    "jwt_format": "dotenv"
+  },
+  "sources": [
+    {"id": "data", "path": "/opt/chisacloudcode/data", "sensitive": true, "exclude": []},
+    {"id": "workspace", "path": "/opt/chisacloudcode/workspaces", "sensitive": true, "exclude": []},
+    {"id": "home", "path": "/opt/chisacloudcode/home", "sensitive": true, "exclude": []},
+    {"id": "deploy", "path": "/opt/chisacloudcode/deploy", "sensitive": true, "exclude": []},
+    {"id": "secrets", "path": "/opt/chisacloudcode/secrets", "sensitive": true, "exclude": []},
+    {"id": "api_unit", "path": "/etc/systemd/system/chisa-workspace-api.service", "sensitive": true},
+    {"id": "sync_unit", "path": "/etc/systemd/system/chisa-workspace-sync.service", "sensitive": true},
+    {"id": "mount_unit", "path": "/etc/systemd/system/opt-chisacloudcode-workspaces.mount", "sensitive": true},
+    {"id": "ssh_trust", "path": "/root/.ssh/known_hosts", "sensitive": true}
+  ],
+  "coverage": [
+    {"role": "workspace", "source": "workspace", "path": "/opt/chisacloudcode/workspaces"},
+    {"role": "home", "source": "home", "path": "/opt/chisacloudcode/home"},
+    {"role": "leases", "source": "home", "path": "/opt/chisacloudcode/home/.chisa-workspace-runtime"},
+    {"role": "attachments", "source": "home", "path": "/opt/chisacloudcode/home/.cloudcli/assets"},
+    {"role": "configuration", "source": "deploy", "path": "/opt/chisacloudcode/deploy"},
+    {"role": "secrets", "source": "secrets", "path": "/opt/chisacloudcode/secrets"},
+    {"role": "ssh_trust", "source": "ssh_trust", "path": "/root/.ssh/known_hosts"}
+  ],
+  "mount": {
+    "target": "/opt/chisacloudcode/workspaces",
+    "uuid": "3737881d-ff82-4307-afff-3734e5c87c57",
+    "fstype": "ext4",
+    "backing_file": "/opt/chisacloudcode/storage-50g-20261015/workspaces.img",
+    "required_options": ["nodev", "nosuid"]
+  },
+  "quiescence": {
+    "evidence": "/run/chisa-recovery/fence.json",
+    "writer_units": ["chisa-workspace-api.service", "chisa-workspace-sync.service"],
+    "writer_timers": []
+  },
+  "encryption": {
+    "gpg": "/usr/bin/gpg",
+    "public_key_home": "/etc/chisa-recovery/public-keyring",
+    "recipient_fingerprint": null,
+    "recovery_key_evidence": "/etc/chisa-recovery/recovery-key-evidence.json",
+    "recovery_key_evidence_sha256": null
+  },
+  "offsite": {
+    "transport": "sftp",
+    "destination": null,
+    "port": 22,
+    "directory": null,
+    "identity_file": "/etc/chisa-recovery/offsite-write-key",
+    "known_hosts": "/etc/chisa-recovery/known_hosts",
+    "known_hosts_hostkey_sha256": null,
+    "retention_evidence": "/etc/chisa-recovery/retention-evidence.json",
+    "retention_evidence_sha256": null,
+    "timeout_seconds": 7200
+  },
+  "monitor": {
+    "rpo_seconds": 3600,
+    "minimum_free_ratio": 0.1,
+    "max_drill_age_seconds": 2592000,
+    "verified_drill_record": "/var/lib/chisa-recovery/production-drill.json",
+    "dependency_max_age_seconds": 86400,
+    "exporter": {"evidence": null, "sha256": null},
+    "alert_sink": {"evidence": null, "sha256": null},
+    "certificate_file": "/opt/letsencrypt/live/example.com/fullchain.pem"
+  }
+}

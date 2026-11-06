@@ -160,6 +160,29 @@ export const TOOL_CONFIGS: Record<string, ToolDisplayConfig> = {
     }
   },
 
+  mcp__workspace__run_command: {
+    input: {
+      type: 'one-line',
+      icon: 'terminal',
+      getValue: (input) => input.command,
+      getSecondary: (input) => input.description || (input.path && input.path !== '/workspace' ? `in ${input.path}` : undefined),
+      action: 'copy',
+      style: 'terminal',
+      wrapText: true,
+      colorScheme: {
+        primary: 'text-green-400 font-mono',
+        secondary: 'text-gray-400',
+        background: '',
+        border: 'border-green-500 dark:border-green-400',
+        icon: 'text-green-500 dark:text-green-400'
+      }
+    },
+    result: {
+      hideOnSuccess: true,
+      type: 'special'
+    }
+  },
+
   // ============================================================================
   // WEB TOOLS
   // ============================================================================

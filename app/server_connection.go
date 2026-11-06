@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,15 +32,23 @@ type serviceDefaults struct {
 }
 
 type serverConnection struct {
-	baseURL         string
-	loginURL        string
-	client          *http.Client
-	ctx             context.Context
-	cancel          context.CancelFunc
-	version         uint64
-	authenticated   bool
-	accountIdentity string
-	accessToken     string
+	baseURL             string
+	loginURL            string
+	client              *http.Client
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	version             uint64
+	authenticated       bool
+	accountIdentity     string
+	accessToken         string
+	sessionHandle       string
+	serverKey           string
+	tokenRevision       uint64
+	proxyCapability     string
+	restorationToken    string
+	revocationRetryOnce sync.Once
+	// Set only from a verified login/profile response, never restored from Config.
+	verifiedWorkspaceURL string
 	// SSH has its own account-identity context so an identity refresh can revoke
 	// queued SSH work without changing the existing cloud transport lifecycle.
 	sshContext context.Context
@@ -48,6 +57,8 @@ type serverConnection struct {
 
 var apiConnection *serverConnection
 var apiConnectionVersion uint64
+
+// Compatibility name for tests; never admitted by the v2 proxy.
 var apiProxyKey = randHex(24)
 
 func distributionService() serviceDefaults {
@@ -123,6 +134,7 @@ func newServerConnection(loginURL, baseURL string) (*serverConnection, error) {
 		PingTimeout:     15 * time.Second,
 	}
 	return &serverConnection{baseURL: baseURL, loginURL: loginURL, ctx: ctx, cancel: cancel, version: version, sshContext: sshContext, sshCancel: sshCancel,
+		sessionHandle: randHex(24), serverKey: serverKey(loginURL, baseURL), tokenRevision: 1, proxyCapability: randHex(32),
 		client: &http.Client{Transport: &serverTLSRecoveryTransport{transport: transport, account: ctx}, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 
@@ -138,6 +150,7 @@ func replaceServerConnection(next *serverConnection) {
 		previous.cancel()
 		previous.client.CloseIdleConnections()
 	}
+	startAccountRevocationRetry(next, false)
 }
 
 func initializeServerConnection() error {
@@ -155,31 +168,19 @@ func initializeServerConnection() error {
 		}
 		return err
 	}
+	if next != nil {
+		// Unavailable or mismatched credentials leave initialization signed out.
+		// A corrupt/inaccessible envelope also blocks future credential writes;
+		// it must be repaired before a login can be committed durably.
+		next.restorationToken, err = loadAccountCredential(next.serverKey)
+		if err != nil {
+			log.Printf("[account-session] saved credential unavailable; profile repair required before authentication can be saved")
+			next.restorationToken = ""
+		}
+	}
 	apiConnection = next
+	startAccountRevocationRetry(next, true)
 	return nil
-}
-
-func (FrontendBridge) GetApiConnection() map[string]any {
-	serverConnectionMu.RLock()
-	defer serverConnectionMu.RUnlock()
-	result := map[string]any{"configured": apiConnection != nil, "webSocketUrl": fmt.Sprintf("ws://127.0.0.1:%d/channel/%s", apiProxyPort, apiProxyKey)}
-	if apiConnection != nil {
-		result["loginUrl"], result["apiUrl"], result["version"] = apiConnection.loginURL, apiConnection.baseURL, apiConnection.version
-	}
-	return result
-}
-
-func (FrontendBridge) EndServerSession(version uint64) {
-	serverConnectionMu.Lock()
-	defer serverConnectionMu.Unlock()
-	if apiConnection == nil || apiConnection.version != version {
-		return
-	}
-	next, err := newServerConnection(apiConnection.loginURL, apiConnection.baseURL)
-	if err != nil {
-		return
-	}
-	replaceServerConnection(next)
 }
 
 type frontendProxyRequest struct {
@@ -242,12 +243,39 @@ func StartAPIProxy() error {
 	apiProxyPort = listener.Addr().(*net.TCPAddr).Port
 	log.Printf("[app-start] api_proxy_port=%d", apiProxyPort)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		prefix := "/channel/" + apiProxyKey
-		if !strings.HasPrefix(request.URL.Path, prefix+"/") {
+		// Resolve the capability and capture token under the admission lock.
+		// No request can turn an old capability into a new global connection.
+		serverConnectionMu.RLock()
+		connection := apiConnection
+		if serverConnectionSwitching {
+			serverConnectionMu.RUnlock()
+			http.Error(w, "SERVER_SWITCH_IN_PROGRESS", http.StatusConflict)
+			return
+		}
+		if connection == nil || !connection.authenticated || connection.ctx.Err() != nil {
+			serverConnectionMu.RUnlock()
+			http.Error(w, "SESSION_NOT_AUTHENTICATED", http.StatusUnauthorized)
+			return
+		}
+		prefix := "/channel/" + connection.proxyCapability
+		if !strings.HasPrefix(request.URL.Path, prefix+"/") || request.URL.RawPath != "" {
+			serverConnectionMu.RUnlock()
 			http.NotFound(w, request)
 			return
 		}
+		token, revision := connection.accessToken, connection.tokenRevision
+		windowContext, pending, open := reserveFrontendProxy(request.Context())
+		serverConnectionMu.RUnlock()
+		if !open {
+			http.Error(w, "桌面窗口已关闭", http.StatusServiceUnavailable)
+			return
+		}
+		defer finishFrontendProxy(pending)
 		path := strings.TrimPrefix(request.URL.Path, prefix)
+		if strings.HasPrefix(path, "/api/auth/") || strings.Contains(path, "/../") || strings.Contains(path, "/./") || strings.Contains(path, "\\") {
+			http.Error(w, "INVALID_REQUEST_PURPOSE", http.StatusForbidden)
+			return
+		}
 		apiPath := strings.HasPrefix(path, "/api/")
 		if !apiPath && path != "/ws" && path != "/shell" && path != "/desktop-notifications" && !strings.HasPrefix(path, "/plugin-ws/") {
 			http.NotFound(w, request)
@@ -268,25 +296,34 @@ func StartAPIProxy() error {
 			w.WriteHeader(204)
 			return
 		}
-		windowContext, pending, open := reserveFrontendProxy(request.Context())
-		if !open {
-			http.Error(w, "桌面窗口已关闭", http.StatusServiceUnavailable)
-			return
-		}
-		defer finishFrontendProxy(pending)
-		serverConnectionMu.RLock()
-		connection := apiConnection
-		ready := connection != nil && connection.authenticated
-		serverConnectionMu.RUnlock()
-		if !ready {
-			http.Error(w, "请先登录账号服务", http.StatusUnauthorized)
-			return
-		}
 		target, _ := url.Parse(connection.baseURL)
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		proxy.Transport = connection.client.Transport
 		proxy.FlushInterval = -1
+		// This loopback boundary owns browser CORS. ReverseProxy adds upstream
+		// headers, so remove upstream CORS values before they can be duplicated.
+		credentialSaveFailed := false
+		proxy.ModifyResponse = func(response *http.Response) error {
+			response.Header.Del("Access-Control-Allow-Origin")
+			response.Header.Del("Access-Control-Allow-Headers")
+			response.Header.Del("Access-Control-Allow-Methods")
+			serverConnectionMu.Lock()
+			defer serverConnectionMu.Unlock()
+			if apiConnection != connection || connection.ctx.Err() != nil || serverConnectionSwitching || windowContext.Err() != nil {
+				return fmt.Errorf("stale proxy session")
+			}
+			err := recordNativeRefreshedToken(connection, response.Header, response.StatusCode, token, revision)
+			// Renderer credentials can only be adopted from the native snapshot.
+			response.Header.Del("X-Refreshed-Token")
+			credentialSaveFailed = err != nil
+			return err
+		}
 		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
+			if credentialSaveFailed {
+				w.Header().Set("X-Chisa-Error", "SESSION_SAVE_FAILED")
+				http.Error(w, "SESSION_SAVE_FAILED", http.StatusBadGateway)
+				return
+			}
 			http.Error(w, "聊天服务连接失败", http.StatusBadGateway)
 		}
 		copy := request.Clone(windowContext)
@@ -294,6 +331,25 @@ func StartAPIProxy() error {
 		copy.Host = target.Host
 		copy.URL.Path = path
 		copy.URL.RawPath = ""
+		copy.Header.Del("Cookie")
+		copy.Header.Del("Proxy-Authorization")
+		copy.Header.Set("Authorization", "Bearer "+token)
+		// Native WS authentication uses the captured bearer and service origin;
+		// renderer-controlled origins and query credentials cannot cross here.
+		if strings.EqualFold(copy.Header.Get("Upgrade"), "websocket") {
+			copy.Header.Set("Origin", target.Scheme+"://"+target.Host)
+		}
+		query, queryErr := url.ParseQuery(copy.URL.RawQuery)
+		if queryErr != nil {
+			http.Error(w, "invalid query", http.StatusBadRequest)
+			return
+		}
+		for key := range query {
+			if credentialQueryKey(key) {
+				query.Del(key)
+			}
+		}
+		copy.URL.RawQuery = query.Encode()
 		ctx, cancel := context.WithCancel(copy.Context())
 		stop := context.AfterFunc(connection.ctx, cancel)
 		defer stop()

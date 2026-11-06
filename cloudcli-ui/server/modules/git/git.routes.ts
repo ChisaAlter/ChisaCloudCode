@@ -5,7 +5,7 @@ import express from 'express';
 import type { RequestHandler } from 'express';
 
 import type { ProviderRunFunction, WorkspaceGitFileSystem } from '@/shared/index.js';
-import { AppError } from '@/shared/index.js';
+import { AppError, getGitErrorDetails } from '@/shared/index.js';
 import { runWorkspaceCommand, workspaceRequestScope, workspaceRequestSignal } from '@/modules/workspace-bridge/index.js';
 
 // cross-spawn: drop-in spawn with Windows .cmd/PATHEXT resolution.
@@ -15,6 +15,7 @@ import { changeGitBranch } from './git-branch.service.js';
 import { createGitOperationHandlers, gitOperationReadOnly } from './git-operation.service.js';
 import { createGitCommitMessageService } from './git-commit-message.service.js';
 import { readSshGitMetadata } from './ssh-git-metadata.service.js';
+import { getBranchDiffForFile, listBranchDiffFiles } from './git-branch-diff.service.js';
 
 type GitRouterDependencies = {
   fileSystem: WorkspaceGitFileSystem;
@@ -229,10 +230,6 @@ async function validateGitRepository(projectPath) {
 
     throw error;
   }
-}
-
-function getGitErrorDetails(error) {
-  return `${error?.message || ''} ${error?.stderr || ''} ${error?.stdout || ''}`;
 }
 
 function preserveWorkspaceFailure(error) {
@@ -756,10 +753,107 @@ routes.get('/branches', async (req, res) => {
     const branches = [...localBranches, ...remoteBranches]
       .filter((b, i, arr) => arr.indexOf(b) === i);
 
-    res.json({ branches, localBranches, remoteBranches });
+    // Full remote-tracking names (`origin/main`) for callers that need an
+    // unambiguous ref, e.g. the Compare tab's base selector.
+    const remoteRefs = rawLines
+      .filter(b => b.startsWith('remotes/'))
+      .map(b => b.replace(/^remotes\//, ''));
+
+    res.json({ branches, localBranches, remoteBranches, remoteRefs });
   } catch (error) {
     console.error('Git branches error:', error);
     throw error;
+  }
+});
+
+// Shared error shaping for the two compare routes: service AppErrors (unknown
+// ref, no merge base) keep their status/code; anything else follows the
+// module's GET convention of a 200 with `error`/`details`.
+function sendBranchDiffError(res, error, context) {
+  if (error instanceof AppError) {
+    return res.status(error.statusCode).json({ error: error.message, code: error.code, details: error.details });
+  }
+  console.error(`Git ${context} error:`, error);
+  res.json({ error: 'Git operation failed', details: error.message });
+}
+
+// List files the working copy changed relative to the merge base with `base`
+routes.get('/branch-diff', async (req, res) => {
+  const { project, base } = req.query;
+
+  if (!project || !base) {
+    return res.status(400).json({ error: 'Project id and base branch are required' });
+  }
+
+  try {
+    validateBranchName(base);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+
+  try {
+    const projectPath = await getActualProjectPath(project);
+    await validateGitRepository(projectPath);
+    // Run from the repository root so untracked paths are root-relative like
+    // everything else the panel shows, even for projects nested in a repo.
+    const repositoryRootPath = await getRepositoryRootPath(projectPath);
+    const result = await listBranchDiffFiles({
+      projectPath: repositoryRootPath,
+      base,
+      runCommand: spawnAsync,
+    });
+    res.json(result);
+  } catch (error) {
+    sendBranchDiffError(res, error, 'branch diff');
+  }
+});
+
+// Diff of one file between the merge base with `base` and the working copy.
+// `oldPath` is the pre-rename path of an `R` entry from `/branch-diff`.
+routes.get('/branch-diff/file', async (req, res) => {
+  const { project, base, file, oldPath } = req.query;
+
+  if (!project || !base || !file) {
+    return res.status(400).json({ error: 'Project id, base branch and file path are required' });
+  }
+
+  try {
+    validateBranchName(base);
+    validateFilePath(file);
+    if (oldPath !== undefined) {
+      validateFilePath(oldPath);
+    }
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+
+  try {
+    const projectPath = await getActualProjectPath(project);
+    await validateGitRepository(projectPath);
+
+    // `/branch-diff` already reports repository-root-relative paths, and
+    // compare files need not appear in `git status` (committed-only changes),
+    // so the status-based resolver is skipped: its bare-filename fallback
+    // could remap e.g. `README.md` onto a changed `docs/README.md`.
+    const repositoryRootPath = await getRepositoryRootPath(projectPath);
+    const repositoryRelativeFilePath = normalizeRepositoryRelativeFilePath(file);
+    validateFilePath(repositoryRelativeFilePath, repositoryRootPath);
+    const repositoryRelativeOldPath = oldPath === undefined ? undefined : normalizeRepositoryRelativeFilePath(oldPath);
+    if (repositoryRelativeOldPath !== undefined) {
+      validateFilePath(repositoryRelativeOldPath, repositoryRootPath);
+    }
+
+    const diff = await getBranchDiffForFile({
+      projectPath: repositoryRootPath,
+      base,
+      file: repositoryRelativeFilePath,
+      oldPath: repositoryRelativeOldPath,
+      runCommand: spawnAsync,
+      readFile: (absolutePath) => fs.readFile(absolutePath, 'utf-8'),
+    });
+    res.json({ diff: stripDiffHeaders(diff) });
+  } catch (error) {
+    sendBranchDiffError(res, error, 'branch diff file');
   }
 });
 

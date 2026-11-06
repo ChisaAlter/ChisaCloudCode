@@ -1,13 +1,22 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
 import { useAuth } from '@/modules/auth';
-import { beginBackgroundOperation, IS_PLATFORM } from '@/shared/utils';
-import { expireAuthSession, getAuthSessionVersion, isAuthTokenExpired } from '@/shared/authToken';
+import { beginBackgroundOperation } from '@/shared/utils';
+import { dispatchWithAuthSession, getAuthSessionSnapshot, isCurrentAuthSession, subscribeToAuthSession } from '@/shared/authToken';
 import type { ServerEvent } from '@/shared/types';
-import { desktopWebSocketUrl, FrontendBridge, getServerConnectionVersion, isDesktop } from '@/shared/chisa';
+import { getServerTransportVersion, subscribeToServerConnection } from '@/shared/chisa';
+import { resolveWebSocketAdmissionUrl } from '@/shared/webSocketAdmission';
 
 
 type ServerEventListener = (event: ServerEvent) => void;
+
+/**
+ * Where the chat socket stands. `connecting` covers a handshake the provider
+ * started on purpose (after sign-in, or with a refreshed token) and the time
+ * signed out; `disconnected` a socket that closed on its own (it dropped, or an
+ * attempt failed) until a reconnect opens again.
+ */
+type ConnectionStatus = 'connecting' | 'connected' | 'disconnected';
 
 type WebSocketContextType = {
   ws: WebSocket | null;
@@ -24,6 +33,8 @@ type WebSocketContextType = {
   isConnected: boolean;
   /** Uses an already-fetched authoritative snapshot to settle stops whose terminal frame was lost. */
   reconcileRunningSessions: (sessionIds: ReadonlySet<string>, snapshotRequestedAt: number) => boolean;
+  /** Distinguishes an unexpected drop from the initial or refreshed-token handshake. */
+  connectionStatus: ConnectionStatus;
 };
 
 const WebSocketContext = createContext<WebSocketContextType | null>(null);
@@ -36,20 +47,8 @@ export const useWebSocket = () => {
   return context;
 };
 
-const buildWebSocketUrl = (token: string | null) => {
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  if (typeof globalThis !== 'undefined' && (globalThis as any).mygo !== undefined) {
-    if (!token) return null;
-    return desktopWebSocketUrl('/ws', token);
-  }
-  if (IS_PLATFORM) return `${protocol}//${window.location.host}/ws`; // Platform mode: Use same domain as the page (goes through proxy)
-  if (!token) return null;
-  if (isAuthTokenExpired(token)) {
-    expireAuthSession();
-    return null;
-  }
-  return `${protocol}//${window.location.host}/ws?token=${encodeURIComponent(token)}`; // OSS mode: Use same host:port that served the page
-};
+/** Features that also render outside the provider (isolated tests, embeds) opt into live updates only when a socket exists. */
+export const useOptionalWebSocket = () => useContext(WebSocketContext);
 
 const useWebSocketProviderState = (): WebSocketContextType => {
   const wsRef = useRef<WebSocket | null>(null);
@@ -63,11 +62,17 @@ const useWebSocketProviderState = (): WebSocketContextType => {
   const listenersRef = useRef(new Set<ServerEventListener>());
   // Stop status lasts until this session's acknowledgement without locking other conversations.
   const pendingStopsRef = useRef(new Map<string, { finish: () => void; requestedAt: number }>());
-  const [isConnected, setIsConnected] = useState(false);
+  // Distinguishes a dropped connection from an intentional new handshake in the workspace header.
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   // Each effect incarnation owns its lookup and socket; a refreshed account invalidates both.
   const connectionGeneration = useRef(0);
-  const { isLoading: isAuthLoading, token, user } = useAuth();
+  const { isLoading: isAuthLoading, user } = useAuth();
+  // Both failed/no-op probes and committed identity changes must resume or invalidate this transport.
+  const transportVersion = useSyncExternalStore(subscribeToServerConnection, getServerTransportVersion, getServerTransportVersion);
+  const authSnapshot = useSyncExternalStore(subscribeToAuthSession, getAuthSessionSnapshot, getAuthSessionSnapshot);
+  // Each send remains bound to the socket's creation identity, even before React has processed a notification.
+  const socketIdentityRef = useRef<{ session: typeof authSnapshot; transport: number; generation: number } | null>(null);
 
   const dispatch = useCallback((event: ServerEvent) => {
     for (const listener of listenersRef.current) {
@@ -83,28 +88,34 @@ const useWebSocketProviderState = (): WebSocketContextType => {
   // without reading the `connect` binding while it is still initializing.
   const connect = useCallback(async function connect() {
     if (unmountedRef.current) return;
-    if (!IS_PLATFORM && (isAuthLoading || !user)) return;
+    if (isAuthLoading || !user || authSnapshot.phase !== 'ready') return;
     const generation = connectionGeneration.current;
-    const authVersion = getAuthSessionVersion();
-    const serverVersion = getServerConnectionVersion();
-    const current = () => !unmountedRef.current && generation === connectionGeneration.current && authVersion === getAuthSessionVersion() && serverVersion === getServerConnectionVersion();
+    const expected = getAuthSessionSnapshot();
+    if (expected.sessionInstanceId !== authSnapshot.sessionInstanceId || expected.serverKey !== authSnapshot.serverKey
+      || expected.tokenRevision !== authSnapshot.tokenRevision) return;
+    let serverVersion = transportVersion;
+    const current = () => !unmountedRef.current && generation === connectionGeneration.current
+      && isCurrentAuthSession(expected) && expected.phase === 'ready' && serverVersion === getServerTransportVersion();
     try {
-      // Login changes the auth epoch after HTTP completes; reacquire the native URL for that identity.
-      if (isDesktop()) await FrontendBridge.getApiConnection();
       if (!current()) return;
-      // Construct WebSocket URL
-      const wsUrl = buildWebSocketUrl(token);
-
-      if (!wsUrl) return console.warn('No authentication token found for WebSocket connection');
-
-      const websocket = new WebSocket(wsUrl);
+      const wsUrl = await resolveWebSocketAdmissionUrl('/ws', expected);
+      // Native lookup can publish its legitimate capability revision while preserving the captured login.
+      serverVersion = getServerTransportVersion();
+      if (!current()) return;
+      const admitted = await dispatchWithAuthSession(expected, () => {
+        if (!current()) throw new DOMException('WebSocket identity changed', 'AbortError');
+        return Promise.resolve(new WebSocket(wsUrl));
+      });
+      const websocket = await admitted.operation;
+      if (!current()) { websocket.close(); return; }
+      socketIdentityRef.current = { session: admitted.snapshot, transport: serverVersion, generation };
       // Store connecting sockets too, so a token refresh can close them before
       // their handshake completes with stale credentials.
       wsRef.current = websocket;
 
       websocket.onopen = () => {
         if (wsRef.current !== websocket || !current()) return;
-        setIsConnected(true);
+        setConnectionStatus('connected');
         if (pendingStopsRef.current.size) websocket.send(JSON.stringify({
           type: 'chat.subscribe', sessions: [...pendingStopsRef.current.keys()].map(sessionId => ({ sessionId })),
         }));
@@ -126,8 +137,8 @@ const useWebSocketProviderState = (): WebSocketContextType => {
             pendingStopsRef.current.delete(data.sessionId);
           }
           dispatch(data);
-        } catch (error) {
-          console.error('Error parsing WebSocket message:', error);
+        } catch {
+          console.error('Error parsing WebSocket message');
         }
       };
 
@@ -135,7 +146,10 @@ const useWebSocketProviderState = (): WebSocketContextType => {
         if (wsRef.current !== websocket || !current()) {
           return;
         }
-        setIsConnected(false);
+        // Also reached when the very first attempt fails, which is a lost
+        // connection too. The effect cleanup detaches this handler before
+        // closing a socket on purpose, so a token refresh never gets here.
+        setConnectionStatus('disconnected');
         wsRef.current = null;
 
         // Attempt to reconnect after 3 seconds
@@ -144,16 +158,18 @@ const useWebSocketProviderState = (): WebSocketContextType => {
         }, 3000);
       };
 
-      websocket.onerror = (error) => {
-        console.error('WebSocket error:', error);
+      websocket.onerror = () => {
+        // Browser error events expose target.url; never log an admission ticket or native capability.
+        console.error('WebSocket transport error');
       };
 
-    } catch (error) {
+    } catch {
       if (!current()) return;
-      console.error('Error creating WebSocket connection:', error);
+      setConnectionStatus('disconnected');
+      console.error('WebSocket admission failed');
       reconnectTimeoutRef.current = setTimeout(() => { if (current()) void connect(); }, 3000);
     }
-  }, [dispatch, isAuthLoading, token, user]); // reconnect with current authentication state
+  }, [dispatch, isAuthLoading, user, authSnapshot.phase, authSnapshot.sessionInstanceId, authSnapshot.serverKey, authSnapshot.tokenRevision, transportVersion]);
 
   // Declared after `connect` so the effect body does not reference it before
   // initialization. `connect` is memoized on [dispatch, isAuthLoading, token,
@@ -165,8 +181,8 @@ const useWebSocketProviderState = (): WebSocketContextType => {
     // at its unmounted guard and leave the socket permanently disconnected.
     unmountedRef.current = false;
     ++connectionGeneration.current;
-    setIsConnected(false);
-    if (!IS_PLATFORM && (isAuthLoading || !user)) {
+    setConnectionStatus('connecting');
+    if (isAuthLoading || !user || authSnapshot.phase !== 'ready') {
       return undefined;
     }
     connect();
@@ -188,13 +204,23 @@ const useWebSocketProviderState = (): WebSocketContextType => {
         activeSocket.close();
         wsRef.current = null;
       }
+      // What comes next is a socket with a refreshed token, or none after a
+      // sign-out or session expiry. Either way it starts from a fresh
+      // handshake: the socket closed here is no longer live, and a drop seen
+      // before must not show as "Reconnecting" after the next sign-in.
+      socketIdentityRef.current = null;
+      setConnectionStatus('connecting');
     };
-  }, [connect, isAuthLoading, user]); // reconnect after authentication or token refresh
+  }, [connect, isAuthLoading, user, authSnapshot.phase]);
 
   const sendMessage = useCallback((message: unknown) => {
     const socket = wsRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      throw new Error('聊天连接已断开，请等待重新连接后重试。');
+    const identity = socketIdentityRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN || !identity
+      || identity.generation !== connectionGeneration.current || !isCurrentAuthSession(identity.session)
+      || authSnapshot.sessionInstanceId !== identity.session.sessionInstanceId || authSnapshot.serverKey !== identity.session.serverKey
+      || getAuthSessionSnapshot().phase !== 'ready' || identity.transport !== getServerTransportVersion()) {
+      throw new Error('聊天连接已断开或账号正在切换，请等待重新连接后重试。');
     }
     socket.send(JSON.stringify(message));
     const frame = message as { type?: string; sessionId?: string } | null;
@@ -206,12 +232,17 @@ const useWebSocketProviderState = (): WebSocketContextType => {
         requestedAt: performance.now(),
       });
     }
-  }, []);
+  }, [authSnapshot.sessionInstanceId, authSnapshot.serverKey]);
 
-  useEffect(() => () => {
+  useEffect(() => {
+    hasConnectedRef.current = false;
     pendingStopsRef.current.forEach(stop => stop.finish());
     pendingStopsRef.current.clear();
-  }, []);
+    return () => {
+      pendingStopsRef.current.forEach(stop => stop.finish());
+      pendingStopsRef.current.clear();
+    };
+  }, [authSnapshot.sessionInstanceId]);
 
   const reconcileRunningSessions = useCallback((sessionIds: ReadonlySet<string>, snapshotRequestedAt: number) => {
     // Reject the same stale snapshot for both the busy map and the stop notice.
@@ -236,9 +267,10 @@ const useWebSocketProviderState = (): WebSocketContextType => {
     ws: wsRef.current,
     sendMessage,
     subscribe,
-    isConnected,
+    isConnected: connectionStatus === 'connected',
+    connectionStatus,
     reconcileRunningSessions,
-  }), [sendMessage, subscribe, isConnected, reconcileRunningSessions]);
+  }), [sendMessage, subscribe, connectionStatus, reconcileRunningSessions]);
 
   return value;
 };

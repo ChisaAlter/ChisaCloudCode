@@ -9,7 +9,7 @@ import Database from 'better-sqlite3';
 import { sessionsDb } from '@/modules/database/index.js';
 import { managedProviderHome, profileForArtifact, resolveProviderHome } from '@/modules/providers/services/provider-state.service.js';
 import { AppError } from '@/shared/index.js';
-import type { LLMProvider, ProviderProcessJob } from '@/shared/index.js';
+import type { LLMProvider, ProviderProcessJob, ProviderTrustedSlot } from '@/shared/index.js';
 
 type Provider = Exclude<LLMProvider, 'claude'>;
 const HOME = '/runtime/provider-state/home';
@@ -50,7 +50,17 @@ function nativeId(job: ProviderProcessJob) {
 }
 
 /** Provider container composition mounts persistent dedicated provider state and fresh read-only credential snapshots; native host profiles are imported read-only and never receive copyback. */
-export async function prepareProviderProfile(provider: Provider, sessionId: string, job: ProviderProcessJob, signal?: AbortSignal) {
+export async function prepareProviderProfile(provider: Provider, sessionId: string, job: ProviderProcessJob, signal?: AbortSignal, slot?: ProviderTrustedSlot) {
+  if (slot) {
+    signal?.throwIfAborted();
+    if (slot.provider !== provider || slot.sessionId !== sessionId || slot.home !== managedProviderHome(provider,sessionId)) throw unavailable('The trusted slot does not belong to this provider session.');
+    const mounts = slot.mounts.filter(mount => mount.target === HOME || mount.target.startsWith(HOME + '/'));
+    if (!mounts.some(mount => mount.source === slot.home && mount.target === HOME && mount.writable)) throw unavailable('The trusted slot does not contain its persistent HOME.');
+    return { home: slot.home,mounts,finish: (mode: 'publish' | 'discard' | 'retain') => slot.finish(mode) };
+  }
+  // Native history/import consumers retain their deterministic host-only store.
+  // Container composition always supplies a prepared operator slot above.
+  if (process.env.CHISA_PROVIDER_SLOT_CLIENT_CONFIG) throw unavailable('Configured provider execution requires its prepared trusted slot.');
   const release = await lock(`${provider}:${sessionId}`, signal);
   let credentialRoot = '';
   try {

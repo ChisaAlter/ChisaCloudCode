@@ -7,14 +7,52 @@ import type { Options } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 
 import { AppError } from '@/shared/index.js';
-import type { ProjectRuntimeLaunchContext, ProjectRuntimeManifest, WorkspaceDescriptor } from '@/shared/index.js';
+import type { ProjectRuntimeLaunchContext, ProjectRuntimeManifest, SshWorkspaceRpcResult, WorkspaceDescriptor } from '@/shared/index.js';
 
 import { createProjectContentResolver } from './project-runtime-content.service.js';
 import { resolveProjectExtensions, matchesProjectExtensionPermission } from './project-runtime-extensions.service.js';
 import { saveProjectRuntimeManifest, updateProjectRuntimeManifest, readProjectMemory, writeProjectMemory } from './project-runtime-state.service.js';
 
 const MAX_FILE_BYTES = 256 * 1024;
-type RpcResult = { b64?: string; hash?: string; size?: number; dir?: boolean; symlink?: boolean; mode?: number; path?: string; truncated?: boolean; entries?: Array<{ name: string; dir: boolean; stats?: { symlink?: boolean } }> };
+const MAX_SSH_BATCH_OPERATIONS = 64;
+type RpcResult = Omit<Partial<SshWorkspaceRpcResult>, 'results' | 'ok' | 'entries'> & {
+  ok?: boolean;
+  results?: unknown;
+  entries?: Array<{ name: string; dir: boolean; stats?: Partial<SshMetadata> }>;
+};
+type SshMetadata = Required<Pick<SshWorkspaceRpcResult, 'size' | 'mtime' | 'mode' | 'dir' | 'symlink'>>;
+type SshInspection = { op: 'lstat' | 'read' | 'list'; path: string; includeStats?: true };
+
+function invalidSshResponse(): never {
+  throw new AppError('Project configuration inspection returned an invalid response.', { code: 'PROJECT_RUNTIME_CONFIG_INVALID', statusCode: 400 });
+}
+function sshRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) invalidSshResponse();
+  return value as Record<string, unknown>;
+}
+function sshMetadata(value: unknown): SshMetadata {
+  const row = sshRecord(value);
+  if (row.symlink === true || typeof row.mode === 'number' && (row.mode & 0o170000) === 0o120000) {
+    throw new AppError('Linked project configuration is unsupported.', { code: 'PROJECT_RUNTIME_PATH_INVALID', statusCode: 400 });
+  }
+  if (row.truncated !== undefined && row.truncated !== false
+    || typeof row.dir !== 'boolean' || typeof row.symlink !== 'boolean' || !Number.isSafeInteger(row.size) || (row.size as number) < 0
+    || typeof row.mtime !== 'number' || !Number.isFinite(row.mtime) || !Number.isSafeInteger(row.mode)
+    || (row.mode as number) < 0 || (row.mode as number) > 0o177777
+    || ((row.mode as number) & 0o170000) !== (row.dir ? 0o040000 : 0o100000)) invalidSshResponse();
+  return row as SshMetadata;
+}
+function sshCandidateMetadata(rows: unknown[], directory: boolean): SshMetadata {
+  const metadata = rows.map(sshMetadata);
+  if (metadata.slice(0, -1).some(row => !row.dir)) invalidSshResponse();
+  const leaf = metadata[metadata.length - 1];
+  if (!leaf || leaf.dir !== directory) {
+    throw new AppError(directory ? 'A project configuration directory is not a directory.' : 'A project configuration file is a directory.', { code: 'PROJECT_RUNTIME_CONFIG_INVALID', statusCode: 400 });
+  }
+  if (!directory && leaf.size > MAX_FILE_BYTES) throw new AppError('Project configuration exceeds 256 KiB.', { code: 'PROJECT_RUNTIME_LIMIT', statusCode: 400 });
+  return leaf;
+}
 type Input = {
   launch: ProjectRuntimeLaunchContext;
   descriptor: WorkspaceDescriptor;
@@ -55,6 +93,67 @@ export async function prepareProjectRuntime(input: Input) {
   saveProjectRuntimeManifest(launch.userId, manifest, launch.accountKey);
   const persist = () => { check(); updateProjectRuntimeManifest(launch.userId, descriptor.projectId, runId, manifest, launch.accountKey); };
   const call = async (request: Record<string, unknown>) => { check(); const value = await input.execute(request, signal); check(); return value; };
+  const sshBatch = async (requests: SshInspection[]) => {
+    const value = sshRecord(await call({ op: 'batch', requests }));
+    if (value.ok !== undefined && value.ok !== true || value.truncated !== undefined && value.truncated !== false
+      || !Array.isArray(value.results) || value.results.length !== requests.length) invalidSshResponse();
+    // Inner helper results have no envelope, and any operation error rejects the
+    // whole batch. Never accept a partial result or interpret missing items as ENOENT.
+    return value.results.map(result => {
+      const row = sshRecord(result);
+      if (row.ok !== undefined && row.ok !== true) invalidSshResponse();
+      return row;
+    });
+  };
+  // A run-local snapshot replaces a process launch for every tiny configuration
+  // read. Imports outside its known files still use the ordinary inspected path.
+  let startupSnapshot: Promise<{ files: Map<string, Record<string, unknown>>; directories: Map<string, Record<string, unknown>> } | null> | undefined;
+  const loadStartupSnapshot = () => startupSnapshot ??= (async () => {
+    let response: Record<string, unknown>;
+    try { response = sshRecord(await call({ op: 'project_snapshot' })); }
+    catch (error) {
+      check();
+      if ((error as { code?: string }).code === 'SSH_WORKSPACE_REQUEST_INVALID') return null; // older desktop helper
+      throw error;
+    }
+    if (response.snapshotVersion !== 1 || !Array.isArray(response.files) || response.files.length > 256
+      || !Array.isArray(response.directories) || response.directories.length > 128) invalidSshResponse();
+    const files = new Map<string, Record<string, unknown>>(), directories = new Map<string, Record<string, unknown>>();
+    for (const item of response.files) {
+      const row = sshRecord(item);
+      if (typeof row.path !== 'string' || relativePath(row.path) !== row.path || files.has(row.path)) invalidSshResponse();
+      if (row.missing !== true) sshCandidateMetadata([row.stats], false);
+      files.set(row.path, row);
+    }
+    for (const item of response.directories) {
+      const row = sshRecord(item);
+      if (typeof row.path !== 'string' || relativePath(row.path) !== row.path || directories.has(row.path) || !Array.isArray(row.entries)) invalidSshResponse();
+      directories.set(row.path, { entries: row.entries, truncated: false });
+    }
+    return { files, directories };
+  })();
+  const inspectSsh = async (relative: string, op: 'read' | 'list') => {
+    const snapshot = await loadStartupSnapshot();
+    const cached = (op === 'read' ? snapshot?.files : snapshot?.directories)?.get(relative);
+    if (cached) {
+      if (cached.missing === true) throw new AppError('Project configuration file does not exist.', { code: 'ENOENT', statusCode: 404 });
+      return cached;
+    }
+    const components = relative.split('/');
+    // The second request includes the operation plus every post-check. Refuse
+    // paths that cannot fit the existing 64-operation helper contract.
+    if (components.length >= MAX_SSH_BATCH_OPERATIONS || relative.length + '/workspace/'.length > 2048) {
+      throw new AppError('Project configuration inspection exceeds its path limit.', { code: 'PROJECT_RUNTIME_LIMIT', statusCode: 400 });
+    }
+    let cursor = '/workspace';
+    const inspections: SshInspection[] = components.map(component => ({ op: 'lstat', path: cursor += '/' + component }));
+    // Keep the 256 KiB metadata gate before dispatching read: the unchanged
+    // native helper only has an 8 MiB limit. Each batch concerns ONE candidate.
+    sshCandidateMetadata(await sshBatch(inspections), op === 'list');
+    const values = await sshBatch([{ op, path: '/workspace/' + relative, ...(op === 'list' ? { includeStats: true as const } : {}) }, ...inspections]);
+    sshCandidateMetadata(values.slice(1), op === 'list');
+    return values[0];
+  };
   // The Windows helper already refuses links/reparse points. The cloud adapter
   // is checked component by component too, rather than trusting a text prefix.
   const safePath = async (candidate: string) => {
@@ -71,6 +170,19 @@ export async function prepareProjectRuntime(input: Input) {
   const read = async (candidate: string): Promise<{ content: string; hash: string } | null> => {
     const relative = relativePath(candidate);
     try {
+      if (descriptor.sourceMode === 'ssh') {
+        const value = await inspectSsh(relative, 'read');
+        if (typeof value.b64 !== 'string') invalidSshResponse();
+        if (value.b64.length > Math.ceil(MAX_FILE_BYTES / 3) * 4 || value.truncated === true) {
+          throw new AppError('Project configuration response exceeds its limit.', { code: 'PROJECT_RUNTIME_LIMIT', statusCode: 400 });
+        }
+        const bytes = Buffer.from(value.b64, 'base64');
+        if (bytes.length > MAX_FILE_BYTES) throw new AppError('Project configuration exceeds 256 KiB.', { code: 'PROJECT_RUNTIME_LIMIT', statusCode: 400 });
+        const hash = createHash('sha256').update(bytes).digest('hex');
+        if (bytes.toString('base64') !== value.b64 || value.hash !== hash
+          || value.truncated !== undefined && value.truncated !== false) invalidSshResponse();
+        return { content: new TextDecoder('utf-8', { fatal: true }).decode(bytes), hash };
+      }
       const before = await safePath(relative);
       if (before.dir) throw new AppError('A project configuration file is a directory.', { code: 'PROJECT_RUNTIME_CONFIG_INVALID', statusCode: 400 });
       if ((before.size ?? 0) > MAX_FILE_BYTES) throw new AppError('Project configuration exceeds 256 KiB.', { code: 'PROJECT_RUNTIME_LIMIT', statusCode: 400 });
@@ -85,6 +197,23 @@ export async function prepareProjectRuntime(input: Input) {
   const list = async (candidate: string) => {
     const relative = relativePath(candidate);
     try {
+      if (descriptor.sourceMode === 'ssh') {
+        const value = await inspectSsh(relative, 'list');
+        if (value.truncated === true || Array.isArray(value.entries) && value.entries.length > 512) {
+          throw new AppError('Project configuration discovery exceeds its limit.', { code: 'PROJECT_RUNTIME_LIMIT', statusCode: 400 });
+        }
+        if (value.truncated !== false || !Array.isArray(value.entries)) invalidSshResponse();
+        const names = new Set<string>();
+        return value.entries.map(entry => {
+          const row = sshRecord(entry);
+          if (typeof row.name !== 'string' || !row.name || row.name === '.' || row.name === '..' || row.name.length > 2048
+            || /[/\\\u0000-\u001f\u007f:]/.test(row.name) || names.has(row.name) || typeof row.dir !== 'boolean') invalidSshResponse();
+          const stats = sshMetadata(row.stats);
+          if (row.dir !== stats.dir) invalidSshResponse();
+          names.add(row.name);
+          return { name: row.name, directory: row.dir };
+        });
+      }
       const stats = await safePath(relative);
       if (!stats.dir) throw new AppError('A project configuration directory is not a directory.', { code: 'PROJECT_RUNTIME_CONFIG_INVALID', statusCode: 400 });
       const value = await call({ op: 'list', path: '/workspace/' + relative, includeStats: true });
@@ -126,7 +255,7 @@ export async function prepareProjectRuntime(input: Input) {
     if (remoteConfigBytes > MAX_FILE_BYTES) throw new AppError('Combined project configuration exceeds 256 KiB.', { code: 'PROJECT_RUNTIME_LIMIT', statusCode: 400 });
     return file;
   };
-  const resolver = createProjectContentResolver({ read: measuredRead, list, assertCurrent: check, signal });
+  const resolver = createProjectContentResolver({ read: measuredRead, list, assertCurrent: check, signal, prefetch: descriptor.sourceMode === 'ssh' });
   const accountList = async (candidate: string) => {
     check();
     if (!candidate.startsWith('.claude/skills')) return [];
@@ -237,6 +366,7 @@ export async function prepareProjectRuntime(input: Input) {
     tool('read_skill_resource', 'Read a bounded UTF-8 resource belonging to a selected cloud account skill; this cannot read credentials or arbitrary VPS files. Project skills use workspace file tools.', { name: z.string(), path: z.string() }, args => result(async () => {
       const metadata = runtime.skills.find(entry => entry.name.toLowerCase() === args.name.toLowerCase() && entry.path.startsWith('account/'));
       if (!metadata) throw new AppError('The selected account skill does not exist.', { code: 'PROJECT_RUNTIME_SKILL_NOT_FOUND', statusCode: 404 });
+      if (metadata.unsupported.length) throw new AppError(`${metadata.name}: unsupported skill resources (${metadata.unsupported.join(', ')}).`, { code: 'PROJECT_RUNTIME_SKILL_UNSUPPORTED', statusCode: 400 });
       const resource = relativePath(args.path);
       const relative = path.posix.join(path.posix.dirname(metadata.path.slice('account/.claude/'.length)), resource);
       const file = await accountRead(relative);

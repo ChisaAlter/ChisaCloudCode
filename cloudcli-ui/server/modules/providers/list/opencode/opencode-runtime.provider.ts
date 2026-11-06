@@ -1,12 +1,12 @@
 import fsSync from 'node:fs';
 import path from 'node:path';
-import { resolveProviderHome } from '@/modules/providers/services/provider-state.service.js';
 
 import Database from 'better-sqlite3';
 
+import { resolveProviderHome } from '@/modules/providers/services/provider-state.service.js';
 import { runProviderProcess } from '@/modules/providers/services/provider-process.service.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
-import { appendFilesInputTag, appendImagesInputTag, normalizeAttachmentDescriptors, createCompleteMessage, createNormalizedMessage, flattenPromptForWindowsShell, getOpenCodeDatabasePath } from '@/shared/index.js';
+import { appendFilesInputTag, appendImagesInputTag, normalizeAttachmentDescriptors, createCompleteMessage, createNormalizedMessage, flattenPromptForWindowsShell, getOpenCodeDatabasePath, stripAnsiSequences } from '@/shared/index.js';
 import type { AnyRecord, ProviderModelsDefinition, ProviderRuntimeContext, ProviderRuntimeWriter } from '@/shared/index.js';
 
 type OpenCodeRun = { controller: AbortController; completion: Promise<void>; cleanupError?: unknown };
@@ -117,7 +117,8 @@ export function createOpenCodeRuntime(runProcess: typeof runProviderProcess = ru
           for (const line of lines) processLine(line.trim());
         },
         stderr(text) {
-          if (text.trim() && !controller.signal.aborted) ws.send(createNormalizedMessage({ kind: 'error', content: text, sessionId: capturedSessionId || sessionId || null, provider: 'opencode' }));
+          const content = stripAnsiSequences(text);
+          if (content.trim() && !controller.signal.aborted) ws.send(createNormalizedMessage({ kind: 'error', content, sessionId: capturedSessionId || sessionId || null, provider: 'opencode' }));
         },
       }, controller.signal);
       if (stdoutBuffer.trim()) processLine(stdoutBuffer.trim());
@@ -151,6 +152,9 @@ export function createOpenCodeRuntime(runProcess: typeof runProviderProcess = ru
 
   return {
     run,
+    isSessionActive(sessionId: string): boolean {
+      return active.has(sessionId);
+    },
     async abort(sessionId: string) {
       const entry = active.get(sessionId);
       if (!entry) return false;
@@ -164,3 +168,8 @@ export function createOpenCodeRuntime(runProcess: typeof runProviderProcess = ru
 
 /** Used by OpenCodeProvider; the dispatcher supplies workspace admission. */
 export const opencodeRuntime = createOpenCodeRuntime();
+
+/** OpenCode history marks child tools as live only while this runtime owns the session process. */
+export function isOpenCodeSessionActive(sessionId: string): boolean {
+  return opencodeRuntime.isSessionActive(sessionId);
+}

@@ -24,6 +24,7 @@ vi.mock('@/shared/context/WebSocketContext', () => ({
 const renderContexts = async () => {
   const {
     SessionProtectionProvider,
+    useBackgroundSessionIdSet,
     useBusySessionIdSet,
     useProcessingSessions,
     useSessionProtectionActions,
@@ -35,6 +36,7 @@ const renderContexts = async () => {
   return renderHook(
     () => ({
       busyIds: useBusySessionIdSet(),
+      backgroundIds: useBackgroundSessionIdSet(),
       activity: useProcessingSessions(),
       actions: useSessionProtectionActions(),
     }),
@@ -106,4 +108,42 @@ test('finishing a session removes it from the set', async () => {
 test('the set starts empty', async () => {
   const { result } = await renderContexts();
   assert.equal(result.current.busyIds.size, 0);
+});
+
+test('a session left with background work stays busy and joins the background set until a new turn starts', async () => {
+  // The sidebar counts it among the running sessions but draws it with the
+  // purple dot rather than the spinner; both sets keep the same identity
+  // while their membership holds.
+  const { result } = await renderContexts();
+  const tasks = [{
+    taskId: 'wxkj4kcvd',
+    toolUseId: 'toolu_workflow_1',
+    taskType: 'local_workflow',
+    description: 'Audit the frontend',
+    startedAt: Date.now() - 60_000,
+  }];
+
+  act(() => {
+    result.current.actions.markSessionProcessing('session-1');
+  });
+  const busyWhileProcessing = result.current.busyIds;
+  assert.equal(result.current.backgroundIds.size, 0);
+
+  act(() => {
+    result.current.actions.markSessionBackground('session-1', tasks);
+  });
+  assert.equal(result.current.busyIds, busyWhileProcessing, 'still busy: membership did not change');
+  assert.deepEqual([...result.current.backgroundIds], ['session-1']);
+  const backgroundIds = result.current.backgroundIds;
+
+  act(() => {
+    result.current.actions.markSessionBackground('session-1', tasks);
+  });
+  assert.equal(result.current.backgroundIds, backgroundIds, 'the same tasks reported again change nothing');
+
+  act(() => {
+    result.current.actions.markSessionProcessing('session-1');
+  });
+  assert.equal(result.current.backgroundIds.size, 0, 'a new turn is a response in flight again');
+  assert.deepEqual([...result.current.busyIds], ['session-1']);
 });

@@ -3,6 +3,7 @@ import type { MutableRefObject, RefObject } from 'react';
 import type { FitAddon } from '@xterm/addon-fit';
 import type { Terminal } from '@xterm/xterm';
 
+import { useTheme } from '@/shared/context/ThemeContext';
 import type { Project, ProjectSession } from '@/shared/types';
 import { useShellConnection } from '@/modules/shell/hooks/useShellConnection';
 import { useShellTerminal } from '@/modules/shell/hooks/useShellTerminal';
@@ -28,6 +29,9 @@ type UseShellRuntimeResult = {
   isInitialized: boolean;
   isConnecting: boolean;
   transport: 'pty' | 'pipe' | null;
+  // A live Claude CLI was launched in the other theme and keeps those colours
+  // until it is restarted.
+  isClaudeThemeOutdated: boolean;
   connectToShell: (options?: { forceRestart?: boolean }) => void;
   disconnectFromShell: (options?: { suppressAutoConnect?: boolean }) => void;
 };
@@ -44,6 +48,7 @@ export function useShellRuntime({
   onProcessComplete,
   onOutputRef,
 }: UseShellRuntimeOptions): UseShellRuntimeResult {
+  const { isDarkMode } = useTheme();
   const terminalContainerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -54,6 +59,7 @@ export function useShellRuntime({
   const initialCommandRef = useRef(initialCommand);
   const isPlainShellRef = useRef(isPlainShell);
   const bypassPermissionsRef = useRef(bypassPermissions);
+  const isDarkModeRef = useRef(isDarkMode);
   const onProcessCompleteRef = useRef(onProcessComplete);
   const lastSessionIdRef = useRef<string | null>(selectedSession?.id ?? null);
 
@@ -64,8 +70,9 @@ export function useShellRuntime({
     initialCommandRef.current = initialCommand;
     isPlainShellRef.current = isPlainShell;
     bypassPermissionsRef.current = bypassPermissions;
+    isDarkModeRef.current = isDarkMode;
     onProcessCompleteRef.current = onProcessComplete;
-  }, [selectedProject, selectedSession, initialCommand, isPlainShell, bypassPermissions, onProcessComplete]);
+  }, [selectedProject, selectedSession, initialCommand, isPlainShell, bypassPermissions, isDarkMode, onProcessComplete]);
 
   const closeSocket = useCallback(() => {
     const activeSocket = wsRef.current;
@@ -94,7 +101,14 @@ export function useShellRuntime({
     closeSocket,
   });
 
-  const { isConnected, isConnecting, transport, connectToShell, disconnectFromShell } = useShellConnection({
+  const {
+    isConnected,
+    isConnecting,
+    transport,
+    claudeLaunchColorScheme,
+    connectToShell,
+    disconnectFromShell,
+  } = useShellConnection({
     wsRef,
     terminalRef,
     fitAddonRef,
@@ -103,6 +117,7 @@ export function useShellRuntime({
     initialCommandRef,
     isPlainShellRef,
     bypassPermissionsRef,
+    isDarkModeRef,
     onProcessCompleteRef,
     isInitialized,
     autoConnect,
@@ -110,6 +125,11 @@ export function useShellRuntime({
     clearTerminalScreen,
     onOutputRef,
   });
+
+  const isClaudeThemeOutdated =
+    isConnected &&
+    claudeLaunchColorScheme !== null &&
+    claudeLaunchColorScheme !== (isDarkMode ? 'dark' : 'light');
 
   useEffect(() => {
     if (!isRestarting) {
@@ -146,6 +166,7 @@ export function useShellRuntime({
     isInitialized,
     isConnecting,
     transport,
+    isClaudeThemeOutdated,
     connectToShell,
     disconnectFromShell,
   };

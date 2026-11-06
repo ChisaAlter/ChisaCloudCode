@@ -9,7 +9,7 @@ import { SshAgentStatus, useSshAgent } from '@/modules/ssh-workspaces';
 import { BrowserUsePanel, useBrowserUseEnabled } from '@/modules/browser-use';
 import { usePaletteOpsRegister } from '@/modules/command-palette';
 import { TaskMasterPanel, useTaskMasterProjectSync, useTasksSettings } from '@/modules/task-master';
-import type { AppTab, CodeEditorDiffInfo, Project, ProjectSession, SessionEstablishedContext, SessionNavigationOptions, SettingsMainTab, WorkspaceDescriptor } from '@/shared/types';
+import type { AppTab, CodeEditorDiffInfo, DirectoryRevealRequest, Project, ProjectSession, SessionEstablishedContext, SessionNavigationOptions, SettingsMainTab, WorkspaceDescriptor } from '@/shared/types';
 import { useUiPreferences } from '@/shared/context/UiPreferencesContext';
 import { useFileOpenResolver } from '@/modules/project-workspace/hooks/useFileOpenResolver';
 import { EditorSidebar, useEditorSidebar } from '@/modules/code-editor';
@@ -41,6 +41,8 @@ type WorkspaceMainProps = {
   onProjectSelect: (project: Project) => void;
   /** Silently re-syncs the sidebar project list after worktree projects change. */
   onProjectsRefresh: () => void;
+  /** Persists a new title for a session; resolves false when the backend refuses it. Used by the header's inline rename. */
+  onRenameSession: (sessionId: string, summary: string) => Promise<boolean>;
 };
 
 /** Rendered by ProjectMainRegion to show the selected project's active tab: chat, files, shell, git, tasks, browser or a plugin. */
@@ -62,6 +64,7 @@ function WorkspaceMain({
   newSessionTrigger,
   onProjectSelect,
   onProjectsRefresh,
+  onRenameSession,
 }: WorkspaceMainProps) {
   const preferences = useUiPreferences();
   const { showRawParameters, showThinking, sendByCtrlEnter } = preferences;
@@ -70,6 +73,9 @@ function WorkspaceMain({
   const browserUseEnabled = useBrowserUseEnabled();
 
   useTaskMasterProjectSync(selectedProject?.sourceMode === 'ssh' ? null : selectedProject);
+  // The folder an in-chat `path/` reference asked to reveal. Held as an object
+  // so that re-clicking the same folder is a new request the tree acts on.
+  const [revealDirectory, setRevealDirectory] = useState<DirectoryRevealRequest | null>(null);
 
   const sshProject = selectedProject?.sourceMode === 'ssh';
   const shouldShowTasksTab = Boolean(!sshProject && tasksEnabled && isTaskMasterInstalled);
@@ -100,6 +106,7 @@ function WorkspaceMain({
     handleCloseEditor,
     handleToggleEditorExpand,
     handleResizeStart,
+    handleUnsavedChangesChange,
   } = useEditorSidebar({
     projects,
     selectedProject,
@@ -108,11 +115,11 @@ function WorkspaceMain({
 
   // Resolves bare/partial file references (e.g. links inside chat messages) to
   // real project files before opening them in the in-app editor.
-  const openWorkspaceFile = useCallback((path: string, diffInfo?: CodeEditorDiffInfo | null) => {
-    handleFileOpen(path, diffInfo, activeWorkspace);
+  const openWorkspaceFile = useCallback((path: string, diffInfo?: CodeEditorDiffInfo | null, line?: number | null) => {
+    return handleFileOpen(path, diffInfo, activeWorkspace, line);
   }, [handleFileOpen, activeWorkspace]);
-  const openSessionFile = useCallback((path: string, diffInfo?: CodeEditorDiffInfo | null) => {
-    handleFileOpen(path, diffInfo, sessionWorkspace);
+  const openSessionFile = useCallback((path: string, diffInfo?: CodeEditorDiffInfo | null, line?: number | null) => {
+    return handleFileOpen(path, diffInfo, sessionWorkspace, line);
   }, [handleFileOpen, sessionWorkspace]);
   const resolvedFileOpen = useFileOpenResolver(selectedProject, openWorkspaceFile, activeWorkspace);
   const resolvedSessionFileOpen = useFileOpenResolver(selectedProject, openSessionFile, sessionWorkspace);
@@ -137,18 +144,27 @@ function WorkspaceMain({
   }, [setActiveTab]);
 
   const openFile = useCallback((filePath: string) => {
-    setActiveTab('files');
-    openWorkspaceFile(filePath);
+    if (openWorkspaceFile(filePath)) setActiveTab('files');
   }, [openWorkspaceFile, setActiveTab]);
 
   // Opens the editor side panel in place, keeping the current tab (e.g. chat).
-  const openFileInEditor = useCallback((filePath: string) => {
-    resolvedFileOpen(filePath);
-  }, [resolvedFileOpen]);
+  const openFileInEditor = useCallback((filePath: string, line?: number | null) => {
+    const resolve = activeTab === 'chat' ? resolvedSessionFileOpen : resolvedFileOpen;
+    resolve(filePath, undefined, line);
+  }, [activeTab, resolvedFileOpen, resolvedSessionFileOpen]);
+
+  // Directories cannot be read as text: reveal them in the file tree instead.
+  const openDirectory = useCallback((directoryPath: string) => {
+    const target = activeTab === 'chat' ? sessionWorkspace : activeWorkspace;
+    if (!target?.capabilities.read) return;
+    setScopeChoice({ key: selectionKey, kind: target.kind });
+    setActiveTab('files');
+    setRevealDirectory({ path: directoryPath });
+  }, [activeTab, activeWorkspace, selectionKey, sessionWorkspace, setActiveTab]);
 
   // Stable arguments keep usePaletteOpsRegister's effect from tearing down and
   // rewriting the whole palette registry on every render.
-  usePaletteOpsRegister({ openFile, openFileInEditor });
+  usePaletteOpsRegister({ openFile, openFileInEditor, openDirectory });
 
   if (isLoading) {
     return <WorkspaceScopeContext.Provider value={null}><WorkspaceStateView mode="loading" isMobile={isMobile} onMenuClick={onMenuClick} /><ProjectCommandPalette /></WorkspaceScopeContext.Provider>;
@@ -188,6 +204,7 @@ function WorkspaceMain({
         isMobile={isMobile}
         onMenuClick={onMenuClick}
         statusControl={sshProject ? workspaceControl : undefined}
+        onRenameSession={onRenameSession}
       />
 
       {!sshProject && workspaceControl}
@@ -222,7 +239,7 @@ function WorkspaceMain({
 
           {activeTab === 'files' && activeWorkspace?.capabilities.read && (
             <div key={scopeKey} className="h-full overflow-hidden">
-              <FileTree selectedProject={scopedProject} onFileOpen={openWorkspaceFile} />
+              <FileTree selectedProject={scopedProject} onFileOpen={openWorkspaceFile} revealDirectory={revealDirectory} />
             </div>
           )}
 
@@ -284,6 +301,7 @@ function WorkspaceMain({
           onCloseEditor={handleCloseEditor}
           onToggleEditorExpand={handleToggleEditorExpand}
           projectPath={editingFile?.workspace?.rootPath ?? selectedProject.path}
+          onUnsavedChangesChange={handleUnsavedChangesChange}
           fillSpace={activeTab === 'files'}
         />
       </div>

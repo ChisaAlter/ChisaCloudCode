@@ -3,8 +3,8 @@
 import { call } from 'mygo-runtime';
 
 import { withBackgroundOperation } from '@/shared/utils';
-import { getAuthSessionVersion } from '@/shared/authToken';
-import type { BridgeResponse, ChisaApiConnection, ChisaState, FrontendErrorReport, SshAgentEnsureResult, SshDefaultsResult, SshHelperInstallResult, SshNativePathResult, SshPreflight, SshTunnelProfileInput, SshTunnelProfilesResult, SshTunnelSaveResult, SshTunnelStatusResult } from '@/shared/types';
+import { beginAuthServerSwitch, finishAuthServerSwitch, getAuthSessionSnapshot, isCurrentAuthSession, observeNativeAuthSession } from '@/shared/authToken';
+import type { BridgeResponse, ChisaApiConnection, ChisaRequestReservation, ChisaServerConnectionResult, ChisaSessionEndResult, ChisaState, FrontendErrorReport, SshAgentEnsureResult, SshDefaultsResult, SshHelperInstallResult, SshNativePathResult, SshPreflight, SshTunnelProfileInput, SshTunnelProfilesResult, SshTunnelSaveResult, SshTunnelStatusResult } from '@/shared/types';
 
 export function isDesktop(): boolean {
   try {
@@ -14,55 +14,140 @@ export function isDesktop(): boolean {
   }
 }
 
-// Account transport identity invalidates in-flight replies when the server changes.
+// A transport attempt is observable independently of committed native identity, including failed/no-op probes.
 let serverConnectionVersion = 0;
+let serverTransportVersion = 0;
 let accountConnection: ChisaApiConnection | null = null;
-let accountConnectionAuthVersion = -1;
 let apiConnectionRevision = 0;
+const connectionListeners = new Set<() => void>();
 
-/** Shared API URL builders use the native loopback proxy, whose remote side verifies HTTPS. */
+function announceConnection(identityChanged = false): void {
+  if (identityChanged) serverConnectionVersion++;
+  serverTransportVersion++;
+  for (const listener of connectionListeners) listener();
+}
+function interrupted(): DOMException { return new DOMException('Account service connection changed', 'AbortError'); }
+function validateConnection(connection: ChisaApiConnection): void {
+  if (connection.protocolVersion !== 2 || (connection.configured && (!connection.sessionHandle || !connection.serverKey))
+    || !Number.isSafeInteger(connection.tokenRevision) || !Number.isSafeInteger(connection.generation)) {
+    throw new Error('桌面连接协议需要升级，请安装支持安全会话的客户端');
+  }
+}
+function publishConnection(connection: ChisaApiConnection): ChisaApiConnection {
+  validateConnection(connection);
+  const previous = accountConnection;
+  accountConnection = Object.freeze({ ...connection });
+  observeNativeAuthSession({ sessionInstanceId: connection.sessionHandle, nativeHandle: connection.sessionHandle,
+    serverKey: connection.serverKey, userId: null, token: connection.authenticated ? connection.accessToken : null,
+    tokenRevision: connection.tokenRevision, nativeGeneration: connection.generation,
+    phase: connection.switching ? 'switching' : connection.authenticated ? 'ready' : 'signedOut', storageMode: 'window' });
+  if (!previous || previous.sessionHandle !== connection.sessionHandle || previous.tokenRevision !== connection.tokenRevision
+    || previous.switching !== connection.switching || previous.webSocketUrl !== connection.webSocketUrl) announceConnection(!previous || previous.sessionHandle !== connection.sessionHandle);
+  return accountConnection;
+}
+function currentProxyConnection(token?: string | null): ChisaApiConnection {
+  const snapshot = getAuthSessionSnapshot();
+  if (!accountConnection || accountConnection.switching || !accountConnection.authenticated
+    || snapshot.phase !== 'ready' || snapshot.nativeHandle !== accountConnection.sessionHandle
+    || !isCurrentAuthSession(snapshot, true) || (token != null && token !== accountConnection.accessToken)) {
+    throw new Error('账号服务尚未初始化或会话已改变');
+  }
+  return accountConnection;
+}
+
+/** URL capabilities already bind native identity; a caller-supplied token is never appended or forwarded. */
 export function desktopWebSocketUrl(path: string, token: string | null): string {
-  if (!accountConnection || accountConnectionAuthVersion !== getAuthSessionVersion()) throw new Error('账号服务尚未初始化');
-  return `${accountConnection.webSocketUrl}${path}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+  return currentProxyConnection(token).webSocketUrl + path;
 }
 
-/** Streaming API requests and file uploads use the same account-bound native proxy as chat. */
+/** Stream/upload capabilities fail closed on stale identity and never resolve against a later target. */
 export function desktopHttpUrl(path: string): string {
-  if (!accountConnection || accountConnectionAuthVersion !== getAuthSessionVersion()) throw new Error('账号服务尚未初始化');
-  return accountConnection.webSocketUrl.replace(/^ws:/, 'http:') + path;
+  const parsed = new URL(path, 'https://native.invalid');
+  parsed.searchParams.delete('token');
+  return currentProxyConnection().httpProxyUrl + parsed.pathname + parsed.search;
 }
 
-/** API requests use this generation to discard replies from a replaced connection. */
+/** Account-scoped feature results keep this observable transport incarnation fence. */
 export function getServerConnectionVersion(): number { return serverConnectionVersion; }
+/** Sockets react to token/probe transport changes without remounting the account workspace. */
+export function getServerTransportVersion(): number { return serverTransportVersion; }
+/** Sockets and auth subscribe to attempt/resume transitions even if the service address does not change. */
+export function subscribeToServerConnection(listener: () => void): () => void {
+  connectionListeners.add(listener);
+  return () => { connectionListeners.delete(listener); };
+}
+
+/** API accepts an authentication handoff only for the exact native request predecessor. */
+export function acceptNativeSessionTransition(response: BridgeResponse, previous: ChisaApiConnection): void {
+  const transition = response.sessionTransition;
+  if (!transition) return;
+  if (!accountConnection || accountConnection.sessionHandle !== previous.sessionHandle
+    || accountConnection.tokenRevision !== previous.tokenRevision
+    || transition.previousSessionHandle !== previous.sessionHandle || transition.previousTokenRevision !== previous.tokenRevision) throw interrupted();
+  ++apiConnectionRevision;
+  publishConnection(transition.connection);
+}
 
 /** Auth, shared API transport and error reporting use only the native account-service capabilities. */
 export const FrontendBridge = {
-  connectServer(rawURL: string): Promise<Record<string, unknown>> {
-    serverConnectionVersion++;
-    accountConnection = null;
-    return withBackgroundOperation('正在连接服务器', '正在后台建立连接。', () => call('FrontendBridge.ConnectServer', rawURL));
+  async connectServer(rawURL: string): Promise<ChisaServerConnectionResult> {
+    const attempt = beginAuthServerSwitch();
+    ++apiConnectionRevision;
+    announceConnection();
+    try {
+      const result = await withBackgroundOperation('正在连接服务器', '正在后台建立连接。',
+        () => call<ChisaServerConnectionResult>('FrontendBridge.ConnectServer', rawURL));
+      if (result.connection) publishConnection(result.connection);
+      else throw new Error('桌面连接协议需要升级，未收到绑定会话');
+      await finishAuthServerSwitch(attempt, false);
+      return result;
+    } catch (error) {
+      await finishAuthServerSwitch(attempt, false);
+      throw error;
+    } finally { announceConnection(); }
   },
   getState(): Promise<ChisaState> {
     return call('FrontendBridge.GetState');
   },
   async getApiConnection(): Promise<ChisaApiConnection> {
-    const serverVersion = serverConnectionVersion;
-    const authVersion = getAuthSessionVersion();
-    const revision = ++apiConnectionRevision;
+    if (getAuthSessionSnapshot().phase === 'switching') throw interrupted();
+    const revision = apiConnectionRevision;
     const connection = await call<ChisaApiConnection>('FrontendBridge.GetApiConnection');
-    if (serverVersion !== serverConnectionVersion || authVersion !== getAuthSessionVersion()) throw new DOMException('Account service connection changed', 'AbortError');
-    // A late lookup cannot replace the newer URL or native connection generation.
-    if (revision === apiConnectionRevision) { accountConnection = connection; accountConnectionAuthVersion = authVersion; }
-    return connection;
+    if (revision !== apiConnectionRevision) {
+      if (accountConnection && connection.sessionHandle === accountConnection.sessionHandle
+        && connection.tokenRevision <= accountConnection.tokenRevision && getAuthSessionSnapshot().phase !== 'switching') return accountConnection;
+      throw interrupted();
+    }
+    // Concurrent lookups may complete out of order. Never roll back a newer generation/token revision.
+    if (accountConnection && (connection.generation < accountConnection.generation
+      || (connection.sessionHandle === accountConnection.sessionHandle && connection.tokenRevision < accountConnection.tokenRevision))) throw interrupted();
+    return publishConnection(connection);
   },
-  recordConnectionVersion(version: string | null): void {
-    if (accountConnection && version) accountConnection.version = Number(version);
-  },
-  endServerSession(): Promise<void> {
-    const version = accountConnection?.version ?? 0;
-    serverConnectionVersion++;
-    accountConnection = null;
-    return call('FrontendBridge.EndServerSession', version);
+  async endServerSession(): Promise<ChisaSessionEndResult> {
+    const predecessor = accountConnection;
+    const captured = getAuthSessionSnapshot();
+    // Auth retains its committed handle independently of the URL cache; no zero/wildcard logout is ever sent.
+    const handle = predecessor?.sessionHandle ?? captured.nativeHandle;
+    if (!handle) return { ok: false, code: 'STALE_SERVER_SESSION' };
+    const attempt = beginAuthServerSwitch();
+    ++apiConnectionRevision;
+    announceConnection();
+    try {
+      let revision = predecessor?.tokenRevision ?? captured.tokenRevision;
+      let result = await call<ChisaSessionEndResult>('FrontendBridge.EndServerSessionV2', handle, revision);
+      if (!result.ok && result.code === 'STALE_SERVER_SESSION') {
+        const current = await call<ChisaApiConnection>('FrontendBridge.GetApiConnection');
+        validateConnection(current);
+        // Refresh may race logout. Retry only the unsent conditional revoke for the same login, never another handle.
+        if (current.sessionHandle === handle) {
+          revision = current.tokenRevision;
+          result = await call<ChisaSessionEndResult>('FrontendBridge.EndServerSessionV2', handle, revision);
+        }
+      }
+      if (result.connection && getAuthSessionSnapshot().nativeHandle === handle) publishConnection(result.connection);
+      if (!result.ok) throw new Error('账号会话未能安全关闭，请重试注销');
+      return result;
+    } finally { await finishAuthServerSwitch(attempt, false); announceConnection(); }
   },
   reportFrontendError(report: FrontendErrorReport): Promise<void> {
     return call('FrontendBridge.ReportFrontendError', report);
@@ -76,7 +161,9 @@ export const FrontendBridge = {
   ): Promise<BridgeResponse> {
     return call('FrontendBridge.ServerRequest', requestId, method, path, headers, bodyB64);
   },
-  beginServerRequest(): Promise<string> { return call('FrontendBridge.BeginServerRequest'); },
+  beginServerRequest(connection: ChisaApiConnection, purpose: 'api' | 'login' | 'restore' | 'public-status', token = connection.accessToken): Promise<ChisaRequestReservation> {
+    return call('FrontendBridge.BeginServerRequestV2', connection.sessionHandle, token, connection.tokenRevision, purpose, connection.serverKey);
+  },
   cancelServerRequest(requestId: string): Promise<void> { return call('FrontendBridge.CancelServerRequest', requestId); },
   selectSshLocalFolder(): Promise<SshNativePathResult> { return call('FrontendBridge.SelectSshLocalFolder'); },
   selectSshIdentityFile(): Promise<SshNativePathResult> { return call('FrontendBridge.SelectSshIdentityFile'); },

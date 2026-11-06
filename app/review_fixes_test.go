@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/base64"
 	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -18,18 +17,8 @@ func (f reviewRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { re
 // Account requests use real HTTP sockets without creating an SSH process.
 func reviewHTTP(t *testing.T, handler http.HandlerFunc) *serverConnection {
 	t.Helper()
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-	previous := apiConnection
-	current, err := newServerConnection(server.URL, server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	apiConnection = current
-	t.Cleanup(func() {
-		current.cancel()
-		apiConnection = previous
-	})
+	current := nativeSessionFixture(t, handler)
+	current.accessToken = "TRACE_SECRET_REQUEST_HEADER"
 	return current
 }
 
@@ -46,7 +35,7 @@ func TestReviewBridgeCancellationReachesRealHTTP(t *testing.T) {
 		close(canceled)
 	})
 	bridge := FrontendBridge{}
-	id := bridge.BeginServerRequest()
+	id := reserveTestRequest(t, "api")
 	result := make(chan BridgeResponse, 1)
 	go func() { result <- bridge.ServerRequest(id, "GET", "/api/slow", nil, "") }()
 	select {
@@ -74,11 +63,11 @@ func TestReviewBridgeSendsNoHealthPreflight(t *testing.T) {
 	paths := make(chan string, 2)
 	reviewHTTP(t, func(w http.ResponseWriter, r *http.Request) {
 		paths <- r.URL.Path
-		w.Header().Set("X-Refreshed-Token", "example.payload.signature")
+		w.Header().Set("X-Refreshed-Token", testSessionToken(1, "fixture", "trace-refresh"))
 		_, _ = w.Write([]byte("actual HTTP response"))
 	})
 	bridge := FrontendBridge{}
-	response := bridge.ServerRequest(bridge.BeginServerRequest(), "GET", "/api/projects", nil, "")
+	response := bridge.ServerRequest(reserveTestRequest(t, "api"), "GET", "/api/projects", nil, "")
 	body, _ := base64.StdEncoding.DecodeString(response.BodyB64)
 	if response.Status != 200 || string(body) != "actual HTTP response" {
 		t.Fatalf("response lost: %+v", response)
@@ -91,12 +80,12 @@ func TestReviewBridgeSendsNoHealthPreflight(t *testing.T) {
 func TestReviewBridgeCancelBeforeForwardAndOnAccountReplacement(t *testing.T) {
 	current := reviewHTTP(t, func(w http.ResponseWriter, r *http.Request) { t.Error("canceled request was forwarded") })
 	bridge := FrontendBridge{}
-	id := bridge.BeginServerRequest()
+	id := reserveTestRequest(t, "api")
 	bridge.CancelServerRequest(id)
 	if response := bridge.ServerRequest(id, "GET", "/api/projects", nil, ""); response.Status != 499 {
 		t.Fatal(response)
 	}
-	id = bridge.BeginServerRequest()
+	id = reserveTestRequest(t, "api")
 	value, _ := bridgeRequests.Load(id)
 	current.cancel()
 	if value.(*bridgeRequest).ctx.Err() != context.Canceled {

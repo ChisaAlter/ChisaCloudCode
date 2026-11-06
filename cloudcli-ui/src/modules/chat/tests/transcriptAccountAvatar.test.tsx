@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { createRef, useEffect } from 'react';
 import type { ComponentProps } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { act, render, waitFor } from '@testing-library/react';
-import { beforeEach, test, vi } from 'vitest';
+import { act, cleanup, render, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, test, vi } from 'vitest';
 
 import { AuthProvider, useAuth } from '@/modules/auth';
 import { TranscriptExportDocument } from '@/modules/chat/export/TranscriptExportDocument';
@@ -13,9 +13,11 @@ import MessageComponent from '@/modules/chat/transcript/MessageComponent';
 import { UiPreferencesProvider } from '@/shared/context/UiPreferencesContext';
 import type { AuthUserProfile, ChatMessage, DiffLine } from '@/shared/types';
 import type * as UserSettings from '@/shared/userSettings';
+import type * as Api from '@/shared/api';
+import { clearAuthToken, getAuthSessionSnapshot, initializeAuthSession, startAuthSession } from '@/shared/authToken';
 
 const requests = vi.hoisted(() => ({ user: vi.fn(), updateProfile: vi.fn(), onboardingStatus: vi.fn() }));
-vi.mock('@/shared/api', () => ({ api: { auth: requests, user: { onboardingStatus: requests.onboardingStatus } } }));
+vi.mock('@/shared/api', async importOriginal => ({ ...(await importOriginal<typeof Api>()), api: { auth: requests, user: { onboardingStatus: requests.onboardingStatus } } }));
 vi.mock('@/shared/chatDrafts', () => ({ hydrateChatDrafts: vi.fn(), resetChatDrafts: vi.fn() }));
 vi.mock('@/shared/userSettings', async (importOriginal) => ({
   ...await importOriginal<typeof UserSettings>(),
@@ -34,7 +36,7 @@ vi.mock('@/modules/chat/transcript/MessageSpeakControl', () => ({ default: () =>
 
 const FIRST_AVATAR = 'data:image/png;base64,Zmlyc3Q=';
 const SAVED_AVATAR = 'data:image/png;base64,c2F2ZWQ=';
-const initialUser: AuthUserProfile = { id: 1, username: 'demo-user', displayName: 'Demo User', avatarDataUrl: FIRST_AVATAR };
+const initialUser: AuthUserProfile = { id: 1, username: 'ayase', displayName: 'Ayase', avatarDataUrl: FIRST_AVATAR };
 const userMessage: ChatMessage = { type: 'user', content: 'Keep this existing turn', timestamp: '2026-10-06T07:00:00.000Z' };
 const assistantMessage: ChatMessage = { type: 'assistant', content: 'Existing reply', timestamp: '2026-10-06T07:00:01.000Z' };
 const messages = [userMessage, assistantMessage];
@@ -54,7 +56,7 @@ const paneProps: ComponentProps<typeof ChatMessagesPane> = {
   providerModels: { claude: 'test', cursor: 'test', codex: 'test', opencode: 'test' },
   setProviderModel: noop,
   providerModelCatalog: {},
-  providerModelActions: { create: async () => {}, update: async () => {}, remove: async () => {} },
+  providerModelActions: { create: async () => {}, update: async () => {}, remove: async () => {}, setCustomModelsOnly: async () => {} },
   providerModelsLoading: false,
   tasksEnabled: false,
   isTaskMasterInstalled: false,
@@ -66,6 +68,8 @@ const paneProps: ComponentProps<typeof ChatMessagesPane> = {
   visibleMessageCount: messages.length,
   visibleMessages: messages,
   loadEarlierMessages: noop,
+  revealMessage: noop,
+  sendMessage: noop,
   loadAllMessages: noop,
   allMessagesLoaded: true,
   isLoadingAllMessages: false,
@@ -92,13 +96,20 @@ const liveTranscript = () => (
 );
 const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } });
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.resetAllMocks();
   localStorage.clear();
-  localStorage.setItem('auth-token', 'initial.payload.signature');
+  await initializeAuthSession();
+  await clearAuthToken(getAuthSessionSnapshot());
+  const encode = (value: unknown) => btoa(JSON.stringify(value)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const now = Math.floor(Date.now() / 1000);
+  const current = await startAuthSession(`${encode({ alg: 'HS256' })}.${encode({ userId: 1, iat: now, exp: now + 3600 })}.signature`, getAuthSessionSnapshot());
+  assert.ok(current);
   requests.user.mockImplementation(() => Promise.resolve(json({ user: initialUser })));
   requests.onboardingStatus.mockImplementation(() => Promise.resolve(json({ hasCompletedOnboarding: true })));
 });
+
+afterEach(async () => { cleanup(); await clearAuthToken(getAuthSessionSnapshot()); });
 
 test('saving a profile updates the existing live user avatar through the memoized transcript', async () => {
   const view = render(liveTranscript());
@@ -112,7 +123,7 @@ test('saving a profile updates the existing live user avatar through the memoize
 
   requests.updateProfile.mockImplementation(() => Promise.resolve(json({ user: { ...initialUser, avatarDataUrl: SAVED_AVATAR } })));
   await act(async () => {
-    const result = await auth.updateProfile('Demo User', SAVED_AVATAR);
+    const result = await auth.updateProfile('Ayase', SAVED_AVATAR);
     assert.deepEqual(result, { success: true });
   });
   // The account context, not a new message or a new pane instance, triggers it.
@@ -124,7 +135,7 @@ test('saving a profile updates the existing live user avatar through the memoize
   assert.equal(view.container.querySelector('.chat-message.assistant'), reply);
   assert.equal(reply?.querySelector('svg'), providerAvatar);
   assert.equal(reply?.querySelector('img'), null, 'the account picture must not replace the provider avatar');
-  assert.deepEqual(requests.updateProfile.mock.calls, [['Demo User', SAVED_AVATAR]]);
+  assert.deepEqual(requests.updateProfile.mock.calls, [['Ayase', SAVED_AVATAR]]);
 });
 
 test('a missing profile and a static export render neutral avatars without an AuthProvider', () => {

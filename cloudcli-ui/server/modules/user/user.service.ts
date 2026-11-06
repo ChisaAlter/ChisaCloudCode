@@ -1,4 +1,5 @@
-import { AppError } from '@/shared/utils.js';
+import { AppError } from '@/shared/index.js';
+import type { QueuedChatMessage, UserPreferenceSnapshot, UserPreferenceTransaction, UserPreferenceTransactionResult } from '@/shared/index.js';
 
 type GitConfig = {
   git_name: string | null;
@@ -21,12 +22,20 @@ type UserDependencies = {
     hasCompletedOnboarding(userId: number): boolean;
   };
   preferences: {
-    getPreferences(userId: number): Record<string, unknown>;
+    getPreferenceSnapshot(userId: number): UserPreferenceSnapshot;
     savePreferences(userId: number, updates: Record<string, unknown>): void;
+    savePreferenceTransaction(userId: number, transaction: UserPreferenceTransaction): UserPreferenceTransactionResult;
   };
   drafts: {
     getDrafts(userId: number): DraftRecord[];
-    saveDraft(userId: number, scope: string, draft: { text: string; queuedMessage?: unknown | null }): void;
+    saveDraft(userId: number, scope: string, draft: { text: string; queuedMessage: unknown | null }): void;
+    saveDraftText(userId: number, scope: string, text: string): void;
+    appendQueuedMessage(
+      userId: number,
+      scope: string,
+      message: QueuedChatMessage,
+    ): { queuedMessage: QueuedChatMessage; appended: boolean } | null;
+    clearQueuedMessage(userId: number, scope: string): void;
     deleteDraft(userId: number, scope: string): void;
   };
   readSystemGitConfig(): Promise<GitConfig>;
@@ -58,6 +67,28 @@ const readDraftScope = (value: unknown): string => {
   return scope;
 };
 
+const isPlainObject = (value: unknown): value is Record<string, unknown> => (
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+);
+
+/** Reads the message the composer asks to queue; one with nothing to send is refused. */
+const readQueuedMessageInput = (value: unknown): QueuedChatMessage => {
+  const message = isPlainObject(value) ? value : {};
+  const content = typeof message.content === 'string' ? message.content : '';
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  if (!content.trim() && attachments.length === 0) {
+    throw new AppError('A queued message needs text or attachments', {
+      code: 'INVALID_QUEUED_MESSAGE',
+      statusCode: 400,
+    });
+  }
+  return {
+    content,
+    ...(isPlainObject(message.options) ? { options: message.options } : {}),
+    attachments,
+  };
+};
+
 const readPreferenceUpdates = (body: unknown): Record<string, unknown> => {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     throw new AppError('Preferences must be sent as an object', {
@@ -79,7 +110,7 @@ const readPreferenceUpdates = (body: unknown): Record<string, unknown> => {
   return updates;
 };
 
-/** Creates user-profile workflows with explicit repository and Git adapters. */
+/** The User module/router consumes profile workflows with explicit repository and Git adapters. */
 export function createUserService(dependencies: UserDependencies) {
   return {
     async getGitConfig(userId: number) {
@@ -143,20 +174,21 @@ export function createUserService(dependencies: UserDependencies) {
       };
     },
 
-    /** Every stored preference at once; the client fills gaps with its defaults. */
+    /** Values and revisions are read together; absent keys have revision zero. */
     getPreferences(userId: number) {
-      return { success: true, preferences: dependencies.preferences.getPreferences(userId) };
+      return { success: true, ...dependencies.preferences.getPreferenceSnapshot(userId) };
     },
 
-    /**
-     * Merge-patch: only the keys in the request body are touched, so two
-     * independent settings screens can save concurrently without one erasing
-     * the other's work.
-     */
+    /** Legacy writes keep merge semantics and increment the same revisions as versioned writes. */
     savePreferences(userId: number, body: unknown) {
       const updates = readPreferenceUpdates(body);
       dependencies.preferences.savePreferences(userId, updates);
-      return { success: true, preferences: dependencies.preferences.getPreferences(userId) };
+      return { success: true, ...dependencies.preferences.getPreferenceSnapshot(userId) };
+    },
+
+    /** The repository compares all revisions and commits synchronously without an async admission gap. */
+    savePreferenceTransaction(userId: number, transaction: UserPreferenceTransaction) {
+      return dependencies.preferences.savePreferenceTransaction(userId, transaction);
     },
 
     getDrafts(userId: number) {
@@ -175,10 +207,45 @@ export function createUserService(dependencies: UserDependencies) {
         });
       }
 
+      // The composer's debounced save sends only the text. Its copy of the
+      // queued message can be stale (already claimed by the dispatcher, or added
+      // to from another tab), so a save without one leaves the stored one alone.
+      if (payload.queuedMessage === undefined) {
+        dependencies.drafts.saveDraftText(userId, scope, text);
+        return { success: true };
+      }
+
       dependencies.drafts.saveDraft(userId, scope, {
         text,
-        ...('queuedMessage' in payload ? { queuedMessage: payload.queuedMessage ?? null } : {}),
+        queuedMessage: payload.queuedMessage ?? null,
       });
+      return { success: true };
+    },
+
+    /**
+     * Queues a message behind the session's running turn. A message already
+     * waiting there is kept and this one is added after it, so a burst of
+     * follow-ups all reach the provider, in order, as the next turn.
+     *
+     * A slash command is the one exception: it only works as a turn of its
+     * own, so it is refused rather than merged, and the composer keeps it.
+     */
+    appendQueuedMessage(userId: number, scopeInput: unknown, queuedMessageInput: unknown) {
+      const scope = readDraftScope(scopeInput);
+      const message = readQueuedMessageInput(queuedMessageInput);
+      const result = dependencies.drafts.appendQueuedMessage(userId, scope, message);
+      if (!result) {
+        throw new AppError(
+          'A slash command runs as a turn of its own, so it cannot be combined with the queued message. '
+            + 'Send it after the queued message has gone.',
+          { code: 'QUEUED_MESSAGE_NOT_COMBINABLE', statusCode: 409 },
+        );
+      }
+      return { success: true, queuedMessage: result.queuedMessage, appended: result.appended };
+    },
+
+    clearQueuedMessage(userId: number, scopeInput: unknown) {
+      dependencies.drafts.clearQueuedMessage(userId, readDraftScope(scopeInput));
       return { success: true };
     },
 

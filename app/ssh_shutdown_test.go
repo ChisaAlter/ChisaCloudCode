@@ -55,10 +55,11 @@ func TestSshDesktopShutdownPreservesLateServerCleanupThenWaitsSupervisor(t *test
 	waitRegistration(t, manager, scope, profile.ID, "registered")
 	bridge := FrontendBridge{}
 	frontendDone := make(chan BridgeResponse, 1)
+	id := reserveTestRequest(t, "api")
 	go func() {
-		frontendDone <- bridge.ServerRequest(bridge.BeginServerRequest(), http.MethodGet, "/api/wait-before-close", nil, "")
+		frontendDone <- bridge.ServerRequest(id, http.MethodGet, "/api/wait-before-close", nil, "")
 	}()
-	<-started
+	awaitNativeSignal(t, started, "frontend shutdown fixture did not reach the upstream")
 	// The UI callback must not wait for the account lock or cancel its shared
 	// native account connection before cleanup can use it.
 	serverConnectionMu.Lock()

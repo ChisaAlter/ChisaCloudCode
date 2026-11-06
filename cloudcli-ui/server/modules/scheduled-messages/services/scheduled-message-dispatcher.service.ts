@@ -1,7 +1,9 @@
 import { scheduledMessagesDb, sessionDraftsDb } from '@/modules/database/index.js';
 import type { QueuedSessionMessageRecord, ScheduledMessageRow } from '@/modules/database/index.js';
 import { isChatRunInFlight, onChatRunSettled, runDetachedChatTurn } from '@/modules/websocket/index.js';
+import { announceScheduledMessagesChanged } from './scheduled-messages.service.js';
 import type { ProviderRuntimeGateway } from '@/modules/websocket/index.js';
+import { readQueuedChatMessage } from '@/shared/utils.js';
 
 // Completion wakes the queue immediately; polling also catches persisted edits
 // and workspace changes that did not come from a chat run in this process.
@@ -13,12 +15,6 @@ let dispatchInFlight = false;
 let dispatchRequested = false;
 const sessionDispatches = new Map<string, Promise<void>>();
 
-type StoredQueuedMessage = {
-  content: string;
-  options: Record<string, unknown>;
-  attachments: unknown[];
-};
-
 function readOptions(raw: string): Record<string, unknown> {
   try {
     const parsed: unknown = JSON.parse(raw);
@@ -28,20 +24,6 @@ function readOptions(raw: string): Record<string, unknown> {
   } catch {
     return {};
   }
-}
-
-function readQueuedMessage(value: unknown): StoredQueuedMessage | null {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const content = typeof record.content === 'string' ? record.content : '';
-  const attachments = Array.isArray(record.attachments)
-    ? record.attachments
-    : Array.isArray(record.images) ? record.images : [];
-  if (!content.trim() && attachments.length === 0) return null;
-  const options = record.options && typeof record.options === 'object' && !Array.isArray(record.options)
-    ? record.options as Record<string, unknown>
-    : {};
-  return { content, options, attachments };
 }
 
 function reportDispatchError(error: unknown): void {
@@ -65,7 +47,7 @@ async function sendClaimedQueuedMessage(
   candidate: QueuedSessionMessageRecord,
   runtime: ProviderRuntimeGateway,
 ): Promise<void> {
-  const message = readQueuedMessage(candidate.queuedMessage);
+  const message = readQueuedChatMessage(candidate.queuedMessage);
   if (!message) {
     sessionDraftsDb.deleteEmptyDraft(candidate.userId, candidate.sessionId);
     return;
@@ -91,11 +73,24 @@ async function sendClaimedQueuedMessage(
   if (result.error) throw Object.assign(new Error(result.error), { code: result.code });
 }
 
+/**
+ * Whether a queued turn has to keep waiting for the session.
+ *
+ * A turn that ends with background work still going (a backgrounded command,
+ * agent or workflow) is marked completed, but its CLI process stays open so
+ * that work can report back. A new turn replaces that process and stops the
+ * work, which is why the composer asks before an interactive send. A queued
+ * turn was promised to go "when this finishes", so it waits for that work too.
+ */
+function isSessionBusy(sessionId: string, runtime: ProviderRuntimeGateway): boolean {
+  return isChatRunInFlight(sessionId) || runtime.hasBackgroundWork(sessionId);
+}
+
 /** Scheduled dispatcher and tests claim idle-session queued turns once; tests may await completion. */
 export async function dispatchQueuedMessages(runtime: ProviderRuntimeGateway, waitForCompletion = true): Promise<number> {
   const tasks: Promise<void>[] = [];
   for (const candidate of sessionDraftsDb.listQueuedMessages()) {
-    if (sessionDispatches.has(candidate.sessionId) || isChatRunInFlight(candidate.sessionId)) continue;
+    if (sessionDispatches.has(candidate.sessionId) || isSessionBusy(candidate.sessionId, runtime)) continue;
     if (!sessionDraftsDb.claimQueuedMessage(candidate)) continue;
     tasks.push(enqueueSessionDispatch(candidate.sessionId, () => sendClaimedQueuedMessage(candidate, runtime)));
   }
@@ -103,7 +98,16 @@ export async function dispatchQueuedMessages(runtime: ProviderRuntimeGateway, wa
   return tasks.length;
 }
 
-async function sendClaimedMessage(row: ScheduledMessageRow, runtime: ProviderRuntimeGateway): Promise<void> {
+/** Records why a claimed message did not go, and shows it on its session's banner. */
+function recordFailure(row: ScheduledMessageRow, reason: string): void {
+  scheduledMessagesDb.markFailed(row.id, reason);
+  announceScheduledMessagesChanged(row.session_id);
+}
+
+async function sendClaimedMessage(
+  row: ScheduledMessageRow,
+  runtime: ProviderRuntimeGateway,
+): Promise<void> {
   try {
     const result = await runDetachedChatTurn(
       {
@@ -118,10 +122,11 @@ async function sendClaimedMessage(row: ScheduledMessageRow, runtime: ProviderRun
       { runtime },
     );
     if (!result.started || result.error) {
-      scheduledMessagesDb.markFailed(row.id, result.error ?? 'The session was unavailable when this was due.');
+      recordFailure(row, result.error ?? 'The session was unavailable when this was due.');
     }
   } catch (error) {
-    scheduledMessagesDb.markFailed(row.id, error instanceof Error ? error.message : String(error));
+    const message = error instanceof Error ? error.message : String(error);
+    recordFailure(row, message);
   }
 }
 
@@ -132,6 +137,16 @@ export async function dispatchDueScheduledMessages(
   waitForCompletion = true,
 ): Promise<number> {
   const due = scheduledMessagesDb.claimDue(now);
+  if (due.length === 0) {
+    return 0;
+  }
+
+  // The claim already recorded them as sent, so their banners come down now,
+  // as the turns start, rather than once the last turn has finished.
+  for (const sessionId of new Set(due.map((row) => row.session_id))) {
+    announceScheduledMessagesChanged(sessionId);
+  }
+
   const tasks = due.map(row => enqueueSessionDispatch(row.session_id, () => sendClaimedMessage(row, runtime)));
   if (waitForCompletion) await Promise.all(tasks);
   return due.length;

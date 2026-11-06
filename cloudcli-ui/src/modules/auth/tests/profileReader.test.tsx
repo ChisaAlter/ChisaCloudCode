@@ -4,7 +4,7 @@ import { afterEach, beforeEach, test, vi } from 'vitest';
 import { AccountProfileEditor } from '@/modules/auth/AccountProfileEditor';
 
 const actions = vi.hoisted(() => ({ updateProfile: vi.fn(), logout: vi.fn() }));
-vi.mock('@/modules/auth/context/AuthContext', () => ({ useAuth: () => ({ user: { username: 'demo-user', avatarDataUrl: 'data:image/png;base64,old' }, ...actions }) }));
+vi.mock('@/modules/auth/context/AuthContext', () => ({ useAuth: () => ({ user: { username: 'ayase', avatarDataUrl: 'data:image/png;base64,old' }, ...actions }) }));
 class AvatarReader {
   static readers: AvatarReader[] = [];
   result: string | null = null;
@@ -35,7 +35,7 @@ test('only the current avatar reader can become a persistable preview', async ()
   act(() => AvatarReader.readers[0].finish('data:image/png;base64,stale'));
   assert.equal(view.container.querySelector('img')?.getAttribute('src'), 'data:image/png;base64,new');
   await act(async () => { fireEvent.submit(view.container.querySelector('form')!); });
-  assert.deepEqual(actions.updateProfile.mock.calls, [['demo-user', 'data:image/png;base64,new']]);
+  assert.deepEqual(actions.updateProfile.mock.calls, [['ayase', 'data:image/png;base64,new']]);
 });
 
 test('unmount aborts the reader and ignores its late preview', () => {

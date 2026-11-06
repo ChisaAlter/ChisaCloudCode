@@ -95,7 +95,7 @@ func TestServerRequestTracePostHeaderEOFDoesNotReplay(t *testing.T) {
 		}
 	})
 	bridge := FrontendBridge{}
-	response := bridge.ServerRequest(bridge.BeginServerRequest(), http.MethodPost, "/api/trace-post?secret=TRACE_SECRET_QUERY", map[string]string{
+	response := bridge.ServerRequest(reserveTestRequest(t, "api"), http.MethodPost, "/api/trace-post?secret=TRACE_SECRET_QUERY", map[string]string{
 		"Authorization": "Bearer TRACE_SECRET_REQUEST_HEADER",
 	}, base64.StdEncoding.EncodeToString([]byte(body)))
 	requireServerRequestError(t, response, 502, "UPSTREAM_CONNECTION_FAILED")
@@ -121,7 +121,7 @@ func TestServerRequestTraceBodyEOFReportsPartialRead(t *testing.T) {
 		}
 	})
 	bridge := FrontendBridge{}
-	response := bridge.ServerRequest(bridge.BeginServerRequest(), http.MethodGet, "/api/trace-body?secret=TRACE_SECRET_QUERY", map[string]string{
+	response := bridge.ServerRequest(reserveTestRequest(t, "api"), http.MethodGet, "/api/trace-body?secret=TRACE_SECRET_QUERY", map[string]string{
 		"Authorization": "Bearer TRACE_SECRET_REQUEST_HEADER",
 	}, "")
 	requireServerRequestError(t, response, 502, "UPSTREAM_RESPONSE_READ_FAILED")

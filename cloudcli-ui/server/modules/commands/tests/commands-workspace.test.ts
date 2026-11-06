@@ -11,7 +11,10 @@ import { closeConnection, initializeDatabase, projectsDb, sessionsDb } from '@/m
 // Catalog/selector fixtures deliberately do not restore an account runtime.
 mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
   ensureCloudWorkspaceBinding() {}, excludeCloudWorkspaceMetadata() {}, getWorkspaceRuntimeIdentity() { return undefined; },
-  assertCloudWorkspaceOwner() { assert.fail('unexpected account-history authorization in catalog fixture'); },
+  getWorkspaceBrokerAdmission() { assert.fail('read-only catalog must not start a broker lease'); },
+  closeWorkspaceBrokerLease() { assert.fail('read-only catalog must not close a broker lease'); },
+  readCloudWorkspaceOwner() { return undefined; },
+  assertCloudWorkspaceOwner() { /* Account ownership has dedicated workspace composition coverage. */ },
   executeWorkspaceRuntimePreview() { assert.fail('unexpected preview'); }, createWorkspaceRuntimeService() { assert.fail('unexpected restore'); },
 } });
 const { assertWorkspaceDescriptor, bridgeFileSystem, describeWorkspaceSelection, isWorkspaceBound, workspaceRequestScope } = await import('@/modules/workspace-bridge/index.js');

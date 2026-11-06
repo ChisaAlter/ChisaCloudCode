@@ -7,7 +7,10 @@ import type { SshExistingProject, WizardStep } from '@/shared/types';
 type WizardFooterProps = {
   step: WizardStep;
   isCreating: boolean;
+  isCancelling: boolean;
   isCloneWorkflow: boolean;
+  cloneRetry: boolean;
+  onCancelClone: () => void;
   existingProject?: SshExistingProject;
   onClose: () => void;
   onBack: () => void;
@@ -19,7 +22,10 @@ type WizardFooterProps = {
 export default function WizardFooter({
   step,
   isCreating,
+  isCancelling,
   isCloneWorkflow,
+  cloneRetry,
+  onCancelClone,
   existingProject,
   onClose,
   onBack,
@@ -30,8 +36,10 @@ export default function WizardFooter({
 
   return (
     <div className="flex items-center justify-between border-t border-gray-200 p-6 dark:border-gray-700">
-      <Button variant="outline" onClick={step === 1 ? onClose : onBack} disabled={isCreating}>
-        {step === 1 ? (
+      <Button variant="outline" onClick={isCloneWorkflow && (isCreating || cloneRetry) ? onCancelClone : step === 1 ? onClose : onBack} disabled={isCancelling || (isCreating && !isCloneWorkflow)}>
+        {isCloneWorkflow && (isCreating || cloneRetry || isCancelling) ? (
+          isCancelling ? 'Cancelling import…' : 'Cancel import'
+        ) : step === 1 ? (
           t('projectWizard.buttons.cancel')
         ) : (
           <>
@@ -41,7 +49,7 @@ export default function WizardFooter({
         )}
       </Button>
 
-      <Button onClick={existingProject || step === 2 ? onCreate : onNext} disabled={isCreating}>
+      <Button onClick={existingProject || step === 2 ? onCreate : onNext} disabled={isCreating || isCancelling}>
         {isCreating ? (
           <>
             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -49,6 +57,8 @@ export default function WizardFooter({
               ? t('projectWizard.buttons.cloning', { defaultValue: 'Cloning...' })
               : t('projectWizard.buttons.creating')}
           </>
+        ) : cloneRetry ? (
+          <>Retry import / open project</>
         ) : existingProject ? (
           <>{existingProject.isArchived ? '恢复并打开项目' : '打开已有项目'}</>
         ) : step === 2 ? (

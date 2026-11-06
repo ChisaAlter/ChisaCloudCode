@@ -12,10 +12,17 @@ type Dependencies = Parameters<typeof createWebSocketServer>[1];
 
 function dependencies(): Dependencies {
   return {
-    verifyClient: { isPlatform: false, authenticateWebSocket: token => token === 'test-token' ? { id: 'one', username: 'test' } : null },
+    verifyClient: {
+      isPlatform: false,
+      authenticateWebSocket: token => token === 'test-token' ? { id: 1, username: 'test', sessionId: 'session-one', sessionVersion: 0, sessionExpiresAt: Math.floor(Date.now() / 1000) + 60 } : null,
+      consumeWebSocketTicket: () => null,
+      isAuthSessionActive: () => true,
+      authorizeUpgrade: request => request.headers.origin === 'http://127.0.0.1',
+    },
     chat: {} as Dependencies['chat'],
     shell: { resolveProviderSessionId: () => null },
     getPluginPort: () => null,
+    authorizePluginAccess: () => { throw new Error('denied'); },
   };
 }
 
@@ -24,6 +31,7 @@ test('one upgrade dispatcher exclusively delegates runtime preview requests', as
   let previewCalls = 0;
   const wss = createWebSocketServer(server, {
     ...dependencies(),
+    authorizePreviewUpgrade: () => true,
     handlePreviewUpgrade(request, socket, head) {
       previewCalls += 1;
       assert.equal(request.url, '/api/workspace-runtime/preview/token/hmr');
@@ -54,7 +62,7 @@ test('ordinary shell upgrade still authenticates and enforces workspace selector
   const denied = new WebSocket(`ws://127.0.0.1:${address.port}/shell?token=invalid`);
   const rejected = await new Promise<Error>(resolve => denied.once('error', resolve));
   assert.match(rejected.message, /401/);
-  const client = new WebSocket(`ws://127.0.0.1:${address.port}/shell?token=test-token`);
+  const client = new WebSocket(`ws://127.0.0.1:${address.port}/shell`, { headers: { Authorization: 'Bearer test-token', Origin: 'http://127.0.0.1' } });
   try {
     await once(client, 'open');
     const message = once(client, 'message');

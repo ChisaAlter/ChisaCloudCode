@@ -2,11 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { TFunction } from 'i18next';
 
 import { api, ApiRequestError, readApiJson } from '@/shared/api';
-import { getServerConnectionVersion, isDesktop } from '@/shared/chisa';
-import { getAuthSessionVersion } from '@/shared/authToken';
+import { getServerConnectionVersion, getServerTransportVersion, isDesktop, subscribeToServerConnection } from '@/shared/chisa';
+import { getAuthSessionSnapshot, getAuthSessionVersion, isCurrentAuthSession, subscribeToAuthSession } from '@/shared/authToken';
+import { createAuthenticatedEventSource } from '@/shared/authenticatedEventSource';
 import { subscribeToUserPreferences } from '@/shared/userSettings';
 import { usePaletteOps } from '@/modules/command-palette';
-import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationProjectResult, ConversationSearchResults, LLMProvider, Project, ProjectSession, ProjectSortOrder, RecentConversationListItem, SearchProgress, ActiveSidebarRename, PendingSidebarDeletion, SessionTitleSearchResult, SessionWithProvider, SidebarSearchMode } from '@/shared/types';
+import type { ArchivedProjectListItem, ArchivedSessionListItem, ConversationProjectResult, ConversationSearchResults, LLMProvider, Project, ProjectSession, ProjectSortOrder, RecentConversationListItem, SearchProgress, ActiveSidebarRename, PendingSidebarDeletion, SessionTitleSearchResult, SessionWithProvider, SidebarSearchMode, SidebarSessionSelection } from '@/shared/types';
 import {
   filterProjects,
   getAllSessions,
@@ -18,6 +19,20 @@ import {
   readProjectSortOrder,
 } from '@/modules/sidebar/utils/sidebarStoredPreferences';
 
+
+const EXPANDED_PROJECTS_STORAGE_KEY = 'cloudcli-expanded-projects';
+
+/** Read browser-local project expansion, tolerating missing or invalid storage. */
+function readExpandedProjects(): Set<string> | null {
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(EXPANDED_PROJECTS_STORAGE_KEY) ?? 'null');
+    return Array.isArray(saved)
+      ? new Set(saved.filter((id): id is string => typeof id === 'string'))
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 type ArchivedSessionsApiPayload = {
   success?: boolean;
@@ -49,6 +64,8 @@ type UseSidebarControllerArgs = {
   selectedProject: Project | null;
   selectedSession: ProjectSession | null;
   activeSessions: ReadonlySet<string>;
+  /** The busy sessions only running background work; unlike the rest of `activeSessions` they can be deleted. */
+  backgroundSessionIds: ReadonlySet<string>;
   isLoading: boolean;
   isMobile: boolean;
   t: TFunction;
@@ -62,13 +79,16 @@ type UseSidebarControllerArgs = {
   setCurrentProject: (project: Project) => void;
   setSidebarVisible: (visible: boolean) => void;
   sidebarVisible: boolean;
+  keepProjectsExpanded?: boolean;
 };
 
+/** Used by Sidebar to coordinate project navigation, expansion and session actions. */
 export function useSidebarController({
   projects,
   selectedProject,
   selectedSession: _selectedSession,
   activeSessions,
+  backgroundSessionIds,
   isLoading,
   isMobile,
   t,
@@ -81,18 +101,56 @@ export function useSidebarController({
   setCurrentProject,
   setSidebarVisible,
   sidebarVisible,
+  keepProjectsExpanded = false,
 }: UseSidebarControllerArgs) {
   // App replaces this account-owned controller; late HTTP bodies and SSE events are fenced too.
   const [identity] = useState(() => ({ auth: getAuthSessionVersion(), server: getServerConnectionVersion() }));
   const mounted = useRef(true);
   const deletionRequest = useRef<AbortController | null>(null);
+  const accountIdentityCurrent = identity.auth === getAuthSessionVersion() && identity.server === getServerConnectionVersion();
   const accountCurrent = useCallback(() => mounted.current && identity.auth === getAuthSessionVersion() && identity.server === getServerConnectionVersion(), [identity]);
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; deletionRequest.current?.abort(); };
   }, []);
   const paletteOps = usePaletteOps();
-  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
+  // Remember whether a saved set existed before the first persistence effect.
+  const restoredExpandedProjects = useRef<Set<string> | null>(null);
+  // Project expansion is browser-local; the opt-in preference follows the user.
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => {
+    restoredExpandedProjects.current = keepProjectsExpanded ? readExpandedProjects() : null;
+    return restoredExpandedProjects.current ?? new Set();
+  });
+  // Detect preference hydration as well as a live toggle without overwriting saved groups.
+  const previousKeepProjectsExpanded = useRef(keepProjectsExpanded);
+  // Distinguish the initial restored selection from subsequent navigation.
+  const selectionExpansion = useRef<{ seenSelection: boolean; projectId?: string }>({ seenSelection: false });
+  useEffect(() => {
+    const wasEnabled = previousKeepProjectsExpanded.current;
+    previousKeepProjectsExpanded.current = keepProjectsExpanded;
+    if (!keepProjectsExpanded) {
+      if (wasEnabled && expandedProjects.size > 1) {
+        const retainedId = selectedProject?.projectId && expandedProjects.has(selectedProject.projectId)
+          ? selectedProject.projectId
+          : [...expandedProjects][0];
+        setExpandedProjects(new Set([retainedId]));
+      }
+      return;
+    }
+    if (!wasEnabled) {
+      const saved = readExpandedProjects();
+      restoredExpandedProjects.current = saved;
+      if (saved) {
+        setExpandedProjects(saved);
+        return;
+      }
+    }
+    try {
+      localStorage.setItem(EXPANDED_PROJECTS_STORAGE_KEY, JSON.stringify([...expandedProjects]));
+    } catch { /* Keep navigation working when browser storage is unavailable. */ }
+  }, [expandedProjects, keepProjectsExpanded, selectedProject?.projectId]);
+  // Running groups start expanded and remember manual collapses independently of Projects.
+  const [collapsedRunningProjects, setCollapsedRunningProjects] = useState<Set<string>>(new Set());
   // The one rename the sidebar has open, as a single value so a project and a
   // session cannot both be mid-rename. See ActiveSidebarRename.
   const [activeRename, setActiveRename] = useState<ActiveSidebarRename | null>(null);
@@ -115,6 +173,15 @@ export function useSidebarController({
   const [sidebarError, setSidebarError] = useState<string | null>(null);
   // Desktop starts with recent conversations; projects remain one click away.
   const [searchMode, setSearchMode] = useState<SidebarSearchMode>(() => isDesktop() ? 'conversations' : 'projects');
+  // The one session list currently in bulk-selection mode, with the rows ticked
+  // in it. It lives here rather than in the list component because the delete it
+  // feeds runs from this hook, and because holding a single selection is what
+  // keeps a bulk delete from spanning two projects. See SidebarSessionSelection.
+  const [sessionSelection, setSessionSelection] = useState<SidebarSessionSelection | null>(null);
+  // The ids a bulk delete has sent and not yet heard back about. A ref, not
+  // state: nothing renders from it, it only stops a second confirmation of the
+  // same rows (still on screen until the first settles) from sending them again.
+  const sessionIdsBeingDeletedRef = useRef<Set<string>>(new Set());
   const [conversationResults, setConversationResults] = useState<ConversationSearchResults | null>(null);
   const [isSearching, setIsSearching] = useState(false);
   const [searchProgress, setSearchProgress] = useState<SearchProgress | null>(null);
@@ -133,9 +200,15 @@ export function useSidebarController({
   const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
   const [optimisticStarByProjectId, setOptimisticStarByProjectId] = useState<Map<string, boolean>>(new Map());
   const [loadingMoreProjects, setLoadingMoreProjects] = useState<Set<string>>(new Set());
+  // The projects whose next session page is being fetched; `loadingMoreProjects`
+  // only mirrors it for the button. A ref, because the click handler has to know
+  // at once whether a load is running, and a flag set inside a state updater is
+  // not set yet when read back: React may hold the updater until the next render.
+  const projectIdsLoadingMoreSessionsRef = useRef<Set<string>>(new Set());
   const searchSeqRef = useRef(0);
   const recentConversationsSeqRef = useRef(0);
-  const eventSourceRef = useRef<EventSource | null>(null);
+  // The synchronous wrapper owns fetch admission and reader cancellation for this search only.
+  const eventSourceRef = useRef<ReturnType<typeof createAuthenticatedEventSource> | null>(null);
   const starToggleSequenceByProjectRef = useRef<Map<string, number>>(new Map());
   const migrationStartedRef = useRef(false);
   const onRefreshRef = useRef(onRefresh);
@@ -163,9 +236,13 @@ export function useSidebarController({
     // Depending on the full `selectedProject` object (or `selectedSession`) causes
     // websocket-driven list refreshes to re-open projects users manually collapsed.
     const selectedProjectId = selectedProject?.projectId;
-    if (!selectedProjectId) {
-      return;
-    }
+    if (selectionExpansion.current.projectId === selectedProjectId) return;
+    const isInitialSelection = !selectionExpansion.current.seenSelection;
+    selectionExpansion.current.projectId = selectedProjectId;
+    if (!selectedProjectId) return;
+    selectionExpansion.current.seenSelection = true;
+    // A saved set is authoritative on reload, including an intentionally empty set.
+    if (isInitialSelection && keepProjectsExpanded && restoredExpandedProjects.current !== null) return;
 
     setExpandedProjects((prev) => {
       if (prev.has(selectedProjectId)) {
@@ -175,7 +252,7 @@ export function useSidebarController({
       next.add(selectedProjectId);
       return next;
     });
-  }, [selectedProject?.projectId]);
+  }, [selectedProject?.projectId, keepProjectsExpanded]);
 
   useEffect(() => {
     if (projects.length > 0 && !isLoading) {
@@ -351,6 +428,41 @@ export function useSidebarController({
     reloadRecentConversations();
   }, [debouncedSearchQuery, reloadRecentConversations, searchMode]);
 
+  // The Conversations list is only fetched when its tab opens, while `projects`
+  // is patched the moment a session is renamed from the workspace header. Fold
+  // those title changes into the rows already loaded, or a header rename would
+  // leave the highlighted conversation on its old name. The loaded rows are
+  // returned as-is when no session carries a different custom name, so
+  // unrelated `projects` updates do not re-render the list, and an empty
+  // summary never overwrites the id the server shows for an unnamed session.
+  const recentConversationsWithCurrentTitles = useMemo(() => {
+    if (recentConversations.length === 0) {
+      return recentConversations;
+    }
+
+    // Trimmed, because that is how the server derives a row's `sessionTitle`.
+    const summaryBySessionId = new Map<string, string>();
+    for (const project of projects) {
+      for (const session of project.sessions ?? []) {
+        const summary = typeof session.summary === 'string' ? session.summary.trim() : '';
+        if (summary) {
+          summaryBySessionId.set(session.id, summary);
+        }
+      }
+    }
+
+    let changed = false;
+    const next = recentConversations.map((conversation) => {
+      const summary = summaryBySessionId.get(conversation.sessionId);
+      if (summary === undefined || summary === conversation.sessionTitle) {
+        return conversation;
+      }
+      changed = true;
+      return { ...conversation, sessionTitle: summary };
+    });
+    return changed ? next : recentConversations;
+  }, [projects, recentConversations]);
+
   useEffect(() => {
     if (searchMode !== 'archived') {
       return;
@@ -400,6 +512,24 @@ export function useSidebarController({
     };
   }, [searchFilter]);
 
+  // Retire an account's visible search immediately on authority/transport notification, even before App remounts.
+  useEffect(() => {
+    const expected = getAuthSessionSnapshot();
+    const transport = getServerTransportVersion();
+    const invalidate = () => {
+      if (accountCurrent() && isCurrentAuthSession(expected) && transport === getServerTransportVersion()) return;
+      ++searchSeqRef.current;
+      eventSourceRef.current?.close();
+      eventSourceRef.current = null;
+      setConversationResults(null);
+      setSearchProgress(null);
+      setIsSearching(false);
+    };
+    const stopAuth = subscribeToAuthSession(invalidate);
+    const stopTransport = subscribeToServerConnection(invalidate);
+    return () => { stopAuth(); stopTransport(); };
+  }, [accountCurrent]);
+
   // Debounced conversation search with SSE streaming
   useEffect(() => {
     if (eventSourceRef.current) {
@@ -408,7 +538,7 @@ export function useSidebarController({
     }
 
     const query = debouncedSearchQuery;
-    if (searchMode !== 'conversations' || query.length < 2) {
+    if (!accountCurrent() || searchMode !== 'conversations' || query.length < 2 || query !== searchFilter.trim()) {
       searchSeqRef.current += 1;
       setConversationResults(null);
       setSearchProgress(null);
@@ -425,8 +555,12 @@ export function useSidebarController({
       return;
     }
 
-    const url = api.searchConversationsUrl(query);
-    const es = new EventSource(url);
+    const expected = getAuthSessionSnapshot();
+    const transport = getServerTransportVersion();
+    const controller = new AbortController();
+    const currentSearch = () => accountCurrent() && seq === searchSeqRef.current && !controller.signal.aborted
+      && isCurrentAuthSession(expected) && transport === getServerTransportVersion();
+    const es = createAuthenticatedEventSource(api.searchConversationsUrl(query), { expectedSession: expected, signal: controller.signal });
     eventSourceRef.current = es;
 
     const accumulated: ConversationProjectResult[] = [];
@@ -434,7 +568,7 @@ export function useSidebarController({
     let totalMatches = 0;
 
     es.addEventListener('title-results', (evt) => {
-      if (!accountCurrent() || seq !== searchSeqRef.current) { es.close(); return; }
+      if (!currentSearch()) { es.close(); return; }
       try {
         const data = JSON.parse(evt.data) as { titleResults: SessionTitleSearchResult[] };
         titleResults = Array.isArray(data.titleResults) ? data.titleResults : [];
@@ -450,7 +584,7 @@ export function useSidebarController({
     });
 
     es.addEventListener('result', (evt) => {
-      if (!accountCurrent() || seq !== searchSeqRef.current) { es.close(); return; }
+      if (!currentSearch()) { es.close(); return; }
       try {
         const data = JSON.parse(evt.data) as {
           projectResult: ConversationProjectResult;
@@ -473,7 +607,7 @@ export function useSidebarController({
     });
 
     es.addEventListener('progress', (evt) => {
-      if (!accountCurrent() || seq !== searchSeqRef.current) { es.close(); return; }
+      if (!currentSearch()) { es.close(); return; }
       try {
         const data = JSON.parse(evt.data) as { totalMatches: number; scannedProjects: number; totalProjects: number };
         totalMatches = data.totalMatches;
@@ -484,7 +618,7 @@ export function useSidebarController({
     });
 
     es.addEventListener('done', () => {
-      if (!accountCurrent() || seq !== searchSeqRef.current) { es.close(); return; }
+      if (!currentSearch()) { es.close(); return; }
       es.close();
       eventSourceRef.current = null;
       setIsSearching(false);
@@ -498,7 +632,7 @@ export function useSidebarController({
     });
 
     es.addEventListener('error', () => {
-      if (!accountCurrent() || seq !== searchSeqRef.current) { es.close(); return; }
+      if (!currentSearch()) { es.close(); return; }
       es.close();
       eventSourceRef.current = null;
       setIsSearching(false);
@@ -512,24 +646,52 @@ export function useSidebarController({
     });
 
     return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
-      }
+      ++searchSeqRef.current;
+      controller.abort();
+      es.close();
+      if (eventSourceRef.current === es) eventSourceRef.current = null;
     };
-  }, [accountCurrent, debouncedSearchQuery, searchMode]);
+  }, [accountCurrent, debouncedSearchQuery, searchFilter, searchMode]);
 
   // All sidebar state keys (expanded, starred, loading, etc.) use the DB
   // `projectId` as their identifier after the migration.
-  const toggleProject = useCallback((projectId: string) => {
-    setExpandedProjects((prev) => {
-      const next = new Set<string>();
-      if (!prev.has(projectId)) {
-        next.add(projectId);
+  const toggleProject = useCallback(
+    (projectId: string) => {
+      // Collapsing or expanding takes the ticked rows off screen, so the
+      // selection they belong to is dropped with them.
+      setSessionSelection(null);
+
+      if (searchMode === 'running') {
+        setCollapsedRunningProjects((prev) => {
+          const next = new Set(prev);
+          if (!next.delete(projectId)) {
+            next.add(projectId);
+          }
+          return next;
+        });
+        return;
       }
-      return next;
-    });
-  }, []);
+
+      setExpandedProjects((prev) => {
+        const next = keepProjectsExpanded ? new Set(prev) : new Set<string>();
+        if (prev.has(projectId)) {
+          next.delete(projectId);
+        } else {
+          next.add(projectId);
+        }
+        return next;
+      });
+    },
+    [searchMode, keepProjectsExpanded],
+  );
+
+  const isProjectExpanded = useCallback(
+    (projectId: string) =>
+      searchMode === 'running'
+        ? !collapsedRunningProjects.has(projectId)
+        : expandedProjects.has(projectId),
+    [collapsedRunningProjects, expandedProjects, searchMode],
+  );
 
   const handleSessionClick = useCallback(
     (session: SessionWithProvider, projectId: string) => {
@@ -620,21 +782,18 @@ export function useSidebarController({
       return;
     }
 
-    let shouldLoad = false;
-    setLoadingMoreProjects((previous) => {
-      if (previous.has(projectId)) {
-        return previous;
-      }
+    // A second click before the button re-renders as disabled would fetch the
+    // same page again.
+    if (projectIdsLoadingMoreSessionsRef.current.has(projectId)) {
+      return;
+    }
 
-      shouldLoad = true;
+    projectIdsLoadingMoreSessionsRef.current.add(projectId);
+    setLoadingMoreProjects((previous) => {
       const next = new Set(previous);
       next.add(projectId);
       return next;
     });
-
-    if (!shouldLoad) {
-      return;
-    }
 
     try {
       await onLoadMoreSessions(projectId);
@@ -642,6 +801,7 @@ export function useSidebarController({
       console.error('[Sidebar] Failed to load more sessions:', error);
       alert(t('messages.refreshError'));
     } finally {
+      projectIdsLoadingMoreSessionsRef.current.delete(projectId);
       setLoadingMoreProjects((previous) => {
         const next = new Set(previous);
         next.delete(projectId);
@@ -824,10 +984,10 @@ export function useSidebarController({
     [accountCurrent],
   );
 
-  const deletionMessage = useCallback((cause: unknown) => {
-    const fallback = t('messages.deleteSessionFailed');
+  const deletionMessage = useCallback((cause: unknown, hardDelete: boolean) => {
+    const fallback = hardDelete ? t('messages.deleteSessionFailed') : t('messages.archiveSessionFailed', { defaultValue: 'Failed to archive session. Please try again.' });
     // Only parsed API errors are suitable for display; malformed JSON and transport errors use a local explanation.
-    if (!(cause instanceof ApiRequestError)) return fallback;
+    if (!(cause instanceof ApiRequestError) || cause.code === 'INVALID_JSON_RESPONSE') return fallback;
     const message = typeof cause.message === 'string' && cause.message.trim() ? cause.message : fallback;
     return cause.code ? `${message} (${cause.code})` : message;
   }, [t]);
@@ -853,7 +1013,7 @@ export function useSidebarController({
       await fetchArchivedSessions();
     } catch (cause) {
       if (!accountCurrent() || controller.signal.aborted) return;
-      const message = deletionMessage(cause);
+      const message = deletionMessage(cause, hardDelete);
       if (confirmation) setDeletionError(message);
       else setSidebarError(message);
     } finally {
@@ -872,6 +1032,136 @@ export function useSidebarController({
   const archiveSession = useCallback((sessionId: string) => {
     void deleteSession(sessionId);
   }, [deleteSession]);
+
+  const setProjectSessionSelection = useCallback((selection: SidebarSessionSelection) => {
+    setSessionSelection(selection);
+    // Selecting replaces the row's controls, so an open rename would be left
+    // hanging behind the checkboxes with no way to save it.
+    setActiveRename(null);
+  }, []);
+
+  const toggleSessionSelected = useCallback((projectId: string, sessionId: string) => {
+    setSessionSelection((previous) => {
+      // A row of another project starts that project's selection from scratch;
+      // one selection at a time is what keeps a bulk delete inside one list.
+      const sessionIds = new Set(previous?.projectId === projectId ? previous.sessionIds : []);
+      if (!sessionIds.delete(sessionId)) {
+        sessionIds.add(sessionId);
+      }
+      return { projectId, sessionIds };
+    });
+  }, []);
+
+  const cancelSessionSelection = useCallback(() => {
+    setSessionSelection(null);
+  }, []);
+
+  // Takes the ids instead of reading `sessionSelection`, so it stays referentially
+  // stable: it is handed to every memoized project row, and re-creating it on each
+  // tick of the selection would re-render all of them.
+  const showDeleteSelectedSessionsConfirmation = useCallback((sessionIds: string[]) => {
+    if (!accountCurrent() || deletionRequest.current || sessionIds.length === 0) return;
+    setDeletionError(null);
+    setSidebarError(null);
+    setPendingDeletion({ kind: 'sessions', sessionIds });
+  }, [accountCurrent]);
+
+  const confirmDeleteSessions = useCallback(async (hardDelete = false) => {
+    if (!accountCurrent() || deletionRequest.current || pendingDeletion?.kind !== 'sessions') {
+      return;
+    }
+
+    const selectionProjectId = sessionSelection?.projectId ?? null;
+    setPendingDeletion(null);
+    // Leaving selection mode as soon as the dialog is accepted takes the
+    // "Delete N sessions" button away while the requests are out, so the same
+    // rows cannot be confirmed twice.
+    setSessionSelection(null);
+
+    // The ids were resolved when the dialog opened, so they are checked again
+    // now: a session that started a response since then is left alone (the rule
+    // the rows apply), and one an earlier confirmation is still deleting is not
+    // sent twice. Neither is a failure — nothing was attempted for them.
+    const deletingIds = sessionIdsBeingDeletedRef.current;
+    const sessionIds = pendingDeletion.sessionIds.filter(
+      (sessionId) =>
+        !deletingIds.has(sessionId) &&
+        !(activeSessions.has(sessionId) && !backgroundSessionIds.has(sessionId)),
+    );
+    if (sessionIds.length === 0) {
+      return;
+    }
+    sessionIds.forEach((sessionId) => deletingIds.add(sessionId));
+    const controller = new AbortController();
+    deletionRequest.current = controller;
+    setIsDeleting(true);
+
+    // One request per id: the endpoint deletes a single session, and settling
+    // them all means one failure does not hide the sessions that did go.
+    const outcomes = await Promise.allSettled(
+      sessionIds.map(async (sessionId) => {
+        const response = await api.deleteSession(sessionId, hardDelete, { signal: controller.signal });
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`status ${response.status}: ${errorText}`);
+        }
+        return sessionId;
+      }),
+    );
+    sessionIds.forEach((sessionId) => deletingIds.delete(sessionId));
+    if (deletionRequest.current === controller) deletionRequest.current = null;
+    if (!accountCurrent() || controller.signal.aborted) return;
+    setIsDeleting(false);
+
+    const deletedSessionIds: string[] = [];
+    const failedSessionIds: string[] = [];
+    outcomes.forEach((outcome, index) => {
+      if (outcome.status === 'fulfilled') {
+        deletedSessionIds.push(outcome.value);
+      } else {
+        failedSessionIds.push(sessionIds[index]);
+        console.error('[Sidebar] Failed to delete session:', {
+          sessionId: sessionIds[index],
+          error: outcome.reason,
+        });
+      }
+    });
+
+    if (deletedSessionIds.length > 0) {
+      const deletedIdSet = new Set(deletedSessionIds);
+      deletedSessionIds.forEach((sessionId) => onSessionDelete?.(sessionId));
+      // Same bookkeeping as the single delete, batched: the recents feed is not
+      // refetched here, so the rows that just went are pruned from it by hand.
+      // Counted outside the updater so both updaters stay pure: React may run an
+      // updater twice, which would take the rows off the total twice.
+      const removed = new Set([...pinnedConversations, ...recentConversations].filter(row => deletedIdSet.has(row.sessionId)).map(row => row.sessionId)).size;
+      setPinnedConversations(previous => previous.filter(row => !deletedIdSet.has(row.sessionId)));
+      setRecentConversations((previous) =>
+        previous.filter((conversation) => !deletedIdSet.has(conversation.sessionId)),
+      );
+      if (removed > 0) {
+        setRecentConversationsTotal((total) => Math.max(0, total - removed));
+      }
+      await fetchArchivedSessions();
+    }
+
+    if (!accountCurrent()) return;
+    if (failedSessionIds.length > 0) {
+      // The rows that could not be deleted come back ticked, ready to retry —
+      // unless another selection was started while the requests were out.
+      if (selectionProjectId) {
+        setSessionSelection(
+          (current) => current ?? { projectId: selectionProjectId, sessionIds: new Set(failedSessionIds) },
+        );
+      }
+      alert(
+        t('messages.deleteSessionsPartialFailure', {
+          count: failedSessionIds.length,
+          total: sessionIds.length,
+        }),
+      );
+    }
+  }, [accountCurrent, activeSessions, backgroundSessionIds, fetchArchivedSessions, onSessionDelete, pendingDeletion, pinnedConversations, recentConversations, sessionSelection, t]);
 
   const requestProjectDelete = useCallback(
     (project: Project) => {
@@ -1078,9 +1368,16 @@ export function useSidebarController({
     setSidebarVisible(true);
   }, [setSidebarVisible]);
 
+  // Wrapped rather than reset from an effect: leaving the Projects tab hides the
+  // ticked rows, and a selection left behind would come back with the tab.
+  const changeSearchMode = useCallback((mode: SidebarSearchMode) => {
+    setSessionSelection(null);
+    setSearchMode(mode);
+  }, []);
+
   return {
     isSidebarCollapsed,
-    expandedProjects,
+    isProjectExpanded,
     activeRename,
     showNewProject,
     initialSessionsLoaded,
@@ -1101,7 +1398,7 @@ export function useSidebarController({
     archivedSessions: filteredArchivedSessions,
     archivedSessionsCount: archivedProjects.length + archivedSessions.length,
     isArchivedSessionsLoading,
-    recentConversations,
+    recentConversations: recentConversationsWithCurrentTitles,
     pinnedConversations,
     recentConversationsTotal,
     recentConversationsHasMore,
@@ -1125,6 +1422,12 @@ export function useSidebarController({
     showDeleteSessionConfirmation,
     confirmDeleteSession,
     archiveSession,
+    sessionSelection,
+    setProjectSessionSelection,
+    toggleSessionSelected,
+    cancelSessionSelection,
+    showDeleteSelectedSessionsConfirmation,
+    confirmDeleteSessions,
     requestProjectDelete,
     confirmDeleteProject,
     handleProjectSelect,
@@ -1137,10 +1440,10 @@ export function useSidebarController({
     expandSidebar,
     setShowNewProject,
     searchMode,
-    setSearchMode,
-    conversationResults,
-    isSearching,
-    searchProgress,
+    setSearchMode: changeSearchMode,
+    conversationResults: accountIdentityCurrent ? conversationResults : null,
+    isSearching: accountIdentityCurrent && isSearching,
+    searchProgress: accountIdentityCurrent ? searchProgress : null,
     clearConversationResults: useCallback(() => {
       searchSeqRef.current += 1;
       if (eventSourceRef.current) {

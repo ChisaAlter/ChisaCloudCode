@@ -6,7 +6,7 @@ import test from 'node:test';
 
 import { WebSocket } from 'ws';
 
-import { handleShellConnection } from '@/modules/websocket/services/shell-websocket.service.js';
+import { handleShellConnection } from '../services/shell-websocket.service.js';
 import { AppError, type WorkspaceDescriptor } from '@/shared/index.js';
 
 type Dependencies = Parameters<typeof handleShellConnection>[1];
@@ -58,9 +58,11 @@ function harness(bound = true) {
     remappedRoot: undefined as string | undefined,
   };
   const dependencies: Dependencies = {
+    isSessionActive: () => true,
     resolveProviderSessionId: () => 'provider-session',
     spawnPty: () => { state.hostSpawns += 1; throw new Error('Host PTY must not run'); },
-    resolveSelectedWorkspace(projectId, selector) {
+    resolveSelectedWorkspace(projectId, userId, selector) {
+      assert.ok(userId, 'every resolution receives the authenticated handshake identity');
       if (projectId !== descriptor.projectId || selector?.workspaceId !== descriptor.workspaceId || selector?.sessionId !== descriptor.sessionId) {
         throw new AppError('Foreign workspace', { code: 'WORKSPACE_SELECTION_MISMATCH', statusCode: 409 });
       }
@@ -126,7 +128,7 @@ test('production shell rejects client paths without a workspace selector', () =>
     { projectId: 'project', generation: 'generation' },
   ]) {
     const ws = socket();
-    handleShellConnection(ws as never, { resolveProviderSessionId: () => null });
+    handleShellConnection(ws as never, { resolveProviderSessionId: () => null, isSessionActive: () => true }, { user: { id: 'owner' } } as never);
     ws.emit('message', JSON.stringify({ type: 'init', ...fields }));
     assert.equal(errorCode(ws), 'WORKSPACE_SELECTOR_REQUIRED');
   }

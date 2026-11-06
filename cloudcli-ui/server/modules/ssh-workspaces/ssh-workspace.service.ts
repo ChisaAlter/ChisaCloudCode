@@ -10,13 +10,14 @@ import { AppError } from '@/shared/index.js';
 import type { SshWorkspaceConnection, SshWorkspaceRpcResult, SshWorkspaceProbeResult } from '@/shared/index.js';
 
 import { agentRelayBroker } from './agent-relay.service.js';
+import { createSshWorkspaceReadCache, sshWorkspaceReadCache } from './workspace-read-cache.service.js';
 
 /** Windows helper requests use virtual project paths; exec deliberately grants the SSH user's command permissions. */
 export type SshWorkspaceRequest = {
   op: string; path?: string; destination?: string; b64?: string; expectedHash?: string | null;
   requests?: SshWorkspaceRequest[]; recursive?: boolean; includeStats?: boolean;
   query?: string; command?: string; argv?: string[]; readOnly?: boolean; timeoutSeconds?: number;
-  jobId?: string; operationId?: string;
+  jobId?: string; operationId?: string; stream?: string; offset?: number; maxBytes?: number;
 };
 
 /** The bridge pins the physical root identity after probe; a changed identity is never silently adopted. */
@@ -45,6 +46,7 @@ type TransportDependencies = {
   agentConnections?: (ownerId: string) => Promise<AgentConnectionReference[]>;
   agentFetch?: (url: string, init: RequestInit) => Promise<Response>;
   agentRelayCall?: typeof agentRelayBroker.call;
+  readCache?: typeof sshWorkspaceReadCache;
   requestTimeoutMs?: number;
   cleanupTimeoutMs?: number;
 };
@@ -63,8 +65,11 @@ async function defaultAgentConnections(ownerId: string): Promise<AgentConnection
 const PROTOCOL = 1;
 const MAX_INPUT_BYTES = 12 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
-const OPS = new Set(['probe', 'stat', 'lstat', 'list', 'batch', 'realpath', 'read', 'write', 'mkdir', 'rename', 'copy', 'remove', 'search', 'grep', 'exec', 'job_status', 'job_cancel', 'operation_status', 'operation_cancel']);
+const OPS = new Set(['probe', 'project_snapshot', 'stat', 'lstat', 'list', 'batch', 'realpath', 'read', 'write', 'mkdir', 'rename', 'copy', 'remove', 'search', 'grep', 'exec', 'job_status', 'job_cancel', 'job_output', 'operation_status', 'operation_cancel']);
 const FILE_MUTATIONS = new Set(['write', 'mkdir', 'rename', 'copy', 'remove']);
+// Deterministic inspections are the only operations the read cache may serve;
+// batch is cacheable because validation restricts it to inspection requests.
+const CACHEABLE_OPS = new Set(['stat', 'lstat', 'list', 'realpath', 'read', 'search', 'grep', 'batch']);
 const AGENT_REFUSALS = new Map([['AGENT_UNAUTHORIZED', 401], ['AGENT_REQUEST_TOO_LARGE', 413], ['AGENT_REQUEST_INVALID', 400], ['AGENT_ROOT_INVALID', 400], ['AGENT_BUSY', 503]]);
 const JOB_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -99,6 +104,14 @@ async function boundedAgentResponse(response: Response): Promise<Buffer> {
 function failure(code: string, message: string, status = 503, details?: Record<string, unknown>): SshWorkspaceError {
   return new SshWorkspaceError(code, message, status, details);
 }
+function validateOperationReceipt(result: SshWorkspaceRpcResult, target: SshWorkspaceTarget, operationId: string): void {
+  if (result.operationId !== operationId || result.generation !== target.generation
+    || result.rootPath !== target.rootPath || !['running', 'completed', 'cancelled', 'unknown', 'not_found'].includes(String(result.state))
+    || typeof result.cleanupConfirmed !== 'boolean'
+    || (result.cleanupConfirmed === true && !['completed', 'cancelled'].includes(String(result.state)))) {
+    throw failure('SSH_WORKSPACE_PROTOCOL_INVALID', 'Desktop agent returned an invalid file operation receipt', 502);
+  }
+}
 function requiredString(value: unknown, name: string, maximum = 4096): string {
   if (typeof value !== 'string' || !value.trim() || value.length > maximum || /[\u0000-\u001f\u007f]/.test(value)) throw failure('SSH_CONNECTION_CONFIG_INVALID', `Invalid SSH connection ${name}`, 500);
   return value;
@@ -131,6 +144,12 @@ function validateRequest(request: SshWorkspaceRequest, nested = false): void {
     if (request.timeoutSeconds !== undefined && (!Number.isInteger(request.timeoutSeconds) || request.timeoutSeconds < 1 || request.timeoutSeconds > 600)) throw failure('SSH_WORKSPACE_REQUEST_INVALID', 'Command timeout must be 1 to 600 seconds', 400);
   }
   if (['job_status', 'job_cancel'].includes(request.op) && (!request.jobId || !JOB_ID.test(request.jobId))) throw failure('SSH_WORKSPACE_REQUEST_INVALID', 'A valid job ID is required', 400);
+  if (request.op === 'job_output') {
+    if (!request.jobId || !JOB_ID.test(request.jobId)) throw failure('SSH_WORKSPACE_REQUEST_INVALID', 'A valid job ID is required', 400);
+    if (request.stream !== undefined && request.stream !== 'stdout' && request.stream !== 'stderr') throw failure('SSH_WORKSPACE_REQUEST_INVALID', 'Job output stream must be stdout or stderr', 400);
+    if (request.offset !== undefined && (!Number.isSafeInteger(request.offset) || request.offset < 0)) throw failure('SSH_WORKSPACE_REQUEST_INVALID', 'Job output offset must be a nonnegative integer', 400);
+    if (request.maxBytes !== undefined && (!Number.isInteger(request.maxBytes) || request.maxBytes < 1 || request.maxBytes > 256 * 1024)) throw failure('SSH_WORKSPACE_REQUEST_INVALID', 'Job output chunk must be 1 to 256 KiB', 400);
+  }
   if (['operation_status', 'operation_cancel'].includes(request.op) && (!request.operationId || !JOB_ID.test(request.operationId))) throw failure('SSH_WORKSPACE_REQUEST_INVALID', 'A valid file operation ID is required', 400);
 }
 
@@ -194,6 +213,10 @@ function sshArguments(record: SshCatalogRecord): string[] {
 /** Tests inject process/catalog access; production consumers use the singleton functions below. No connection is made until an operation is requested. */
 export function createSshWorkspaceTransport(dependencies: TransportDependencies = {}) {
   const env = dependencies.env ?? process.env;
+  // Each transport owns its read cache by default so parallel transports and
+  // test fixtures cannot leak results into one another; only the production
+  // singleton shares the store the event fan-out invalidates.
+  const transportReadCache = dependencies.readCache ?? createSshWorkspaceReadCache();
   const spawn = dependencies.spawn ?? ((command, args, options) => systemSpawn(command, args, options));
   async function catalog(userId: string): Promise<CatalogRecord[]> {
     const owner = safeUser(userId);
@@ -239,6 +262,18 @@ export function createSshWorkspaceTransport(dependencies: TransportDependencies 
     if (signal?.aborted) throw failure('SSH_WORKSPACE_INTERRUPTED', 'Workspace operation interrupted before dispatch', 499, { requestDispatched: false });
     // Validate immediately before header construction, even for injected registries.
     if (record.token.length !== 64 || !/^[a-f0-9]{64}$/.test(record.token)) throw failure('SSH_CONNECTION_CONFIG_INVALID', 'Agent connection registry contains an invalid credential', 500);
+    const cache = dependencies.readCache ?? transportReadCache;
+    // Only identity-pinned targets participate: the bucket is the verified
+    // physical root, never a loose path string another directory could share.
+    const cacheScope = target.expectedRootIdentity;
+    if (cacheScope !== undefined && (FILE_MUTATIONS.has(request.op) || request.op === 'exec')) {
+      cache.invalidateRoot(record.ownerId, record.id, cacheScope);
+    }
+    const cacheable = cacheScope !== undefined && CACHEABLE_OPS.has(request.op);
+    if (cacheable) {
+      const hit = cache.get(record.ownerId, record.id, cacheScope!, request as Record<string, unknown>);
+      if (hit) return hit;
+    }
     const payload = JSON.stringify({ protocol: PROTOCOL, rootPath: target.rootPath, expectedRootIdentity: target.expectedRootIdentity, generation: target.generation, operationId: target.operationId, request });
     if (Buffer.byteLength(payload) > MAX_INPUT_BYTES) throw failure('SSH_WORKSPACE_REQUEST_TOO_LARGE', 'Workspace request exceeds 12 MiB', 413);
     const controller = new AbortController();
@@ -254,7 +289,7 @@ export function createSshWorkspaceTransport(dependencies: TransportDependencies 
         // The broker knows whether native delivery happened. Offline/queued
         // cancellation must retain its false flag instead of creating a fence.
         const reply = await (dependencies.agentRelayCall ?? agentRelayBroker.call)(record.ownerId, record.id, record.token,
-          JSON.parse(payload) as Record<string, unknown>, controller.signal);
+          JSON.parse(payload) as Record<string, unknown>, controller.signal, { deadlineAt: Date.now() + timeoutMs });
         dispatched = true;
         response = new Response(reply.body, { status: reply.status });
       } else {
@@ -302,6 +337,7 @@ export function createSshWorkspaceTransport(dependencies: TransportDependencies 
       // The native Agent never needs the credential in a response. Fail closed
       // rather than publishing an echoed secret from an unexpected listener.
       if (JSON.stringify(result).toLowerCase().includes(record.token)) throw failure('SSH_WORKSPACE_PROTOCOL_INVALID', 'Desktop agent returned an unsafe workspace response', 502);
+      if (cacheable) cache.put(record.ownerId, record.id, cacheScope!, request as Record<string, unknown>, result as SshWorkspaceRpcResult);
       return result as SshWorkspaceRpcResult;
     } catch (error) {
       const errorDetails = error instanceof AppError && error.details && typeof error.details === 'object'
@@ -431,19 +467,26 @@ export function createSshWorkspaceTransport(dependencies: TransportDependencies 
         const result = await call(record, callTarget, request);
         if (request.op === 'exec' && (result.jobId !== request.jobId || result.cleanupConfirmed !== true)) throw failure('SSH_EXECUTION_UNCONFIRMED', 'Windows command cleanup was not confirmed', 503, { jobId: request.jobId, cleanupConfirmed: false });
         if (['job_status', 'job_cancel'].includes(request.op) && result.jobId !== request.jobId) throw failure('SSH_WORKSPACE_PROTOCOL_INVALID', 'Windows helper returned a different command receipt', 502);
-        if (['operation_status', 'operation_cancel'].includes(request.op)) {
-          if (result.operationId !== request.operationId || result.generation !== input.generation
-            || result.rootPath !== input.rootPath || !['running', 'completed', 'cancelled', 'unknown', 'not_found'].includes(String(result.state))
-            || typeof result.cleanupConfirmed !== 'boolean'
-            || (result.cleanupConfirmed === true && !['completed', 'cancelled'].includes(String(result.state)))) {
-            throw failure('SSH_WORKSPACE_PROTOCOL_INVALID', 'Desktop agent returned an invalid file operation receipt', 502);
-          }
-        }
+        if (['operation_status', 'operation_cancel'].includes(request.op)) validateOperationReceipt(result, input, request.operationId!);
         return result;
       } catch (error) {
         if (request.op !== 'exec') {
           if (FILE_MUTATIONS.has(request.op) && error instanceof SshWorkspaceError
             && error.details?.requestDispatched === true && error.details?.transportConfirmed !== true) {
+            let confirmed = false;
+            if (operationId) {
+              // Inspect the same durable receipt on an independent channel. Never
+              // probe, cancel or replay a file mutation after its response is lost.
+              const cleanupInput = { ...input, signal: undefined };
+              try {
+                const cleanup = await call(record, cleanupInput, { op: 'operation_status', operationId }, undefined,
+                  Math.min(dependencies.cleanupTimeoutMs ?? 10_000, 10_000));
+                validateOperationReceipt(cleanup, input, operationId);
+                confirmed = cleanup.cleanupConfirmed === true;
+              } catch { /* Unknown or still-running receipts keep the original writer fence. */ }
+            }
+            if (confirmed) throw failure(error.code, error.message, error.statusCode,
+              { ...error.details, cleanupConfirmed: true, operationId, jobId: `operation:${operationId}` });
             throw failure('SSH_OPERATION_UNCONFIRMED', 'Windows file operation state is unknown; recover the original operation before starting another writer', 503,
               { originalCode: error.code, cleanupConfirmed: false, ...(operationId ? { operationId, jobId: `operation:${operationId}` } : {}) });
           }
@@ -466,7 +509,7 @@ export function createSshWorkspaceTransport(dependencies: TransportDependencies 
     },
   };
 }
-const defaultTransport = createSshWorkspaceTransport();
+const defaultTransport = createSshWorkspaceTransport({ readCache: sshWorkspaceReadCache });
 
 /** Project settings use the account-filtered safe connection catalog. */
 export const listSshConnections = defaultTransport.listSshConnections;

@@ -16,8 +16,9 @@ func registerSshAgent(ctx context.Context, scope sshAccountScope, profile SshTun
 	connection := scope.connection
 	current := connection != nil && apiConnection == connection && connection.authenticated && connection.accountIdentity == scope.identity && connection.version == scope.version && scope.ctx.Err() == nil && connection.ctx.Err() == nil
 	accessToken := ""
+	var revision uint64
 	if current {
-		accessToken = connection.accessToken
+		accessToken, revision = connection.accessToken, connection.tokenRevision
 	}
 	serverConnectionMu.RUnlock()
 	if !current {
@@ -51,8 +52,22 @@ func registerSshAgent(ctx context.Context, scope sshAccountScope, profile SshTun
 	if ctx.Err() != nil {
 		return sshFailure("SSH_AGENT_REGISTRATION_FAILED", "Agent 登记请求超时或中断，请重试。")
 	}
-	if response.StatusCode != http.StatusOK || readErr != nil || len(raw) > 64*1024 {
-		return sshFailure("SSH_AGENT_REGISTRATION_FAILED", "账号服务未能确认 Agent 登记，请重试。")
+	// A truncated success response cannot commit a refresh header. Recognized
+	// authentication failures still revoke their captured revision below.
+	if response.StatusCode != http.StatusUnauthorized && (readErr != nil || len(raw) > 64*1024) {
+		return sshFailure("SSH_AGENT_REGISTRATION_FAILED", "账号服务未能确认 Agent 登记，正在重试。")
+	}
+	if err := recordNativeRefreshedToken(connection, response.Header, response.StatusCode, accessToken, revision); err != nil {
+		return sshFailure("SESSION_SAVE_FAILED", "账号凭据未保存，请重试。")
+	}
+	if response.StatusCode != http.StatusOK {
+		if failure := sshAgentHTTPFailure(response.StatusCode, response.Header, raw, accessToken, connection.accessToken); failure != nil {
+			return failure
+		}
+		return sshFailure("SSH_AGENT_REGISTRATION_FAILED", "账号服务未能确认 Agent 登记，正在重试。")
+	}
+	if readErr != nil || len(raw) > 64*1024 {
+		return sshFailure("SSH_AGENT_REGISTRATION_FAILED", "账号服务未能确认 Agent 登记，正在重试。")
 	}
 	var result struct {
 		OK         bool `json:"ok"`
@@ -65,6 +80,5 @@ func registerSshAgent(ctx context.Context, scope sshAccountScope, profile SshTun
 	if json.Unmarshal(raw, &result) != nil || !result.OK || result.Connection.ID != profile.ID || result.Connection.Port != profile.RemotePort || result.Connection.Transport != "agent" {
 		return sshFailure("SSH_AGENT_REGISTRATION_FAILED", "账号服务返回的 Agent 登记身份无效，请重试。")
 	}
-	recordNativeRefreshedToken(connection, response.Header, response.StatusCode)
 	return nil
 }

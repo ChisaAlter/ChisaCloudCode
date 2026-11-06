@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 import { binaryPath } from 'mygo-cli';
 import configuration from '../mygo.config.ts';
+import { nsisEnvironment, resolveTrustedNsis, verifyNsisTree } from './nsis-integrity.mjs';
 
 const app = fileURLToPath(new URL('../', import.meta.url));
 const frontend = fileURLToPath(new URL('../../cloudcli-ui/', import.meta.url));
@@ -20,6 +21,21 @@ const run = (executable, values, cwd = app, extra = {}) => {
 };
 const hash = file => createHash('sha256').update(readFileSync(file)).digest('hex');
 try {
+  // MyGo 0.1.22 also runs makensis internally. Verify and pin that first
+  // invocation before any build command can reach its PATH/cache discovery.
+  const trustedNsis = process.platform === 'win32' ? resolveTrustedNsis() : undefined;
+  const nativeEnv = trustedNsis ? nsisEnvironment(trustedNsis.root) : process.env;
+  if (trustedNsis) {
+    // Go 1.27 uses APPDATA/go/telemetry even during compilation. Keep its
+    // documented internal directory override outside the immutable NSIS tree;
+    // disabling counters here must not change the user's global Go settings.
+    const telemetry = path.join(stage, 'go-telemetry');
+    mkdirSync(telemetry);
+    writeFileSync(path.join(telemetry, 'mode'), 'off\n');
+    for (const key of Object.keys(nativeEnv)) if (['test_telemetry_dir', 'goenv'].includes(key.toLowerCase())) delete nativeEnv[key];
+    nativeEnv.TEST_TELEMETRY_DIR = telemetry;
+    nativeEnv.GOENV = 'off';
+  }
   // Node loads the existing typed config directly. The isolated JSON staging
   // avoids Bun config-loader failures without renaming the user's config or
   // changing source midway through a build.
@@ -36,14 +52,17 @@ try {
   writeFileSync(path.join(stage, 'mygo.json'), JSON.stringify(config));
   const values = ['build', '-skip-build-command', '-o', out];
   if (args.includes('--debug')) values.push('-debug');
-  run(binaryPath(), values, stage);
-  if (process.platform === 'win32') run(process.execPath, [path.join(app, 'scripts/build-installer.mjs'), '--stage', path.join(out, 'windows-amd64')]);
+  if (trustedNsis) verifyNsisTree(trustedNsis.compiler);
+  run(binaryPath(), values, stage, { env: nativeEnv });
+  if (process.platform === 'win32') run(process.execPath, [path.join(app, 'scripts/build-installer.mjs'), '--stage', path.join(out, 'windows-amd64')], app, { env: nativeEnv });
+  if (trustedNsis) verifyNsisTree(trustedNsis.compiler);
   const executable = path.join(out, `${process.platform === 'win32' ? 'windows' : process.platform}-${process.arch === 'x64' ? 'amd64' : process.arch}`, configuration.name + (process.platform === 'win32' ? '.exe' : ''));
   if (!existsSync(executable)) throw new Error('Native build did not produce the expected executable');
   mkdirSync(out, { recursive: true });
   writeFileSync(path.join(out, 'build-receipt.json'), JSON.stringify({ builtAt: new Date().toISOString(), version: configuration.version,
     buildIdentity: readFileSync(path.join(app, 'build_identity_generated.go'), 'utf8'), debug: args.includes('--debug'), executable,
-    executableSha256: hash(executable), sourceHashes, frontendIndexSha256: hash(path.join(frontend, 'dist/index.html')) }, null, 2));
+    executableSha256: hash(executable), sourceHashes, frontendIndexSha256: hash(path.join(frontend, 'dist/index.html')),
+    ...(trustedNsis ? { nsis: { version: trustedNsis.version, archiveSha256: trustedNsis.archiveSha256, fileCount: trustedNsis.fileCount, source: trustedNsis.source, compilerSha256: hash(trustedNsis.compiler), upstreamSelection: 'verified Bin first on PATH; NSISDIR/NSISCONFDIR fixed root; APPDATA/HOME fixed verified Bin without user config', guardedInstaller: '/NOCONFIG' } } : {}) }, null, 2));
   console.log(`Build receipt: ${path.join(out, 'build-receipt.json')}`);
 } finally {
   // stage is the exact newly allocated temp root, never a user-supplied path.

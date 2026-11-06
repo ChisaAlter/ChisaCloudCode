@@ -12,6 +12,8 @@ Subsequent polls wait up to 25 seconds and deliver at most four `{requestId,payl
 
 Transient polling failures use bounded exponential backoff (1 to 32 seconds) with the same Agent/token. Authentication/protocol failures terminate the session. Stop, logout, account/service replacement and desktop close cancel polling, result delivery, registration and active helper requests. A terminal native status is published only after registration/relay workers, Agent listener and admitted helper processes have finished cleanup.
 
+When the v2 handshake advertises `capabilities.events`, the supervisor lazily watches workspace roots that jobs actually touch (snapshot-diff sweeps, idle roots stop after ten minutes). Deduplicated `{root,rootIdentity,path,kind}` batches post to `POST /agent/relay/events` on the Agent token; a failed post only delays advisory invalidation. Generated-tree directories (node_modules, .git, build outputs) are ignored, and an optional `.chisa/workspace.json` may scope observation with `includePaths`/`excludePaths`. Events never write: they only let the server invalidate its read cache and refresh open file trees.
+
 ## Native API
 
 Calls go through `FrontendBridge`. They require the current native authenticated account and return fixed safe errors `{ok:false,code,error}`. No public status, result or application log contains Agent tokens, account tokens, key contents or raw SSH diagnostics.
@@ -60,7 +62,7 @@ The HTTP listener is loopback-only, requires the private token before parsing wo
 
 For `write/mkdir/rename/copy/remove`, the backend supplies a UUID `operationId`. Before dispatch, native durably claims that ID with exact root path, physical identity and generation. Duplicate IDs are refused without replay. Completed/reaped requests persist a receipt; `operation_status` returns its state and `cleanupConfirmed`. `operation_cancel` can atomically tombstone an undispatched ID or cancel and wait for its active owned helper. Missing status alone never proves cleanup. A crashed/incomplete persisted claim remains unknown rather than claiming success. Receipts live outside the hash-versioned helper directory so normal helper upgrades preserve them.
 
-Command jobs retain their existing durable `jobId` status/cancel protocol. Invalid cwd/command/argv/timeout is checked before a permanent command claim. A v2 claim remains held until terminal state publication; cancellation can distinguish a crashed marked pre-state executor from a live one. Unmarked historical claims remain conservatively uncertain. Pinned helper refusals include the actual physical root identity; identity mismatch is not represented as a confirmed connection.
+Command jobs retain their existing durable `jobId` status/cancel protocol. Helper 1.0.3 also spills each output stream into the job directory (8 MiB cap), so the read-only `job_output` op serves byte-offset incremental chunks — including while the command still runs — over the relay control lane; older helpers simply refuse the op and output arrives at completion. Invalid cwd/command/argv/timeout is checked before a permanent command claim. A v2 claim remains held until terminal state publication; cancellation can distinguish a crashed marked pre-state executor from a live one. Unmarked historical claims remain conservatively uncertain. Pinned helper refusals include the actual physical root identity; identity mismatch is not represented as a confirmed connection.
 
 ## Explicit reverse-SSH compatibility
 

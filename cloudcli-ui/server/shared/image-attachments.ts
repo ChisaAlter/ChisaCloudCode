@@ -1,4 +1,5 @@
-import { promises as fs, realpathSync } from 'node:fs';
+import { realpathSync } from 'node:fs';
+import type { PreparedImageAttachment, VerifiedImageAttachment } from './types.js';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -7,9 +8,9 @@ import path from 'node:path';
  *
  * Uploaded chat files are persisted once in the global `~/.cloudcli/assets`
  * folder and referenced by absolute path everywhere else:
- * - Claude: paths are read back into base64 `image` content blocks.
- * - Codex: paths become `local_image` input items.
- * - General files: verified paths are appended inside a `<files_input>` tag,
+ * - Claude: owner-verified byte snapshots become base64 `image` content blocks.
+ * - Codex: private staged paths become `local_image` input items.
+ * - General files: prepared paths are appended inside a `<files_input>` tag,
  *   which every provider history adapter strips back out for display.
  * - Cursor/OpenCode images: paths use the equivalent `<images_input>` tag.
  *
@@ -357,53 +358,24 @@ type ClaudeContentBlock =
   | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
 
 /**
- * Builds the Claude user-message content list: the prompt text followed by one
- * base64 `image` block per attachment. Images the Claude API cannot accept
- * (e.g. SVG) or that fail to read are skipped with a warning so the prompt
- * itself still goes through.
+ * Claude's runtime passes owner-verified snapshots from its attachment service.
+ * This conversion performs no filesystem access: replacing or deleting the
+ * original path after authorization cannot change the bytes sent to the SDK.
  */
 export async function buildClaudeUserContent(
   prompt: string,
-  images: unknown,
-  cwd?: string,
+  images: readonly VerifiedImageAttachment[],
 ): Promise<ClaudeContentBlock[]> {
   const blocks: ClaudeContentBlock[] = [{ type: 'text', text: prompt }];
-
-  for (const descriptor of normalizeImageDescriptors(images)) {
-    const mediaType = resolveImageMediaType(descriptor);
-    if (!mediaType || !CLAUDE_IMAGE_MEDIA_TYPES.has(mediaType)) {
-      console.warn(`[Images] Skipping unsupported Claude image type for ${descriptor.path}`);
-      continue;
+  for (const image of images) {
+    if (!(image.bytes instanceof Uint8Array) || image.bytes.byteLength === 0
+      || image.size !== image.bytes.byteLength || !CLAUDE_IMAGE_MEDIA_TYPES.has(image.mimeType)) {
+      throw new TypeError('Claude image input requires verified raster bytes');
     }
-
-    const resolvedPath = resolveImageAbsolutePath(cwd, descriptor.path);
-    if (!isAllowedImageSourcePath(resolvedPath, cwd)) {
-      console.warn(`[Images] Refusing to read image outside allowed roots: ${descriptor.path}`);
-      continue;
-    }
-
-    try {
-      const canonicalPath = await fs.realpath(resolvedPath);
-      if (!isAllowedImageSourcePath(canonicalPath, cwd)) {
-        console.warn(`[Images] Refusing to read symlinked image outside allowed roots: ${descriptor.path}`);
-        continue;
-      }
-
-      const bytes = await fs.readFile(canonicalPath);
-      blocks.push({
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: mediaType,
-          data: bytes.toString('base64'),
-        },
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[Images] Failed to read image ${descriptor.path}: ${message}`);
-    }
+    blocks.push({ type: 'image', source: {
+      type: 'base64', media_type: image.mimeType, data: Buffer.from(image.bytes).toString('base64'),
+    } });
   }
-
   return blocks;
 }
 
@@ -412,24 +384,13 @@ type CodexInputItem =
   | { type: 'local_image'; path: string };
 
 /**
- * Builds the Codex `runStreamed` input list: prompt text plus one
- * `local_image` item per attachment, resolved to absolute paths so the Codex
- * runtime can read them regardless of its own working directory handling.
+ * Codex's runtime passes only private staged paths, or descriptors awaiting the
+ * trusted slot launcher's exact verified-asset mapping. No path is resolved or
+ * reopened here; a client descriptor must first cross that provider boundary.
  */
-export function buildCodexInputItems(prompt: string, images: unknown, cwd?: string): CodexInputItem[] {
-  const items: CodexInputItem[] = [{ type: 'text', text: prompt }];
-  for (const descriptor of normalizeImageDescriptors(images)) {
-    const resolvedPath = resolveImageAbsolutePath(cwd, descriptor.path);
-    if (!isAllowedImageSourcePath(resolvedPath, cwd)) {
-      // Same trust boundary as buildClaudeUserContent — the Codex runtime
-      // reads this file, so it must stay within the allowed roots.
-      console.warn(`[Images] Refusing to attach image outside allowed roots: ${descriptor.path}`);
-      continue;
-    }
-    items.push({
-      type: 'local_image',
-      path: resolvedPath,
-    });
-  }
-  return items;
+export function buildCodexInputItems(prompt: string, images: readonly PreparedImageAttachment[]): CodexInputItem[] {
+  return [{ type: 'text', text: prompt }, ...images.map((image): CodexInputItem => {
+    if (!path.isAbsolute(image.path)) throw new TypeError('Codex requires a prepared absolute image path');
+    return { type: 'local_image', path: image.path };
+  })];
 }

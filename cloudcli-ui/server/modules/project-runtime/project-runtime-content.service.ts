@@ -13,6 +13,8 @@ type ContentDependencies = {
   list(relative: string): Promise<Array<{ name: string; directory: boolean }>>;
   assertCurrent(): void;
   signal?: AbortSignal;
+  // Only remote SSH callers opt in: prefetch changes I/O scheduling, never parse order.
+  prefetch?: boolean;
 };
 type Rule = { path: string; body: string; patterns: string[] };
 type Skill = { metadata: SkillMetadata; body: string };
@@ -62,18 +64,24 @@ function mergeSettings(base: Record<string, unknown>, override: Record<string, u
   return result;
 }
 
-function markdown(content: string, source: string) {
+function markdown(content: string, source: string, optionalSkill = false) {
   const text = content.replace(/^\uFEFF/, '');
-  if (text.startsWith('---') && !/^---(?:yaml)?\s*\r?\n/.test(text)) fail('CONFIG_INVALID', `Unsupported frontmatter format in ${source}.`);
-  if (/^---(?:yaml)?\s*\r?\n/.test(text) && !/^---\s*$/m.test(text.slice(text.indexOf('\n') + 1))) fail('CONFIG_INVALID', `Unterminated frontmatter in ${source}.`);
+  function invalidFrontmatter(message: string) {
+    // A broken optional skill must not block ordinary chat. Its unparsed body
+    // and metadata stay unavailable; mandatory instructions/rules still fail.
+    if (!optionalSkill) fail('CONFIG_INVALID', message);
+    return { body: '', data: {} as Record<string, unknown>, invalidFrontmatter: true };
+  }
+  if (text.startsWith('---') && !/^---(?:yaml)?\s*\r?\n/.test(text)) return invalidFrontmatter(`Unsupported frontmatter format in ${source}.`);
+  if (/^---(?:yaml)?\s*\r?\n/.test(text) && !/^---\s*$/m.test(text.slice(text.indexOf('\n') + 1))) return invalidFrontmatter(`Unterminated frontmatter in ${source}.`);
   try {
     const parsed = parseFrontMatter(text);
     const data = safeData(parsed.data);
     if (!plainObject(data)) fail('CONFIG_INVALID', `Frontmatter in ${source} must be an object.`);
-    return { body: parsed.content, data };
+    return { body: parsed.content, data, invalidFrontmatter: false };
   } catch (error) {
     if (error instanceof AppError) throw error;
-    fail('CONFIG_INVALID', `Malformed frontmatter in ${source}.`);
+    return invalidFrontmatter(`Malformed frontmatter in ${source}.`);
   }
 }
 
@@ -159,7 +167,7 @@ function argumentTokens(args: string): string[] {
   return tokens;
 }
 
-/** Project-runtime composition injects its owner/generation-pinned virtual filesystem; this resolver never reads host files, invokes tools, or grants permissions. PROJECT_RUNTIME_* errors fail explicit malformed/unsafe input rather than silently dropping it. */
+/** Project-runtime composition injects its owner/generation-pinned virtual filesystem; this resolver never reads host files, invokes tools, or grants permissions. Invalid optional skill syntax is reported and blocked; mandatory or unsafe input fails explicitly. */
 export function createProjectContentResolver(dependencies: ContentDependencies) {
   const files = new Map<string, ContentFile | null>();
   const sources = new Map<string, ContentSource>();
@@ -169,13 +177,63 @@ export function createProjectContentResolver(dependencies: ContentDependencies) 
     settings: Record<string, unknown>; skills: Map<string, Skill>; rules: Rule[] }> | undefined;
 
   function check() { dependencies.signal?.throwIfAborted(); dependencies.assertCurrent(); }
+  // Speculative reads keep their errors as data until the deterministic parser
+  // reaches that source. Four workers bound remote helper/memory admission.
+  type Prefetched<T> = { value: T } | { error: unknown };
+  const fileReads = new Map<string, Promise<Prefetched<ContentFile | null>>>();
+  const directoryReads = new Map<string, Promise<Prefetched<Array<{ name: string; directory: boolean }>>>>();
+  const waiting: Array<() => void> = [];
+  let activeReads = 0;
+  const schedule = <T>(operation: () => Promise<T>): Promise<Prefetched<T>> => new Promise(resolve => {
+    const start = () => {
+      activeReads++;
+      void (async () => {
+        try { check(); const value = await operation(); check(); resolve({ value }); }
+        catch (error) { resolve({ error }); }
+        finally { activeReads--; waiting.shift()?.(); }
+      })();
+    };
+    if (activeReads < 4) start(); else waiting.push(start);
+  });
+  const fetchFile = (relative: string) => {
+    let pending = fileReads.get(relative);
+    if (!pending) {
+      if (fileReads.size >= MAX_FILES) fail('LIMIT', 'Project content discovery exceeds 256 files.');
+      pending = schedule(() => dependencies.read(relative));
+      fileReads.set(relative, pending);
+    }
+    return pending;
+  };
+  const fetchDirectory = (relative: string) => {
+    let pending = directoryReads.get(relative);
+    if (!pending) {
+      if (directoryReads.size >= 128) fail('LIMIT', 'Project content discovery exceeds 128 directories.');
+      pending = schedule(() => dependencies.list(relative));
+      directoryReads.set(relative, pending);
+    }
+    return pending;
+  };
+  const unwrap = async <T>(pending: Promise<Prefetched<T>>) => {
+    const result = await pending;
+    check();
+    if ('error' in result) throw result.error;
+    return result.value;
+  };
+  const prefetchChildren = (directory: string, children: Array<{ name: string; directory: boolean }>, skill: boolean) => {
+    if (!dependencies.prefetch) return;
+    for (const child of children.slice(0, 4)) {
+      const relative = relativePath(child.name, directory);
+      if (child.directory) void fetchDirectory(relative);
+      else if (skill ? child.name === 'SKILL.md' : child.name.toLowerCase().endsWith('.md')) void fetchFile(relative);
+    }
+  };
   async function read(candidate: string, kind: ContentSource['kind']): Promise<ContentFile | null> {
     check();
     const relative = relativePath(candidate);
     if (!files.has(relative)) {
       if (files.size >= MAX_FILES) fail('LIMIT', 'Project content discovery exceeds 256 files.');
       let value: ContentFile | null;
-      try { value = await dependencies.read(relative); }
+      try { value = await (dependencies.prefetch ? unwrap(fetchFile(relative)) : dependencies.read(relative)); }
       catch (error) { check(); if ((error as { code?: string }).code === 'ENOENT') value = null; else throw error; }
       check();
       if (value !== null) {
@@ -196,7 +254,7 @@ export function createProjectContentResolver(dependencies: ContentDependencies) 
     const relative = relativePath(candidate);
     if (++listings > 128) fail('LIMIT', 'Project content discovery exceeds 128 directories.');
     let rows: Array<{ name: string; directory: boolean }>;
-    try { rows = await dependencies.list(relative); }
+    try { rows = await (dependencies.prefetch ? unwrap(fetchDirectory(relative)) : dependencies.list(relative)); }
     catch (error) { check(); if ((error as { code?: string }).code === 'ENOENT') rows = []; else throw error; }
     check();
     if (!Array.isArray(rows) || (entries += rows.length) > MAX_ENTRIES) fail('LIMIT', 'Project content discovery exceeds 512 directory entries.');
@@ -257,6 +315,11 @@ export function createProjectContentResolver(dependencies: ContentDependencies) 
   }
 
   async function build() {
+    if (dependencies.prefetch) {
+      for (const relative of ['CLAUDE.md', '.claude/CLAUDE.md', 'CLAUDE.local.md', '.claude/settings.json', '.claude/settings.local.json']) void fetchFile(relative);
+      void fetchDirectory('.claude/rules');
+      void fetchDirectory('.claude/skills');
+    }
     const seen = new Set<string>();
     const parts: string[] = [];
     for (const relative of ['CLAUDE.md', '.claude/CLAUDE.md', 'CLAUDE.local.md']) {
@@ -268,7 +331,10 @@ export function createProjectContentResolver(dependencies: ContentDependencies) 
     const rules: Rule[] = [];
     async function discoverRules(directory: string, depth: number): Promise<void> {
       if (depth > MAX_TREE_DEPTH) fail('LIMIT', 'Project rules exceed directory depth 8.');
-      for (const entry of await list(directory)) {
+      const children = await list(directory);
+      for (let index = 0; index < children.length; index++) {
+        prefetchChildren(directory, children.slice(index, index + 4), false);
+        const entry = children[index];
         const relative = relativePath(entry.name, directory);
         if (entry.directory) await discoverRules(relative, depth + 1);
         else if (entry.name.toLowerCase().endsWith('.md')) {
@@ -288,15 +354,29 @@ export function createProjectContentResolver(dependencies: ContentDependencies) 
     }
     await discoverRules('.claude/rules', 0);
     const skills = new Map<string, Skill>();
+    const invalidSkills = new Map<string, Skill>();
+    let skillCount = 0;
     async function discoverSkills(directory: string, depth: number): Promise<void> {
       if (depth > MAX_TREE_DEPTH) fail('LIMIT', 'Project skills exceed directory depth 8.');
       const children = await list(directory);
       if (children.some(entry => !entry.directory && entry.name === 'SKILL.md')) {
-        if (skills.size >= 100) fail('LIMIT', 'Project skill discovery exceeds 100 skills.');
+        if (dependencies.prefetch) void fetchFile(`${directory}/SKILL.md`);
+        if (++skillCount > 100) fail('LIMIT', 'Project skill discovery exceeds 100 skills.');
         const relative = `${directory}/SKILL.md`;
         const file = await read(relative, 'skill');
         if (!file) fail('CONFIG_INVALID', `Project skill disappeared during discovery: ${relative}.`);
-        const parsed = markdown(file.content, relative);
+        const parsed = markdown(file.content, relative, true);
+        if (parsed.invalidFrontmatter) {
+          warnings.add(`${relative}: invalid YAML frontmatter; this skill is unavailable. Fix its YAML header before invoking it.`);
+          const fallbackName = path.posix.basename(directory);
+          // No metadata from an invalid header is trusted. A diagnostic fallback
+          // must not collide with a healthy command or require a valid directory name.
+          if (/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(fallbackName)) invalidSkills.set(fallbackName.toLowerCase(), { body: '', metadata: {
+            name: fallbackName, description: '', path: relative, hash: file.hash, userInvocable: true,
+            disableModelInvocation: true, allowedTools: [], unsupported: ['invalid YAML frontmatter'],
+          } });
+          return;
+        }
         const name = textField(parsed.data, 'name', relative) ?? path.posix.basename(directory);
         if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(name)) fail('CONFIG_INVALID', `${relative}: skill name must be a bounded command identifier.`);
         if (skills.has(name.toLowerCase())) fail('CONFIG_INVALID', `Project skill name is duplicated: ${name}.`);
@@ -318,9 +398,14 @@ export function createProjectContentResolver(dependencies: ContentDependencies) 
         // the existing pinned workspace file tools; do not scan their contents.
         return;
       }
-      for (const entry of children) if (entry.directory) await discoverSkills(relativePath(entry.name, directory), depth + 1);
+      for (let index = 0; index < children.length; index++) {
+        prefetchChildren(directory, children.slice(index, index + 4), true);
+        const entry = children[index];
+        if (entry.directory) await discoverSkills(relativePath(entry.name, directory), depth + 1);
+      }
     }
     await discoverSkills('.claude/skills', 0);
+    for (const [name, skill] of invalidSkills) if (!skills.has(name)) skills.set(name, skill);
     check();
     const instructions = parts.join('\n\n');
     if (Buffer.byteLength(instructions) + rules.reduce((total, rule) => total + Buffer.byteLength(rule.body), 0) > MAX_BYTES) fail('LIMIT', 'Expanded project content exceeds 256 KiB.');

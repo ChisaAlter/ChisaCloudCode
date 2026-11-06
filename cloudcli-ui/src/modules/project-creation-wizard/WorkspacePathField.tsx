@@ -3,6 +3,8 @@ import { useTranslation } from 'react-i18next';
 import { FolderOpen } from 'lucide-react';
 
 import { Button, Input } from '@/shared/ui';
+import { getAuthSessionVersion } from '@/shared/authToken';
+import { getServerConnectionVersion } from '@/shared/chisa';
 import { browseFilesystemFolders } from '@/modules/project-creation-wizard/utils/workspaceApi';
 import { getSuggestionRootPath } from '@/modules/project-creation-wizard/utils/pathUtils';
 import type { FolderSuggestion } from '@/shared/types';
@@ -31,9 +33,14 @@ export default function WorkspacePathField({
   const [showFolderBrowser, setShowFolderBrowser] = useState(false);
 
   useEffect(() => {
-    if (value.trim().length <= 2) {
-      setPathSuggestions([]);
-      setShowPathDropdown(false);
+    let cancelled = false;
+    const auth = getAuthSessionVersion();
+    const server = getServerConnectionVersion();
+    const current = () => !cancelled && auth === getAuthSessionVersion() && server === getServerConnectionVersion();
+    // An old listing must not stay selectable while a different path is being resolved.
+    setPathSuggestions([]);
+    setShowPathDropdown(false);
+    if (disabled || value.trim().length <= 2) {
       return;
     }
 
@@ -42,7 +49,8 @@ export default function WorkspacePathField({
       try {
         const directoryPath = getSuggestionRootPath(value);
         const result = await browseFilesystemFolders(directoryPath);
-        const normalizedInput = value.toLowerCase();
+        if (!current()) return;
+        const normalizedInput = value.trim().toLowerCase();
 
         const matchingSuggestions = result.suggestions
           .filter((suggestion) => {
@@ -57,14 +65,15 @@ export default function WorkspacePathField({
         setPathSuggestions(matchingSuggestions);
         setShowPathDropdown(matchingSuggestions.length > 0);
       } catch (error) {
-        console.error('Failed to load path suggestions:', error);
+        if (current()) console.error('Failed to load path suggestions:', error);
       }
     }, 200);
 
     return () => {
+      cancelled = true;
       window.clearTimeout(timerId);
     };
-  }, [value]);
+  }, [disabled, value]);
 
   const handleSuggestionSelect = useCallback(
     (suggestion: FolderSuggestion) => {
@@ -98,7 +107,7 @@ export default function WorkspacePathField({
             disabled={disabled}
           />
 
-          {showPathDropdown && pathSuggestions.length > 0 && (
+          {!disabled && showPathDropdown && pathSuggestions.length > 0 && (
             <div className="absolute z-10 mt-1 max-h-60 w-full overflow-y-auto rounded-lg border border-gray-200 bg-white shadow-lg dark:border-gray-700 dark:bg-gray-800">
               {pathSuggestions.map((suggestion) => (
                 <button

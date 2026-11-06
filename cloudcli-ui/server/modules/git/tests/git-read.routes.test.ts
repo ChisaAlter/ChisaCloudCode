@@ -211,7 +211,7 @@ test('branches removes current and worktree markers while keeping literal leadin
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), {
       branches: ['+available', '+linked', '+main', '+remote'],
-      localBranches: ['+available', '+linked', '+main'], remoteBranches: ['+remote'],
+      localBranches: ['+available', '+linked', '+main'], remoteBranches: ['+remote'], remoteRefs: ['origin/+remote'],
     });
   } finally {
     if (server) await stopRouter(server);

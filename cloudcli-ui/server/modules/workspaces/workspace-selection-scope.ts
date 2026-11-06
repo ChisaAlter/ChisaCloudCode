@@ -80,5 +80,5 @@ export function currentWorkspaceSelector(): WorkspaceSelector | null {
   return scopes.getStore()?.readSelector() ?? null;
 }
 
-/** Workspaces enforces saved SSH ownership using authenticated transport identity, never request JSON. */
+/** Workspaces enforces SSH and cloud account ownership using authenticated transport identity, never request JSON. */
 export function currentWorkspaceUserId(): string | number | null { return scopes.getStore()?.userId ?? null; }

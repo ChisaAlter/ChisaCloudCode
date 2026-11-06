@@ -7577,6 +7577,8 @@ var LocalExecutionAdapter = class {
           cwd: request.cwd,
           env: {
             ...process.env,
+            // Attribute headless Claude commands to this app even inside an SDK session.
+            CLAUDE_CODE_ENTRYPOINT: "chisacloudcode",
             SCHEDULED_PROMPT: task.prompt,
             SCHEDULED_TASK_ID: task.id,
             SCHEDULED_TASK_NAME: task.name,

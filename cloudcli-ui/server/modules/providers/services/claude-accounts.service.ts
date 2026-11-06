@@ -63,11 +63,9 @@ export class ClaudeAccountsService {
 
   async getState(userId: unknown): Promise<ClaudeAccountsState> {
     const id = this.requireUser(userId);
-    const summaries = await Promise.all(claudeAccountsDb.list(id).map(account => this.summarize(id, account)));
-    const defaultSnapshot = this.defaultAllowed(id) ? await this.defaultSummary(id) : null;
-    // A second user or account removal can occur while an informational quota request is in flight.
-    const accounts = summaries.filter(account => claudeAccountsDb.get(id, account.id) !== null);
-    const defaultAccount = this.defaultAllowed(id) ? defaultSnapshot : null;
+    // State and mutation responses are local snapshots; only explicit refreshes wait for renewal/quota.
+    const accounts = claudeAccountsDb.list(id).map(account => this.summarize(id, account));
+    const defaultAccount = this.defaultAllowed(id) ? this.defaultSummary(id) : null;
     const activeId = claudeAccountsDb.activeId(id);
     const active = accounts.find(account => account.id === activeId);
     const connection = claudeConnectionsService.getActiveConnection(id);
@@ -245,20 +243,18 @@ export class ClaudeAccountsService {
   private defaultAllowed(userId: number): boolean { const active = userDb.getActiveUserIds(); return active.length === 1 && active[0] === String(userId); }
   private requireAccount(userId: number, accountId: string): ClaudeAccountRecord { const account = claudeAccountsDb.get(userId, accountId); if (!account) throw notFound(); return account; }
   private authenticated(credentials: ClaudeAccountCredentialRead): boolean { return !credentials.unavailable && (credentials.refreshable || Boolean(credentials.accessToken && (credentials.expiresAt === null || credentials.expiresAt > this.now()))); }
-  private async summarize(userId: number, account: ClaudeAccountRecord): Promise<ClaudeAccountSummary> {
-    await this.ensureRenewed(userId, account.id);
+  private summarize(userId: number, account: ClaudeAccountRecord): ClaudeAccountSummary {
     const credentials = this.profiles.read(userId, account.id, this.now());
     const { organizationUuid: _organizationUuid, ...metadata } = account;
     return { ...metadata, email: credentials.email ?? account.email, organizationName: credentials.organizationName ?? account.organizationName,
       plan: credentials.plan ?? account.plan, needsSignIn: !this.authenticated(credentials),
-      usage: await this.quota.read(this.key(userId, account.id), () => this.profiles.read(userId, account.id, this.now())) };
+      usage: this.quota.peek(this.key(userId, account.id), credentials) };
   }
-  private async defaultSummary(userId: number): Promise<ClaudeAccountSummary & { id: 'default' }> {
-    await this.ensureRenewed(userId, 'default');
+  private defaultSummary(userId: number): ClaudeAccountSummary & { id: 'default' } {
     const credentials = this.profiles.read(userId, 'default', this.now());
     return { id: 'default', name: '服务器默认登录', email: credentials.email, organizationName: credentials.organizationName, plan: credentials.plan,
       needsSignIn: !this.authenticated(credentials), createdAt: 0, updatedAt: 0,
-      usage: await this.quota.read(this.key(userId, 'default'), () => this.defaultAllowed(userId) ? this.profiles.read(userId, 'default', this.now()) : { ...credentials, accessToken: null, refreshable: false, unavailable: true }) };
+      usage: this.quota.peek(this.key(userId, 'default'), credentials) };
   }
   private serialize<T>(userId: number, operation: () => Promise<T>): Promise<T> {
     const previous = this.queues.get(userId) ?? Promise.resolve();

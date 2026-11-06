@@ -92,6 +92,47 @@ async function withFileTreeServer(
   }
 }
 
+test('cloud folder routes forward paths, preserve suggestions and report reserved metadata errors', async () => {
+  const browsed: Array<string | null> = [];
+  const created: string[] = [];
+  const services = createFakeServices({
+    browseWorkspace: async input => {
+      browsed.push(input);
+      if (input === '~/.chisa-ssh-projects') {
+        throw new AppError('Reserved SSH metadata', { code: 'SSH_ANCHOR_RESERVED', statusCode: 400 });
+      }
+      return { path: '/cloud', suggestions: [{ path: '/cloud/Projects', name: 'Projects', type: 'directory' }] };
+    },
+    createWorkspaceFolder: async input => {
+      created.push(input);
+      if (input === '~/.chisa-ssh-projects/new') {
+        throw new AppError('Reserved SSH metadata', { code: 'SSH_ANCHOR_RESERVED', statusCode: 400 });
+      }
+      return { success: true, path: '/cloud/new' };
+    },
+  });
+  await withFileTreeServer(services, async baseUrl => {
+    const browseEndpoint = `${baseUrl}/api/file-tree/browse-filesystem`;
+    for (const query of ['?path=~', '']) {
+      const response = await fetch(browseEndpoint + query);
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { path: '/cloud', suggestions: [{ path: '/cloud/Projects', name: 'Projects', type: 'directory' }] });
+    }
+    const reserved = await fetch(`${browseEndpoint}?path=${encodeURIComponent('~/.chisa-ssh-projects')}`);
+    assert.equal(reserved.status, 400);
+    assert.deepEqual(await reserved.json(), { error: 'Reserved SSH metadata', code: 'SSH_ANCHOR_RESERVED' });
+    for (const [input, status] of [['~/new', 200], ['~/.chisa-ssh-projects/new', 400], [null, 400]] as const) {
+      const response = await fetch(`${baseUrl}/api/file-tree/create-folder`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: input }),
+      });
+      assert.equal(response.status, status);
+      if (status === 200) assert.deepEqual(await response.json(), { success: true, path: '/cloud/new' });
+    }
+  });
+  assert.deepEqual(browsed, ['~', null, '~/.chisa-ssh-projects']);
+  assert.deepEqual(created, ['~/new', '~/.chisa-ssh-projects/new']);
+});
+
 test('editor save route forwards the loaded hash and rejects malformed hashes', async () => {
   const inputs: Parameters<FileTreeServices['saveTextFile']>[] = [];
   const services = createFakeServices({ saveTextFile: async (...input) => {

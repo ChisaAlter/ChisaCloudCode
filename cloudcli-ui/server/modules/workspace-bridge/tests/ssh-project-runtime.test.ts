@@ -69,6 +69,27 @@ async function fixture(files: Record<string, string>, run: (value: {
     assert.equal(input.workspaceMode, 'shared');
     active = true;
     const assertCurrent = () => { assert.equal(active, true, 'configuration and tool RPC require the exact live admission'); };
+    const inspect = (request: Record<string, unknown>) => {
+      const relative = String(request.path).replace(/^\/workspace\//, '');
+      const content = remote.get(relative);
+      const children = [...remote.keys()].filter(key => key.startsWith(relative + '/'));
+      const missing = () => { throw Object.assign(new Error('Fixture optional config absent'), { code: 'ENOENT' }); };
+      const stats = (dir: boolean, size = 0) => ({ dir, size, mode: dir ? 0o040700 : 0o100600, mtime: 1, symlink: false });
+      // Model an older helper's explicit unsupported-operation response; configuration falls back to read-only batch inspection.
+      if (request.op === 'project_snapshot') throw Object.assign(new Error('Startup snapshots are not supported by this fixture helper'), { code: 'SSH_WORKSPACE_REQUEST_INVALID' });
+      if (request.op === 'lstat') {
+        if (content !== undefined) return stats(false, Buffer.byteLength(content));
+        return children.length ? stats(true) : missing();
+      }
+      if (request.op === 'read') return content === undefined ? missing() : { b64: Buffer.from(content).toString('base64'), hash: digest(content) };
+      if (request.op === 'list') {
+        if (!children.length) return missing();
+        const names = new Map<string, boolean>();
+        for (const child of children) { const parts = child.slice(relative.length + 1).split('/'); names.set(parts[0], parts.length > 1 || Boolean(names.get(parts[0]))); }
+        return { entries: [...names].map(([name, dir]) => ({ name, dir, stats: stats(dir) })), truncated: false };
+      }
+      assert.fail('A project runtime test must not execute commands or mutate remote files.');
+    };
     return {
       cwd: target.anchorPath, sourceRoot: target.anchorPath, assertCurrent,
       async execute(request: Record<string, unknown>, signal?: AbortSignal) {
@@ -76,22 +97,12 @@ async function fixture(files: Record<string, string>, run: (value: {
         assert.equal(signal, input.signal);
         signal?.throwIfAborted();
         requests.push({ ...request });
-        const relative = String(request.path).replace(/^\/workspace\//, '');
-        const content = remote.get(relative);
-        const children = [...remote.keys()].filter(key => key.startsWith(relative + '/'));
-        const missing = () => { throw Object.assign(new Error('Fixture optional config absent'), { code: 'ENOENT' }); };
-        if (request.op === 'lstat') {
-          if (content !== undefined) return { dir: false, size: Buffer.byteLength(content), mode: 0o100600 };
-          return children.length ? { dir: true, mode: 0o040700 } : missing();
+        if (request.op === 'batch') {
+          assert.ok(Array.isArray(request.requests));
+          assert.ok(request.requests.length >= 1 && request.requests.length <= 64);
+          return { results: request.requests.map(row => inspect(row)), ok: true as const };
         }
-        if (request.op === 'read') return content === undefined ? missing() : { b64: Buffer.from(content).toString('base64'), hash: digest(content) };
-        if (request.op === 'list') {
-          if (!children.length) return missing();
-          const names = new Map<string, boolean>();
-          for (const child of children) { const parts = child.slice(relative.length + 1).split('/'); names.set(parts[0], parts.length > 1 || Boolean(names.get(parts[0]))); }
-          return { entries: [...names].map(([name, dir]) => ({ name, dir, stats: { symlink: false } })) };
-        }
-        assert.fail('A project runtime test must not execute commands or mutate remote files.');
+        return inspect(request);
       },
       async close() { closeCalls++; active = false; },
     } as Awaited<ReturnType<Admit>>;
@@ -111,11 +122,7 @@ async function fixture(files: Record<string, string>, run: (value: {
 
 function prompt(options: Options) {
   const value = options.systemPrompt;
-  if (typeof value === 'string') return value;
-  if (Array.isArray(value)) return value.join('\n');
-  if (!value) return '';
-  if (value.type === 'preset') return value.append ?? '';
-  return Array.isArray(value.prompt) ? value.prompt.join('\n') : value.prompt;
+  return typeof value === 'string' ? value : Array.isArray(value) ? value.join('\n') : value?.type === 'custom' ? (Array.isArray(value.prompt) ? value.prompt.join('\n') : value.prompt) : value?.append ?? '';
 }
 
 test('actual SSH query wrapper prepares session-scoped provenance and keeps configured MCP beside workspace tools', async () => fixture({
@@ -165,14 +172,10 @@ test('actual SSH query wrapper preserves project ask against captured bypass and
   onQuery = async input => {
     const options = input.options!;
     assert.equal(options.allowedTools?.includes('mcp__workspace__read_file'), false);
-    const context: Parameters<NonNullable<Options['canUseTool']>>[2] = { signal: new AbortController().signal, toolUseID: 'wrapper-tool', requestId: 'ssh-project-runtime-request' };
-    const commandDecision = await options.canUseTool!('mcp__workspace__run_command', {}, context);
-    assert.ok(commandDecision, 'the SSH wrapper returns the explicit project deny');
-    assert.equal(commandDecision.behavior, 'deny');
+    const context = { signal: new AbortController().signal, toolUseID: 'wrapper-tool', requestId: 'wrapper-request' } as Parameters<NonNullable<Options['canUseTool']>>[2];
+    assert.equal((await options.canUseTool!('mcp__workspace__run_command', {}, context))?.behavior, 'deny');
     assert.equal(permissionCalls, 0, 'deny wins before the captured bypass callback');
-    const readDecision = await options.canUseTool!('mcp__workspace__read_file', { path: '/workspace/src/index.ts' }, context);
-    assert.ok(readDecision, 'the SSH wrapper retains the explicit approval decision');
-    assert.equal(readDecision.behavior, 'deny');
+    assert.equal((await options.canUseTool!('mcp__workspace__read_file', { path: '/workspace/src/index.ts' }, context))?.behavior, 'deny');
     assert.equal(permissionCalls, 1, 'ask crosses both wrapper layers and forces explicit permission');
     const workspace = options.mcpServers!.workspace as unknown as MockServer;
     const read = workspace.tools.find(tool => tool.name === 'read_file')!;
@@ -187,5 +190,5 @@ test('actual SSH query wrapper preserves project ask against captured bypass and
   assert.equal(queryCalls, 1);
   assert.equal(current.closes(), 1);
   assert.equal(current.manifest()?.status, 'completed');
-  assert.ok(current.requests.every(request => ['lstat', 'list', 'read'].includes(String(request.op))));
+  assert.ok(current.requests.every(request => ['lstat', 'list', 'read', 'batch', 'project_snapshot'].includes(String(request.op))));
 }));

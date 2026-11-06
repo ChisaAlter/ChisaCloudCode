@@ -1,6 +1,7 @@
 ---
 name: github-task
-description: Manage GitHub Issues as tasks — list, move between columns, update with comments, and order the Plan tab. Reads GitHub config from .GitHubBoard/github-sync.json in the current project. Use when the user invokes /github-task or asks to "check tasks", "move issue to in-progress", "update task", "what needs testing", "mark done", "sprawdź taski", "przenieś task", "zaktualizuj task", or to order/rank the Plan board: "ułóż plan", "ustaw kolejność w Plan", "uporządkuj plan wg pilności", "przelicz plan", "ustaw kolejność issues", "ułóż issues od najpilniejszych", "order the plan", "set plan order", "reorder phases".
+description: >-
+  Manage GitHub Issues as tasks — list, move between columns, update with comments, and order the Plan tab. Reads GitHub config from .GitHubBoard/github-sync.json in the current project. Use when the user invokes /github-task or asks to "check tasks", "move issue to in-progress", "update task", "what needs testing", "mark done", "sprawdź taski", "przenieś task", "zaktualizuj task", or to order/rank the Plan board: "ułóż plan", "ustaw kolejność w Plan", "uporządkuj plan wg pilności", "przelicz plan", "ustaw kolejność issues", "ułóż issues od najpilniejszych", "order the plan", "set plan order", "reorder phases".
 ---
 
 # github-task skill

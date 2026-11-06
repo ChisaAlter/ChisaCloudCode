@@ -22,7 +22,7 @@ vi.mock('@/shared/context/UiPreferencesContext', () => ({
   useUiPreferences: () => ({ sidebarVisible: true }),
   useSetUiPreference: () => vi.fn(),
 }));
-vi.mock('@/shared/context/SessionProtectionContext', () => ({ useBusySessionIdSet: () => new Set() }));
+vi.mock('@/shared/context/SessionProtectionContext', () => ({ useBusySessionIdSet: () => new Set(), useBackgroundSessionIdSet: () => new Set() }));
 vi.mock('@/modules/auth', () => ({ AccountMenu: () => null }));
 vi.mock('@/modules/claude-accounts', () => ({ ClaudeUsageTrigger: () => null }));
 vi.mock('@/modules/settings', () => ({ Settings: () => null }));

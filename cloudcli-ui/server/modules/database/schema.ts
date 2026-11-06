@@ -10,8 +10,36 @@ CREATE TABLE IF NOT EXISTS users (
     is_active BOOLEAN DEFAULT 1,
     git_name TEXT,
     git_email TEXT,
-    has_completed_onboarding BOOLEAN DEFAULT 0
+    has_completed_onboarding BOOLEAN DEFAULT 0,
+    auth_version INTEGER NOT NULL DEFAULT 0
 );
+`;
+
+/** Authentication sessions are distinct from provider/chat sessions. Persistent revocation and an absolute expiry are checked on HTTP and existing WebSocket transports. */
+export const AUTH_SESSIONS_TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    sid TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    session_version INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    CHECK (session_version >= 0 AND created_at > 0 AND expires_at > created_at)
+);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at);
+`;
+
+/** Database-level password/activation changes revoke every prior login version, including direct SQL administration. Install after legacy users receive auth_version. */
+export const AUTH_VERSION_TRIGGER_SCHEMA_SQL = `
+CREATE TRIGGER IF NOT EXISTS users_revoke_auth_on_credentials_change
+AFTER UPDATE OF password_hash, is_active ON users
+WHEN NEW.password_hash IS NOT OLD.password_hash OR NEW.is_active IS NOT OLD.is_active
+BEGIN
+  UPDATE users SET auth_version = OLD.auth_version + 1 WHERE id = NEW.id;
+  UPDATE auth_sessions SET revoked_at = COALESCE(revoked_at, CAST(strftime('%s', 'now') AS INTEGER)) WHERE user_id = NEW.id;
+END;
 `;
 
 export const API_KEYS_TABLE_SCHEMA_SQL = `
@@ -267,6 +295,11 @@ CREATE TABLE IF NOT EXISTS app_config (
  * controlled in each provider's `-models.provider.ts` adapter so they can be
  * updated without migrating application data. `model_id` is unique only within
  * a provider because different CLIs can accept the same identifier.
+ *
+ * `effort_values` (JSON array of level ids) and `effort_default` hold the
+ * reasoning-effort levels the user declared for the model; both stay NULL when
+ * none were declared. They sit after the timestamps so fresh installs match the
+ * column order that `runMigrations` produces on upgraded databases.
  */
 export const PROVIDER_MODELS_TABLE_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS provider_models (
@@ -277,6 +310,8 @@ CREATE TABLE IF NOT EXISTS provider_models (
     sort_order INTEGER NOT NULL DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    effort_values TEXT DEFAULT NULL,
+    effort_default TEXT DEFAULT NULL,
     UNIQUE(provider, model_id)
 );
 `;
@@ -297,6 +332,31 @@ CREATE TABLE IF NOT EXISTS user_preferences (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, preference_key),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+`;
+
+/** Durable field revisions, bounded replay acknowledgments and a monotonic time watermark shared by user preference CAS transactions and legacy writes. */
+export const USER_PREFERENCE_CAS_TABLE_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS user_preference_versions (
+    user_id INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision BETWEEN 0 AND 9007199254740991),
+    PRIMARY KEY (user_id, key),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS user_preference_operations (
+    user_id INTEGER NOT NULL,
+    op_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    ack_json TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, op_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_user_preference_operations_expires ON user_preference_operations(expires_at);
+CREATE TABLE IF NOT EXISTS user_preference_cas_state (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    observed_at INTEGER NOT NULL CHECK (typeof(observed_at) = 'integer' AND observed_at >= 0)
 );
 `;
 
@@ -348,6 +408,8 @@ export const INIT_SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
 
 ${USER_TABLE_SCHEMA_SQL}
+${AUTH_SESSIONS_TABLE_SCHEMA_SQL}
+-- Install auth-version trigger only after legacy users are upgraded in runMigrations.
 -- Indexes for performance for user lookups
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE INDEX IF NOT EXISTS idx_users_active ON users(is_active);
@@ -392,6 +454,7 @@ CREATE INDEX IF NOT EXISTS idx_provider_models_provider_order
 ON provider_models(provider, sort_order, id);
 
 ${USER_PREFERENCES_TABLE_SCHEMA_SQL}
+${USER_PREFERENCE_CAS_TABLE_SCHEMA_SQL}
 
 -- Server-private routing configuration is not exposed through preference/credential CRUD.
 CREATE TABLE IF NOT EXISTS hiroute_connections (

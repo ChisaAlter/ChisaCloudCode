@@ -1,3 +1,4 @@
+export { getWorkspaceBrokerAdmission, closeWorkspaceBrokerLease } from './workspace-runtime-broker.service.js';
 export { createWorkspaceRuntimeService, getWorkspaceRuntimeIdentity } from './workspace-runtime.service.js';
 // Catalog/history gateways read existing ownership without restoring or claiming an account root.
 export { readCloudWorkspaceOwner, assertCloudWorkspaceOwner } from './workspace-owner.service.js';

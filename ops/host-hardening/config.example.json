@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "change_id": "operator-change-required",
+  "machine": {"machine_id_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "boot_id": "operator-boot-required"},
+  "inventory": {"path": "/etc/chisa-hardening/inventory.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+  "management": {
+    "user": "operator_required", "port": 22, "sources": ["192.0.2.10/32", "2001:db8::10/128"],
+    "host_key_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "server_address": "192.0.2.20", "ssh_config": "/etc/ssh/sshd_config",
+    "ssh_include_verified": false, "firewall_backend": "iptables", "input_chain": "INPUT", "forward_chain": "DOCKER-USER", "upstream_rules": []
+  },
+  "ports": [
+    {"port":22,"protocol":"tcp","owner":"chisacloudcode","business":"Host management; replace documentation addresses with verified sources","action":"restrict","sources":["192.0.2.10/32","2001:db8::10/128"],"path":"INPUT","local_addresses":["192.0.2.20","2001:db8::20"],"consumers":["operator_required"]},
+    {"port":80,"protocol":"tcp","owner":"shared_proxy","business":"Shared HTTP and certificate challenge; preserve until owner reviewed","action":"preserve","sources":[],"path":"both","local_addresses":["192.0.2.20","2001:db8::20"],"consumers":["shared_sites"]},
+    {"port":443,"protocol":"tcp","owner":"shared_proxy","business":"Shared HTTPS; preserve existing services","action":"preserve","sources":[],"path":"both","local_addresses":["192.0.2.20","2001:db8::20"],"consumers":["shared_sites"]},
+    {"port":443,"protocol":"udp","owner":"shared_proxy","business":"Existing shared UDP ingress","action":"preserve","sources":[],"path":"both","local_addresses":["192.0.2.20","2001:db8::20"],"consumers":["shared_sites"]},
+    {"port":2096,"protocol":"tcp","owner":"chisacloudcode","business":"Current project reverse proxy; exact CDN/source inventory pending","action":"preserve","sources":[],"path":"both","local_addresses":["192.0.2.20","2001:db8::20"],"consumers":["current_proxy"]},
+    {"port":6768,"protocol":"tcp","owner":"orca_ide","business":"Orca IDE; unrelated shared service ownership pending","action":"preserve","sources":[],"path":"INPUT","local_addresses":["192.0.2.20","2001:db8::20"],"consumers":["ide_owner_required"]},
+    {"port":32768,"protocol":"tcp","owner":"chisacloudcode","business":"Legacy sync SSH2222 under Restart=always supervisor","action":"preserve","sources":[],"path":"DOCKER-USER","local_addresses":["192.0.2.20","2001:db8::20"],"consumers":["inventory_required"]},
+    {"port":8791,"protocol":"tcp","owner":"chisacloudcode","business":"Current host-network API; loopback candidate requires actual internal caller review","action":"preserve","sources":[],"path":"INPUT","local_addresses":["192.0.2.20","2001:db8::20"],"consumers":["current_proxy"]},
+    {"port":8443,"protocol":"tcp","owner":"shared_service","business":"Existing shared ingress; preserve","action":"preserve","sources":[],"path":"both","local_addresses":["192.0.2.20","2001:db8::20"],"consumers":["shared_owner_required"]},
+    {"port":2053,"protocol":"tcp","owner":"shared_service","business":"Existing shared ingress; preserve","action":"preserve","sources":[],"path":"both","local_addresses":["192.0.2.20","2001:db8::20"],"consumers":["shared_owner_required"]},
+    {"port":2083,"protocol":"tcp","owner":"shared_service","business":"Existing shared ingress; preserve","action":"preserve","sources":[],"path":"both","local_addresses":["192.0.2.20","2001:db8::20"],"consumers":["shared_owner_required"]},
+    {"port":8088,"protocol":"tcp","owner":"shared_service","business":"Existing shared Docker ingress; preserve","action":"preserve","sources":[],"path":"both","local_addresses":["192.0.2.20","2001:db8::20"],"consumers":["shared_owner_required"]},
+    {"port":8090,"protocol":"tcp","owner":"shared_service","business":"Existing shared Docker ingress; preserve","action":"preserve","sources":[],"path":"both","local_addresses":["192.0.2.20","2001:db8::20"],"consumers":["shared_owner_required"]},
+    {"port":4100,"protocol":"tcp","owner":"shared_service","business":"Observed Docker subnet source rule; preserve","action":"preserve","sources":[],"path":"both","local_addresses":["192.0.2.20"],"consumers":["shared_owner_required"]}
+  ],
+  "sync": {
+    "unit":"chisa-workspace-sync.service", "container_id":"0000000000000000000000000000000000000000000000000000000000000000",
+    "image_id":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "mounts":[{"source":"/opt/chisacloudcode/workspaces","target":"/opt/chisacloudcode/workspaces","writable":true}],
+    "networks":["0000000000000000000000000000000000000000000000000000000000000000"],
+    "consumers":["inventory_required"], "retire":false, "supervisors":["chisa-workspace-sync.service"], "observed_restart":"always"
+  },
+  "deployment": {
+    "version":1,"owner_id":"operator_owner_required","artifact_root":"/opt/chisa-candidate","egress":[],
+    "images":{"node_base":null,"api":null,"gateway":null,"proxy":null,"rollback_api":null},
+    "api":{"uid":10001,"gid":10001,"home":"/opt/chisacloudcode/home","workspaces_root":"/opt/chisacloudcode/workspaces","database_path":"/opt/chisacloudcode/data/chisacloudcode.db","listen_port":8791,"allowed_hosts":["app.example.invalid"],"allowed_origins":["https://app.example.invalid"],"trusted_proxy":"172.30.240.4","health_path":"/health","command":["node","dist-server/server/index.js"],"memory_mb":2048,"cpus":2},
+    "network":{"service_name":"chisa_candidate_service","service_subnet":"172.30.240.0/28","api_address":"172.30.240.2","gateway_address":"172.30.240.3","proxy_address":"172.30.240.4","account_gateway_address":"172.30.241.2","account_name":"operator_account_network","account_id":"0000000000000000000000000000000000000000000000000000000000000000","account_subnet":"172.30.241.0/24","api_loopback_port":18791},
+    "gateway":{"account_id":"operator_owner_required","audience":"chisa_preview_gateway","key_id":"operator_key_required","public_key_file":"/etc/chisa-client/preview-gateway-public.pem","broker_socket":"/run/chisa-broker/broker.sock","grant_issuer_socket":"/run/chisa-authority/issuer.sock","listen_port":8792,"uid":10002,"gid":10002,"renew_socket":"/run/chisa-preview-renew/renew.sock","renew_gid":10104,"authority_manifest":"/etc/chisa-preview-authority/manifest.json","authority_private_socket":"/run/chisa-preview-authority/private.sock"},
+    "mounts":[
+      {"source":"/opt/chisacloudcode/data","target":"/opt/chisacloudcode/data","writable":true,"uid":10001,"gid":10001,"mode":"0700","purpose":"data"},
+      {"source":"/opt/chisacloudcode/workspaces","target":"/opt/chisacloudcode/workspaces","writable":true,"uid":0,"gid":10105,"mode":"01770","purpose":"workspace"},
+      {"source":"/opt/chisacloudcode/home/.chisa-workspace-runtime","target":"/opt/chisacloudcode/home/.chisa-workspace-runtime","writable":true,"uid":10001,"gid":10001,"mode":"0700","purpose":"runtime"}
+    ],
+    "authority_files":[
+      {"source":"/etc/chisa-client/broker-client.json","target":"/etc/chisa-client/broker-client.json","env":"CHISA_WORKSPACE_BROKER_CLIENT_CONFIG","sha256":"0000000000000000000000000000000000000000000000000000000000000000"},
+      {"source":"/etc/chisa-client/bridge-profiles.json","target":"/etc/chisa-client/bridge-profiles.json","env":"CHISA_WORKSPACE_BROKER_PROFILE_CONFIG","sha256":"0000000000000000000000000000000000000000000000000000000000000000"},
+      {"source":"/etc/chisa-client/provider-slots.json","target":"/etc/chisa-client/provider-slots.json","env":"CHISA_PROVIDER_SLOT_CLIENT_CONFIG","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}
+    ],
+    "socket_directories":[{"path":"/run/chisa-broker","gid":10101},{"path":"/run/chisa-authority","gid":10102},{"path":"/run/chisa-provider-slots","gid":10103}],
+    "recovery":{"config_path":"/etc/chisa/workspace-broker-recovery.json","config_sha256":"0000000000000000000000000000000000000000000000000000000000000000","client_gid":10106,"metadata_gid":10105,"native_witness_directory":"/var/lib/chisa-native-stopped","authority_manifest":"/etc/chisa-workspace-authority/manifest.json","authority_manifest_sha256":"0000000000000000000000000000000000000000000000000000000000000000","stop_producer_evidence":null},
+    "secret_env_file":"/opt/chisacloudcode/secrets/api.env",
+    "mapping":[
+      {"path":"/opt/chisacloudcode/data","old_uid":0,"old_gid":0,"new_uid":10001,"new_gid":10001,"expected_type":"directory","old_mode":"0755","new_mode":"0700","device":0,"inode":0},
+      {"path":"/opt/chisacloudcode/workspaces","old_uid":0,"old_gid":0,"new_uid":0,"new_gid":10105,"expected_type":"directory","old_mode":"0755","new_mode":"01770","device":0,"inode":0},
+      {"path":"/opt/chisacloudcode/home/.chisa-workspace-runtime","old_uid":0,"old_gid":0,"new_uid":10001,"new_gid":10001,"expected_type":"directory","old_mode":"0700","new_mode":"0700","device":0,"inode":0}
+    ]
+  },
+  "evidence":{"g1":null,"administration":null,"fence":null,"acceptance":null}
+}

@@ -1,0 +1,78 @@
+diff --git a/package.json b/package.json
+index 9ffaf5e..325d451 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "eslint-plugin-import-x",
+-  "version": "4.17.1",
++  "version": "4.17.1-chisa.1",
+   "type": "module",
+   "description": "Import with sanity.",
+   "repository": "https://github.com/un-ts/eslint-plugin-import-x",
+@@ -62,9 +62,9 @@
+     "debug": "^4.4.1",
+     "eslint-import-context": "^0.1.9",
+     "is-glob": "^4.0.3",
+-    "minimatch": "^9.0.3 || ^10.1.2",
++    "minimatch": "11.0.3",
+     "semver": "^7.7.2",
+     "stable-hash-x": "^0.2.0",
+     "unrs-resolver": "^1.9.2"
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/lib/rules/no-internal-modules.js b/lib/rules/no-internal-modules.js
+index cf36962..10aafd8 100644
+--- a/lib/rules/no-internal-modules.js
++++ b/lib/rules/no-internal-modules.js
+@@ -1,4 +1,4 @@
+-import { makeRe } from 'minimatch';
++import { Minimatch } from 'minimatch';
+ import { importType, createRule, moduleVisitor, resolve, } from '../utils/index.js';
+ function normalizeSep(somePath) {
+     return somePath.split('\\').join('/');
+@@ -67,16 +67,16 @@ export default createRule({
+     create(context) {
+         const options = context.options[0] || {};
+         const allowRegexps = (options.allow || [])
+-            .map(p => makeRe(p))
++            .map(p => new Minimatch(p))
+             .filter(Boolean);
+         const forbidRegexps = (options.forbid || [])
+-            .map(p => makeRe(p))
++            .map(p => new Minimatch(p))
+             .filter(Boolean);
+         function reachingAllowed(importPath) {
+-            return allowRegexps.some(re => re.test(importPath));
++            return allowRegexps.some(re => re.match(importPath));
+         }
+         function reachingForbidden(importPath) {
+-            return forbidRegexps.some(re => re.test(importPath));
++            return forbidRegexps.some(re => re.match(importPath));
+         }
+         function isAllowViolation(importPath) {
+             const steps = toSteps(importPath);
+diff --git a/lib/index.cjs b/lib/index.cjs
+index bba741d..0588881 100644
+--- a/lib/index.cjs
++++ b/lib/index.cjs
+@@ -4694,13 +4694,13 @@ var no_internal_modules_default = createRule({
+ 	defaultOptions: [],
+ 	create(context) {
+ 		const options = context.options[0] || {};
+-		const allowRegexps = (options.allow || []).map((p) => (0, minimatch.makeRe)(p)).filter(Boolean);
+-		const forbidRegexps = (options.forbid || []).map((p) => (0, minimatch.makeRe)(p)).filter(Boolean);
++		const allowRegexps = (options.allow || []).map((p) => new minimatch.Minimatch(p)).filter(Boolean);
++		const forbidRegexps = (options.forbid || []).map((p) => new minimatch.Minimatch(p)).filter(Boolean);
+ 		function reachingAllowed(importPath) {
+-			return allowRegexps.some((re) => re.test(importPath));
++			return allowRegexps.some((re) => re.match(importPath));
+ 		}
+ 		function reachingForbidden(importPath) {
+-			return forbidRegexps.some((re) => re.test(importPath));
++			return forbidRegexps.some((re) => re.match(importPath));
+ 		}
+ 		function isAllowViolation(importPath) {
+ 			const steps = toSteps(importPath);

@@ -27,3 +27,16 @@ export function setConnectedClientUserId(client: RealtimeClientConnection, userI
 export function getConnectedClientUserId(client: RealtimeClientConnection): string | undefined {
   return connectedClientOwners.get(client);
 }
+
+/** Account-scoped realtime fan-out used by the SSH workspace event service; only the owner's open sockets receive the serialized frame. */
+export function broadcastToUser(userId: string, payload: string): number {
+  let delivered = 0;
+  for (const client of connectedClients) {
+    if (getConnectedClientUserId(client) !== userId || client.readyState !== WS_OPEN_STATE) continue;
+    try {
+      client.send(payload);
+      delivered += 1;
+    } catch { /* A closing socket simply misses this advisory update. */ }
+  }
+  return delivered;
+}

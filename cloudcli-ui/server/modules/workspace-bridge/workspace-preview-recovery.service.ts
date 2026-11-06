@@ -4,12 +4,15 @@ import os from 'node:os';
 
 import { AppError } from '@/shared/index.js';
 
+import { workspaceBrokerRecoveryPython } from './workspace-broker-recovery.service.js';
+
 // The runtime supplies account identity, never a caller-supplied cleanup verdict.
 type RecoveryRequest = { userId: string; accountRoot: string; root: string; previewId: string };
 type RecoveryReply = { ok?: boolean; released?: boolean; code?: string; error?: string };
 
 const previewRecoveryScript = String.raw`
-import datetime, errno, fcntl, hashlib, json, os, re, secrets, stat, subprocess, sys
+import datetime, errno, fcntl, hashlib, json, os, re, secrets, stat, sys
+${workspaceBrokerRecoveryPython}
 
 class RecoveryError(Exception):
     def __init__(self,message,code='WORKSPACE_PREVIEW_RECOVERY_REQUIRED'):
@@ -56,23 +59,6 @@ def validate_lease(value):
         values=value.get(key,[])
         if not isinstance(values,list) or any(not text(item) for item in values) or len(set(values))!=len(values): fail('Lease cleanup inventory is invalid')
     if 'integrationOperation' in value: fail('Integration reservation cannot be recovered as a preview')
-def stopped(lease):
-    with open('/proc/sys/kernel/random/boot_id') as stream: boot=stream.read().strip()
-    if not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',boot): fail('Current Linux boot identity cannot be verified')
-    if boot!=lease['bootId']: return
-    try:
-        with open('/proc/'+str(lease['pid'])+'/stat') as stream: fields=stream.read().rsplit(')',1)[1].split()
-    except FileNotFoundError:
-        try: os.kill(lease['pid'],0)
-        except ProcessLookupError: return
-        fail('Lease process absence is not confirmed','WORKSPACE_BUSY')
-    if len(fields)<=19 or not re.fullmatch(r'[0-9]+',fields[19]): fail('Lease process birth cannot be verified')
-    if fields[0] in ('Z','X') or fields[19]!=lease['processStartTime']: return
-    fail('The exact lease process is still alive','WORKSPACE_BUSY')
-def absent_container(filter_value):
-    result=subprocess.run(['docker','ps','--all','--filter',filter_value,'--format','{{.Names}}'],capture_output=True,text=True,timeout=2)
-    if result.returncode!=0 or len(result.stdout)>65536 or len(result.stderr)>65536: fail('Docker absence could not be confirmed','WORKSPACE_CLEANUP_FAILED')
-    if result.stdout.strip(): fail('Workspace containers are still reserved','WORKSPACE_CLEANUP_FAILED')
 def operate(q):
     if not isinstance(q,dict): fail('Invalid recovery request')
     root,account,home,preview,user=[q.get(key) for key in ('root','accountRoot','home','previewId','userId')]
@@ -115,7 +101,6 @@ def operate(q):
         witness=observe(inventory_fd,preview+'.json',True)
         if set(witness)!=set(('version','userId','accountRoot','root','previewId','lease')) or type(witness.get('version')) is not int or witness['version']!=1 or any(witness.get(key)!=q[key] for key in ('userId','accountRoot','root','previewId')): fail('Runtime inventory does not match the exact stopped preview')
         expected=witness['lease']; validate_lease(expected)
-        stopped(expected)
         for suffix in ('.chisa-writer.guard','.chisa-lease.guard'):
             name=base+suffix
             fd=os.open(name,os.O_RDWR|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent_fd); opened.append(fd)
@@ -147,12 +132,14 @@ def operate(q):
             if entries not in ([],['state.json']): fail('Workspace jobs or unconfirmed state are still reserved','WORKSPACE_BUSY')
             if entries:
                 actual=read(lease_fd,'state.json',True); validate_lease(actual)
-                if any(actual.get(key)!=expected.get(key) for key in ('owner','id','epoch','pid','processStartTime','bootId','writerGate')): fail('Workspace lease changed after runtime inventory was recorded','WORKSPACE_BUSY')
+                if any(actual.get(key)!=expected.get(key) for key in ('owner','id','epoch','pid','processStartTime','bootId','writerGate')) or any(key in expected and actual.get(key)!=expected[key] for key in ('pidNamespace','brokerLeaseId','brokerSessionId','brokerPreviewProfileId')): fail('Workspace lease changed after runtime inventory was recorded','WORKSPACE_BUSY')
         if actual is None and generation['state']!='complete': fail('A partial dirty lease cannot confirm preview recovery')
         if generation['state']=='complete' and actual and (actual.get('previews') or actual.get('cleanupPending')): fail('Completed generation still has unconfirmed runtime work')
-        # Docker is independently queried while both permanent guards are held.
-        absent_container('name=^/'+preview+'$')
-        stopped(expected); check()
+        # Read root-owned supervisor stop evidence and authenticate issuer and
+        # broker peers while BOTH permanent guards remain held. The broker closes
+        # this exact lease durably before confirming its immutable resources.
+        trusted_workspace_cleanup(root,actual if actual is not None else expected,'legacy-writer-release',preview)
+        check()
         def check_state():
             check()
             if read(parent_fd,generation_name)!=generation: fail('Cloud generation changed during preview cleanup')
@@ -169,10 +156,10 @@ def operate(q):
                 # directory fsync; confirm durability even on an unchanged retry.
                 check_state(); os.fsync(lease_fd); os.fsync(parent_fd)
                 return {'ok':True,'released':False}
-        # No worker or preview container, even one missing from a damaged list,
-        # may survive publication of this lease's complete cloud generation.
-        absent_container('label=chisa.workspace-root='+hashlib.sha256(root.encode()).hexdigest())
-        stopped(expected); check_state()
+        # Quiescence covers every immutable operation in the old lease and
+        # permanently rejects another run, including with a renewed stale grant.
+        trusted_workspace_cleanup(root,actual if actual is not None else expected,'legacy-writer-release',preview)
+        check_state()
         if generation['state']!='complete':
             complete={'version':1,'root':root,'generation':secrets.token_hex(32),'state':'complete','writer':'cloud','bindingEpoch':expected['epoch'],'leaseId':expected['id'],'updatedAt':datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00','Z')}
             atomic(parent_fd,generation_name,complete,generation,parent_fd); generation=complete
@@ -194,18 +181,18 @@ try:
     response=operate(json.load(sys.stdin))
 except RecoveryError as error:
     response={'ok':False,'code':error.code,'error':error.message}
-except (OSError,ValueError,TypeError,KeyError,IndexError,subprocess.SubprocessError) as error:
+except (OSError,ValueError,TypeError,KeyError,IndexError,RuntimeError,http.client.HTTPException) as error:
     response={'ok':False,'code':'WORKSPACE_PREVIEW_RECOVERY_REQUIRED','error':'Stopped preview recovery could not be verified; keep the lease ('+type(error).__name__+')'}
 print(json.dumps(response,separators=(',',':')))
 `;
 
-/** Workspace-runtime calls this only after stopping an orphan preview; it independently verifies the durable witness and Docker absence before releasing an enrolled writer. */
+/** Workspace-runtime requests orphan recovery; the original guarded helper authenticates independent supervisor/issuer/broker evidence before releasing any enrolled writer. */
 export function recoverStoppedWorkspacePreview(input: RecoveryRequest): { released: boolean } {
   if (os.platform() !== 'linux') throw new AppError('Stopped preview recovery requires Linux process birth verification', { code: 'WORKSPACE_PREVIEW_RECOVERY_UNAVAILABLE', statusCode: 503 });
   let reply: RecoveryReply;
   try {
     const result = spawnSync('python3', ['-I', '-c', previewRecoveryScript], {
-      input: JSON.stringify({ ...input, home: realpathSync(os.homedir()) }), encoding: 'utf8', timeout: 8_000,
+      input: JSON.stringify({ ...input, home: realpathSync(os.homedir()) }), encoding: 'utf8', timeout: 30_000,
       killSignal: 'SIGKILL', maxBuffer: 65_536, windowsHide: true,
     });
     if (result.error || result.status !== 0 || result.signal) throw new Error('Recovery helper did not finish');

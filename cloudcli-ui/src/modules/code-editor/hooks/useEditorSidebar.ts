@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent } from 'react';
+import { useTranslation } from 'react-i18next';
 
 import type { Project, CodeEditorDiffInfo, CodeEditorFile, WorkspaceDescriptor } from '@/shared/types';
 
@@ -16,37 +17,69 @@ export const useEditorSidebar = ({
   isMobile,
   initialWidth = 600,
 }: UseEditorSidebarOptions) => {
+  const { t } = useTranslation('codeEditor');
   const [editingFile, setEditingFile] = useState<CodeEditorFile | null>(null);
   const [editorWidth, setEditorWidth] = useState(initialWidth);
   const [editorExpanded, setEditorExpanded] = useState(false);
   const [isResizing, setIsResizing] = useState(false);
   const [hasManualWidth, setHasManualWidth] = useState(false);
   const resizeHandleRef = useRef<HTMLDivElement | null>(null);
+  // Whether the open editor's buffer differs from disk, as reported by
+  // CodeEditor. A ref rather than state or a dependency: it is only read inside
+  // `handleFileOpen`, and keeping it out of that callback's dependency list
+  // keeps the callback stable for the memoised chat and tree consumers.
+  const hasUnsavedChangesRef = useRef(false);
+  // The open file, mirrored for the same reason: `handleFileOpen` has to know
+  // which file is on screen without re-creating itself whenever it changes.
+  const editingFileRef = useRef<CodeEditorFile | null>(null);
 
+  useEffect(() => {
+    editingFileRef.current = editingFile;
+  }, [editingFile]);
+
+  const handleUnsavedChangesChange = useCallback((hasUnsavedChanges: boolean) => {
+    hasUnsavedChangesRef.current = hasUnsavedChanges;
+  }, []);
+
+  // Returns whether the file was opened, i.e. false when the user kept the
+  // unsaved buffer, so callers can skip follow-ups such as switching tabs.
   const handleFileOpen = useCallback(
-    (filePath: string, diffInfo: CodeEditorDiffInfo | null = null, workspace?: WorkspaceDescriptor | null) => {
-      if (workspace === null || (workspace && !workspace.capabilities.read)) return;
+    (filePath: string, diffInfo: CodeEditorDiffInfo | null = null, workspace?: WorkspaceDescriptor | null, line: number | null = null): boolean => {
+      if (workspace === null || (workspace && !workspace.capabilities.read)) return false;
       const normalizedPath = filePath.replace(/\\/g, '/');
       const fileName = normalizedPath.split('/').pop() || filePath;
-      // Absolute transcript references can belong to another registered project
-      // (e.g. /tmp/frames). Keep server path guards and use the most specific owner.
+      // Absolute transcript references can belong to another registered project.
+      // Explicit workspace identities must never be replaced with a local owner.
       const isAbsolute = normalizedPath.startsWith('/') || /^[A-Za-z]:\//.test(normalizedPath);
       const owner = isAbsolute && workspace === undefined ? projects?.filter(project => {
         const root = (project.fullPath || project.path || '').replace(/\\/g, '/').replace(/\/+$/, '');
         return root && normalizedPath.startsWith(`${root}/`);
       }).sort((a, b) => (b.fullPath || b.path || '').length - (a.fullPath || a.path || '').length)[0] : undefined;
+      const projectId = workspace?.projectId ?? owner?.projectId ?? selectedProject?.projectId;
+      const openFile = editingFileRef.current;
+      // Polls may replace the descriptor object; identity, generation and project
+      // decide whether this open will reuse the buffer rather than discard edits.
+      const reusesBuffer = openFile !== null && openFile.path === filePath
+        && openFile.projectId === projectId
+        && openFile.workspace?.workspaceId === workspace?.workspaceId
+        && openFile.workspace?.generation === workspace?.generation
+        && !openFile.diffInfo && !diffInfo;
+      if (openFile && !reusesBuffer && hasUnsavedChangesRef.current
+        && !window.confirm(t('unsavedChanges.confirmClose'))) return false;
 
-      setEditingFile({
+      const nextFile: CodeEditorFile = {
         name: fileName,
         path: filePath,
-        // DB projectId is forwarded to the editor so it can read/save files
-        // via `/api/file-tree/projects/:projectId/file` endpoints.
-        projectId: workspace?.projectId ?? owner?.projectId ?? selectedProject?.projectId,
+        projectId,
         ...(workspace === undefined ? {} : { workspace }),
         diffInfo,
-      });
+        ...(line == null ? {} : { line }),
+      };
+      editingFileRef.current = nextFile;
+      setEditingFile(nextFile);
+      return true;
     },
-    [projects, selectedProject?.projectId],
+    [projects, selectedProject?.projectId, t],
   );
 
   const handleCloseEditor = useCallback(() => {
@@ -148,5 +181,6 @@ export const useEditorSidebar = ({
     handleCloseEditor,
     handleToggleEditorExpand,
     handleResizeStart,
+    handleUnsavedChangesChange,
   };
 };

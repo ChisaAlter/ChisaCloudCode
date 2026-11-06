@@ -16,6 +16,10 @@ import express from 'express';
 // Route fixtures do not restore an account cloud runtime.
 mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
   ensureCloudWorkspaceBinding() {}, excludeCloudWorkspaceMetadata() {}, getWorkspaceRuntimeIdentity() { return undefined; },
+  getWorkspaceBrokerAdmission() { assert.fail('local Git fixture must not start a broker lease'); },
+  closeWorkspaceBrokerLease() { assert.fail('local Git fixture must not close a broker lease'); },
+  readCloudWorkspaceOwner() { return undefined; },
+  assertCloudWorkspaceOwner() {},
   executeWorkspaceRuntimePreview() { assert.fail('unexpected preview'); }, createWorkspaceRuntimeService() { assert.fail('unexpected restore'); },
 } });
 const { createGitRouter } = await import('../git.routes.js');

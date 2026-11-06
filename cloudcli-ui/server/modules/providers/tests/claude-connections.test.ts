@@ -122,19 +122,19 @@ test('custom Claude connections enforce CRUD isolation, redaction, validation, a
       assert.deepEqual(options.settings.permissions, { allow: ['Read'] });
     }
     const originalGetStatus = providerRegistry.resolveProvider('claude').auth.getStatus;
-    providerRegistry.resolveProvider('claude').auth.getStatus = async () => ({ provider: 'claude', installed: true, authenticated: false, email: null, method: null });
+    providerRegistry.resolveProvider('claude').auth.getStatus = async () => ({ provider: 'claude', installed: true, installedVersion: null, authenticated: false, email: null, method: null });
     try {
       assert.equal((await providerAuthService.getProviderAuthStatus('claude', first)).method, 'model_connection');
       assert.equal((await providerAuthService.getProviderAuthStatus('claude', second)).authenticated, false);
       claudeConnectionsService.activate(first, null);
       // Any saved endpoint enables HiRoute availability without requiring it to be active.
       assert.equal((await providerAuthService.getProviderAuthStatus('claude', first)).method, 'model_connection');
-      const nativeStatus: ProviderAuthStatus = { provider: 'claude', installed: true, authenticated: true, email: 'native-fixture', method: 'credentials_file' };
+      const nativeStatus: ProviderAuthStatus = { provider: 'claude', installed: true, installedVersion: null, authenticated: true, email: 'native-fixture', method: 'credentials_file' };
       providerRegistry.resolveProvider('claude').auth.getStatus = async () => nativeStatus;
       const scoped = await providerAuthService.getProviderAuthStatus('claude', first);
       assert.equal(scoped.method, 'model_connection', 'a multi-user server never reports shared native credentials as this caller\'s subscription');
       assert.notEqual(scoped.email, nativeStatus.email);
-      providerRegistry.resolveProvider('claude').auth.getStatus = async () => ({ provider: 'claude', installed: true, authenticated: false, email: null, method: null });
+      providerRegistry.resolveProvider('claude').auth.getStatus = async () => ({ provider: 'claude', installed: true, installedVersion: null, authenticated: false, email: null, method: null });
       // Corrupt legacy gateway settings cannot interfere with ordinary activation or authentication.
       getConnection().prepare('UPDATE hiroute_connections SET connection_json = ? WHERE user_id = ?').run('{}', first);
       claudeConnectionsService.activate(first, id);

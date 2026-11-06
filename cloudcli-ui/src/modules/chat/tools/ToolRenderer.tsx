@@ -1,9 +1,12 @@
 import React, { memo, useMemo, useCallback } from 'react';
 
 import type { DiffLine, Project,ToolStatus } from '@/shared/types';
+import { useWorkspaceExecutionScope, useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
+import { useSshJobOutputStream } from '@/shared/hooks/useSshJobOutputStream';
 import { formatToolDisplayName, getToolConfig } from '@/modules/chat/tools/configs/toolConfigs';
 import { OneLineDisplay } from '@/modules/chat/tools/OneLineDisplay';
 import { BashCommandDisplay } from '@/modules/chat/tools/BashCommandDisplay';
+import { BashEditDiff } from '@/modules/chat/tools/BashEditDiff';
 import { CollapsibleDisplay } from '@/modules/chat/tools/CollapsibleDisplay';
 import { ToolDiffViewer } from '@/modules/chat/tools/ToolDiffViewer';
 import { MarkdownContent } from '@/modules/chat/tools/ContentRenderers/MarkdownContent';
@@ -32,16 +35,74 @@ type ToolRendererProps = {
   toolStatus?: string;
 };
 
+const COMMAND_TOOL_NAMES = new Set(['Bash', 'PowerShell', 'mcp__workspace__run_command']);
+
 function getToolCategory(toolName: string): string {
   if (['Edit', 'Write', 'ApplyPatch'].includes(toolName)) return 'edit';
   if (['Grep', 'Glob'].includes(toolName)) return 'search';
-  if (toolName === 'Bash') return 'bash';
+  if (COMMAND_TOOL_NAMES.has(toolName)) return 'bash';
   if (['TodoWrite', 'TodoRead'].includes(toolName)) return 'todo';
   if (['TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet'].includes(toolName)) return 'task';
   if (toolName === 'Task') return 'agent';
   if (toolName === 'exit_plan_mode' || toolName === 'ExitPlanMode') return 'plan';
   if (toolName === 'AskUserQuestion') return 'question';
   return 'default';
+}
+
+function unwrapMcpTextContent(rawContent: unknown): string {
+  if (Array.isArray(rawContent)) {
+    const textParts = rawContent
+      .filter((part: any) => part && part.type === 'text' && typeof part.text === 'string')
+      .map((part: any) => part.text);
+    return textParts.length > 0 ? textParts.join('\n') : JSON.stringify(rawContent, null, 2);
+  }
+  if (typeof rawContent === 'string') {
+    try {
+      const parsed = JSON.parse(rawContent);
+      if (Array.isArray(parsed)) {
+        const textParts = parsed
+          .filter((part: any) => part && part.type === 'text' && typeof part.text === 'string')
+          .map((part: any) => part.text);
+        if (textParts.length > 0) return textParts.join('\n');
+      }
+    } catch {
+      // Plain text or non-array JSON
+    }
+    return rawContent;
+  }
+  return rawContent != null ? String(rawContent) : '';
+}
+
+function extractCommandToolOutput(toolName: string, toolResult: any): { output: string; isError: boolean } {
+  if (!toolResult) return { output: '', isError: false };
+  const rawText = unwrapMcpTextContent(toolResult.content);
+  if (toolName === 'mcp__workspace__run_command' && rawText.trim().startsWith('{')) {
+    try {
+      const parsed = JSON.parse(rawText) as {
+        stdout?: unknown;
+        stderr?: unknown;
+        exitCode?: unknown;
+        truncated?: unknown;
+      };
+      if (parsed && typeof parsed === 'object' && ('stdout' in parsed || 'stderr' in parsed || 'exitCode' in parsed)) {
+        const stdout = typeof parsed.stdout === 'string' ? parsed.stdout : '';
+        const stderr = typeof parsed.stderr === 'string' ? parsed.stderr : '';
+        const parts: string[] = [];
+        if (stdout) parts.push(stdout.replace(/\r?\n$/, ''));
+        if (stderr) parts.push(`[stderr]\n${stderr.replace(/\r?\n$/, '')}`);
+        if (parsed.truncated) parts.push('[output truncated]');
+        const exitCode = typeof parsed.exitCode === 'number' ? parsed.exitCode : 0;
+        if (exitCode !== 0 && parts.length === 0) parts.push(`[exit ${exitCode}]`);
+        return {
+          output: parts.join('\n'),
+          isError: Boolean(toolResult.isError) || exitCode !== 0,
+        };
+      }
+    } catch {
+      // Fall back to raw text
+    }
+  }
+  return { output: rawText, isError: Boolean(toolResult.isError) };
 }
 
 // Exact denial messages from the Claude runtime adapter — other providers can't reliably signal denial
@@ -105,6 +166,22 @@ export const ToolRenderer: React.FC<ToolRendererProps> = memo(({
     [mode, toolResult, reportedStatus],
   );
 
+  const primaryWorkspaceScope = useWorkspaceScope();
+  const executionWorkspaceScope = useWorkspaceExecutionScope();
+  const workspaceScope = primaryWorkspaceScope ?? executionWorkspaceScope;
+  const isCommandTool = COMMAND_TOOL_NAMES.has(toolName);
+  const isSshCommand = isCommandTool && (
+    toolName === 'mcp__workspace__run_command'
+    || selectedProject?.sourceMode === 'ssh'
+    || workspaceScope?.sourceMode === 'ssh'
+  );
+  const sshProjectId = selectedProject?.projectId ?? workspaceScope?.projectId ?? null;
+  const liveJobOutput = useSshJobOutputStream({
+    enabled: Boolean(mode === 'input' && isSshCommand && toolStatus === 'running' && sshProjectId),
+    projectId: sshProjectId,
+    generation: workspaceScope?.generation,
+  });
+
   const handleAction = useCallback(() => {
     if (displayConfig?.action === 'open-file' && onFileOpen) {
       const value = displayConfig.getValue?.(parsedData) || '';
@@ -117,7 +194,9 @@ export const ToolRenderer: React.FC<ToolRendererProps> = memo(({
   // Bash renders as a Codex-style command row: the command on a single line with
   // a chevron that expands to show the output inline. The combined view lives on
   // the input render; the separate result section is suppressed in MessageComponent.
-  if (toolName === 'Bash' && mode === 'input') {
+  // Files the command changed are listed under the row, outside its collapse, so
+  // they read like the Edit rows they stand in for.
+  if (isCommandTool && mode === 'input') {
     const command = typeof parsedData === 'object' && parsedData !== null && 'command' in parsedData
       ? String(parsedData.command || '')
       : typeof toolInput === 'string'
@@ -127,23 +206,34 @@ export const ToolRenderer: React.FC<ToolRendererProps> = memo(({
           : '';
     const description = typeof parsedData === 'object' && parsedData !== null && 'description' in parsedData
       ? String(parsedData.description || '')
-      : undefined;
-    const output = typeof toolResult?.content === 'string'
-      ? toolResult.content
-      : toolResult?.content != null
-        ? String(toolResult.content)
-        : '';
+      : typeof parsedData === 'object' && parsedData !== null && 'path' in parsedData && parsedData.path && parsedData.path !== '/workspace'
+        ? `in ${String(parsedData.path)}`
+        : undefined;
+    const { output: completedOutput, isError } = extractCommandToolOutput(toolName, toolResult);
+    const liveOutputText = [
+      liveJobOutput.stdout.replace(/\r?\n$/, ''),
+      liveJobOutput.stderr ? `[stderr]\n${liveJobOutput.stderr.replace(/\r?\n$/, '')}` : '',
+    ].filter(Boolean).join('\n');
+    const output = completedOutput || liveOutputText;
+    const effectiveStatus = !completedOutput && isError ? 'error' : toolStatus;
     return (
-      <BashCommandDisplay
-        command={command}
-        description={description}
-        output={output}
-        isError={Boolean(toolResult?.isError)}
-        status={toolStatus !== 'completed' ? toolStatus : undefined}
-        // Commands stay collapsed by default — including failures; the status
-        // badge marks errors and the output expands via the chevron.
-        defaultOpen={false}
-      />
+      <>
+        <BashCommandDisplay
+          command={command}
+          description={description}
+          output={output}
+          isError={isError}
+          status={effectiveStatus !== 'completed' ? effectiveStatus : undefined}
+          // Commands stay collapsed by default once completed — including failures;
+          // while an SSH command is actively streaming live output, auto-open once.
+          defaultOpen={Boolean(!completedOutput && liveOutputText)}
+        />
+        <BashEditDiff
+          toolUseResult={toolResult?.toolUseResult}
+          onFileOpen={onFileOpen}
+          projectRoot={selectedProject?.fullPath}
+        />
+      </>
     );
   }
 

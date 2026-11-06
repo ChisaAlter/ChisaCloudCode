@@ -270,7 +270,7 @@ export function createCommandsService(dependencies: CommandsDependencies) {
         return { builtIn: builtInCommands, custom, count: builtInCommands.length + custom.length };
       });
     },
-    execute(input: { commandName: string; commandPath?: string; args: string[]; context: CommandContext }) {
+    execute(input: { commandName: string; commandPath?: string; args: string[]; rawArgs?: string; context: CommandContext }) {
       return inContext(input.context, async (root, checked) => {
         if (builtInCommands.some(command => command.name === input.commandName)) return builtin(input.commandName, input.context, root, checked);
         if (!input.commandPath) throw new AppError('Command path is required for custom commands', { code: 'COMMAND_PATH_REQUIRED', statusCode: 400 });
@@ -286,8 +286,10 @@ export function createCommandsService(dependencies: CommandsDependencies) {
         const { data: metadata, content } = parseFrontMatter(text);
         // Leave provider file/bash instructions literal. They run only after
         // the composer confirms and chat revalidates this workspace selector.
-        const processed = content.replace(/\$ARGUMENTS\b|\$(\d+)\b/g, (placeholder, index: string | undefined) =>
-          placeholder === '$ARGUMENTS' ? input.args.join(' ') : input.args[Number(index) - 1] ?? placeholder);
+        // A single replacer preserves raw whitespace and literal dollar sequences;
+        // text inserted for one placeholder is never substituted a second time.
+        const processed = content.replace(/\$ARGUMENTS|\$([1-9]\d*)\b/g, (placeholder, index: string | undefined) =>
+          index === undefined ? input.rawArgs ?? input.args.join(' ') : input.args[Number(index) - 1] ?? placeholder);
         return { type: 'custom', command: input.commandName, content: processed, metadata, hasFileIncludes: processed.includes('@'), hasBashCommands: processed.includes('!') };
       });
     },

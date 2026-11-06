@@ -4,11 +4,12 @@ import { act, renderHook } from '@testing-library/react';
 import type { PropsWithChildren } from 'react';
 import { afterEach, beforeEach, test, vi } from 'vitest';
 
+import type * as SharedApi from '@/shared/api';
 import { WorkspaceExecutionContext } from '@/shared/context/WorkspaceScopeContext';
 import { useChatComposerState } from '@/modules/chat/hooks/useChatComposerState';
-import { hydrateChatDrafts, readDraftText, readQueuedMessage, resetChatDrafts, writeDraftText, writeQueuedMessage } from '@/shared/chatDrafts';
+import { hydrateChatDrafts, readDraftText, readQueuedMessage, resetChatDrafts, writeDraftText, appendQueuedMessage } from '@/shared/chatDrafts';
 import { clearAuthToken } from '@/shared/authToken';
-import type { PendingPermissionRequest, PermissionMode, Project, ProjectSession, WorkspaceDescriptor } from '@/shared/types';
+import type { PendingPermissionRequest, PermissionMode, Project, ProjectSession, SessionActivityMap, WorkspaceDescriptor } from '@/shared/types';
 
 /**
  * Drafts used to be keyed by project, so every session in a project shared one
@@ -29,24 +30,30 @@ const PROJECT: Project = {
 
 // The composer only ever reaches the network through these; stubbing them keeps
 // the test about draft scoping rather than about fetch behaviour in jsdom.
-const transport = vi.hoisted(() => ({ createSession: vi.fn(), uploadFiles: vi.fn(), drafts: vi.fn(), saveDraft: vi.fn(), deleteDraft: vi.fn(), resolveWorkspace: vi.fn(), executeCommand: vi.fn(), connectionVersion: 0 }));
+const transport = vi.hoisted(() => ({ projectSettings: vi.fn(), createSession: vi.fn(), uploadFiles: vi.fn(), drafts: vi.fn(), saveDraft: vi.fn(), deleteDraft: vi.fn(), appendQueuedMessage: vi.fn(), clearQueuedMessage: vi.fn(), resolveWorkspace: vi.fn(), executeCommand: vi.fn(), connectionVersion: 0 }));
 vi.mock('@/shared/chisa', () => ({
   getServerConnectionVersion: () => transport.connectionVersion,
 }));
 const okJson = (data: unknown = {}): Response => new Response(JSON.stringify(data), { status: 200 });
-vi.mock('@/shared/api', () => {
+vi.mock('@/shared/api', async importOriginal => {
+  const actual = await importOriginal<typeof SharedApi>();
   const ok = (data: unknown) => Promise.resolve({ ok: true, json: async () => data });
   return {
+    ApiRequestError: actual.ApiRequestError,
+    readApiErrorMessage: actual.readApiErrorMessage,
     readApiJson: async (response: Response) => {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       return response.json();
     },
     api: {
+      projectSettings: transport.projectSettings,
       workspaces: { resolve: transport.resolveWorkspace },
       user: {
         drafts: transport.drafts,
         saveDraft: transport.saveDraft,
         deleteDraft: transport.deleteDraft,
+        appendQueuedMessage: transport.appendQueuedMessage,
+        clearQueuedMessage: transport.clearQueuedMessage,
         preferences: () => ok({ success: true, preferences: {} }),
         savePreferences: () => ok({ success: true, preferences: {} }),
       },
@@ -64,7 +71,7 @@ const markProcessing = vi.fn();
 const established = vi.fn();
 const permissions = vi.fn();
 
-const renderComposer = (selectedSession: ProjectSession | null, options: { busy?: boolean; abortable?: boolean; model?: string; workspace?: WorkspaceDescriptor | null } = {}) => renderHook(
+const renderComposer = (selectedSession: ProjectSession | null, options: { busy?: boolean; abortable?: boolean; model?: string; workspace?: WorkspaceDescriptor | null; activity?: SessionActivityMap } = {}) => renderHook(
   ({ session, project }: { session: ProjectSession | null; project: Project }) => useChatComposerState({
     isActive: true,
     selectedProject: project,
@@ -77,6 +84,7 @@ const renderComposer = (selectedSession: ProjectSession | null, options: { busy?
     currentProviderModel: options.model ?? 'test-model',
     currentProviderEffort: 'medium',
     isLoading: options.busy ?? false,
+    processingSessions: options.activity,
     canAbortSession: options.abortable ?? false,
     tokenBudget: null,
     sendMessage: cloudSend,
@@ -111,11 +119,17 @@ beforeEach(() => {
   transport.connectionVersion = 0;
   transport.saveDraft.mockResolvedValue(okJson({ success: true }));
   transport.deleteDraft.mockResolvedValue(okJson({ success: true }));
+  transport.appendQueuedMessage.mockImplementation((_scope, message) => Promise.resolve(okJson({ queuedMessage: message, appended: false })));
+  transport.clearQueuedMessage.mockImplementation(() => Promise.resolve(okJson({ success: true })));
   transport.drafts.mockResolvedValue(okJson({ drafts: [] }));
+  transport.projectSettings.mockImplementation(async () => okJson({ data: { settings: {} } }));
   transport.createSession.mockResolvedValue(okJson({ data: { sessionId: 'created-session' } }));
   transport.uploadFiles.mockResolvedValue(okJson({ attachments: [{ name: 'image.png', path: '/asset/image.png', mimeType: 'image/png' }] }));
 });
-afterEach(() => resetChatDrafts());
+afterEach(() => {
+  vi.useRealTimers();
+  resetChatDrafts();
+});
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -131,7 +145,8 @@ test('the first scoped message uses the replica and a rapid next send resolves i
   await act(async () => { view.result.current.setInput('first message'); });
   await act(async () => { await view.result.current.handleSubmit(submitEvent()); });
   assert.equal(cloudSend.mock.calls.length, 1);
-  assert.deepEqual(transport.resolveWorkspace.mock.calls[0], [PROJECT.projectId, 'created-session']);
+  assert.deepEqual(transport.resolveWorkspace.mock.calls[0].slice(0, 2), [PROJECT.projectId, 'created-session']);
+  assert.ok(transport.resolveWorkspace.mock.calls[0][2].signal instanceof AbortSignal);
   assert.equal(cloudSend.mock.calls[0][0].workspaceId, REPLICA.workspaceId);
   assert.equal(cloudSend.mock.calls[0][0].content, 'first message');
   assert.equal(established.mock.calls[0][0], 'created-session');
@@ -186,6 +201,217 @@ test('a late workspace reply after a generation change or session switch cannot 
   await act(async () => { reply.resolve(okJson({ cloudReplica: REPLICA, session: SESSION })); await submitting; });
   assert.equal(cloudSend.mock.calls.length, 0);
   assert.equal(view.result.current.input, 'old incarnation');
+});
+
+for (const restoredBeforeReply of [true, false]) {
+  test(`transient A → null${restoredBeforeReply ? ' → A' : ''} polling loss still sends once after authoritative A confirmation`, async () => {
+    const reply = deferred<Response>();
+    transport.resolveWorkspace.mockReturnValue(reply.promise);
+    const options: { workspace: WorkspaceDescriptor | null } = { workspace: SESSION };
+    const view = renderComposer({ id: 'session-a' }, options);
+    await act(async () => { view.result.current.setInput('continue after polling loss'); });
+    let submitting!: Promise<void>;
+    await act(async () => { submitting = view.result.current.handleSubmit(submitEvent()); });
+    options.workspace = null;
+    await act(async () => { view.rerender({ session: { id: 'session-a' }, project: PROJECT }); });
+    assert.equal(view.result.current.isPreparingSend, true);
+    await act(async () => { await view.result.current.handleSubmit(submitEvent()); });
+    if (restoredBeforeReply) {
+      options.workspace = SESSION;
+      await act(async () => { view.rerender({ session: { id: 'session-a' }, project: PROJECT }); });
+    }
+    await act(async () => { reply.resolve(okJson({ cloudReplica: REPLICA, session: SESSION })); await submitting; });
+    assert.equal(transport.resolveWorkspace.mock.calls.length, 1);
+    assert.equal(cloudSend.mock.calls.length, 1);
+    assert.equal(cloudSend.mock.calls[0][0].generation, SESSION.generation);
+    assert.equal(view.result.current.sendError, null);
+    assert.equal(view.result.current.isPreparingSend, false);
+    assert.equal(view.result.current.input, '');
+  });
+}
+
+test('observing A → B → A permanently cancels that attempt with same-conversation feedback', async () => {
+  const reply = deferred<Response>();
+  transport.resolveWorkspace.mockReturnValue(reply.promise);
+  const options = { workspace: SESSION };
+  const view = renderComposer({ id: 'session-a' }, options);
+  await act(async () => { view.result.current.setInput('keep generation-specific draft'); });
+  let submitting!: Promise<void>;
+  await act(async () => { submitting = view.result.current.handleSubmit(submitEvent()); });
+  options.workspace = { ...SESSION, generation: 'replacement' };
+  await act(async () => { view.rerender({ session: { id: 'session-a' }, project: PROJECT }); });
+  options.workspace = SESSION;
+  await act(async () => { view.rerender({ session: { id: 'session-a' }, project: PROJECT }); });
+  await act(async () => { reply.resolve(okJson({ cloudReplica: REPLICA, session: SESSION })); await submitting; });
+  assert.equal(cloudSend.mock.calls.length, 0);
+  assert.match(view.result.current.sendError ?? '', /工作区已变化/);
+  assert.equal(view.result.current.input, 'keep generation-specific draft');
+});
+
+for (const transition of ['navigation', 'auth', 'server'] as const) {
+  test(`${transition} cancels old preparation without putting an error in the current conversation`, async () => {
+    const reply = deferred<Response>();
+    transport.resolveWorkspace.mockReturnValue(reply.promise);
+    const view = renderComposer({ id: 'session-a' }, { workspace: SESSION });
+    await act(async () => { view.result.current.setInput('old draft'); });
+    let submitting!: Promise<void>;
+    await act(async () => { submitting = view.result.current.handleSubmit(submitEvent()); });
+    await act(async () => {
+      if (transition === 'auth') clearAuthToken();
+      if (transition === 'server') transport.connectionVersion++;
+      view.rerender({ session: { id: transition === 'navigation' ? 'session-b' : 'session-a' }, project: PROJECT });
+    });
+    await act(async () => { view.result.current.setInput('new draft'); });
+    await act(async () => { reply.resolve(okJson({ cloudReplica: REPLICA, session: SESSION })); await submitting; });
+    assert.equal(cloudSend.mock.calls.length, 0);
+    assert.equal(view.result.current.sendError, null);
+    assert.equal(view.result.current.input, 'new draft');
+    assert.equal(userEcho.mock.calls.filter(([message]) => message.type === 'error').length, 0);
+  });
+}
+
+test('a hung workspace read times out, preserves the draft, and allows one explicit retry', async () => {
+  vi.useFakeTimers();
+  const reply = deferred<Response>();
+  transport.resolveWorkspace.mockReturnValueOnce(reply.promise);
+  const view = renderComposer({ id: 'session-a' }, { workspace: SESSION });
+  await act(async () => { view.result.current.setInput('retry this'); });
+  let submitting!: Promise<void>;
+  await act(async () => { submitting = view.result.current.handleSubmit(submitEvent()); });
+  const signal = transport.resolveWorkspace.mock.calls[0][2].signal as AbortSignal;
+  await act(async () => { await vi.advanceTimersByTimeAsync(15_000); await submitting; });
+  assert.equal(signal.aborted, true);
+  assert.equal(view.result.current.isPreparingSend, false);
+  assert.match(view.result.current.sendError ?? '', /确认工作区超时/);
+  assert.equal(view.result.current.input, 'retry this');
+  assert.equal(readDraftText('session-a'), 'retry this');
+  transport.resolveWorkspace.mockImplementation(async () => okJson({ cloudReplica: REPLICA, session: SESSION }));
+  await act(async () => { await view.result.current.handleSubmit(submitEvent()); });
+  await act(async () => { reply.resolve(okJson({ cloudReplica: REPLICA, session: SESSION })); });
+  assert.equal(cloudSend.mock.calls.length, 1);
+  assert.equal(view.result.current.sendError, null);
+});
+
+test('cancel releases a hung owner; its late response and stale cancel cannot clear or cancel the retry', async () => {
+  const oldReply = deferred<Response>();
+  const newReply = deferred<Response>();
+  transport.resolveWorkspace.mockReturnValueOnce(oldReply.promise).mockReturnValueOnce(newReply.promise);
+  const view = renderComposer({ id: 'session-a' }, { workspace: SESSION });
+  await act(async () => { view.result.current.setInput('cancel and retry'); });
+  let oldSubmit!: Promise<void>;
+  await act(async () => { oldSubmit = view.result.current.handleSubmit(submitEvent()); });
+  const staleCancel = view.result.current.cancelPreparingSend;
+  await act(async () => { staleCancel(); await oldSubmit; });
+  assert.match(view.result.current.sendError ?? '', /已取消发送准备/);
+  assert.equal(view.result.current.input, 'cancel and retry');
+  let newSubmit!: Promise<void>;
+  await act(async () => { newSubmit = view.result.current.handleSubmit(submitEvent()); });
+  await act(async () => { staleCancel(); oldReply.resolve(okJson({ cloudReplica: REPLICA, session: SESSION })); });
+  assert.equal(view.result.current.isPreparingSend, true);
+  assert.equal((transport.resolveWorkspace.mock.calls[1][2].signal as AbortSignal).aborted, false);
+  assert.equal(cloudSend.mock.calls.length, 0);
+  await act(async () => { newReply.resolve(okJson({ cloudReplica: REPLICA, session: SESSION })); await newSubmit; });
+  assert.equal(cloudSend.mock.calls.length, 1);
+  assert.equal(view.result.current.isPreparingSend, false);
+});
+
+for (const stage of ['settings', 'allocation', 'upload'] as const) {
+  test(`hung ${stage} is bounded and canceled replies cannot send later`, async () => {
+    vi.useFakeTimers();
+    const reply = deferred<Response>();
+    if (stage === 'settings') transport.projectSettings.mockReturnValue(reply.promise);
+    if (stage === 'allocation') transport.createSession.mockReturnValue(reply.promise);
+    if (stage === 'upload') transport.uploadFiles.mockReturnValue(reply.promise);
+    const view = renderComposer(stage === 'upload' ? { id: 'session-a' } : null, { workspace: stage === 'upload' ? SESSION : REPLICA });
+    await act(async () => {
+      view.result.current.setInput('retain this preparation draft');
+      if (stage === 'upload') view.result.current.setAttachedFiles([new File(['png'], 'image.png', { type: 'image/png' })]);
+    });
+    let submitting!: Promise<void>;
+    await act(async () => { submitting = view.result.current.handleSubmit(submitEvent()); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(stage === 'upload' ? 30_000 : 15_000); await submitting; });
+    assert.match(view.result.current.sendError ?? '', /超时/);
+    assert.equal(view.result.current.input, 'retain this preparation draft');
+    assert.equal(view.result.current.isPreparingSend, false);
+    await act(async () => { reply.resolve(okJson({ data: { sessionId: 'late-session' }, attachments: [{ name: 'image.png' }] })); });
+    assert.equal(cloudSend.mock.calls.length, 0);
+    assert.equal(established.mock.calls.length, 0);
+    if (stage === 'settings') assert.equal(transport.createSession.mock.calls.length, 0);
+    if (stage === 'upload') assert.equal(view.result.current.attachedFiles.length, 1);
+  });
+}
+
+test('background confirmation pauses the clock and revalidates the workspace after the choice', async () => {
+  vi.useFakeTimers();
+  transport.resolveWorkspace.mockImplementation(async () => okJson({ cloudReplica: REPLICA, session: SESSION }));
+  const activity: SessionActivityMap = new Map([['session-a', { background: true, tasks: [], statusText: null, canInterrupt: false, startedAt: 1 }]]);
+  const view = renderComposer({ id: 'session-a' }, { workspace: SESSION, activity });
+  await act(async () => { view.result.current.setInput('send after confirmation'); });
+  let submitting!: Promise<void>;
+  await act(async () => { submitting = view.result.current.handleSubmit(submitEvent()); });
+  assert.notEqual(view.result.current.backgroundSendPrompt, null);
+  await act(async () => { await vi.advanceTimersByTimeAsync(90_000); });
+  assert.equal(view.result.current.isPreparingSend, true);
+  assert.equal(view.result.current.sendError, null);
+  transport.resolveWorkspace.mockImplementation(async () => okJson({ cloudReplica: REPLICA, session: { ...SESSION, generation: 'replacement-during-dialog' } }));
+  await act(async () => { view.result.current.resolveBackgroundSendPrompt('send'); await submitting; });
+  assert.equal(transport.resolveWorkspace.mock.calls.length, 2);
+  assert.equal(cloudSend.mock.calls.length, 0);
+  assert.match(view.result.current.sendError ?? '', /工作区已变化/);
+  assert.equal(view.result.current.input, 'send after confirmation');
+});
+
+test('a replica promotion pins authoritative session A across the background dialog even while UI polling is unavailable', async () => {
+  transport.resolveWorkspace.mockImplementation(async () => okJson({ cloudReplica: REPLICA, session: SESSION }));
+  const activity: SessionActivityMap = new Map([['session-a', { background: true, tasks: [], statusText: null, canInterrupt: false, startedAt: 1 }]]);
+  const options: { workspace: WorkspaceDescriptor | null; activity: SessionActivityMap } = { workspace: REPLICA, activity };
+  const view = renderComposer({ id: 'session-a' }, options);
+  await act(async () => { view.result.current.setInput('pin the first authoritative session'); });
+  let submitting!: Promise<void>;
+  await act(async () => { submitting = view.result.current.handleSubmit(submitEvent()); });
+  assert.notEqual(view.result.current.backgroundSendPrompt, null);
+  options.workspace = null;
+  await act(async () => { view.rerender({ session: { id: 'session-a' }, project: PROJECT }); });
+  transport.resolveWorkspace.mockImplementation(async () => okJson({ cloudReplica: REPLICA, session: { ...SESSION, generation: 'replacement-during-dialog' } }));
+  await act(async () => { view.result.current.resolveBackgroundSendPrompt('send'); await submitting; });
+  assert.equal(cloudSend.mock.calls.length, 0);
+  assert.match(view.result.current.sendError ?? '', /工作区已变化/);
+});
+
+test('observed promoted A → B → A never adopts replacement generation during preflight', async () => {
+  const reply = deferred<Response>();
+  transport.resolveWorkspace.mockReturnValue(reply.promise);
+  const options = { workspace: REPLICA };
+  const view = renderComposer({ id: 'session-a' }, options);
+  await act(async () => { view.result.current.setInput('keep original promotion'); });
+  let submitting!: Promise<void>;
+  await act(async () => { submitting = view.result.current.handleSubmit(submitEvent()); });
+  for (const workspace of [SESSION, { ...SESSION, generation: 'replacement' }, SESSION]) {
+    options.workspace = workspace;
+    await act(async () => { view.rerender({ session: { id: 'session-a' }, project: PROJECT }); });
+  }
+  await act(async () => { reply.resolve(okJson({ cloudReplica: REPLICA, session: SESSION })); await submitting; });
+  assert.equal(cloudSend.mock.calls.length, 0);
+  assert.match(view.result.current.sendError ?? '', /工作区已变化/);
+});
+
+test('durable queue handoff hides preparation cancel and retains ownership until acknowledgement', async () => {
+  const reply = deferred<Response>();
+  transport.resolveWorkspace.mockImplementation(async () => okJson({ cloudReplica: REPLICA, session: SESSION }));
+  transport.appendQueuedMessage.mockReturnValue(reply.promise);
+  const view = renderComposer({ id: 'session-a' }, { workspace: SESSION, busy: true });
+  await act(async () => { view.result.current.setInput('queue this once'); });
+  let submitting!: Promise<void>;
+  await act(async () => { submitting = view.result.current.handleSubmit(submitEvent()); });
+  assert.equal(view.result.current.isPreparingSend, true);
+  assert.equal(view.result.current.canCancelPreparation, false);
+  assert.equal(view.result.current.preparationStage, '正在确认排队结果…');
+  await act(async () => { view.result.current.cancelPreparingSend(); });
+  assert.equal(view.result.current.sendError, null);
+  await act(async () => { reply.resolve(okJson({ queuedMessage: { content: 'queue this once' }, appended: false })); await submitting; });
+  assert.equal(view.result.current.isPreparingSend, false);
+  assert.equal(transport.appendQueuedMessage.mock.calls.length, 1);
+  assert.equal(cloudSend.mock.calls.length, 0);
 });
 
 test('retrying an old queued selector does not silently rebind after reload', async () => {
@@ -445,7 +671,7 @@ test('repeated submits during new-session allocation create and send only one re
 });
 
 test('a failed queue acknowledgement keeps editable text and does not claim the message was sent', async () => {
-  transport.saveDraft.mockResolvedValue(new Response(JSON.stringify({ error: 'storage failed' }), { status: 500 }));
+  transport.appendQueuedMessage.mockResolvedValue(new Response(JSON.stringify({ error: 'storage failed' }), { status: 500 }));
   const view = renderComposer({ id: 'session-a' }, { busy: true });
   await act(async () => { view.result.current.setInput('queued task'); });
   await act(async () => { await view.result.current.handleSubmit(submitEvent()); });
@@ -453,13 +679,13 @@ test('a failed queue acknowledgement keeps editable text and does not claim the 
   assert.equal(readDraftText('session-a'), 'queued task');
   assert.equal(cloudSend.mock.calls.length, 0);
   assert.equal(view.result.current.queuedDraft, null);
-  assert.match(userEcho.mock.calls.at(-1)?.[0].content, /排队消息未确认/);
+  assert.match(userEcho.mock.calls.at(-1)?.[0].content, /Failed to queue message/);
 });
 
 test('a failed queue cancellation remains visible instead of being treated as a dispatcher claim', async () => {
-  await writeQueuedMessage('session-a', { content: 'queued task' });
+  await appendQueuedMessage('session-a', { content: 'queued task' });
   const view = renderComposer({ id: 'session-a' });
-  transport.deleteDraft.mockResolvedValue(new Response(JSON.stringify({ error: 'delete failed' }), { status: 500 }));
+  transport.clearQueuedMessage.mockResolvedValue(new Response(JSON.stringify({ error: 'delete failed' }), { status: 500 }));
   await act(async () => { view.result.current.deleteQueuedDraft(); });
   await act(async () => { await hydrateChatDrafts(); });
   assert.equal(view.result.current.queuedDraft?.content, 'queued task');
@@ -468,7 +694,7 @@ test('a failed queue cancellation remains visible instead of being treated as a 
 });
 
 test('restoring a queued card does not rewrite a message the server may have claimed already', async () => {
-  await writeQueuedMessage('session-a', { content: 'queued task' });
+  await appendQueuedMessage('session-a', { content: 'queued task' });
   transport.saveDraft.mockClear();
   const view = renderComposer({ id: 'session-a' });
   await act(async () => { view.rerender({ session: { id: 'session-b' }, project: PROJECT }); });

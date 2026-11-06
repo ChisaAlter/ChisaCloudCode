@@ -64,20 +64,20 @@ func TestAccountCheckKeepsConcurrentPluginQuery(t *testing.T) {
 				t.Fatal(err)
 			}
 			bridge := FrontendBridge{}
-			login := bridge.ServerRequest(bridge.BeginServerRequest(), "POST", "/api/auth/login", nil, "")
+			login := bridge.ServerRequest(reserveTestRequest(t, "login"), "POST", "/api/auth/login", nil, "")
 			if login.Status != 200 {
 				t.Fatalf("login status=%d", login.Status)
 			}
 			before := bridge.GetApiConnection()["version"]
 			plugins := make(chan BridgeResponse, 1)
-			id := bridge.BeginServerRequest()
+			id := reserveTestRequest(t, "api")
 			go func() { plugins <- bridge.ServerRequest(id, "GET", "/api/plugins", nil, "") }()
 			select {
 			case <-started:
 			case <-time.After(3 * time.Second):
 				t.Fatal("plugin request did not reach service")
 			}
-			account := bridge.ServerRequest(bridge.BeginServerRequest(), "GET", "/api/auth/user", nil, "")
+			account := bridge.ServerRequest(reserveTestRequest(t, "api"), "GET", "/api/auth/user", nil, "")
 			close(release)
 			if account.Status != 200 {
 				t.Fatalf("account status=%d", account.Status)

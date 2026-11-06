@@ -19,7 +19,7 @@ export type MentionableFile = {
 };
 
 type UseFileMentionsOptions = {
-  isActive: boolean;
+  isActive?: boolean;
   selectedProject: Project | null;
   input: string;
   setInput: Dispatch<SetStateAction<string>>;
@@ -48,78 +48,62 @@ const flattenFileTree = (files: ProjectFileNode[], basePath = ''): MentionableFi
   return flattened;
 };
 
-export function useFileMentions({ isActive, selectedProject, input, setInput, textareaRef }: UseFileMentionsOptions) {
-  // Retain the requested project's files so typing another @ query does not
-  // start a second full scan; a different project cannot use this result.
+// Equivalent refresh results keep the highlighted completion stable.
+const haveSameFiles = (left: MentionableFile[], right: MentionableFile[]) =>
+  left.length === right.length && left.every((file, index) => file.path === right[index].path && file.relativePath === right[index].relativePath);
+
+export function useFileMentions({ isActive = true, selectedProject, input, setInput, textareaRef }: UseFileMentionsOptions) {
+  // Files retain their workspace identity while the dropdown refreshes, never leaking across generations.
   const [projectFiles, setProjectFiles] = useState<{ projectId: string; files: MentionableFile[] } | null>(null);
-  // Native requests cannot cancel their server work. Keep a user's pending
-  // completion request across tab/query changes instead of starting it again.
-  const fileRequestRef = useRef<{ projectId: string; controller: AbortController } | null>(null);
   const [fileMentions, setFileMentions] = useState<string[]>([]);
   const [filteredFiles, setFilteredFiles] = useState<MentionableFile[]>([]);
   const [showFileDropdown, setShowFileDropdown] = useState(false);
   const [selectedFileIndex, setSelectedFileIndex] = useState(-1);
   const [cursorPosition, setCursorPosition] = useState(0);
   const [atSymbolPosition, setAtSymbolPosition] = useState(-1);
-
+  const fileRequestRef = useRef<{ projectId: string; controller: AbortController } | null>(null);
   const projectId = selectedProject?.projectId;
   const api = useWorkspaceApi();
   const workspace = useWorkspaceScope();
   const scopeKey = JSON.stringify([projectId, workspace?.workspaceId, workspace?.generation, workspace === null]);
-  const fileList = useMemo(
-    () => projectFiles && projectFiles.projectId === scopeKey ? projectFiles.files : [],
-    [projectFiles, scopeKey],
-  );
+  const fileList = useMemo(() => projectFiles?.projectId === scopeKey ? projectFiles.files : [], [projectFiles, scopeKey]);
   const textBeforeCursor = input.slice(0, cursorPosition);
   const lastAtIndex = textBeforeCursor.lastIndexOf('@');
   const textAfterAt = textBeforeCursor.slice(lastAtIndex + 1);
   const mentionQuery = lastAtIndex !== -1 && !textAfterAt.includes(' ') ? textAfterAt : null;
-  const needsFileList = isActive && mentionQuery !== null;
+  const mentionKey = mentionQuery === null ? null : `${scopeKey}:${lastAtIndex}`;
+  // A hidden chat keeps its existing query; closing and reopening @ starts one new refresh.
+  const openedQueryRef = useRef<string | null>(null);
+  const filteredQueryRef = useRef<string | null>(null);
 
   useEffect(() => () => {
     fileRequestRef.current?.controller.abort();
     fileRequestRef.current = null;
   }, [scopeKey]);
 
+  // Open once per @ query, reusing a scan already in flight; keystrokes never restart it.
   useEffect(() => {
-    // Chat stays mounted while Files is visible. Only an active @ completion
-    // needs the tree, so mounting or switching projects alone must not scan it.
-    if (!projectId || workspace === null || workspace?.capabilities.read === false || !needsFileList || projectFiles?.projectId === scopeKey || fileRequestRef.current?.projectId === scopeKey) {
-      return;
-    }
-    const abortController = new AbortController();
-    fileRequestRef.current = { projectId: scopeKey, controller: abortController };
-
-    const fetchProjectFiles = async () => {
-      // File list is keyed by DB projectId now; the backend resolves it to
-      // the project's path before reading.
+    if (mentionKey === null) { openedQueryRef.current = null; return; }
+    if (!isActive || !projectId || workspace === null || workspace?.capabilities.read === false || openedQueryRef.current === mentionKey) return;
+    openedQueryRef.current = mentionKey;
+    if (fileRequestRef.current?.projectId === scopeKey) return;
+    const controller = new AbortController();
+    fileRequestRef.current = { projectId: scopeKey, controller };
+    const load = async () => {
       try {
-        const response = await api.getFiles(projectId, {
-          signal: abortController.signal,
-        });
-        if (!response.ok) {
-          return;
-        }
-
-        const files = (await response.json()) as ProjectFileNode[];
-        if (!abortController.signal.aborted) {
-          setProjectFiles({ projectId: scopeKey, files: flattenFileTree(files) });
-        }
+        const response = await api.getFiles(projectId, { signal: controller.signal });
+        if (!response.ok) return;
+        const files = flattenFileTree(await response.json() as ProjectFileNode[]);
+        if (controller.signal.aborted) return;
+        setProjectFiles(previous => previous?.projectId === scopeKey && haveSameFiles(previous.files, files) ? previous : { projectId: scopeKey, files });
       } catch (error) {
-        // Ignore aborts from rapid project switches; we only care about the latest request.
-        if ((error as { name?: string })?.name === 'AbortError') {
-          return;
-        }
-        console.error('Error fetching files:', error);
+        if (!controller.signal.aborted) console.error('Error fetching files:', error);
       } finally {
-        if (fileRequestRef.current?.controller === abortController) {
-          fileRequestRef.current = null;
-        }
+        if (fileRequestRef.current?.controller === controller) fileRequestRef.current = null;
       }
     };
-
-    fetchProjectFiles();
-  }, [api, workspace, scopeKey, projectId, needsFileList, projectFiles?.projectId]);
+    void load();
+  }, [api, isActive, mentionKey, mentionQuery, projectId, scopeKey, workspace === null, workspace?.capabilities.read]);
 
   useEffect(() => {
     if (!isActive || mentionQuery === null) {
@@ -131,7 +115,9 @@ export function useFileMentions({ isActive, selectedProject, input, setInput, te
 
     setAtSymbolPosition(lastAtIndex);
     setShowFileDropdown(true);
-    setSelectedFileIndex(-1);
+    const filterKey = `${mentionKey}:${mentionQuery}`;
+    if (filteredQueryRef.current !== filterKey) setSelectedFileIndex(-1);
+    filteredQueryRef.current = filterKey;
 
     const matchingFiles = fileList
       .filter(
@@ -142,7 +128,7 @@ export function useFileMentions({ isActive, selectedProject, input, setInput, te
       .slice(0, 10);
 
     setFilteredFiles(matchingFiles);
-  }, [isActive, mentionQuery, lastAtIndex, fileList]);
+  }, [isActive, mentionQuery, mentionKey, lastAtIndex, fileList]);
 
   const activeFileMentions = useMemo(() => {
     if (!input || fileMentions.length === 0) {
@@ -237,7 +223,24 @@ export function useFileMentions({ isActive, selectedProject, input, setInput, te
 
   const handleFileMentionsKeyDown = useCallback(
     (event: KeyboardEvent<HTMLTextAreaElement>): boolean => {
-      if (!showFileDropdown || filteredFiles.length === 0) {
+      if (!showFileDropdown) {
+        return false;
+      }
+
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        // The caret is still inside the `@` query, so a refetch landing after
+        // this would re-open the dropdown (or first show it, when nothing
+        // matched yet) and take the next Enter. Drop it; re-opening the
+        // dropdown fetches again.
+        fileRequestRef.current?.controller.abort();
+        fileRequestRef.current = null;
+        openedQueryRef.current = null;
+        setShowFileDropdown(false);
+        return true;
+      }
+
+      if (filteredFiles.length === 0) {
         return false;
       }
 
@@ -264,12 +267,6 @@ export function useFileMentions({ isActive, selectedProject, input, setInput, te
         } else if (filteredFiles.length > 0) {
           selectFile(filteredFiles[0]);
         }
-        return true;
-      }
-
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        setShowFileDropdown(false);
         return true;
       }
 

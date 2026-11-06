@@ -18,7 +18,7 @@ mock.module('../workspace-runtime-preview-access.service.js', { namedExports: {
   resolveWorkspaceRuntimePreviewAccess: async (value: string) => {
     if (value !== token || !enabled) throw Object.assign(new Error('Preview unavailable'), { statusCode: 404 });
     if (revokeAfterResolve) queueMicrotask(() => { enabled = false; });
-    return { host: '127.0.0.1', port: upstreamPort, base };
+    return { host: '127.0.0.1', port: upstreamPort, base,ticket: 'independent-gateway-ticket' };
   },
   retainWorkspaceRuntimePreviewConnection: (_token: string, close: () => void) => {
     if (!enabled) throw Object.assign(new Error('Preview unavailable'), { statusCode: 404 });
@@ -70,7 +70,7 @@ test.after(async () => {
 test('HTTP preview streams its base path and body without main-app credentials or browser privileges', async () => {
   const response = await fetch(origin + base + 'asset?q=one', { method: 'POST', headers: {
     Authorization: 'Bearer main-secret', Cookie: 'main=secret', Origin: 'https://main.example', Referer: 'https://main.example/private',
-    'X-Forwarded-Host': 'main.example', 'Content-Type': 'application/json',
+    'X-Forwarded-Host': 'main.example','X-Chisa-Preview-Ticket':'forged-browser-ticket', 'Content-Type': 'application/json',
   }, body: '{"hello":"world"}' });
   assert.equal(response.status, 200);
   assert.equal(await response.text(), '<html>preview:{"hello":"world"}</html>');
@@ -78,6 +78,7 @@ test('HTTP preview streams its base path and body without main-app credentials o
   assert.equal(received.body, '{"hello":"world"}');
   for (const name of ['authorization', 'cookie', 'origin', 'referer', 'x-forwarded-host']) assert.equal(received.headers?.[name], undefined);
   assert.equal(received.headers?.['content-type'], 'application/json');
+  assert.equal(received.headers?.['x-chisa-preview-ticket'],'independent-gateway-ticket');
   for (const name of ['set-cookie', 'clear-site-data', 'service-worker-allowed', 'refresh', 'access-control-allow-credentials']) assert.equal(response.headers.get(name), null);
   const policy = response.headers.get('content-security-policy')!;
   assert.match(policy, /sandbox allow-scripts allow-forms;/);

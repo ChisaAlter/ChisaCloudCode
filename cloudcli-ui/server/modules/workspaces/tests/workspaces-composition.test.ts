@@ -16,12 +16,16 @@ const descriptor: WorkspaceDescriptor = {
 };
 mock.module('@/modules/database/index.js', { namedExports: {
   projectsDb: { getProjectPathById: (id: string) => id === 'project' ? root : null },
+  userDb: { getActiveUserIds: () => ['owner', 'other'] },
   sessionsDb: {
     getSessionById: (id: string) => ({ session_id: id, project_path: id === 'foreign-session' ? '/other' : root, workspace_mode: 'shared' }),
     getSessionsByProjectPathIncludingArchived: () => [],
   },
 } });
-mock.module('@/modules/workspace-runtime/index.js', { namedExports: { createWorkspaceRuntimeService: () => ({ restore: async () => { throw new Error('SSH resolution must not restore cloud runtime'); } }) } });
+mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
+  assertCloudWorkspaceOwner: () => { assert.fail('SSH resolution must not authorize a cloud workspace'); },
+  createWorkspaceRuntimeService: () => ({ restore: async () => { throw new Error('SSH resolution must not restore cloud runtime'); } }),
+} });
 mock.module('@/modules/workspace-bridge/index.js', { namedExports: {
   assertWorkspaceDescriptor: () => {},
   assertSshProjectOwner: (_target: unknown, id: unknown) => { if (id !== 'owner') throw new AppError('Foreign SSH owner', { code: 'SSH_WORKSPACE_FORBIDDEN', statusCode: 403 }); },

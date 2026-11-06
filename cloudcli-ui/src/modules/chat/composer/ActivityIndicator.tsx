@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 
 import { Shimmer } from '@/shared/ui';
-import type { SessionActivity } from '@/shared/types';
+import type { BackgroundTaskSummary, SessionActivity } from '@/shared/types';
+import { describeBackgroundTask, ownBackgroundTasks } from '@/modules/chat/utils/backgroundTasks';
 
 type ActivityIndicatorProps = {
   activity: SessionActivity | null;
@@ -12,10 +14,27 @@ type ActivityIndicatorProps = {
 
 const EXIT_ANIMATION_MS = 220;
 
+/** What the background work is: the one task by kind and name, or how many when there are several. */
+function describeBackgroundTasks(allTasks: BackgroundTaskSummary[], t: TFunction): string {
+  const tasks = ownBackgroundTasks(allTasks);
+  return tasks.length === 1
+    ? describeBackgroundTask(tasks[0], t)
+    : t('claudeStatus.backgroundTask.count', { count: tasks.length, defaultValue: '{{count}} tasks' });
+}
+
 /**
- * One status row above the composer while a turn is running: the current
- * activity, elapsed time after the first second, and stop. Rendered by
- * ChatComposer; it leaves as soon as the session drops out of the processing map.
+ * Minimal response-in-progress indicator, in the spirit of the inline status
+ * lines in Claude Code / Codex / OpenCode: a shimmering activity label, the
+ * elapsed time, and an interrupt affordance. Rendered only while the viewed
+ * session has an entry in the processing map; it disappears the instant that
+ * entry is removed.
+ *
+ * A session whose turn has ended while the tasks it launched still run is
+ * drawn in the workflow and agent cards' purple, naming the work, and with no
+ * Stop: nothing is responding, and the composer can send.
+ *
+ * Rendered by chat's ChatComposer above the input so the user can see and
+ * interrupt the in-flight turn without leaving the composer.
  */
 export default function ActivityIndicator({ activity, onAbort, isInputFocused = false }: ActivityIndicatorProps) {
   const { t } = useTranslation('chat');
@@ -58,7 +77,9 @@ export default function ActivityIndicator({ activity, onAbort, isInputFocused = 
     : renderedActivity.statusText === 'background_work'
       ? t('claudeStatus.actions.backgroundWork', { defaultValue: '后台任务仍在执行' })
       : renderedActivity.statusText;
-  const label = (statusText || fallbackLabel).replace(/\.+$/, '');
+  const isBackground = Boolean(renderedActivity.background);
+  const label = isBackground ? t('claudeStatus.backgroundWork', 'Background work') : (statusText || fallbackLabel).replace(/\.+$/, '');
+  const detail = isBackground ? describeBackgroundTasks(renderedActivity.tasks ?? [], t) : '';
   const minutes = Math.floor(elapsedSeconds / 60);
   const seconds = elapsedSeconds % 60;
   const elapsedLabel = elapsedSeconds < 1
@@ -72,8 +93,9 @@ export default function ActivityIndicator({ activity, onAbort, isInputFocused = 
       <div className={`flex h-9 items-center gap-2 rounded-xl border bg-card px-3 text-xs ${
         isInputFocused ? 'border-primary/30' : 'border-border/60'
       }`}>
-        <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-[#ef73b0]" aria-hidden />
-        <Shimmer className="font-medium">{label}</Shimmer>
+        <span className={`h-1.5 w-1.5 shrink-0 animate-pulse rounded-full ${isBackground ? 'bg-purple-500 dark:bg-purple-400' : 'bg-[#ef73b0]'}`} aria-hidden />
+        <Shimmer className="shrink-0 font-medium">{label}</Shimmer>
+        {detail && <span className="min-w-0 truncate text-muted-foreground" title={detail}>{detail}</span>}
         {elapsedLabel && <span className="tabular-nums text-muted-foreground">{elapsedLabel}</span>}
         <span className="flex-1" />
         {renderedActivity.canInterrupt && onAbort && (

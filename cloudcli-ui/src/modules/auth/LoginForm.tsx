@@ -9,6 +9,7 @@ import AuthInputField from '@/modules/auth/AuthInputField';
 import AuthScreenLayout from '@/modules/auth/AuthScreenLayout';
 import { AccountServerConnection } from '@/modules/auth/AccountServerConnection';
 import { isDesktop } from '@/shared/chisa';
+import { getAuthSessionSnapshot } from '@/modules/auth-session';
 
 type LoginFormState = {
   username: string;
@@ -74,6 +75,9 @@ export default function LoginForm({ embedded = false }: { embedded?: boolean } =
   const form = (
     <div className="space-y-5">
       {isDesktop() && <div className="auth-server-section border-b border-border pb-5"><AccountServerConnection onConnectionChange={handleServerConnectionChange} /></div>}
+      {!isDesktop() && getAuthSessionSnapshot().storageMode === 'window' && (
+        <p className="text-xs text-muted-foreground" role="status">此浏览器使用独立窗口登录，切换账号不会同步到其它窗口。</p>
+      )}
       <form onSubmit={handleSubmit} className="space-y-4">
         <AuthInputField
           id="username"

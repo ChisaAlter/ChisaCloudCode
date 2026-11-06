@@ -32,7 +32,7 @@ for (const tab of ['plugin:example', 'tasks', 'browser'] as AppTab[]) {
     const setActiveTab = vi.fn();
     render(<WorkspaceMain projects={[]} selectedProject={{ projectId: 'local', displayName: 'Local', fullPath: '/meta/local', sourceMode: 'ssh' }} selectedSession={null}
       activeTab={tab} setActiveTab={setActiveTab} ws={null} sendMessage={vi.fn()} isMobile={false} onMenuClick={vi.fn()} isLoading={false}
-      onNavigateToSession={vi.fn()} onSessionEstablished={vi.fn()} onShowSettings={vi.fn()} externalMessageUpdate={0} newSessionTrigger={0} onProjectSelect={vi.fn()} onProjectsRefresh={vi.fn()} />);
+      onNavigateToSession={vi.fn()} onSessionEstablished={vi.fn()} onShowSettings={vi.fn()} externalMessageUpdate={0} newSessionTrigger={0} onProjectSelect={vi.fn()} onProjectsRefresh={vi.fn()} onRenameSession={vi.fn(async () => true)} />);
     expect(setActiveTab).toHaveBeenCalledWith('chat');
     expect(panels.sync).toHaveBeenCalledWith(null);
     expect(panels.plugin).not.toHaveBeenCalled();

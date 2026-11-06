@@ -21,7 +21,6 @@ type ProjectSettingsDbRow = {
   updated_at: string | null;
 };
 
-/** Projects supplies only changed overrides; undefined inherits the stored value and null clears it. */
 export type ProjectSettingsPatch = {
   provider?: string | null;
   model?: string | null;
@@ -48,7 +47,7 @@ function toRow(row: ProjectSettingsDbRow | undefined): ProjectSettingsRow | null
 }
 
 /**
- * Projects persists explicit project overrides only.
+ * Persists explicit project overrides only.
  *
  * `undefined` leaves a field untouched, `null` clears it so the project follows
  * its account or built-in default again. A row whose fields are all NULL is

@@ -1,9 +1,10 @@
-/* Native sidebar only: browser/mobile retain the existing sidebar presentation. */
+/* Native sidebar only: browser/mobile retain the existing sidebar presentation.
+   Fill the resizable .workspace-sidebar parent so no dead region is left between
+   the sidebar and the workspace. */
 .sidebar-surface.desktop-sidebar {
-  width: 232px;
-  min-width: 232px;
+  width: 100%;
+  min-width: 0;
   background: hsl(var(--sidebar-background));
-  border-right: 1px solid hsl(var(--border) / 0.48);
 }
 
 .desktop-sidebar .sidebar-brand {
@@ -90,6 +91,18 @@
 .desktop-sidebar .sidebar-section-options { width: 28px; min-width: 28px; height: 28px; opacity: 0.65; }
 .desktop-sidebar .sidebar-section-options:hover,
 .desktop-sidebar .sidebar-section-options[aria-expanded="true"] { opacity: 1; }
+/* Reveal only this project's actions, even while a portaled menu owns focus. */
+.sidebar-project-actions { opacity: 0; transition: opacity 120ms; }
+.sidebar-project-row:hover .sidebar-project-actions,
+.sidebar-project-row:focus-within .sidebar-project-actions,
+.sidebar-project-actions:has([aria-expanded="true"]) { opacity: 1; }
+.sidebar-project-row > button:focus-visible,
+.sidebar-project-actions button:focus-visible { outline: 2px solid hsl(var(--ring)); outline-offset: 1px; }
+@media (hover: none), (pointer: coarse) {
+  .sidebar-project-actions { opacity: 1; }
+  .sidebar-project-actions .sidebar-project-more,
+  .sidebar-project-actions .sidebar-project-compose { width: 36px; min-width: 36px; height: 36px; }
+}
 .desktop-sidebar .sidebar-recents { padding: 0 5px; }
 .desktop-sidebar .sidebar-recents-summary { padding: 0 11px 7px; }
 .desktop-sidebar .sidebar-recents-summary > span { font-size: 12px; }
@@ -140,20 +153,40 @@
   z-index: 2;
 }
 .desktop-sidebar .sidebar-recent-item[data-renaming] .sidebar-recent-options input { width: 0; min-width: 0; flex: 1; font-size: 13px; }
-/* Keep the provider status and app identity together without two oversized cards. */
+/* Keep the provider status and app identity merged into a single rounded block. */
 .desktop-sidebar .sidebar-account-footer { margin-top: auto; padding: 6px 10px; }
-.desktop-sidebar .sidebar-account-footer .nav-divider { margin: 0 10px; background: hsl(var(--border) / 0.45); }
+.desktop-sidebar .sidebar-account-footer .nav-divider { display: none; }
 .desktop-sidebar .sidebar-version { padding-top: 6px; font-size: 12px; line-height: 16px; }
-.desktop-sidebar .sidebar-account-menu { display: flex; flex-direction: column; gap: 2px; padding: 6px 0 4px; }
+.desktop-sidebar .sidebar-account-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 2px;
+  border: 1px solid hsl(var(--border) / 0.55);
+  border-radius: 10px;
+  background: hsl(var(--foreground) / 0.025);
+}
 .desktop-sidebar .sidebar-account-menu > * { min-width: 0; }
 .desktop-sidebar .sidebar-account-menu > :not([hidden]) ~ :not([hidden]) { margin-top: 0; margin-bottom: 0; }
+/* Hide the empty quota slot so a missing provider does not leave a dead row. */
+.desktop-sidebar .sidebar-account-quota:not(:has(> *)) { display: none; }
+/* A single hairline separates the quota row from the account row inside the merged card. */
+.desktop-sidebar .sidebar-account-profile { position: relative; }
+.desktop-sidebar .sidebar-account-quota:has(> *) + .sidebar-account-profile::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 8px;
+  right: 8px;
+  border-top: 1px solid hsl(var(--border) / 0.5);
+}
 .desktop-sidebar .sidebar-account-quota > button,
 .desktop-sidebar .sidebar-account-profile > div > button {
   width: 100%;
   gap: 8px;
-  padding: 5px 10px;
+  padding: 6px 8px;
   border: 0;
-  border-radius: 6px;
+  border-radius: 8px;
   background: transparent;
   box-shadow: none;
 }

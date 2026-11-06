@@ -1,6 +1,6 @@
 import express from 'express';
 
-import { projectsDb, sessionsDb } from '@/modules/database/index.js';
+import { projectsDb, sessionsDb, userDb } from '@/modules/database/index.js';
 import {
   assertWorkspaceDescriptor,
   assertSshProjectOwner,
@@ -10,7 +10,7 @@ import {
   isWorkspaceBound,
   workspaceRequestScope,
 } from '@/modules/workspace-bridge/index.js';
-import { createWorkspaceRuntimeService } from '@/modules/workspace-runtime/index.js';
+import { assertCloudWorkspaceOwner, createWorkspaceRuntimeService } from '@/modules/workspace-runtime/index.js';
 import { AppError } from '@/shared/index.js';
 import type { WorkspaceDescriptor, WorkspaceSelector } from '@/shared/index.js';
 
@@ -27,13 +27,27 @@ const catalog = createWorkspaceCatalog({
   isWorkspaceBound,
 });
 
-/** File Tree, Git, Worktrees and Shell resolve a durable workspace and revalidate its generation before using its root. */
-export function resolveSelectedWorkspace(projectId: string, selector?: WorkspaceSelector): WorkspaceDescriptor {
+/** Shell passes its trusted handshake identity explicitly at every resolution and revalidation, without HTTP async-local state. */
+export function resolveSelectedWorkspaceForUser(projectId: string, userId: string | number, selector?: WorkspaceSelector): WorkspaceDescriptor {
+  if (!((typeof userId === 'string' && userId.trim() && !/[\r\n\0]/.test(userId))
+    || (typeof userId === 'number' && Number.isFinite(userId)))) {
+    throw new AppError('Authentication is required', { code: 'UNAUTHORIZED', statusCode: 401 });
+  }
   const sourceRoot = projectsDb.getProjectPathById(projectId);
   const ssh = sourceRoot ? resolveSshProjectTarget(sourceRoot) : null;
+  if (ssh) assertSshProjectOwner(ssh, userId);
+  else if (sourceRoot) assertCloudWorkspaceOwner(sourceRoot, userId, userDb.getActiveUserIds());
+  return catalog.resolveSelectedWorkspace(projectId, selector);
+}
+
+/** File Tree, Git and Worktrees resolve within HTTP identity scope; trusted internal callers retain their existing scope-free behavior. */
+export function resolveSelectedWorkspace(projectId: string, selector?: WorkspaceSelector): WorkspaceDescriptor {
   const userId = currentWorkspaceUserId();
-  if (ssh && userId !== null) assertSshProjectOwner(ssh, userId);
-  return catalog.resolveSelectedWorkspace(projectId, selector ?? currentWorkspaceSelector());
+  const selected = selector ?? currentWorkspaceSelector() ?? undefined;
+  if (userId !== null) return resolveSelectedWorkspaceForUser(projectId, userId, selected);
+  const sourceRoot = projectsDb.getProjectPathById(projectId);
+  if (sourceRoot && !resolveSshProjectTarget(sourceRoot)) assertCloudWorkspaceOwner(sourceRoot, null);
+  return catalog.resolveSelectedWorkspace(projectId, selected);
 }
 
 /** File Tree and Git production gateways resolve paths only through their request's validated workspace selector. */
@@ -49,10 +63,15 @@ export function createWorkspacesRouter() {
     scope(request, response, next);
   }, (request, _response, next) => {
     try {
-      const projectId = typeof request.query.projectId === 'string' ? request.query.projectId : request.body?.projectId;
+      // Authorize the same project field consumed by the mounted route.
+      const projectId = request.method === 'GET' ? request.query.projectId : request.body?.projectId;
       const root = typeof projectId === 'string' ? projectsDb.getProjectPathById(projectId) : null;
       const ssh = root ? resolveSshProjectTarget(root) : null;
-      if (ssh) { assertSshProjectOwner(ssh, currentWorkspaceUserId()); next(); return; }
+      const userId = currentWorkspaceUserId();
+      if (ssh) { assertSshProjectOwner(ssh, userId); next(); return; }
+      // /resolve and integration call the catalog directly, so reject a foreign
+      // known project before runtime restoration or descriptor materialization.
+      if (root) assertCloudWorkspaceOwner(root, userId, userDb.getActiveUserIds());
     } catch (error) { next(error); return; }
     if (process.platform !== 'linux' || !process.env.WORKSPACES_ROOT) { next(); return; }
     const user = (request as express.Request & { user?: { id?: number | string } }).user;

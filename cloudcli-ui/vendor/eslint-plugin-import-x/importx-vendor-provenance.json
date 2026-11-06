@@ -1,0 +1,1214 @@
+{
+  "at": "2026-10-31T21:03:51.494Z",
+  "source": {
+    "name": "eslint-plugin-import-x",
+    "version": "4.17.1",
+    "tarball": "https://registry.npmjs.org/eslint-plugin-import-x/-/eslint-plugin-import-x-4.17.1.tgz",
+    "integrity": "sha512-4cdstYkKCyjumM2Q9NSI03K8D2a9F4Ssz33K2lv2hQa4KmR9jPLwk3uWGtNvclfqBrPGfGuMBwsGMbe6dMRbfg=="
+  },
+  "patchedVersion": "4.17.1-chisa.1",
+  "reason": "Minimatch11 removes makeRe; preserve no-internal-modules allow/forbid rules using reviewed Minimatch.match API in both published ESM and CJS paths. No rule or enforcement disabled.",
+  "changes": [
+    {
+      "path": "package.json",
+      "beforeSha256": "4d99f087a239393a02abcaa2b88f8838d8911329c9fb7754b403f42f0eeaabfd",
+      "afterSha256": "a7ff28ee45dd32dc05802f675967658fddbdd9bbcc88103089d60620c13e51c0"
+    },
+    {
+      "path": "lib/rules/no-internal-modules.js",
+      "beforeSha256": "e8e65c1449e1ade45229001595b08f33fc879c4673e0c9be9013dd1df87acd21",
+      "afterSha256": "de797f6783e4f1156159aaa3d8e0ccf405091ec626babf59ce667d2c6d0c31f0"
+    },
+    {
+      "path": "lib/index.cjs",
+      "beforeSha256": "0d09a1c49ba7f3ec5030e246f81075ee5630cf216429e1db1ea7829bf4c52357",
+      "afterSha256": "087e281cdbddead56953acd26675dcbda11504b8a3a37934aa84fc98efef5304"
+    }
+  ],
+  "originalFiles": [
+    {
+      "path": "LICENSE",
+      "sha256": "7829efc4266fad5f57f7fc489429a3b35d0c62183c0bd617ef6591f64c980c92"
+    },
+    {
+      "path": "lib/index.cjs",
+      "sha256": "0d09a1c49ba7f3ec5030e246f81075ee5630cf216429e1db1ea7829bf4c52357"
+    },
+    {
+      "path": "lib/index.d.cts",
+      "sha256": "f0c62962d8c12a4d891f03a48373bbd678c96b200512bc61dd460d902e236c18"
+    },
+    {
+      "path": "lib/utils/apply-default.js",
+      "sha256": "353b1e40f9ee68e01f16b6c936aeca1037a0904692f6655bef80ed415d1dafed"
+    },
+    {
+      "path": "lib/utils/arraify.js",
+      "sha256": "8ce88a7fa572380ad5adf796402dd6fa8a83b74288576ef22cd95b3754ade272"
+    },
+    {
+      "path": "lib/rules/consistent-type-specifier-style.js",
+      "sha256": "7e523536933816a1550255c47c0aca701c174da7ad77035cdde908f9e0b4c47c"
+    },
+    {
+      "path": "lib/utils/create-rule.js",
+      "sha256": "8fd2d35cc077e35de464e527550d7d8ad471bfe9cc0a066bc77b2a5d4e6d5146"
+    },
+    {
+      "path": "lib/utils/declared-scope.js",
+      "sha256": "c672237a5bdf7416bd4cfc69d16237072f4a29c821add245274983bff42130bc"
+    },
+    {
+      "path": "lib/utils/deep-merge.js",
+      "sha256": "4ea386ee29b6f4b4249bf2fc1a09e61af0d8b7078e7f2730495af1700f152787"
+    },
+    {
+      "path": "lib/rules/default.js",
+      "sha256": "5d90275cc96a459a6022feeef203bc398f04e3534927bbf7daf50c9da9cf1242"
+    },
+    {
+      "path": "lib/utils/docs-url.js",
+      "sha256": "2476e5cd38a1aa5501943678ca3e0a0d05ce9fc0fe33fc9abb9011c7fac07b6d"
+    },
+    {
+      "path": "lib/rules/dynamic-import-chunkname.js",
+      "sha256": "01e704a8c58d887375dbb2b844dc4e9005541c3f5df067ca11941cfab30ea7dd"
+    },
+    {
+      "path": "lib/config/electron.js",
+      "sha256": "a5875ad27423cce62b7a49539f62c50f509b89a06e155357b043e73f3437f821"
+    },
+    {
+      "path": "lib/config/flat/electron.js",
+      "sha256": "a5875ad27423cce62b7a49539f62c50f509b89a06e155357b043e73f3437f821"
+    },
+    {
+      "path": "lib/config/errors.js",
+      "sha256": "7418bd1ef7322160d2c8963d5fa141bc83cfad5f089bc1d06ae0ecf100f26846"
+    },
+    {
+      "path": "lib/config/flat/errors.js",
+      "sha256": "0f8eac9faa14314505aadff90ae46685d011a94fbc62723a5b30b898f39ec43e"
+    },
+    {
+      "path": "lib/utils/export-map.js",
+      "sha256": "49f13f14d9101deb5cddcfa6b14bf59af1d07b06e5b2dbd5f1c9317b53d2d392"
+    },
+    {
+      "path": "lib/rules/export.js",
+      "sha256": "bbe2792218d74f7bc9bcfcff88a400ed30c82a7bbf9525aee21c93f4ab8e8481"
+    },
+    {
+      "path": "lib/rules/exports-last.js",
+      "sha256": "6549739b1db8ac7a07989f819f483ed8db5ef5efedbebe71b10393941b40930c"
+    },
+    {
+      "path": "lib/rules/extensions.js",
+      "sha256": "46223e3553a2c3c0c6ad155487adfa51a2a7c421e14cda49ab4c0547b15ee6b0"
+    },
+    {
+      "path": "lib/rules/first.js",
+      "sha256": "050858c3199b27e21aa06a22c409804f197ff96c4ff37dc8f9fbbc822cc81ca8"
+    },
+    {
+      "path": "lib/utils/get-value.js",
+      "sha256": "d915da1d6b1d13594e319c9703854e1d1c6b6d6db98cf5229febfea4ea370df0"
+    },
+    {
+      "path": "lib/rules/group-exports.js",
+      "sha256": "72fd039f7e6267be58ebab69eafc3d803e385ef3bc74edca4a5d3559b30fb5af"
+    },
+    {
+      "path": "lib/utils/ignore.js",
+      "sha256": "f1d093383eb56d878b1f29ab7ab69e6a1cc4abe735818e6b9189fd1e23ecb6ba"
+    },
+    {
+      "path": "lib/utils/import-declaration.js",
+      "sha256": "b9bd458979499ab8dad2d8130b3b873d46a1a2fe6b463096f14f4d9cc86bf08b"
+    },
+    {
+      "path": "lib/utils/import-type.js",
+      "sha256": "6037949c5546e792be06ecdc9dd991e4b3df2f8a67d5ad1903c6d07223db46cc"
+    },
+    {
+      "path": "lib/rules/imports-first.js",
+      "sha256": "6d3d6893921adfda5400bfdb44178bdf338e2e8bfedce969c4877873b545f818"
+    },
+    {
+      "path": "lib/index.js",
+      "sha256": "2318ffbfc36500fcc464565b4a942a303503c09be28e25364036d925fb0f7c07"
+    },
+    {
+      "path": "lib/utils/index.js",
+      "sha256": "eb18a31b6d706697d335ed7562ab4a05fef6c925426864b24f81c3d245da03cf"
+    },
+    {
+      "path": "lib/utils/lazy-value.js",
+      "sha256": "1256edee13e07cfd09ec9e5e94a2c235fcfe86054fb8d792435469f68875b53d"
+    },
+    {
+      "path": "lib/utils/legacy-resolver-settings.js",
+      "sha256": "9bc8ab58397f240e0d559c14440bb22523f75fccef094d7753de23aa8985de56"
+    },
+    {
+      "path": "lib/rules/max-dependencies.js",
+      "sha256": "8b836d5a78094acf242a55b771ef3039aea67f65ff6016eedfd4c2024d786424"
+    },
+    {
+      "path": "lib/meta.js",
+      "sha256": "b87850d4250a61a75285c34e87e0178fc41d5a238660c45ae23608c022b95b12"
+    },
+    {
+      "path": "lib/utils/module-cache.js",
+      "sha256": "2410d7ad8927e920ffd22c966d46b864522d35791ad472e88b4d3faa16e4fed8"
+    },
+    {
+      "path": "lib/utils/module-require.js",
+      "sha256": "f500c1e7891162266c0e909cb957fc282719dc8ec5e75df9b09786cf828cda28"
+    },
+    {
+      "path": "lib/utils/module-visitor.js",
+      "sha256": "c413c5a08a10072247bf1a756ed7ba63b11e240bd36e26f126f00fce07730f31"
+    },
+    {
+      "path": "lib/rules/named.js",
+      "sha256": "f6f14a3ddad84145e2c804dd31977ad87ce1805dd713448ba209fd3b8b85a894"
+    },
+    {
+      "path": "lib/rules/namespace.js",
+      "sha256": "f7fb376270377b587ce9997f6fa5da6e490612c7b3cc445c5521a117d390c368"
+    },
+    {
+      "path": "lib/rules/newline-after-import.js",
+      "sha256": "9a5faf45b7e54f9f2b0ed4fc573928cf923591ed17993e3f03a7f45c11efee7f"
+    },
+    {
+      "path": "lib/rules/no-absolute-path.js",
+      "sha256": "c04d3c0eb920d42ecca032c8289f39cf44293f599ce5390dce4f9fe998ca291b"
+    },
+    {
+      "path": "lib/rules/no-amd.js",
+      "sha256": "3460b62124a572c622d059fe4eea7e80945ee6ee36a29fd8e7ccef24a191314d"
+    },
+    {
+      "path": "lib/rules/no-anonymous-default-export.js",
+      "sha256": "2fffacf92f22eaff2c0cc0d35f8adb76b88b80eacb9ab2264f5c77b435dc97f6"
+    },
+    {
+      "path": "lib/rules/no-commonjs.js",
+      "sha256": "2bb60ef81a38a8be25e3aa8093789379eebbe1f836d9518d031de5cc62354694"
+    },
+    {
+      "path": "lib/rules/no-cycle.js",
+      "sha256": "7e351667e0da36094aa5d433e3e24f8d2dfa413e557289c252ddbe1ed2dbfd24"
+    },
+    {
+      "path": "lib/rules/no-default-export.js",
+      "sha256": "2d79c6f4bb2f387bc6d5497ec6b74d9f37393f27b1cc0b3965e3644469e9a7be"
+    },
+    {
+      "path": "lib/rules/no-deprecated.js",
+      "sha256": "cbde40f752fd5208a44c52a6018b40917b0ef4d75afa356ab2ff6a6c0c4ab7c6"
+    },
+    {
+      "path": "lib/rules/no-duplicates.js",
+      "sha256": "a1d378d30ca258f34931dec3ec7cf911079158a807603943ac086beea6e5f88f"
+    },
+    {
+      "path": "lib/rules/no-dynamic-require.js",
+      "sha256": "1777de73769361cb71c84a46363ca2a93b7ac856e0432632845f1cc690953830"
+    },
+    {
+      "path": "lib/rules/no-empty-named-blocks.js",
+      "sha256": "523a737ce8affd1c2043021b89aa5aa7ba0dff63902b767f766c193c8a625b49"
+    },
+    {
+      "path": "lib/rules/no-extraneous-dependencies.js",
+      "sha256": "223abe52735a6e8a0977b78955f87e13478ec4a1b9746b169f854bae609e768f"
+    },
+    {
+      "path": "lib/rules/no-import-module-exports.js",
+      "sha256": "00e8b573cf3c5810d064a67910200522c7afc32359d248e7b4aa55a7a78a8ff1"
+    },
+    {
+      "path": "lib/rules/no-internal-modules.js",
+      "sha256": "e8e65c1449e1ade45229001595b08f33fc879c4673e0c9be9013dd1df87acd21"
+    },
+    {
+      "path": "lib/rules/no-mutable-exports.js",
+      "sha256": "150452bc42a6ff5c9463458757f095214d80fe2374d0161ba3dba42b781378ac"
+    },
+    {
+      "path": "lib/rules/no-named-as-default-member.js",
+      "sha256": "5ae073471b6babb0aad7a4da7cb1f76cd5ace0cb6003e81f8c6767fd2ef20ed1"
+    },
+    {
+      "path": "lib/rules/no-named-as-default.js",
+      "sha256": "1f61898a9dbbdb18f103c0fec4cb13d6ef03abd23178e93d8c521b2bb18de358"
+    },
+    {
+      "path": "lib/rules/no-named-default.js",
+      "sha256": "40d7b1cb9ab8d11537f545376a1737b12af5b1d41d20b121060b1150ea8db1ef"
+    },
+    {
+      "path": "lib/rules/no-named-export.js",
+      "sha256": "8913dff4ba163296899c067b597c96a7cf741d34e25e1d83bc461a32c63ea2ce"
+    },
+    {
+      "path": "lib/rules/no-namespace.js",
+      "sha256": "867f844ec4a6579d3c8d37476d862c3764983c81b19425fdcc12ca56f86c588c"
+    },
+    {
+      "path": "lib/rules/no-nodejs-modules.js",
+      "sha256": "dc3061de2286683fd4b0b0cc03128508af87306d1b6cafa40e2c6e0362c40acc"
+    },
+    {
+      "path": "lib/rules/no-relative-packages.js",
+      "sha256": "450487c948cb59414c96ff71b298f8878671e10bd22f0a9cfdaf0e939fe7a4b1"
+    },
+    {
+      "path": "lib/rules/no-relative-parent-imports.js",
+      "sha256": "2ae4e094fadc55a5af404ffa286527ef0f2fa3218f0d4fdaa75ecc81f3e838e0"
+    },
+    {
+      "path": "lib/rules/no-rename-default.js",
+      "sha256": "2f3b8f6f15079fcfd3ddd29c8a371b8cfab5240aa3002e1b36d8e9c3de0899a1"
+    },
+    {
+      "path": "lib/rules/no-restricted-paths.js",
+      "sha256": "79ed9d17da0e92acb426733223c057c232166fd570c6873f36ecac26d24b09d6"
+    },
+    {
+      "path": "lib/rules/no-self-import.js",
+      "sha256": "91db2b3ba2ea6bcceb1e8c1b0d27ac8ef3b7c7760496f5695f63fe7e723a61fc"
+    },
+    {
+      "path": "lib/rules/no-unassigned-import.js",
+      "sha256": "7d2fa9a75c7fa483bfdadab87b574d4eb7a4977f616ef6f3ee9845fdd310e5e3"
+    },
+    {
+      "path": "lib/rules/no-unresolved.js",
+      "sha256": "b9c185188d048c4c630124390f6870e2bc867eb4eb277dfcb161bd046843e23b"
+    },
+    {
+      "path": "lib/rules/no-unused-modules.js",
+      "sha256": "1c74a0573cf1b619d73f5754883642f8ae43bea248d83587444f2e3283d8847e"
+    },
+    {
+      "path": "lib/rules/no-useless-path-segments.js",
+      "sha256": "ac2467d812a0701853992123e6636d8838c4b77418659dca40a536abf7cd146a"
+    },
+    {
+      "path": "lib/rules/no-webpack-loader-syntax.js",
+      "sha256": "52b2868ca3a1f901b7184e95035fb58f804dfe5a84325b19ccb41433ae673874"
+    },
+    {
+      "path": "lib/node-resolver.js",
+      "sha256": "4f50d3943221c212d894b5323e0ea063d465bb5a42e870afa56f30108eee99af"
+    },
+    {
+      "path": "lib/utils/npm-client.js",
+      "sha256": "2821ee6f69a5b94d29fcad39e3faf529827d7be4dd90ec1c1da54a0993c62031"
+    },
+    {
+      "path": "lib/rules/order.js",
+      "sha256": "ff04ad21b4cb3275fa046261c60fbb6f20f1aa1b67fd8463444dc02623206274"
+    },
+    {
+      "path": "lib/utils/package-path.js",
+      "sha256": "1438b4b04313574222a25dc8d5b6581903ed1d9d0f8a599a6c4343db5e4e5040"
+    },
+    {
+      "path": "lib/utils/parse-path.js",
+      "sha256": "e0c6f78a73db57b1d671b11c4d3086351b0a1a434191d246b41b93571cc43bac"
+    },
+    {
+      "path": "lib/utils/parse.js",
+      "sha256": "ca38731f67678be33926996f88ff7662824c658f6f360b150378821f44b5b7aa"
+    },
+    {
+      "path": "lib/utils/pkg-dir.js",
+      "sha256": "0d61251927f4e1dfbea663016d0be98e7cfd032f41edb337b73fb1e95aa6a840"
+    },
+    {
+      "path": "lib/utils/pkg-up.js",
+      "sha256": "30e3d0c7927ce9cc1aa3b3f8298a3f306814e27353d4fadf51626f61beb2a025"
+    },
+    {
+      "path": "lib/rules/prefer-default-export.js",
+      "sha256": "02b9cfc4c16bd344102a1122284653123ac7b47bce7f578e814c5d84548e2d46"
+    },
+    {
+      "path": "lib/rules/prefer-namespace-import.js",
+      "sha256": "563ada9fd382d545782ef86d4b6ea8890db41bc59fc5772d75abdb344503eb20"
+    },
+    {
+      "path": "lib/config/flat/react-native.js",
+      "sha256": "b7e6888f16abce3374abe57a031587accb18aa1c535de99d84ebab77e0cfd8d2"
+    },
+    {
+      "path": "lib/config/react-native.js",
+      "sha256": "b7e6888f16abce3374abe57a031587accb18aa1c535de99d84ebab77e0cfd8d2"
+    },
+    {
+      "path": "lib/config/flat/react.js",
+      "sha256": "2d9e83065d31de495587597f19659f4773be3e244a6e640895e1f9f7e0744ba4"
+    },
+    {
+      "path": "lib/config/react.js",
+      "sha256": "0f86cc13485462779096ab3503072e1915cdb6c844d2fce4e32b93f421930da3"
+    },
+    {
+      "path": "lib/utils/read-pkg-up.js",
+      "sha256": "8145be079ec138c6bbcdf8529d6e3cffce13079cc6eae3c6cfce1fd3f3b46a76"
+    },
+    {
+      "path": "lib/config/flat/recommended.js",
+      "sha256": "639cde040c34523e0e8e7ff831c48090868627182b358517c617cedbb477bae2"
+    },
+    {
+      "path": "lib/config/recommended.js",
+      "sha256": "287ae2297803882d358ca86b060f23dba2187720ec73e0ba38ff912db9915acb"
+    },
+    {
+      "path": "lib/require.js",
+      "sha256": "1a5546c3f8c868dcc669cd285ffa13a625638803cdf631cfd854aca983c96071"
+    },
+    {
+      "path": "lib/utils/resolve.js",
+      "sha256": "423dfbab837df231c007b28fe416e9d4c56e632b1dcbe8d1b75da18034fd6e73"
+    },
+    {
+      "path": "lib/utils/source-type.js",
+      "sha256": "057f3b71de85cdf0bae135e33cfaf768695838ca4598d811f2beb1e4ab39702f"
+    },
+    {
+      "path": "lib/config/flat/stage-0.js",
+      "sha256": "149b9b1ee0c5b303782f42a60a326a83e7510aa660e426a9b2326fe86ddd52df"
+    },
+    {
+      "path": "lib/config/stage-0.js",
+      "sha256": "193e880dcabd9cd9eef5fb90c201a7e44d51e7ba17ac0e77910c751b2f0821f2"
+    },
+    {
+      "path": "lib/utils/static-require.js",
+      "sha256": "11fe56af83bf08ada98f2e1bcd936006d9e0472800af56e239ce15b81ab0a8fa"
+    },
+    {
+      "path": "lib/types.js",
+      "sha256": "01ae2a5b120382f9a648ced7ee8507493a134f216d100fc61600c6c9738235d2"
+    },
+    {
+      "path": "lib/config/flat/typescript.js",
+      "sha256": "3d9b699103c75eb1eae270bfc591750b6b62daa3a25117e705a724077da9d065"
+    },
+    {
+      "path": "lib/config/typescript.js",
+      "sha256": "3d9b699103c75eb1eae270bfc591750b6b62daa3a25117e705a724077da9d065"
+    },
+    {
+      "path": "lib/rules/unambiguous.js",
+      "sha256": "57e73fbbd55004f17f5dff855415f3eeb4e6234358f5d7bc529105c70c38e558"
+    },
+    {
+      "path": "lib/utils/unambiguous.js",
+      "sha256": "d72a824b00e6411ddff7fe3220a10707dfd3620df84ff5ad3f9d8a9351581dce"
+    },
+    {
+      "path": "lib/utils/visit.js",
+      "sha256": "efe317a3928a58acc63b23c7850be15feb490daa2d8996e09601ba72d9cd891d"
+    },
+    {
+      "path": "lib/config/flat/warnings.js",
+      "sha256": "30e4f186832192c3e709ee1e5144e8f60c0251256ea350252e44f5cbadc9dca9"
+    },
+    {
+      "path": "lib/config/warnings.js",
+      "sha256": "e74ccf028bbe984993717078bea9f0501541e0b1ec0eaad261519b3c3cd223c5"
+    },
+    {
+      "path": "package.json",
+      "sha256": "4d99f087a239393a02abcaa2b88f8838d8911329c9fb7754b403f42f0eeaabfd"
+    },
+    {
+      "path": "lib/utils/apply-default.js.map",
+      "sha256": "04ddfdf6a5d990b4b2e69443a16b1c56d752901e12111eb366038dc87b648f97"
+    },
+    {
+      "path": "lib/utils/arraify.js.map",
+      "sha256": "b8e06090c380ca9c7cfc1d3a732bd2d492eea90eb2f52c0efac69e1b4fbbe574"
+    },
+    {
+      "path": "lib/rules/consistent-type-specifier-style.js.map",
+      "sha256": "2291ad7f2b9964a6b1e7e3afa8f8c410a8786268d60f10b2ee968ca18b70c630"
+    },
+    {
+      "path": "lib/utils/create-rule.js.map",
+      "sha256": "03f3323f4e1890949a49fe2728e8031c1fb65576389e1aa5d4b1afd9ab3a61e6"
+    },
+    {
+      "path": "lib/utils/declared-scope.js.map",
+      "sha256": "825a6b03744565fd6e0d99c7aa8d623439456e905a6b9057defc2e2f7e97ad21"
+    },
+    {
+      "path": "lib/utils/deep-merge.js.map",
+      "sha256": "d9da269c902ad669a889aaea48606214fec5dc69e7a8a8bea7b3e708b889b43e"
+    },
+    {
+      "path": "lib/rules/default.js.map",
+      "sha256": "dc9b60249759f420593d8fa90d2b54e5db00f3dec9136c5a852410414d8cfec2"
+    },
+    {
+      "path": "lib/utils/docs-url.js.map",
+      "sha256": "f5b2b4a9efa878b6f6586a5bff533048e9b458b9c2ebe88b0bd369ad73d57e54"
+    },
+    {
+      "path": "lib/rules/dynamic-import-chunkname.js.map",
+      "sha256": "2aa8b130e75bab75278c2ca2801a910d9c69192380d3e2fea9f26f7db217818b"
+    },
+    {
+      "path": "lib/config/electron.js.map",
+      "sha256": "2bce59c5f7a35e7ff5701db29984b95b28cea5fbf221aee752051aaa4ec05f48"
+    },
+    {
+      "path": "lib/config/flat/electron.js.map",
+      "sha256": "450464926f5bb7241c145d161d9add517ff3b61d8f08bdca3b5b53ffc8f90dc2"
+    },
+    {
+      "path": "lib/config/errors.js.map",
+      "sha256": "13bf2e3c4c2b000ca5a4a8289bd709d9d842564791aa2391f5f9eafd649e13d9"
+    },
+    {
+      "path": "lib/config/flat/errors.js.map",
+      "sha256": "8e8c0b5a630a12a5eaa86bb778f37241d5b119809422c414e098f12507e4f94c"
+    },
+    {
+      "path": "lib/utils/export-map.js.map",
+      "sha256": "00cd51f44a89f56a465f8a9272173ac333d4e6e7a6f2046118a9661a96b4fbfe"
+    },
+    {
+      "path": "lib/rules/export.js.map",
+      "sha256": "f3973575bcfe4428dce6f0916d2e1aba4a451c65e0a20249fb178e9c158b98b5"
+    },
+    {
+      "path": "lib/rules/exports-last.js.map",
+      "sha256": "1e1cbd6ffdd70a0ac5147a1109b1b99ac3a0d481fbd7bb8494e6b271f9a79cbf"
+    },
+    {
+      "path": "lib/rules/extensions.js.map",
+      "sha256": "c71f97ecace9150f0199254dd8de54478eeed601d82ddb9ca63efdcf4a9c0b1b"
+    },
+    {
+      "path": "lib/rules/first.js.map",
+      "sha256": "9108c14fb191ebfae9deb9b04150f42eeeb7244b6d2c92109e1c53fe87b78980"
+    },
+    {
+      "path": "lib/utils/get-value.js.map",
+      "sha256": "0e5a564e8bd7c03f6f64165d684c6b486379e36aff31a52a83d2016ffb565b70"
+    },
+    {
+      "path": "lib/rules/group-exports.js.map",
+      "sha256": "fcc806ab3fb22bdcc3eee2cf364e5ccc13d03b51f0069a694ad4a3fbd8b4340f"
+    },
+    {
+      "path": "lib/utils/ignore.js.map",
+      "sha256": "7ad67bd597c7c50e77a16746fd57ce7b0ef3e18ac6402b223189c75c0d68cbee"
+    },
+    {
+      "path": "lib/utils/import-declaration.js.map",
+      "sha256": "c0235cea7dc6f16f08d6b4a2d81ba11616fc07f0ce2546d830c316cec422b688"
+    },
+    {
+      "path": "lib/utils/import-type.js.map",
+      "sha256": "fe0210b4b844581f14aacdcaea6dad9c6d7518a58aa5397b309e23a8dbee74a7"
+    },
+    {
+      "path": "lib/rules/imports-first.js.map",
+      "sha256": "8a566ad006ef67faa80231f7ff9461cd7d52947540597d06c723aca96ba78765"
+    },
+    {
+      "path": "lib/index.js.map",
+      "sha256": "3f303483705bd49c25601b553d4bd242bf68b6039521ecd00633092bdcc6b40b"
+    },
+    {
+      "path": "lib/utils/index.js.map",
+      "sha256": "0ce8256899546b5eb90a11044aeb0686e9d259588772ad00a47ee99364f6100b"
+    },
+    {
+      "path": "lib/utils/lazy-value.js.map",
+      "sha256": "71065f179b48793e28ee28fc290a30965bd390620b7dba41456e57a5c8c06987"
+    },
+    {
+      "path": "lib/utils/legacy-resolver-settings.js.map",
+      "sha256": "fc6560b5c2be65fb3f3fa38bb277860c3895991c4f5d9483b1fb1ca13ecc6588"
+    },
+    {
+      "path": "lib/rules/max-dependencies.js.map",
+      "sha256": "97362ac2164171d0df482d0bb01dcdb90e34a5ee7c3db7b58df4a4b9265ea6ce"
+    },
+    {
+      "path": "lib/meta.js.map",
+      "sha256": "4d396fb55d5a8c732c91f19c11af7da0c1ad897316e2a8eae7f301540053779e"
+    },
+    {
+      "path": "lib/utils/module-cache.js.map",
+      "sha256": "15b7cedf51a2591aedf7a2fddb2080c230249c9ff3815302bd93748291f71a94"
+    },
+    {
+      "path": "lib/utils/module-require.js.map",
+      "sha256": "26bd451068c4d746b28345bdfb0c9a25b7a7827fc121096e989ad63c8c3b118c"
+    },
+    {
+      "path": "lib/utils/module-visitor.js.map",
+      "sha256": "8ed38e6ed1fc655eafc626c8ab84a77db24d0ae8a82a5b86a6b899ab8bfba555"
+    },
+    {
+      "path": "lib/rules/named.js.map",
+      "sha256": "01a03813354a69ffa487c5e74ffe67dacfe5e2484d26fe29e7538e8d286b3e5f"
+    },
+    {
+      "path": "lib/rules/namespace.js.map",
+      "sha256": "aa2f926460552813c49c9806332124e0f0410df4a8a142c0b1e5fb5a103e23d6"
+    },
+    {
+      "path": "lib/rules/newline-after-import.js.map",
+      "sha256": "a1386d5f27c485021cbc6a3ed6d9217e98e5e14c5a21780465e0f292c053f366"
+    },
+    {
+      "path": "lib/rules/no-absolute-path.js.map",
+      "sha256": "e2cea2fca6bfa4193aef9bae0223bd32408e830d4b7560aa3b53b953cc6f2d83"
+    },
+    {
+      "path": "lib/rules/no-amd.js.map",
+      "sha256": "c622045e1cbb0d2ec90977d835b94fce0b6301617b06b476a01012b3860f1b4d"
+    },
+    {
+      "path": "lib/rules/no-anonymous-default-export.js.map",
+      "sha256": "dcbc8e89046346b2f90a1c05a356dfc67fa4413f540e2c75ba0bde51c735fdf2"
+    },
+    {
+      "path": "lib/rules/no-commonjs.js.map",
+      "sha256": "254b362b29ff05df338a929145c053fe809c40fb1720656fbf1af27f0495737a"
+    },
+    {
+      "path": "lib/rules/no-cycle.js.map",
+      "sha256": "8f415fea5f2842575ae0742b7e44a68e3553bf3b0463c1394f1ac2b662879f33"
+    },
+    {
+      "path": "lib/rules/no-default-export.js.map",
+      "sha256": "b7deed02d9cd667ac4ea01bb1b4561c559821085294638a5cebc33fe59e4d0e5"
+    },
+    {
+      "path": "lib/rules/no-deprecated.js.map",
+      "sha256": "b9700135a9d5fe918ff9b5fa28d519b2a598b0ef627e5b448d40fd93af39761f"
+    },
+    {
+      "path": "lib/rules/no-duplicates.js.map",
+      "sha256": "ba3968391b43b9bcb0cc0bcdb1e853307d54eac676af6a29cef142e9f33973f0"
+    },
+    {
+      "path": "lib/rules/no-dynamic-require.js.map",
+      "sha256": "576174c65c51d596461401acc78ecc5f6e212f4faa37821cb9d9883f9b808dca"
+    },
+    {
+      "path": "lib/rules/no-empty-named-blocks.js.map",
+      "sha256": "fcbf45422566e91f3e377b0e87ab7cd80baa8519e6deac01cab33266a1961bc5"
+    },
+    {
+      "path": "lib/rules/no-extraneous-dependencies.js.map",
+      "sha256": "a9363543dcfd21f183a10b48f83c845dae4995b2b66e23f69b8025d0c9d8357e"
+    },
+    {
+      "path": "lib/rules/no-import-module-exports.js.map",
+      "sha256": "47b0a10774d058374b57efe6e54c22556765d43eebb4b60a845f06c2b5e8dfe1"
+    },
+    {
+      "path": "lib/rules/no-internal-modules.js.map",
+      "sha256": "8da0a1fe23203ba5741d245814387056f8c7d99185389dd8d99010daac0373ff"
+    },
+    {
+      "path": "lib/rules/no-mutable-exports.js.map",
+      "sha256": "b51af781afdab41bbe83993b7b9dc698a62c39f3024e46ed9fefbf339e10e709"
+    },
+    {
+      "path": "lib/rules/no-named-as-default-member.js.map",
+      "sha256": "612700fe6a890a2df12dc0f4b247e2bd944b3bb8d32ca2f57d3a21b004378fae"
+    },
+    {
+      "path": "lib/rules/no-named-as-default.js.map",
+      "sha256": "a41cb06912a36604c4b03384f0a5dd9cb015528c48feacf82ba581097819f5e0"
+    },
+    {
+      "path": "lib/rules/no-named-default.js.map",
+      "sha256": "fa139efec1cfb386c1e75be9cef5a0b824a34c8668c807f719ed957f8ae62cff"
+    },
+    {
+      "path": "lib/rules/no-named-export.js.map",
+      "sha256": "92d54f10032b06a0744a844b4e607e1f51deccc13f8898c38f87587f441c95e5"
+    },
+    {
+      "path": "lib/rules/no-namespace.js.map",
+      "sha256": "e02964b178e790a1fc1da228da15a959f2a70c2aec58cfe4f2babbcd34fb9611"
+    },
+    {
+      "path": "lib/rules/no-nodejs-modules.js.map",
+      "sha256": "d1d109e72af0da253e746689976cfd6bec0c82a6b14bfa91365b8f1889767acb"
+    },
+    {
+      "path": "lib/rules/no-relative-packages.js.map",
+      "sha256": "fbb8bf90b89c96aa7381eb4be45cb345ea1cec440cfe1a73b452e7f65c859076"
+    },
+    {
+      "path": "lib/rules/no-relative-parent-imports.js.map",
+      "sha256": "bdac456c8c17314de15abe4fe6a67b912517f8da01a9e94a9e2bbbb34598bf74"
+    },
+    {
+      "path": "lib/rules/no-rename-default.js.map",
+      "sha256": "91e63ce7da2def43e07c5481d0b32422c5bf02d056e89975a7ec4c2089d5ea93"
+    },
+    {
+      "path": "lib/rules/no-restricted-paths.js.map",
+      "sha256": "676f1091316ddae9622d493a747f68729477c48fbd791c895b3cac694867f33b"
+    },
+    {
+      "path": "lib/rules/no-self-import.js.map",
+      "sha256": "a11442512b0b87bdb5d2d34d08066999c6366329296546c469f49514b82ee258"
+    },
+    {
+      "path": "lib/rules/no-unassigned-import.js.map",
+      "sha256": "4d2dc171deb169cfddc7d32beacb97dbad6157365e062dcf8eed28ef5162e95b"
+    },
+    {
+      "path": "lib/rules/no-unresolved.js.map",
+      "sha256": "c51acfd084ae5042d4fba000025587fb105031713d68fca055cc0cca384629a2"
+    },
+    {
+      "path": "lib/rules/no-unused-modules.js.map",
+      "sha256": "5f36e727885ab9081e12617d7f62601d3aeb47f656a28383c347eb98c79990fd"
+    },
+    {
+      "path": "lib/rules/no-useless-path-segments.js.map",
+      "sha256": "b6c06c3639ad8b58e0a7f4c997cb6b81eaffd7abaf0cf20eaa2dfc0b500c07f4"
+    },
+    {
+      "path": "lib/rules/no-webpack-loader-syntax.js.map",
+      "sha256": "6bcf85801a81fddec5c1aa2ef38da030f728308012cc593c9343f03aedc9031d"
+    },
+    {
+      "path": "lib/node-resolver.js.map",
+      "sha256": "668368f97c1222171ba0e609c1fc2c082b5972fa6bdd213ad0eae4a96e55bd4e"
+    },
+    {
+      "path": "lib/utils/npm-client.js.map",
+      "sha256": "621609f3fb9a26c70be8e58e5eccd49c0345ebd23dc1afbee9aa7f44ab7a1137"
+    },
+    {
+      "path": "lib/rules/order.js.map",
+      "sha256": "62045fbeea903d9ba8601377f69ac2358c7be28f379b797372c9a10b223ad446"
+    },
+    {
+      "path": "lib/utils/package-path.js.map",
+      "sha256": "1ebb2584548fa34b46a1a1a90ca7d1863ab8c8654662883a39800798dc2d5179"
+    },
+    {
+      "path": "lib/utils/parse-path.js.map",
+      "sha256": "53c7e3ce4d73446db4b558e6bfa34e2cde1e50a3998c50bb8e6e4d0c34c13416"
+    },
+    {
+      "path": "lib/utils/parse.js.map",
+      "sha256": "092281e3bb3267d4ed919aa780ac0473d866383dfe513c4e9bc07689999fa3c0"
+    },
+    {
+      "path": "lib/utils/pkg-dir.js.map",
+      "sha256": "4095e8d403fac2b7da7db92e8b7a711d56bddfc3ddffdff6011df5ec0e39fccb"
+    },
+    {
+      "path": "lib/utils/pkg-up.js.map",
+      "sha256": "6e810271ca03593297b0d52733795532ab0626f218d0389133ecfc7febd57028"
+    },
+    {
+      "path": "lib/rules/prefer-default-export.js.map",
+      "sha256": "fd3778563e9f0326e4a3a13b42317f9d0589325ce77a5c8128a72c5887dfdca4"
+    },
+    {
+      "path": "lib/rules/prefer-namespace-import.js.map",
+      "sha256": "41ca5696c978c07ab9f1415aa66ea768da8ba91565f5da0b9195d83aeacef197"
+    },
+    {
+      "path": "lib/config/flat/react-native.js.map",
+      "sha256": "a9af3bf4c5848cc82576f1689db2de469cb6ec4901a7e4876ab84246c66a8bb7"
+    },
+    {
+      "path": "lib/config/react-native.js.map",
+      "sha256": "2b6600da606900e5b83f7ecb55facfc847531daaa878604d788366d9b1aab5fe"
+    },
+    {
+      "path": "lib/config/flat/react.js.map",
+      "sha256": "1d92000c519ab33902fb5edfa3370498c32dd71fbe1cf80c1e2535256580f13e"
+    },
+    {
+      "path": "lib/config/react.js.map",
+      "sha256": "49d392bb34ca15ef1eaa2f8ab42898f155b5ed8b07f459404918120384312ebf"
+    },
+    {
+      "path": "lib/utils/read-pkg-up.js.map",
+      "sha256": "40852eba9599499c183dc8ee7194fe98c2982a42b190f9271af656d8df6cae15"
+    },
+    {
+      "path": "lib/config/flat/recommended.js.map",
+      "sha256": "b8b0f57ea702415e12eea33552203f472321be1f82f0ad61592dd87a724cde63"
+    },
+    {
+      "path": "lib/config/recommended.js.map",
+      "sha256": "87d1a351f51ae7e8cd9d7b3fedabee61602b9bfddc955ff17365c9c6d7ac4491"
+    },
+    {
+      "path": "lib/require.js.map",
+      "sha256": "1dac427628cb9686211a4936cb898025889cec70fe8c5593cd307c468e763a24"
+    },
+    {
+      "path": "lib/utils/resolve.js.map",
+      "sha256": "e8d7c47f00372714b298ea7fb71207eb0cc45a8d4d32fd732d92306da421de60"
+    },
+    {
+      "path": "lib/utils/source-type.js.map",
+      "sha256": "35f8ff514f9db8f6c1363adddb3aa0976ab535fbf096d599504629cc7956f0db"
+    },
+    {
+      "path": "lib/config/flat/stage-0.js.map",
+      "sha256": "0387fb4584471378fcb3214466c5618236b561bfe4e9c9396feb836bb5bb047b"
+    },
+    {
+      "path": "lib/config/stage-0.js.map",
+      "sha256": "974de672cba728d24fe18d6a29adecf71f71f9be967c7d8ab9393402faddaa96"
+    },
+    {
+      "path": "lib/utils/static-require.js.map",
+      "sha256": "fa454094c86578b4d340e2883a70dc59db29d892a9e1e68da9f8f40d81587187"
+    },
+    {
+      "path": "lib/types.js.map",
+      "sha256": "a7de897b48fe57bf54d6f84169135ff2e89e2fc95ea0a0a815761cc29a41efee"
+    },
+    {
+      "path": "lib/config/flat/typescript.js.map",
+      "sha256": "8aa10203dfb4de09fe9dc6cc424e54f9ede1a23020518be3507d949562daeadc"
+    },
+    {
+      "path": "lib/config/typescript.js.map",
+      "sha256": "408614c844562e04321bfed3b44da6f39d88c1ce41ecd4057d5e7a277506daa8"
+    },
+    {
+      "path": "lib/rules/unambiguous.js.map",
+      "sha256": "1d80590ecaaf974d2a981784303d517d60d4483e2631ce81f4ae40c4cc002a89"
+    },
+    {
+      "path": "lib/utils/unambiguous.js.map",
+      "sha256": "a91e6d909e15e3ff2b6e5129d59f0c614f64ad4fcc7a3adca605cbc3655708e8"
+    },
+    {
+      "path": "lib/utils/visit.js.map",
+      "sha256": "5fc5d81fd61e820c5053a4b3c60bcc975284601bf756389e0a39c89349207209"
+    },
+    {
+      "path": "lib/config/flat/warnings.js.map",
+      "sha256": "05419b996b06268ad5b00f68ecd1daa6b3690f4e7d397402902aed153960f8ec"
+    },
+    {
+      "path": "lib/config/warnings.js.map",
+      "sha256": "7300309fd649d7fcd42c444d9802da455de4ab220f55f2e3f3be086b67cc6b93"
+    },
+    {
+      "path": "README.md",
+      "sha256": "0c83bb5836c87762010141e086a487726d9e1c0f016b97e93537798c4518f46e"
+    },
+    {
+      "path": "lib/utils/apply-default.d.ts",
+      "sha256": "03978a121253530e2b19bda6c5e24d5d65a2aff4aee1a9ad4c661f9d8ad2ffd1"
+    },
+    {
+      "path": "lib/utils/arraify.d.ts",
+      "sha256": "26811fefb9e2e51a9ac42e92bdcae41c5677d4dfc369afa38457c1fd5663b892"
+    },
+    {
+      "path": "lib/rules/consistent-type-specifier-style.d.ts",
+      "sha256": "8f455c44994a1af8c6a30df93b5f444b0b8538632a4486bcba886e3e0bdff4a1"
+    },
+    {
+      "path": "lib/utils/create-rule.d.ts",
+      "sha256": "3356373aa44cc5a8177bcb623fc786897c9933b03c095d0eb94257e7b7af91f7"
+    },
+    {
+      "path": "lib/utils/declared-scope.d.ts",
+      "sha256": "d83cd740ebb15960179cc797e5d5a9265a80866c4c4e78accb024fe6d9416dce"
+    },
+    {
+      "path": "lib/utils/deep-merge.d.ts",
+      "sha256": "4d88ce80111227b3dcfc55d04093c3f9e3bca9f9de47fd528eda3a1adb629eb8"
+    },
+    {
+      "path": "lib/rules/default.d.ts",
+      "sha256": "babba577286fd72cc94881aef0dbe5df6522d7066186c705272b64e012a1a1a4"
+    },
+    {
+      "path": "lib/utils/docs-url.d.ts",
+      "sha256": "e50e3005a0ab3ebf335b726664ad019d9b97fd8ce0b068603f6e08cde7d958bc"
+    },
+    {
+      "path": "lib/rules/dynamic-import-chunkname.d.ts",
+      "sha256": "f119d2f970494f5f2eabb6605464175b291f9cde52314c8e6f7a95088e53b57d"
+    },
+    {
+      "path": "lib/config/electron.d.ts",
+      "sha256": "fcd2756f09c3986282e7252aebcf3acfe95da1330a0e5a45a21dad332f3b37b3"
+    },
+    {
+      "path": "lib/config/flat/electron.d.ts",
+      "sha256": "fcd2756f09c3986282e7252aebcf3acfe95da1330a0e5a45a21dad332f3b37b3"
+    },
+    {
+      "path": "lib/config/errors.d.ts",
+      "sha256": "e02afb38e5caf57fddd7b3bb375f64809afb6c8c7e7078e20cde508d6f0f68c6"
+    },
+    {
+      "path": "lib/config/flat/errors.d.ts",
+      "sha256": "2e391c8b5eb7e0e1a983903090656257f97bd27aa1637854c077e6244989546e"
+    },
+    {
+      "path": "lib/utils/export-map.d.ts",
+      "sha256": "4d3c1bb7605788637dc7bb3713d511d7fc508fbf8fba8920d5c5555e8b842fa3"
+    },
+    {
+      "path": "lib/rules/export.d.ts",
+      "sha256": "f9f8d45fe7f01716a5aa95709d800e9a9815dc1227419c53ceefcbf87a294f32"
+    },
+    {
+      "path": "lib/rules/exports-last.d.ts",
+      "sha256": "35bfc7f0ecd3431d988b102f9faf634c1382146ee63c3c748c16ed2ff906e939"
+    },
+    {
+      "path": "lib/rules/extensions.d.ts",
+      "sha256": "d3391637e65b7de1f8833c7e12fd252c1464ccbde0e6c22ff576257b6f676876"
+    },
+    {
+      "path": "lib/rules/first.d.ts",
+      "sha256": "05aca50b44c365762c95100bc0452da24ac5ea4be46570834b421ce3eb00f5f9"
+    },
+    {
+      "path": "lib/utils/get-value.d.ts",
+      "sha256": "31abdd7ebfcb03890576f95717cd46a4cf6dfdade29174744d3c82830a8a134e"
+    },
+    {
+      "path": "lib/rules/group-exports.d.ts",
+      "sha256": "43e1e0412606870788fb122a990049e204b47ebe607660d5b728bc9e30552b6f"
+    },
+    {
+      "path": "lib/utils/ignore.d.ts",
+      "sha256": "611461aa40fa2c1d02fa4fde5e9923313edb46a8d052196012284572a7968591"
+    },
+    {
+      "path": "lib/utils/import-declaration.d.ts",
+      "sha256": "da1b34e3d55ab33af0b251f66efcdc3a5b1893181d9b78e716fc5b63c75b806c"
+    },
+    {
+      "path": "lib/utils/import-type.d.ts",
+      "sha256": "a9f169a9e9d7647bbd9b4cc76bf610ae9a80dc11fb9eb048e0bd4ce1fa511d1a"
+    },
+    {
+      "path": "lib/rules/imports-first.d.ts",
+      "sha256": "dc39c061fe0f482a72ad17fbe246bccf9497749676735ed88326ba0c9c0ebafd"
+    },
+    {
+      "path": "lib/index.d.ts",
+      "sha256": "3b29afcff16b8c605af1426a156555f9c01b446a637bd8a7d6fdad361cd7b3ad"
+    },
+    {
+      "path": "lib/utils/index.d.ts",
+      "sha256": "b5e8ea0aaf6ac22d4d0a739509a98d54b92d84ec2086ada0ea81cb6f33d6d41e"
+    },
+    {
+      "path": "lib/utils/lazy-value.d.ts",
+      "sha256": "72b0ee378bbda84a5ad3d4e76535cae06f7f0803fb17066cfb6a8224fa059de4"
+    },
+    {
+      "path": "lib/utils/legacy-resolver-settings.d.ts",
+      "sha256": "7bd955985609ebc2d8638d75f6aff86b416c2cfc74d8c74ed2b9372b9f316426"
+    },
+    {
+      "path": "lib/rules/max-dependencies.d.ts",
+      "sha256": "dd30fce20ecfdd4a94c25ad99175448cc76b905a792276cc618609e1b40ee9c2"
+    },
+    {
+      "path": "lib/meta.d.ts",
+      "sha256": "08b6ecf7372c583f51407a96d9ad2d82cebe50ac192f8afc4b91ea5290dffdb2"
+    },
+    {
+      "path": "lib/utils/module-cache.d.ts",
+      "sha256": "c6cace326f871703821e7ce5f3384403c018d27d54b7ab617630b9528579dd2a"
+    },
+    {
+      "path": "lib/utils/module-require.d.ts",
+      "sha256": "6858756231889c7eeda5ff5f08346dabdf913a3fdde7668c1efbc06769ab661a"
+    },
+    {
+      "path": "lib/utils/module-visitor.d.ts",
+      "sha256": "eaa5c6dfd7c9c424a25d03f1d4c6143024b7aee283b209c991d882d6f289589b"
+    },
+    {
+      "path": "lib/rules/named.d.ts",
+      "sha256": "f818755ef01a8eb1ee91c8cda81fad5dce28bd4d65b76f12a9ffe3cfa9953c34"
+    },
+    {
+      "path": "lib/rules/namespace.d.ts",
+      "sha256": "d4352b2b7c2553405856c6af3317b57da6ff15026390e749f33a4beb89f62b14"
+    },
+    {
+      "path": "lib/rules/newline-after-import.d.ts",
+      "sha256": "96c3b7584d4ac0d9e83d1c8138240a646a5800a34610a6834b5c4bb1e1bd14d3"
+    },
+    {
+      "path": "lib/rules/no-absolute-path.d.ts",
+      "sha256": "74e7d5fb8ddd89191d3b94f51d533995df493dc41b90753cfb2751fa7dabd99a"
+    },
+    {
+      "path": "lib/rules/no-amd.d.ts",
+      "sha256": "e6acabab3889d630d7d529f84548f634f32f62c16f7f6e3a345fac264246d954"
+    },
+    {
+      "path": "lib/rules/no-anonymous-default-export.d.ts",
+      "sha256": "10bfef0633b914e10000cc4d70391ae304d0a13b06c4c944dc3ae64cd01c0b8d"
+    },
+    {
+      "path": "lib/rules/no-commonjs.d.ts",
+      "sha256": "18b11b5dab864348caceedc5bdec19b10acf52f1601e0370f5998abc44a8f120"
+    },
+    {
+      "path": "lib/rules/no-cycle.d.ts",
+      "sha256": "c89089ec2411768b9dd1f50ea22786d5c4e7574352d4176d1c3b45581b82f69d"
+    },
+    {
+      "path": "lib/rules/no-default-export.d.ts",
+      "sha256": "89c34de080ed78bc9448ea417edb027d7207ff0de8b748cc5910cfbb3bd080eb"
+    },
+    {
+      "path": "lib/rules/no-deprecated.d.ts",
+      "sha256": "2f66f12f74cafe3364e56dbed7cc2675376f833d5deb4f87de0bdefac68cf879"
+    },
+    {
+      "path": "lib/rules/no-duplicates.d.ts",
+      "sha256": "9047dbadca6d93ab83056413e303c82e8f4bd786fa377605fc1c085848b66a4c"
+    },
+    {
+      "path": "lib/rules/no-dynamic-require.d.ts",
+      "sha256": "bf0d4a4a111fbd1d2e286e1bf5de7e62f849837076a12ddb55cd6df92dc947bf"
+    },
+    {
+      "path": "lib/rules/no-empty-named-blocks.d.ts",
+      "sha256": "49a6dc3a163a8423befda4dc2382c049fffeb51600998e93e54fc17ebafed150"
+    },
+    {
+      "path": "lib/rules/no-extraneous-dependencies.d.ts",
+      "sha256": "0f9949188826eee6686f187c8d262344bc776834c2240016c98f01333ba809ef"
+    },
+    {
+      "path": "lib/rules/no-import-module-exports.d.ts",
+      "sha256": "bc0e5d841a5e8d60402157c5a27b12eebe791148d47b1a4bcc4a5808f930f158"
+    },
+    {
+      "path": "lib/rules/no-internal-modules.d.ts",
+      "sha256": "978c33a0e2faa43ed83d11380cedb87de0748a4603575a79f5aff10a4baff25f"
+    },
+    {
+      "path": "lib/rules/no-mutable-exports.d.ts",
+      "sha256": "90b847d6abeb94fd6f18ac24eb157e6f9807c4617dd1888a03d4a3f85f7c757b"
+    },
+    {
+      "path": "lib/rules/no-named-as-default-member.d.ts",
+      "sha256": "347b69f9bc9f36dd8b0da536a68b0058af30d833a42d95b87ec8450d58aec36a"
+    },
+    {
+      "path": "lib/rules/no-named-as-default.d.ts",
+      "sha256": "86213c856d7b28886b50ec98400feea7b87d918fc2b2ccebe3fef8bcfd65ca46"
+    },
+    {
+      "path": "lib/rules/no-named-default.d.ts",
+      "sha256": "f0e0af7a609a08955fad558ac31808cbe0cfc9fcee1c333ae4624298c4b051cf"
+    },
+    {
+      "path": "lib/rules/no-named-export.d.ts",
+      "sha256": "3d9f674a0578bc7ce3e8cab19a6f524b1adb2c5b50b223472e2817bcf3695415"
+    },
+    {
+      "path": "lib/rules/no-namespace.d.ts",
+      "sha256": "a81f6d59dcfe1728e3f12ef9bec3f3ae060785174eb88e311aa4d487e8c9b56a"
+    },
+    {
+      "path": "lib/rules/no-nodejs-modules.d.ts",
+      "sha256": "f5ba638841fb08e9dbc5a2a6c0ab17f3d5a1d7007226897d3d197cd0725164ca"
+    },
+    {
+      "path": "lib/rules/no-relative-packages.d.ts",
+      "sha256": "c71b0a1813a50291dfe7f6cb9f3337f7d8cfd1201fda213c3cc8732ebaf06a26"
+    },
+    {
+      "path": "lib/rules/no-relative-parent-imports.d.ts",
+      "sha256": "c71b0a1813a50291dfe7f6cb9f3337f7d8cfd1201fda213c3cc8732ebaf06a26"
+    },
+    {
+      "path": "lib/rules/no-rename-default.d.ts",
+      "sha256": "75df90bf6b473b4bbef159c15e74c74e1c46eb23c9bf8509c99ce0c8a8ef834b"
+    },
+    {
+      "path": "lib/rules/no-restricted-paths.d.ts",
+      "sha256": "bcd1a71aaf73929d69691446eeef093af13b5988821808a00a58001f708a5857"
+    },
+    {
+      "path": "lib/rules/no-self-import.d.ts",
+      "sha256": "18bd6d15b09a343b8f0ea6fcd6d43148dd485b03d62ff8a59e1d532b2e4e44d3"
+    },
+    {
+      "path": "lib/rules/no-unassigned-import.d.ts",
+      "sha256": "ce5044228c79067baaa188e40be7cc5143604cb0c3e93b2c2c66ccaed8d07bed"
+    },
+    {
+      "path": "lib/rules/no-unresolved.d.ts",
+      "sha256": "0032f0627733aea4de57d2613a37cc67deeffbb5a8dba4f56a165d36fd07cdd5"
+    },
+    {
+      "path": "lib/rules/no-unused-modules.d.ts",
+      "sha256": "da6184304f98f72f4c9cb5adbd3b8d97365049c031146eee695f4a8c515e8eb8"
+    },
+    {
+      "path": "lib/rules/no-useless-path-segments.d.ts",
+      "sha256": "c4efbbb4082a872e94f7cac10dc304c010d6ae0115efc3384453d0bf3245baae"
+    },
+    {
+      "path": "lib/rules/no-webpack-loader-syntax.d.ts",
+      "sha256": "46fc3d699ef56a3ff6c172f042f9e6498f66fd67c1d0237a747379432342e526"
+    },
+    {
+      "path": "lib/node-resolver.d.ts",
+      "sha256": "19c76c648eb094ab6865a45a465b26d1acd9355e3d49bd77f50fd4ab82505e07"
+    },
+    {
+      "path": "lib/utils/npm-client.d.ts",
+      "sha256": "34c9cc34add28efdfce4592eb9b74996d379f8668ea3436572fe63b000a07a47"
+    },
+    {
+      "path": "lib/rules/order.d.ts",
+      "sha256": "a024c4650938fe77ee9588077216b5ae955c1075cfb187b22faba933d1f18696"
+    },
+    {
+      "path": "lib/utils/package-path.d.ts",
+      "sha256": "329aa49db0d5688f71d5d58c20538bfa558b68230c311c78899e7eabb0a1f523"
+    },
+    {
+      "path": "lib/utils/parse-path.d.ts",
+      "sha256": "c8a0e475b98d611ab7a0b2cd474a6875af0b535eb150f0ed3cebf67f221c021a"
+    },
+    {
+      "path": "lib/utils/parse.d.ts",
+      "sha256": "c3e8ed4c04a2c81e123200d8b9b486d5d31f1a10b0adefd8824431907d580aca"
+    },
+    {
+      "path": "lib/utils/pkg-dir.d.ts",
+      "sha256": "3666fc92d0046ad5a8dde818a363d4af89f5920e77f99e11c30aed2c0546c0e8"
+    },
+    {
+      "path": "lib/utils/pkg-up.d.ts",
+      "sha256": "c0e36a49097c4de6dc65c43a265d8aec7f8f32b745664dd8bb60685a4b42e4c2"
+    },
+    {
+      "path": "lib/rules/prefer-default-export.d.ts",
+      "sha256": "ecbf0730b3d77ec0d7d59e1c0d5c23078d71149889675e53c87b95132f535c20"
+    },
+    {
+      "path": "lib/rules/prefer-namespace-import.d.ts",
+      "sha256": "6b3c39a7c827f21a6686c109dd59269d0c914a4ad1af85c7be4b69355b5e1e62"
+    },
+    {
+      "path": "lib/config/flat/react-native.d.ts",
+      "sha256": "86a217465e0e267fd69c37adb71c6978d2939027fbfe525d8ba6e9039e66e2b9"
+    },
+    {
+      "path": "lib/config/react-native.d.ts",
+      "sha256": "86a217465e0e267fd69c37adb71c6978d2939027fbfe525d8ba6e9039e66e2b9"
+    },
+    {
+      "path": "lib/config/flat/react.d.ts",
+      "sha256": "a20125c0ed7519db9b89853679ffafcdd7b40199e5730f0d8914dd7e4e5ea30e"
+    },
+    {
+      "path": "lib/config/react.d.ts",
+      "sha256": "114c72e7995a0737b1044206d7c3c70db194e4e2578c15c25b5098484298945d"
+    },
+    {
+      "path": "lib/utils/read-pkg-up.d.ts",
+      "sha256": "27310921f66a8e580ef4405ba98571231b2b3cefdc562663f46499ae55d47f10"
+    },
+    {
+      "path": "lib/config/flat/recommended.d.ts",
+      "sha256": "805711d33ae571ed0f599222856b5a44634030277d3dffd2877d2a0efdfbaaa5"
+    },
+    {
+      "path": "lib/config/recommended.d.ts",
+      "sha256": "d9b0083a9b879e5073e8e85ceb4ad818b930f0a500363e36d909d9442147e470"
+    },
+    {
+      "path": "lib/require.d.ts",
+      "sha256": "2a0d711c75d5c4608ebb8021d0467333be4a7074210961f98765f6a08b78f75e"
+    },
+    {
+      "path": "lib/utils/resolve.d.ts",
+      "sha256": "dc5c44f1425c3c2690fa107d64210ea6a6efaff2d151b9716e4f843b7af329a4"
+    },
+    {
+      "path": "lib/utils/source-type.d.ts",
+      "sha256": "e58020937c7c42447232fca3c62f7ab17e911e04b40db2250a618adc4bdb3975"
+    },
+    {
+      "path": "lib/config/flat/stage-0.d.ts",
+      "sha256": "d93eb16dd892347b1290734ab4e65e91311fcd746c48263a28aff1839e7804ac"
+    },
+    {
+      "path": "lib/config/stage-0.d.ts",
+      "sha256": "042ebc48eb6f2572db4913277fe8be65bb30eaa986f9862a31a40b80ff7e8afd"
+    },
+    {
+      "path": "lib/utils/static-require.d.ts",
+      "sha256": "51f5a3fd72e2beaff2a37ac853caddfda382734588348cf30226c280287a12f0"
+    },
+    {
+      "path": "lib/types.d.ts",
+      "sha256": "60f8f9237df677bda51d97f0e0b7ffdfb0501b7a14fd801e0eb2fa6c27e4d4a1"
+    },
+    {
+      "path": "lib/config/flat/typescript.d.ts",
+      "sha256": "113e6bc0e6d29d48ace2538dbeafa3be928669fa1c52efe3345aa09412da7b2c"
+    },
+    {
+      "path": "lib/config/typescript.d.ts",
+      "sha256": "113e6bc0e6d29d48ace2538dbeafa3be928669fa1c52efe3345aa09412da7b2c"
+    },
+    {
+      "path": "lib/rules/unambiguous.d.ts",
+      "sha256": "2bd09e4c0d9d4afc8e0907538a75d929dfca690595717a67ac88b62dc100db84"
+    },
+    {
+      "path": "lib/utils/unambiguous.d.ts",
+      "sha256": "e0c056af70f2832358cad4749c73d9bda5bca0181727aeaabf167b458617a9b0"
+    },
+    {
+      "path": "lib/utils/visit.d.ts",
+      "sha256": "d017189aea5c3fe196784f284fb03a068447e38d51a37e29065b336d2cf9637f"
+    },
+    {
+      "path": "lib/config/flat/warnings.d.ts",
+      "sha256": "ec6d2a8e38224b4ee4f55c8a82a4604bd1f7c514d9c2d8636483f5e6c6a5972e"
+    },
+    {
+      "path": "lib/config/warnings.d.ts",
+      "sha256": "d845ab8c305f33a7281ea698bceb9d78a0e626c230963576c1b36f7d882b6802"
+    }
+  ]
+}

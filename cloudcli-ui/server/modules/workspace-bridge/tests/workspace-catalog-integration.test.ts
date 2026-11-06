@@ -13,8 +13,36 @@ import type { WorkspaceDescriptor } from '@/shared/index.js';
 const fixtureRoot = realpathSync(await mkdtemp(path.join(os.tmpdir(), 'chisa-catalog-integration-')));
 process.env.WORKSPACES_ROOT = fixtureRoot;
 // This real-Git fixture owns its protocol-3 roots without an account Docker runtime.
+// Reservation admission precedes Git work; this fixture never starts a sandbox resource.
+type BrokerInput = { root: string; userId: string; leaseId?: string; brokerLeaseId?: string; bindingEpoch: string; sessionId?: string };
+const brokerReservations = new Map<string, { root: string; bindingEpoch: string; sessionId: string; brokerLeaseId: string }>();
 mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
   ensureCloudWorkspaceBinding() {}, excludeCloudWorkspaceMetadata() {}, getWorkspaceRuntimeIdentity() { return undefined; },
+  readCloudWorkspaceOwner() { return 'cloud-catalog-fixture'; },
+  async getWorkspaceBrokerAdmission(input: BrokerInput) {
+    assert.equal(input.userId, 'cloud-catalog-fixture');
+    assert.ok(input.leaseId, 'catalog admission requires an existing legacy reservation');
+    const legacyReservationId = input.leaseId;
+    const previous = brokerReservations.get(legacyReservationId);
+    const selected = { root: input.root, bindingEpoch: input.bindingEpoch, sessionId: input.sessionId ?? 'fixture-session', brokerLeaseId: 'broker-' + legacyReservationId };
+    if (previous) assert.deepEqual(selected, previous);
+    if (input.brokerLeaseId !== undefined) assert.equal(input.brokerLeaseId, selected.brokerLeaseId);
+    brokerReservations.set(legacyReservationId, selected);
+    return { workspaceId: 'workspace', generation: 'generation', root: selected.root, bindingEpoch: selected.bindingEpoch, sessionId: selected.sessionId, legacyReservationId, leaseId: selected.brokerLeaseId, profileId: 'provider-rw', previewProfileId: 'preview-ro',
+      async proof(_permission: string, profileId: string) { assert.equal(profileId, 'provider-rw'); return 'independent-grant'; },
+      client: { async run() { assert.fail('unexpected sandbox process'); } },
+    };
+  },
+  async closeWorkspaceBrokerLease(input: BrokerInput) {
+    assert.equal(input.userId, 'cloud-catalog-fixture');
+    assert.ok(input.leaseId);
+    const selected = brokerReservations.get(input.leaseId);
+    assert.ok(selected, 'only an admitted reservation can be closed');
+    assert.equal(input.root, selected.root); assert.equal(input.bindingEpoch, selected.bindingEpoch);
+    assert.equal(input.brokerLeaseId, selected.brokerLeaseId); assert.equal(input.sessionId, selected.sessionId);
+    const confirmedAt = Date.now();
+    return { workspaceId: 'workspace', generation: 'generation', root: selected.root, bindingEpoch: selected.bindingEpoch, sessionId: selected.sessionId, userId: input.userId, ownerId: 'fixture-owner', legacyReservationId: input.leaseId, leaseId: selected.brokerLeaseId, profileId: 'provider-rw', state: 'closed', quiescent: true, cleanupConfirmed: true, resourceInventoryComplete: true, resources: [], closedAt: confirmedAt, confirmedAt, brokerInstanceId: 'fixture-broker' };
+  },
   executeWorkspaceRuntimePreview() { assert.fail('unexpected preview'); },
 } });
 const { admitWorkspaceExecution, assertWorkspaceDescriptor, describeWorkspaceSelection, integrateWorkspaceSession, withWorkspaceWriteOperation } = await import('@/modules/workspace-bridge/index.js');
@@ -449,6 +477,21 @@ for (const point of ['partial-journal', 'receipt', 'publication', 'marker-only']
       await assertIntegrationBlocked(descriptor, request.operationId);
       assert.deepEqual(readRecord(path.join(root + '.chisa-lease', 'state.json')), sourceLease);
       assert.deepEqual(readRecord(path.join(descriptor.rootPath + '.chisa-lease', 'state.json')), sessionLease);
+      const heldState = path.join(descriptor.rootPath + '.chisa-lease', 'state.json');
+      const jobMarker = path.join(descriptor.rootPath + '.chisa-lease', 'sync-job.json');
+      const blockedState = point === 'partial-journal' ? { ...sessionLease, cleanupPending: ['unconfirmed-resource'] }
+        : point === 'receipt' ? { ...sessionLease, previews: ['retained-preview'] }
+        : point === 'publication' ? { ...sessionLease, id: 'replacement-writer' } : sessionLease;
+      if (point === 'marker-only') await writeFile(jobMarker, '{}');
+      else await writeFile(heldState, JSON.stringify(blockedState));
+      await assert.rejects(integrateWorkspaceSession({ descriptor, action: 'recover', operationId: request.operationId }),
+        { code: point === 'publication' ? 'WORKSPACE_CLEANUP_FAILED' : 'WORKSPACE_RECOVERY_REQUIRED' });
+      assert.deepEqual(readRecord(heldState), blockedState, 'failed recovery must preserve the exact retained or replacement writer');
+      assert.ok(existsSync(root + '.chisa-integration.json'));
+      assert.ok(existsSync(descriptor.rootPath + '.chisa-integration.json'));
+      if (point === 'marker-only') await rm(jobMarker);
+      else await writeFile(heldState, JSON.stringify(sessionLease));
+      await assertIntegrationBlocked(descriptor, request.operationId);
       const recovered = await integrateWorkspaceSession({ descriptor, action: 'recover', operationId: request.operationId });
       assert.ok('status' in recovered && recovered.status === 'applied');
       assert.equal(recovered.operationId, request.operationId);

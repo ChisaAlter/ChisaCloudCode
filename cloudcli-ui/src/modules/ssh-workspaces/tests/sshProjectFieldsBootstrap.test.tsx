@@ -4,7 +4,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 import { SshAgentProvider, SshProjectFields, useSshAgent } from '@/modules/ssh-workspaces';
 import { api } from '@/shared/api';
-import { clearAuthToken, startAuthSession } from '@/shared/authToken';
+import { acknowledgeAuthSession, clearAuthToken, getAuthSessionSnapshot, initializeAuthSession, startAuthSession } from '@/shared/authToken';
 import { FrontendBridge } from '@/shared/chisa';
 import type { SshAgentController, SshAgentEnsureResult, SshTunnelProfile, SshTunnelStatus } from '@/shared/types';
 
@@ -23,14 +23,36 @@ function Capture() { const agent = useSshAgent(); useEffect(() => { controller =
 function Fields() { return <SshProjectFields connectionId={profile.id} rootPath="" verified={null} onConnectionChange={vi.fn()} onRootPathChange={vi.fn()} onVerified={vi.fn()} />; }
 function Page({ show = true }: { show?: boolean }) { return <SshAgentProvider accountId={account.user ? String(account.user.id) : null}><Capture />{show && <Fields />}</SshAgentProvider>; }
 
-beforeEach(() => {
+async function login(userId = 1): Promise<void> {
+  await initializeAuthSession();
+  await clearAuthToken(getAuthSessionSnapshot());
+  const encode = (value: unknown) => btoa(JSON.stringify(value)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const current = await startAuthSession(`${encode({ alg: 'HS256' })}.${encode({ userId, iat: 1_700_000_000, exp: 4_102_444_800 })}.signature`, getAuthSessionSnapshot());
+  expect(current).not.toBeNull();
+  acknowledgeAuthSession(current!);
+}
+
+beforeEach(async () => {
   vi.stubGlobal('mygo', {});
   account.user = { id: 1, username: 'account-a' };
-  startAuthSession('accounta.payload.signature');
+  await login();
   vi.spyOn(FrontendBridge, 'getSshTunnelProfiles').mockResolvedValue({ ok: true, profiles: [profile], statuses: [stopped] });
   vi.spyOn(api.sshWorkspaces, 'connections').mockImplementation(async () => Response.json({ configured: true, connections: [connection] }));
 });
-afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
+afterEach(async () => { cleanup(); await clearAuthToken(getAuthSessionSnapshot()); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
+
+test('native folder picker is offered only for this desktop native profile', async () => {
+  vi.spyOn(FrontendBridge, 'ensureSshAgent').mockResolvedValue({ ok: true, profile, status: forwarding });
+  const picker = vi.spyOn(FrontendBridge, 'selectSshLocalFolder').mockResolvedValue({ ok: true, path: 'C:\\local-project' });
+  const change = vi.fn();
+  const fields = (connectionId: string) => <SshAgentProvider accountId="1"><SshProjectFields connectionId={connectionId} rootPath="" verified={null} onConnectionChange={vi.fn()} onRootPathChange={change} onVerified={vi.fn()} /></SshAgentProvider>;
+  const view = render(fields(profile.id));
+  fireEvent.click(await screen.findByRole('button', { name: '选择 Windows 项目目录' }));
+  await waitFor(() => expect(change).toHaveBeenCalledWith('C:\\local-project'));
+  view.rerender(fields('other-computer'));
+  expect(screen.queryByRole('button', { name: '选择 Windows 项目目录' })).toBeNull();
+  expect(picker).toHaveBeenCalledTimes(1);
+});
 
 test('pure cloud provider mount does not list, create or start native SSH capabilities', () => {
   const ensure = vi.spyOn(FrontendBridge, 'ensureSshAgent');
@@ -78,7 +100,7 @@ test('account switch discards a pending ensure without publishing old identity o
   const view = render(<Page />);
   await waitFor(() => expect(ensure).toHaveBeenCalledTimes(1));
   vi.mocked(FrontendBridge.getSshTunnelProfiles).mockResolvedValue({ ok: true, profiles: [], statuses: [] });
-  act(() => { clearAuthToken(); startAuthSession('accountb.payload.signature'); account.user = { id: 2, username: 'account-b' }; });
+  await act(async () => { await login(2); account.user = { id: 2, username: 'account-b' }; });
   view.rerender(<Page />);
   await act(async () => { pending.resolve({ ok: true, profile, status: forwarding }); });
   expect(controller?.profiles).toEqual([]);

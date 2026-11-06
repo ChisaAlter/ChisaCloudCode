@@ -34,6 +34,8 @@ export type LegacyProjectRegistrationDependencies = {
   validatePath: (projectPath: string) => Promise<WorkspacePathValidationResult>;
   isExistingDirectory: (projectPath: string) => Promise<boolean>;
   persistProjectPath: (projectPath: string, customName: string | null) => CreateProjectPathResult;
+  /** HTTP callers bind this policy to the authenticated owner before any lookup or mutation. */
+  assertOwner?: (projectPath: string) => void;
   /** Canonical workspace volume root; defaults to WORKSPACES_ROOT. */
   workspaceRoot?: string;
 };
@@ -62,6 +64,7 @@ function rejected(rawPath: string, reason: string): LegacyProjectPathResult {
 export async function registerExistingProjectPaths(
   input: unknown,
   dependencies: LegacyProjectRegistrationDependencies = defaultDependencies,
+  assertOwner: (projectPath: string) => void = dependencies.assertOwner ?? (() => {}),
 ): Promise<{ results: LegacyProjectPathResult[] }> {
   const requested = Array.isArray(input) ? input.slice(0, LEGACY_PROJECT_PATH_LIMIT) : [];
   const results: LegacyProjectPathResult[] = [];
@@ -80,6 +83,11 @@ export async function registerExistingProjectPaths(
       continue;
     }
 
+    try { assertOwner(normalized); } catch {
+      results.push(rejected(normalized, 'path does not belong to the current account'));
+      continue;
+    }
+
     // Reuses the same containment/symlink/system-directory guard as project
     // creation so a legacy record cannot point at the backend host outside the
     // account workspace volume.
@@ -90,6 +98,10 @@ export async function registerExistingProjectPaths(
     }
 
     const resolvedPath = normalizeProjectPath(path.resolve(validation.resolvedPath));
+    try { assertOwner(resolvedPath); } catch {
+      results.push(rejected(resolvedPath, 'path does not belong to the current account'));
+      continue;
+    }
     const reservedAnchors = path.join(workspaceRoot, '.chisa-ssh-projects');
     if (resolvedPath === reservedAnchors || resolvedPath.startsWith(reservedAnchors + path.sep)) {
       results.push(rejected(resolvedPath, 'SSH metadata anchors are not cloud project sources'));

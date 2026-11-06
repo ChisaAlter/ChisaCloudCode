@@ -9,6 +9,60 @@
     "fix": "排查一个问题",
     "fixPrompt": "帮我排查这个项目中的一个问题。请先询问实际表现和复现步骤，再着手修改。"
   },
+  "tokenStatistics": {
+    "title": "Token 用量",
+    "summary": "已保存的 Token 用量",
+    "total": "总 Token",
+    "input": "输入",
+    "output": "输出",
+    "cacheRead": "缓存读取",
+    "cacheCreation": "缓存写入",
+    "requestCount": "{{value}} 次请求",
+    "requestCount_one": "{{value}} 次请求",
+    "requestCount_other": "{{value}} 次请求",
+    "sessionCount": "{{value}} 个对话",
+    "sessionCount_one": "{{value}} 个对话",
+    "sessionCount_other": "{{value}} 个对话",
+    "scope": "统计范围",
+    "currentSession": "当前对话",
+    "allSessions": "全部对话",
+    "range": "日期范围",
+    "ranges": {
+      "today": "今天",
+      "7d": "近 7 天",
+      "30d": "近 30 天",
+      "all": "全部时间"
+    },
+    "refresh": "刷新",
+    "retry": "重试",
+    "close": "关闭 Token 用量",
+    "loading": "正在读取已保存的用量…",
+    "loadError": "无法读取 Token 用量，请重试。",
+    "unsupportedServer": "当前连接的服务器没有提供 Token 用量统计，可能是服务端版本较旧。请更新服务端后刷新。",
+    "empty": "当前范围内没有已保存的对话。",
+    "unmeasured": "这些对话尚未记录 Token 用量；缺失的用量未知，不代表零消耗。",
+    "zeroUsage": "当前日期范围内已记录的用量为零。",
+    "coverageSummary": "{{indexed}} 个已保存对话中，{{measured}} 个有用量记录",
+    "coverageMissing": "未记录用量：{{unavailable}} 个 · 暂不支持：{{unsupported}} 个",
+    "timeZone": "时区：{{timeZone}}",
+    "daily": "每日用量",
+    "byModel": "按模型",
+    "bySession": "按对话",
+    "date": "日期",
+    "model": "模型",
+    "session": "对话",
+    "requests": "请求数",
+    "unknownModel": "未记录模型",
+    "untitledSession": "未命名对话",
+    "archived": "已归档",
+    "noBreakdown": "此分类暂无用量记录。",
+    "coverage": "统计说明",
+    "sourceNote": "统计已保存的对话记录（含归档）；未记录的消耗无法补算。",
+    "countingNote": "总 Token = 输入 + 输出 + 缓存读取 + 缓存写入。输入仅计算新增、未缓存的 Token；缓存读取和写入为单独计数，不与输入重复。这是累计用量，不是上下文占用。",
+    "coverageNote": "缺少用量或暂不支持的对话不计入已记录总量；部分记录不能代表账号的全部消耗。",
+    "calendarNote": "今天、近 7 天和近 30 天按 {{timeZone}} 的日历日期统计；近 7 天和近 30 天包含今天。",
+    "updatedAt": "更新于 {{time}}"
+  },
   "codeBlock": {
     "copy": "复制",
     "copied": "已复制",
@@ -126,7 +180,7 @@
       "ctrlEnter": "Ctrl+Enter 发送 • Shift+Enter 换行 • Tab 切换模式 • / 斜杠命令",
       "enter": "Enter 发送 • Shift+Enter 换行 • Tab 切换模式 • / 斜杠命令",
       "queue": "Enter 排队发送下一条消息",
-      "updateQueued": "Enter 更新排队消息"
+      "appendQueued": "Enter 添加到排队消息"
     },
     "clickToChangeMode": "点击更改权限模式（或在输入框中按 Tab）",
     "showAllCommands": "显示所有命令",
@@ -134,7 +188,8 @@
     "scrollToBottom": "滚动到底部",
     "queue": {
       "sendNext": "排队发送下一条消息",
-      "update": "更新排队消息",
+      "append": "添加到排队消息",
+      "notCombinable": "无法排队发送消息：斜杠命令会单独运行，因此不能与排队消息合并。请在排队消息发送后再发送。",
       "label": "已排队",
       "willSend": "将在当前完成后发送",
       "edit": "编辑排队消息",
@@ -168,7 +223,8 @@
     "loadingModels": "正在加载模型…",
     "clickToChange": "点击切换模型",
     "welcomeTitle": "今天想完成什么？",
-    "welcomeDescription": "描述你的任务，或选择模型后开始对话。"
+    "welcomeDescription": "描述你的任务，或选择模型后开始对话。",
+    "chooseModelDescriptionCustomOnly": "{{providers, list}} 仅列出您的模型"
   },
   "session": {
     "continue": {
@@ -198,7 +254,8 @@
     "status": {
       "newSession": "新会话",
       "initializing": "初始化中...",
-      "restarting": "重启中..."
+      "restarting": "重启中...",
+      "themeRestartHint": "重启以将新主题应用到 Claude Code"
     },
     "actions": {
       "disconnect": "断开连接",
@@ -220,6 +277,20 @@
     "defaultCommand": "命令"
   },
   "claudeStatus": {
+    "backgroundWork": "后台任务",
+    "backgroundTask": {
+      "workflow": "工作流 {{name}}",
+      "agent": "代理 {{description}}",
+      "command": "命令 {{description}}",
+      "count": "{{count}} 个任务",
+      "prompt": {
+        "title": "此会话仍有后台任务在运行",
+        "description": "发送新消息会开始新一轮对话并停止这些任务，尚未返回的结果将丢失。将消息排队，可在后台任务完成后发送。",
+        "cancel": "取消",
+        "queue": "排队发送",
+        "sendAnyway": "仍然发送"
+      }
+    },
     "actions": {
       "thinking": "思考中",
       "processing": "正在处理",
@@ -255,7 +326,8 @@
   },
   "message": {
     "editAndResend": "编辑并重新发送",
-    "forkFromHere": "从此处派生"
+    "forkFromHere": "从此处派生",
+    "answeredBy": "由 {{model}} 回答"
   },
   "composer": {
     "lastUsedModel": "上次实际使用：{{model}}",
@@ -271,7 +343,14 @@
     },
     "reasoning": "推理强度",
     "model": "模型",
+    "modelMenuHeading": "模型 · 当前会话",
+    "moreModels": "更多模型",
+    "effort": "推理强度",
+    "backToModels": "返回模型菜单",
     "effortDefault": "默认",
+    "effortLabels": { "low": "低", "medium": "中", "high": "高", "xhigh": "更高", "max": "最大", "ultracode": "Ultracode", "minimal": "最低", "none": "关闭" },
+    "customModel": "自定义",
+    "selectionSaveFailed": "未能保存选择，请重试。",
     "loadingModels": "正在加载模型…",
     "modelMenu": "选择模型和推理强度",
     "closeModelPicker": "关闭模型选择",
@@ -279,7 +358,9 @@
     "reasoningDescription": "设置下一条消息的推理强度。",
     "savingModel": "正在保存选择…",
     "effortSaveFailed": "无法保存推理强度，请重试。",
-    "permissionHeading": "如何批准 {{provider}} 的操作？"
+    "permissionHeading": "如何批准 {{provider}} 的操作？",
+    "permissionCycleHint": "在输入框中按 Tab 切换模式",
+    "permissionTriggerLabel": "{{mode}}：{{heading}}"
   },
   "export": {
     "trigger": "导出对话",
@@ -299,6 +380,8 @@
     }
   },
   "misc": {
+    "compacted": "已压缩上下文",
+    "compactionSummary": "完整摘要",
     "sessionOptions": "会话选项",
     "showTokenUsage": "查看会话用量",
     "copyToClipboard": "复制到剪贴板",
@@ -377,5 +460,36 @@
     "instruction": "请在运行 Claude 的终端中选择一个选项。",
     "selectedOption": "✓ Claude 已选择选项 {{number}}",
     "instructionDetail": "在命令行中，可使用方向键或输入编号选择此选项。"
+  },
+  "bashEditDiff": {
+    "created": "已创建",
+    "updated": "已更新",
+    "deleted": "已删除",
+    "emptyFile": "空文件",
+    "moreLines_one": "… 还有 {{count}} 行",
+    "moreLines_other": "… 还有 {{count}} 行",
+    "moreFiles_one": "… 另有 {{count}} 个文件已更改",
+    "moreFiles_other": "… 另有 {{count}} 个文件已更改",
+    "filesNotShown_one": "{{count}} 个文件已更改（二进制、仅模式变更或过大无法显示）",
+    "filesNotShown_other": "{{count}} 个文件已更改（二进制、仅模式变更或过大无法显示）",
+    "filesUnavailable_one": "{{count}} 个文件已更改（无法获取差异）",
+    "filesUnavailable_other": "{{count}} 个文件已更改（无法获取差异）",
+    "filesChanged_one": "{{count}} 个文件已更改",
+    "filesChanged_other": "{{count}} 个文件已更改",
+    "morePaths_one": "另有 {{count}} 个",
+    "morePaths_other": "另有 {{count}} 个",
+    "diffUnavailable": "（无法获取此命令的文件差异）",
+    "partUnavailable": "（部分差异无法获取）",
+    "skipped": "（已跳过此 git 命令的文件差异）",
+    "shared": "（同一时间有另一个命令在此仓库中运行；任一命令所做的更改都可能显示在任一结果下）"
+  },
+  "modelLibrary": {
+    "effortLevels": "推理级别",
+    "effortLevelsHint": "选择此模型支持的推理强度级别。若未选择任何级别，将无法在输入框中为此模型选择级别。",
+    "effortSummary": "推理：{{levels}}",
+    "customModelsOnly": "仅使用我的模型",
+    "customModelsOnlyHint": "在所有模型选择器中隐藏 {{provider}} 的内置模型，并将您的第一个模型设为默认模型。在您添加模型之前，内置模型仍会显示。",
+    "builtInModelsHidden": "开启“仅使用我的模型”时，这些模型不会出现在模型选择器中。",
+    "customModelsOnlyFailed": "无法更改此设置。"
   }
 }

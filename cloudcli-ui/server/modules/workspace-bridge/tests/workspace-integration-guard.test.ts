@@ -54,7 +54,7 @@ test('integration markers and same-process lease adoption retain exact operation
         assert.equal(lease.id, f.leases[root].id);
         assert.throws(() => recoverWorkspaceIntegrationLease(root, f.intent), { code: 'WORKSPACE_BUSY' });
         const adopted = recoverWorkspaceIntegrationLease(root, f.intent, { inactiveLeaseId: lease.id });
-        assert.equal(adopted?.id, lease.id); assert.equal(adopted?.pid, process.pid);
+        assert.equal(adopted?.id, lease.id); assert.equal(adopted?.pid, process.pid); assert.equal(adopted?.integrationPeerChanged, undefined);
         assert.ok(existsSync(markerPath(root)));
       }
       clearWorkspaceIntegration(f.intent);
@@ -194,7 +194,7 @@ test('Linux helper requests are bounded and incomplete output never confirms ado
   let response: unknown = { ok: true };
   const launch = mock.method(childProcess, 'spawnSync', (command: string, args: readonly string[], options: childProcess.SpawnSyncOptionsWithStringEncoding) => {
     assert.equal(command, 'python3'); assert.deepEqual(args.slice(0, 2), ['-I', '-c']);
-    assert.equal(options.timeout, 2500); assert.equal(options.maxBuffer, 65_536); assert.equal(options.shell, undefined);
+    assert.equal(options.timeout, JSON.parse(String(options.input)).action === 'recover' ? 20_000 : 2500); assert.equal(options.maxBuffer, 65_536); assert.equal(options.shell, undefined);
     helperScript = args[2];
     assert.deepEqual(JSON.parse(String(options.input)).intent, f.intent);
     const stdout = JSON.stringify(response);
@@ -225,7 +225,12 @@ def put(path,value):
 def state(root): return pathlib.Path(str(root)+'.chisa-lease/state.json')
 def marker(root): return pathlib.Path(str(root)+'.chisa-integration.json')
 def call(intent,action,**extra):
-    result=subprocess.run([sys.executable,'-I','-c',SCRIPT],input=json.dumps({'intent':intent,'action':action,**extra}),text=True,capture_output=True,timeout=8)
+    # Isolate integration inode/CAS tests from the separately verified trusted
+    # peer coordinator. This fixture uses a positive birth/namespace witness for
+    # its own namespace and refuses every still-running foreign process.
+    verifier="def trusted_workspace_cleanup(root,value,purpose,operation=None):\n if purpose in ('live-writer-release','integration-writer-release'): return {'leaseId':value.get('brokerLeaseId','broker-fixture'),'sessionId':value.get('brokerSessionId','session-1')}\n try:\n  fields=pathlib.Path('/proc/'+str(value['pid'])+'/stat').read_text().rsplit(')',1)[1].split()\n except FileNotFoundError: return {'leaseId':value.get('brokerLeaseId','broker-fixture'),'sessionId':value.get('brokerSessionId','session-1')}\n if fields[0] in ('Z','X') or fields[19]!=value['processStartTime']: return {'leaseId':value.get('brokerLeaseId','broker-fixture'),'sessionId':value.get('brokerSessionId','session-1')}\n fail('independent fixture supervisor still owns writer','WORKSPACE_BUSY')\n"
+    script=SCRIPT.replace('try:\n    request=json.load(sys.stdin)',"import pathlib\n"+verifier+'try:\n    request=json.load(sys.stdin)')
+    result=subprocess.run([sys.executable,'-I','-c',script],input=json.dumps({'intent':intent,'action':action,**extra}),text=True,capture_output=True,timeout=8)
     if result.returncode: raise AssertionError(result.stderr)
     return json.loads(result.stdout)
 @contextlib.contextmanager
@@ -260,7 +265,7 @@ class Integration(unittest.TestCase):
                 for root in (source,execution):
                     self.failure(call(intent,'recover',root=str(root)),'WORKSPACE_BUSY')
                     adopted=self.success(call(intent,'recover',root=str(root),inactiveLeaseId=leases[str(root)]['id']))['lease']
-                    self.assertEqual(adopted['id'],leases[str(root)]['id']); self.assertEqual(adopted['pid'],os.getpid()); self.assertEqual(adopted['integrationOperation'],intent['operationId'])
+                    self.assertEqual(adopted['id'],leases[str(root)]['id']); self.assertEqual(adopted['pid'],os.getpid()); self.assertEqual(adopted['integrationOperation'],intent['operationId']); self.assertEqual(adopted['pidNamespace'],os.readlink('/proc/self/ns/pid')); self.assertNotIn('integrationPeerChanged',adopted)
                 if enrolled: self.assertEqual(pathlib.Path(str(source)+'.chisa-generation.json').read_bytes(),original)
                 self.success(call(intent,'clear'))
                 self.assertFalse(marker(source).exists()); self.assertFalse(marker(execution).exists()); self.assertTrue(state(source).exists())
@@ -277,6 +282,8 @@ class Integration(unittest.TestCase):
             finally: child.terminate(); child.wait(timeout=5)
             adopted=self.success(call(intent,'recover',root=str(source)))['lease']
             self.assertEqual(adopted['id'],old['id']); self.assertEqual(adopted['pid'],os.getpid()); self.assertNotEqual(adopted['processStartTime'],old['processStartTime'])
+            self.assertEqual(adopted['pidNamespace'],os.readlink('/proc/self/ns/pid')); self.assertIs(adopted['integrationPeerChanged'],True); self.assertEqual(adopted['brokerLeaseId'],'broker-fixture'); self.assertEqual(adopted['brokerSessionId'],'session-1')
+            retried=self.success(call(intent,'recover',root=str(source),inactiveLeaseId=old['id']))['lease']; self.assertEqual(retried,adopted)
             self.success(call(intent,'clear'))
     def test_partial_pair_and_old_witness_before_tag_are_recoverable(self):
         with fixture() as (source,execution,intent,leases):

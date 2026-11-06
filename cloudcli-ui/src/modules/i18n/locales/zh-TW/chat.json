@@ -1,4 +1,58 @@
 {
+  "tokenStatistics": {
+    "title": "Token 用量",
+    "summary": "已儲存的 Token 用量",
+    "total": "總 Token",
+    "input": "輸入",
+    "output": "輸出",
+    "cacheRead": "快取讀取",
+    "cacheCreation": "快取寫入",
+    "requestCount": "{{value}} 次請求",
+    "requestCount_one": "{{value}} 次請求",
+    "requestCount_other": "{{value}} 次請求",
+    "sessionCount": "{{value}} 個對話",
+    "sessionCount_one": "{{value}} 個對話",
+    "sessionCount_other": "{{value}} 個對話",
+    "scope": "統計範圍",
+    "currentSession": "目前對話",
+    "allSessions": "全部對話",
+    "range": "日期範圍",
+    "ranges": {
+      "today": "今天",
+      "7d": "近 7 天",
+      "30d": "近 30 天",
+      "all": "全部時間"
+    },
+    "refresh": "重新整理",
+    "retry": "重試",
+    "close": "關閉 Token 用量",
+    "loading": "正在讀取已儲存的用量…",
+    "loadError": "無法讀取 Token 用量，請重試。",
+    "unsupportedServer": "目前連線的伺服器沒有提供 Token 用量統計，可能是伺服器版本較舊。請更新伺服器後重新整理。",
+    "empty": "目前範圍內沒有已儲存的對話。",
+    "unmeasured": "這些對話尚未記錄 Token 用量；缺少的用量未知，不代表零消耗。",
+    "zeroUsage": "目前日期範圍內已記錄的用量為零。",
+    "coverageSummary": "{{indexed}} 個已儲存對話中，{{measured}} 個有用量記錄",
+    "coverageMissing": "未記錄用量：{{unavailable}} 個 · 暫不支援：{{unsupported}} 個",
+    "timeZone": "時區：{{timeZone}}",
+    "daily": "每日用量",
+    "byModel": "依模型",
+    "bySession": "依對話",
+    "date": "日期",
+    "model": "模型",
+    "session": "對話",
+    "requests": "請求數",
+    "unknownModel": "未記錄模型",
+    "untitledSession": "未命名對話",
+    "archived": "已封存",
+    "noBreakdown": "此分類暫無用量記錄。",
+    "coverage": "統計說明",
+    "sourceNote": "統計已儲存的對話記錄（含封存）；未記錄的消耗無法補算。",
+    "countingNote": "總 Token = 輸入 + 輸出 + 快取讀取 + 快取寫入。輸入僅計算新增、未快取的 Token；快取讀取和寫入為獨立計數，不與輸入重複。這是累計用量，不是上下文占用。",
+    "coverageNote": "缺少用量或暫不支援的對話不計入已記錄總量；部分記錄不能代表帳號的全部消耗。",
+    "calendarNote": "今天、近 7 天和近 30 天依 {{timeZone}} 的日曆日期統計；近 7 天和近 30 天包含今天。",
+    "updatedAt": "更新於 {{time}}"
+  },
   "codeBlock": {
     "copy": "複製",
     "copied": "已複製",
@@ -105,12 +159,17 @@
     "stop": "停止",
     "hintText": {
       "ctrlEnter": "Ctrl+Enter 傳送 • Shift+Enter 換行 • Tab 切換模式 • / 斜線指令",
-      "enter": "Enter 傳送 • Shift+Enter 換行 • Tab 切換模式 • / 斜線指令"
+      "enter": "Enter 傳送 • Shift+Enter 換行 • Tab 切換模式 • / 斜線指令",
+      "appendQueued": "Enter 加入排隊訊息"
     },
     "clickToChangeMode": "點擊變更權限模式（或在輸入框中按 Tab）",
     "showAllCommands": "顯示所有指令",
     "clearInput": "清空輸入",
-    "scrollToBottom": "捲動到底部"
+    "scrollToBottom": "捲動到底部",
+    "queue": {
+      "append": "加入排隊訊息",
+      "notCombinable": "無法將訊息加入排隊：斜線指令會單獨執行，因此無法與排隊訊息合併。請在排隊訊息送出後再傳送。"
+    }
   },
   "thinkingMode": {
     "selector": {
@@ -164,7 +223,8 @@
       "codex": "準備好使用 {{model}} 的 Codex。請在下方開始輸入您的訊息。",
       "default": "請在上方選擇一個提供者以開始"
     },
-    "pressToSearch": "按 <kbd>{{shortcut}}</kbd> 搜尋工作階段、檔案和提交"
+    "pressToSearch": "按 <kbd>{{shortcut}}</kbd> 搜尋工作階段、檔案和提交",
+    "chooseModelDescriptionCustomOnly": "{{providers, list}} 僅列出您的模型"
   },
   "session": {
     "continue": {
@@ -194,7 +254,8 @@
     "status": {
       "newSession": "新工作階段",
       "initializing": "初始化中...",
-      "restarting": "重新啟動中..."
+      "restarting": "重新啟動中...",
+      "themeRestartHint": "重新啟動以將新的佈景主題套用到 Claude Code"
     },
     "actions": {
       "disconnect": "中斷連線",
@@ -250,15 +311,28 @@
   },
   "message": {
     "editAndResend": "編輯並重新傳送",
-    "forkFromHere": "從此處分支"
+    "forkFromHere": "從此處分支",
+    "answeredBy": "由 {{model}} 回答"
   },
   "composer": {
+    "modelMenuHeading": "模型 · 目前對話",
+    "moreModels": "更多模型",
+    "effort": "推理強度",
+    "backToModels": "返回模型選單",
+    "effortDefault": "預設",
+    "effortLabels": { "low": "低", "medium": "中", "high": "高", "xhigh": "更高", "max": "最大", "ultracode": "Ultracode", "minimal": "最低", "none": "關閉" },
+    "customModel": "自訂",
+    "selectionSaveFailed": "未能儲存選擇，請重試。",
+    "closeModelPicker": "關閉模型選擇",
     "lastUsedModel": "上次實際使用：{{model}}",
     "editing": {
       "title": "正在取代先前的訊息",
       "filesNotReverted": "已修改的檔案不會還原",
       "cancel": "取消"
-    }
+    },
+    "permissionHeading": "如何核准 {{provider}} 的操作？",
+    "permissionCycleHint": "在輸入框中按 Tab 切換模式",
+    "permissionTriggerLabel": "{{mode}}：{{heading}}"
   },
   "export": {
     "trigger": "匯出對話",
@@ -292,5 +366,30 @@
     "failed": "未傳送 — {{reason}}",
     "cancel": "取消排程訊息",
     "dismiss": "關閉失敗提示"
+  },
+  "bashEditDiff": {
+    "created": "已建立",
+    "updated": "已更新",
+    "deleted": "已刪除",
+    "emptyFile": "空白檔案",
+    "moreLines_other": "… 還有 {{count}} 行",
+    "moreFiles_other": "… 另有 {{count}} 個檔案已變更",
+    "filesNotShown_other": "{{count}} 個檔案已變更（二進位、僅模式變更或過大無法顯示）",
+    "filesUnavailable_other": "{{count}} 個檔案已變更（無法取得差異）",
+    "filesChanged_other": "{{count}} 個檔案已變更",
+    "morePaths_other": "另有 {{count}} 個",
+    "diffUnavailable": "（無法取得此指令的檔案差異）",
+    "partUnavailable": "（部分差異無法取得）",
+    "skipped": "（已略過此 git 指令的檔案差異）",
+    "shared": "（同一時間有另一個指令在此儲存庫中執行；任一指令所做的變更都可能顯示在任一結果下）"
+  },
+  "modelLibrary": {
+    "effortLevels": "推理等級",
+    "effortLevelsHint": "選擇此模型支援的推理強度等級。若未選擇任何等級，將無法在輸入框中為此模型選擇等級。",
+    "effortSummary": "推理：{{levels}}",
+    "customModelsOnly": "僅使用我的模型",
+    "customModelsOnlyHint": "在所有模型選擇器中隱藏 {{provider}} 的內建模型，並將您的第一個模型設為預設模型。在您新增模型之前，內建模型仍會顯示。",
+    "builtInModelsHidden": "開啟「僅使用我的模型」時，這些模型不會出現在模型選擇器中。",
+    "customModelsOnlyFailed": "無法變更此設定。"
   }
 }

@@ -9,7 +9,12 @@ import type {
   FileTreeServices,
   FileTreeUploadedFile,
 } from '@/shared/types.js';
-import { AppError, FORBIDDEN_WORKSPACE_PATHS, normalizeProjectPath } from '@/shared/utils.js';
+import {
+  AppError,
+  FORBIDDEN_WORKSPACE_PATHS,
+  normalizeProjectPath,
+  resolvePathUnderRoots,
+} from '@/shared/utils.js';
 
 const HARD_EXCLUDED_DIRECTORY_NAMES = new Set([
   'node_modules', '.git', '.svn', '.hg',
@@ -181,6 +186,25 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
     : 1;
   const { acquire, release } = createConcurrencyLimiter(concurrencyLimit);
 
+  function isSshMetadataPath(candidatePath: string, workspaceRoot = dependencies.workspace.rootPath): boolean {
+    const relativePath = path.relative(path.resolve(workspaceRoot, '.chisa-ssh-projects'), path.resolve(candidatePath));
+    return relativePath === '' || (!path.isAbsolute(relativePath) && relativePath !== '..' && !relativePath.startsWith(`..${path.sep}`));
+  }
+
+  function assertCloudFolderPath(candidatePath: string, workspaceRoot?: string): void {
+    if (isSshMetadataPath(candidatePath, workspaceRoot)) {
+      throw createFileTreeError('该目录用于保存 SSH 项目绑定，请选择其他云端目录。', 400, 'SSH_ANCHOR_RESERVED');
+    }
+  }
+
+  async function resolveWorkspaceRoot(): Promise<string> {
+    try {
+      return await fileSystem.realpath(dependencies.workspace.rootPath);
+    } catch {
+      return dependencies.workspace.rootPath;
+    }
+  }
+
   async function resolveProjectRoot(projectId: string): Promise<string> {
     const projectRoot = await dependencies.projects.getProjectPathById(projectId);
     if (!projectRoot) {
@@ -200,6 +224,7 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
     directoryPath: string,
     includeEntry: FileTreeEntryFilter,
     remainingEntries: FileTreeEntryBudget,
+    requireReadableDirectory = false,
   ): Promise<FileTreeDirectoryEntry[]> {
     const visibleEntries: FileTreeDirectoryEntry[] = [];
 
@@ -233,6 +258,13 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
         throw error;
       }
       const errorCode = readErrorCode(error);
+      if (requireReadableDirectory) {
+        mapFileSystemError(error, {
+          EACCES: { message: 'Permission denied', statusCode: 403 },
+          EPERM: { message: 'Permission denied', statusCode: 403 },
+          ENOENT: { message: 'Directory not accessible', statusCode: 404 },
+        });
+      }
       if (errorCode !== 'EACCES' && errorCode !== 'EPERM') {
         dependencies.logger.error(`Error reading directory "${directoryPath}"`, error);
       }
@@ -251,7 +283,10 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
     includeEntry: FileTreeEntryFilter = includeEntryByFallbackDirectoryNames,
     remainingEntries: FileTreeEntryBudget = { value: MAXIMUM_FILE_TREE_ENTRIES },
   ): Promise<FileTreeNode[]> {
-    const visibleEntries = await collectVisibleEntries(directoryPath, includeEntry, remainingEntries);
+    // A broad legacy project can contain the SSH metadata namespace. It is not
+    // project content and must be filtered before metadata lookup or traversal.
+    const visibleEntries = await collectVisibleEntries(directoryPath, (entryPath, isDirectory) =>
+      (isSshMetadataPath(directoryPath) || !isSshMetadataPath(entryPath)) && includeEntry(entryPath, isDirectory), remainingEntries);
 
     const items = await Promise.all(visibleEntries.map(async (entry): Promise<FileTreeNode> => {
       const itemPath = path.join(directoryPath, entry.name);
@@ -316,6 +351,62 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
     });
   }
 
+  /**
+   * Resolves a directory the browser may list.
+   *
+   * The read-only roots (the system temp directory and the Claude projects
+   * directory, see `READ_ONLY_ROOTS` in shared/utils) are browsable but never
+   * writable, so they are checked before the workspace policy rejects them.
+   * `createWorkspaceFolder` deliberately does not do this, which is what keeps
+   * them read-only.
+   */
+  async function resolveBrowsablePath(targetPath: string): Promise<string> {
+    const readOnlyPath = await dependencies.workspace.resolveReadOnlyRootPath(targetPath);
+    if (readOnlyPath) {
+      return readOnlyPath;
+    }
+
+    const validation = await dependencies.workspace.validatePath(targetPath);
+    if (!validation.valid) {
+      throw createFileTreeError(validation.error ?? 'Path is outside the workspace root', 403, 'INVALID_WORKSPACE_PATH');
+    }
+
+    return validation.resolvedPath || targetPath;
+  }
+
+  /**
+   * Resolves a path the viewer is allowed to read.
+   *
+   * A file reference in a transcript is normally inside the project, but a
+   * background command's log lives in the system temp directory and a
+   * background agent's output file is a link from there into the Claude
+   * projects directory, and the transcript quotes those paths verbatim. Those
+   * resolve through the read-only root policy instead of the project root.
+   *
+   * The agent may also point at a file in another folder of the workspace, the
+   * same tree `browseWorkspace` lists, so anything under the workspace root is
+   * readable too. Symlinks are resolved before that comparison. The writing
+   * endpoints keep using `resolvePathInsideProject` alone, so nothing outside
+   * the project can be changed.
+   */
+  async function resolveReadablePath(projectRoot: string, targetPath: string): Promise<string> {
+    if (path.isAbsolute(targetPath)) {
+      const readOnlyPath = await dependencies.workspace.resolveReadOnlyRootPath(targetPath);
+      if (readOnlyPath) {
+        return readOnlyPath;
+      }
+
+      const workspacePath = await resolvePathUnderRoots(targetPath, [dependencies.workspace.rootPath]);
+      if (workspacePath) {
+        // Recheck account ownership after resolving links outside the project.
+        const validation = await dependencies.workspace.validatePath(workspacePath);
+        if (validation.valid) return validation.resolvedPath || workspacePath;
+      }
+    }
+
+    return resolvePathInsideProject(projectRoot, targetPath);
+  }
+
   async function cleanupTemporaryFiles(files: FileTreeUploadedFile[]): Promise<void> {
     await Promise.all(files.map(async (file) => {
       try {
@@ -332,12 +423,12 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
         ? expandWorkspacePath(dependencies.workspace.rootPath, inputPath)
         : dependencies.workspace.rootPath;
       const targetPath = path.resolve(requestedPath);
-      const validation = await dependencies.workspace.validatePath(targetPath);
-      if (!validation.valid) {
-        throw createFileTreeError(validation.error ?? 'Path is outside the workspace root', 403, 'INVALID_WORKSPACE_PATH');
-      }
-
-      const resolvedPath = validation.resolvedPath || targetPath;
+      assertCloudFolderPath(targetPath);
+      const resolvedWorkspaceRoot = await resolveWorkspaceRoot();
+      assertCloudFolderPath(targetPath, resolvedWorkspaceRoot);
+      const resolvedPath = await resolveBrowsablePath(targetPath);
+      assertCloudFolderPath(resolvedPath);
+      assertCloudFolderPath(resolvedPath, resolvedWorkspaceRoot);
       try {
         await fileSystem.access(resolvedPath);
         const stats = await fileSystem.stat(resolvedPath);
@@ -349,10 +440,14 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
         throw error;
       }
 
-      const fileTree = await buildFileTree(resolvedPath, 1);
-      const directories = fileTree
-        .filter((item) => item.type === 'directory')
-        .map((item) => ({ path: item.path, name: item.name, type: 'directory' as const }))
+      // The cloud chooser needs immediate directory names only. Filter metadata
+      // anchors before any bridge lookup, and never inspect child contents.
+      const entries = await collectVisibleEntries(resolvedPath, (entryPath, isDirectory) =>
+        isDirectory && includeEntryByFallbackDirectoryNames(entryPath, isDirectory)
+          && !isSshMetadataPath(entryPath) && !isSshMetadataPath(entryPath, resolvedWorkspaceRoot),
+      { value: MAXIMUM_FILE_TREE_ENTRIES }, true);
+      const directories = entries
+        .map((entry) => ({ path: path.join(resolvedPath, entry.name), name: entry.name, type: 'directory' as const }))
         .sort((left, right) => {
           const leftHidden = left.name.startsWith('.');
           const rightHidden = right.name.startsWith('.');
@@ -360,13 +455,6 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
           if (!leftHidden && rightHidden) return -1;
           return left.name.localeCompare(right.name);
         });
-
-      let resolvedWorkspaceRoot = dependencies.workspace.rootPath;
-      try {
-        resolvedWorkspaceRoot = await fileSystem.realpath(dependencies.workspace.rootPath);
-      } catch {
-        // The configured workspace root remains the comparison fallback.
-      }
 
       const suggestions = resolvedPath === resolvedWorkspaceRoot
         ? [
@@ -381,12 +469,17 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
     async createWorkspaceFolder(folderPath) {
       const expandedPath = expandWorkspacePath(dependencies.workspace.rootPath, folderPath);
       const resolvedInput = path.resolve(expandedPath);
+      assertCloudFolderPath(resolvedInput);
+      const resolvedWorkspaceRoot = await resolveWorkspaceRoot();
+      assertCloudFolderPath(resolvedInput, resolvedWorkspaceRoot);
       const validation = await dependencies.workspace.validatePath(resolvedInput);
       if (!validation.valid) {
         throw createFileTreeError(validation.error ?? 'Path is outside the workspace root', 403, 'INVALID_WORKSPACE_PATH');
       }
 
       const targetPath = validation.resolvedPath || resolvedInput;
+      assertCloudFolderPath(targetPath);
+      assertCloudFolderPath(targetPath, resolvedWorkspaceRoot);
       try {
         await fileSystem.access(path.dirname(targetPath));
       } catch (error) {
@@ -414,7 +507,7 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
 
     async readTextFile(projectId, filePath) {
       const projectRoot = await resolveProjectRoot(projectId);
-      const resolvedPath = resolvePathInsideProject(projectRoot, filePath);
+      const resolvedPath = await resolveReadablePath(projectRoot, filePath);
       try {
         const snapshot = fileSystem.readTextSnapshot
           ? await fileSystem.readTextSnapshot(resolvedPath)
@@ -424,13 +517,14 @@ export function createFileTreeService(dependencies: FileTreeServiceDependencies)
         mapFileSystemError(error, {
           ENOENT: { message: 'File not found', statusCode: 404 },
           EACCES: { message: 'Permission denied', statusCode: 403 },
+          EISDIR: { message: 'Path is a directory, not a file', statusCode: 400 },
         });
       }
     },
 
     async openFile(projectId, filePath) {
       const projectRoot = await resolveProjectRoot(projectId);
-      const resolvedPath = resolvePathInsideProject(projectRoot, filePath);
+      const resolvedPath = await resolveReadablePath(projectRoot, filePath);
       try {
         await fileSystem.access(resolvedPath);
       } catch (error) {

@@ -3,6 +3,8 @@ import { useTranslation } from 'react-i18next';
 import { Eye, EyeOff, FolderOpen, FolderPlus, Loader2, Plus, X } from 'lucide-react';
 
 import { Button, Input } from '@/shared/ui';
+import { getAuthSessionVersion } from '@/shared/authToken';
+import { getServerConnectionVersion } from '@/shared/chisa';
 import { browseFilesystemFolders, createFolderInFilesystem } from '@/modules/project-creation-wizard/utils/workspaceApi';
 import { getParentPath, joinFolderPath } from '@/modules/project-creation-wizard/utils/pathUtils';
 import type { FolderSuggestion } from '@/shared/types';
@@ -22,32 +24,47 @@ export default function FolderBrowserModal({
   onFolderSelected,
 }: FolderBrowserModalProps) {
   const { t } = useTranslation();
-  const [currentPath, setCurrentPath] = useState('~');
+  // Only a successfully loaded directory may be selected or used as a creation parent.
+  const [currentPath, setCurrentPath] = useState('');
+  // Display only entries returned for the current directory request.
   const [folders, setFolders] = useState<FolderSuggestion[]>([]);
+  // Hide directory actions until the pending listing has settled.
   const [loadingFolders, setLoadingFolders] = useState(false);
+  // Let the user reveal hidden directory entries.
   const [showHiddenFolders, setShowHiddenFolders] = useState(false);
+  // Keep the folder-name editor open while the user supplies a name.
   const [showNewFolderInput, setShowNewFolderInput] = useState(false);
+  // Retain the draft folder name through a failed creation request.
   const [newFolderName, setNewFolderName] = useState('');
+  // Lock navigation and selection until folder creation has settled.
   const [creatingFolder, setCreatingFolder] = useState(false);
+  // Keep directory and creation failures visible until the next request.
   const [error, setError] = useState<string | null>(null);
 
-  // Keep the loader stable across locale changes: t lands in a ref so an
-  // open browser does not reload and snap back to the home folder when the
-  // user switches language.
+  const requestRef = useRef(0);
+  const createPendingRef = useRef(false);
+  // Keep locale changes from reopening the browser at the home directory.
   const loadFoldersRef = useRef<(pathToLoad: string) => Promise<void>>();
 
   const loadFolders = useCallback(async (pathToLoad: string) => {
+    const request = ++requestRef.current;
+    const auth = getAuthSessionVersion();
+    const server = getServerConnectionVersion();
+    const current = () => request === requestRef.current && auth === getAuthSessionVersion() && server === getServerConnectionVersion();
+    setCurrentPath('');
+    setFolders([]);
     setLoadingFolders(true);
     setError(null);
 
     try {
       const result = await browseFilesystemFolders(pathToLoad);
+      if (!current()) return;
       setCurrentPath(result.path);
       setFolders(result.suggestions);
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : t('folderBrowser.loadFailed'));
+      if (current()) setError(loadError instanceof Error ? loadError.message : t('folderBrowser.loadFailed'));
     } finally {
-      setLoadingFolders(false);
+      if (current()) setLoadingFolders(false);
     }
   }, [t]);
 
@@ -59,7 +76,12 @@ export default function FolderBrowserModal({
     if (!isOpen) {
       return;
     }
+    createPendingRef.current = false;
+    setCreatingFolder(false);
+    setShowNewFolderInput(false);
+    setNewFolderName('');
     void loadFoldersRef.current?.('~');
+    return () => { ++requestRef.current; };
   }, [isOpen]);
 
   const visibleFolders = useMemo(
@@ -78,32 +100,42 @@ export default function FolderBrowserModal({
   };
 
   const handleClose = () => {
+    ++requestRef.current;
     setError(null);
     resetNewFolderState();
     onClose();
   };
 
   const handleCreateFolder = useCallback(async () => {
-    if (!newFolderName.trim()) {
+    if (!newFolderName.trim() || !currentPath || loadingFolders || createPendingRef.current) {
       return;
     }
 
+    const request = requestRef.current;
+    const auth = getAuthSessionVersion();
+    const server = getServerConnectionVersion();
+    const current = () => request === requestRef.current && auth === getAuthSessionVersion() && server === getServerConnectionVersion();
+    createPendingRef.current = true;
     setCreatingFolder(true);
     setError(null);
 
     try {
       const folderPath = joinFolderPath(currentPath, newFolderName);
       const createdPath = await createFolderInFilesystem(folderPath);
+      if (!current()) return;
       resetNewFolderState();
+      // The follow-up listing owns its own request generation.
+      createPendingRef.current = false;
+      setCreatingFolder(false);
       await loadFolders(createdPath);
     } catch (createError) {
-      setError(createError instanceof Error ? createError.message : t('folderBrowser.createFailed'));
+      if (current()) setError(createError instanceof Error ? createError.message : t('folderBrowser.createFailed'));
     } finally {
-      setCreatingFolder(false);
+      if (current()) { createPendingRef.current = false; setCreatingFolder(false); }
     }
-  }, [currentPath, loadFolders, newFolderName, t]);
+  }, [currentPath, loadingFolders, loadFolders, newFolderName, t]);
 
-  const parentPath = getParentPath(currentPath);
+  const parentPath = currentPath ? getParentPath(currentPath) : null;
 
   if (!isOpen) {
     return null;
@@ -140,6 +172,7 @@ export default function FolderBrowserModal({
                   : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-700 dark:hover:text-gray-300'
               }`}
               title={t('folderBrowser.createNew')}
+              disabled={!currentPath || loadingFolders || creatingFolder}
             >
               <Plus className="h-5 w-5" />
             </button>
@@ -161,6 +194,7 @@ export default function FolderBrowserModal({
                 onChange={(event) => setNewFolderName(event.target.value)}
                 placeholder={t('folderBrowser.newFolderPlaceholder')}
                 className="flex-1"
+                disabled={loadingFolders || creatingFolder || !currentPath}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter') {
                     handleCreateFolder();
@@ -174,7 +208,7 @@ export default function FolderBrowserModal({
               <Button
                 size="sm"
                 onClick={handleCreateFolder}
-                disabled={!newFolderName.trim() || creatingFolder}
+                disabled={!newFolderName.trim() || creatingFolder || loadingFolders || !currentPath}
               >
                 {creatingFolder ? <Loader2 className="h-4 w-4 animate-spin" /> : t('folderBrowser.create')}
               </Button>
@@ -187,7 +221,7 @@ export default function FolderBrowserModal({
 
         {error && (
           <div className="px-4 pt-3">
-            <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+            <p role="alert" className="text-sm text-red-600 dark:text-red-400">{error}</p>
           </div>
         )}
 
@@ -201,6 +235,7 @@ export default function FolderBrowserModal({
               {parentPath && (
                 <button
                   onClick={() => loadFolders(parentPath)}
+                  disabled={creatingFolder}
                   className="flex w-full items-center gap-3 rounded-lg px-4 py-3 text-left hover:bg-gray-100 dark:hover:bg-gray-700"
                 >
                   <FolderOpen className="h-5 w-5 text-gray-400" />
@@ -208,7 +243,7 @@ export default function FolderBrowserModal({
                 </button>
               )}
 
-              {visibleFolders.length === 0 ? (
+              {error && !currentPath ? null : visibleFolders.length === 0 ? (
                 <div className="py-8 text-center text-gray-500 dark:text-gray-400">
                   {t('folderBrowser.noSubfolders')}
                 </div>
@@ -217,6 +252,7 @@ export default function FolderBrowserModal({
                   <div key={folder.path} className="flex items-center gap-2">
                     <button
                       onClick={() => loadFolders(folder.path)}
+                      disabled={creatingFolder}
                       className="flex flex-1 items-center gap-3 rounded-lg px-4 py-3 text-left hover:bg-gray-100 dark:hover:bg-gray-700"
                     >
                       <FolderPlus className="h-5 w-5 text-blue-500" />
@@ -228,6 +264,7 @@ export default function FolderBrowserModal({
                       variant="ghost"
                       size="sm"
                       onClick={() => onFolderSelected(folder.path, autoAdvanceOnSelect)}
+                      disabled={creatingFolder}
                       className="px-3 text-xs"
                     >
                       {t('folderBrowser.select')}
@@ -243,7 +280,7 @@ export default function FolderBrowserModal({
           <div className="flex items-center gap-2 bg-gray-50 px-4 py-3 dark:bg-gray-900/50">
             <span className="text-sm text-gray-600 dark:text-gray-400">{t('folderBrowser.pathLabel')}</span>
             <code className="flex-1 truncate font-mono text-sm text-gray-900 dark:text-white">
-              {currentPath}
+              {currentPath || '-'}
             </code>
           </div>
           <div className="flex items-center justify-end gap-2 p-4">
@@ -253,6 +290,7 @@ export default function FolderBrowserModal({
             <Button
               variant="outline"
               onClick={() => onFolderSelected(currentPath, autoAdvanceOnSelect)}
+              disabled={!currentPath || loadingFolders || creatingFolder}
             >
               {t('folderBrowser.useThisFolder')}
             </Button>

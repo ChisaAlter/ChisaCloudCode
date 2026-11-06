@@ -19,7 +19,7 @@ vi.mock('@/modules/auth', () => ({ AccountMenu: () => null, AccountAvatar: () =>
 vi.mock('@/shared/context/UiPreferencesContext', () => ({
   useUiPreferences: () => ({ sidebarVisible: true }), useSetUiPreference: () => vi.fn(),
 }));
-vi.mock('@/shared/context/SessionProtectionContext', () => ({ useBusySessionIdSet: () => new Set() }));
+vi.mock('@/shared/context/SessionProtectionContext', () => ({ useBusySessionIdSet: () => new Set(), useBackgroundSessionIdSet: () => new Set() }));
 vi.mock('@/modules/task-master', () => ({
   useTaskMaster: () => ({ setCurrentProject: mocks.currentProject }), useTasksSettings: () => ({ tasksEnabled: false }),
 }));

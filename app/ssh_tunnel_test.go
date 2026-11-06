@@ -58,6 +58,17 @@ func (r *fakeSshRuntime) dependencies() sshTunnelDependencies {
 	}
 }
 
+func awaitSshStart(t *testing.T, starts <-chan fakeSshStart) fakeSshStart {
+	t.Helper()
+	select {
+	case started := <-starts:
+		return started
+	case <-time.After(3 * time.Second):
+		t.Fatal("SSH child did not start")
+		return fakeSshStart{}
+	}
+}
+
 func sshTestScope(t *testing.T, identity string) sshAccountScope {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -200,7 +211,7 @@ func TestSshReverseTunnelAcknowledgesOuterOnlyAndStopsOwnedProcess(t *testing.T)
 	if err != nil || initial.State != "starting" || initial.OuterConnected || initial.Verified {
 		t.Fatal(initial, err)
 	}
-	started := <-runtime.starts
+	started := awaitSshStart(t, runtime.starts)
 	if started.executable != "system-ssh.exe" || !reflect.DeepEqual(started.args, sshTunnelArguments(profile)) {
 		t.Fatal("SSH executable/argv escaped explicit command contract")
 	}
@@ -244,7 +255,7 @@ func TestSshReverseTunnelAcknowledgesOuterOnlyAndStopsOwnedProcess(t *testing.T)
 	if _, err := manager.stop(scope, profile.ID); err != nil {
 		t.Fatal(err)
 	}
-	<-started.process.killed
+	awaitNativeSignal(t, started.process.killed, "SSH stop did not terminate the owned child")
 	stopped := waitSshState(t, manager, scope, profile.ID, "stopped")
 	if stopped.OuterConnected || stopped.Verified {
 		t.Fatal(stopped)
@@ -261,7 +272,7 @@ func TestSshTunnelFailureTypedBoundedAndDoesNotReconnect(t *testing.T) {
 	if _, err := manager.start(scope, profile.ID); err != nil {
 		t.Fatal(err)
 	}
-	started := <-runtime.starts
+	started := awaitSshStart(t, runtime.starts)
 	_, _ = io.WriteString(started.output, "PRIVATE PATH C:\\secret-identity\nHost key verification failed.\n")
 	started.process.exit(errors.New("raw error containing secret"))
 	status := waitSshState(t, manager, scope, profile.ID, "error")
@@ -287,18 +298,18 @@ func TestSshStartupTimeoutAndAccountCancellationCannotLeaveReady(t *testing.T) {
 	if _, err := manager.start(scope, profile.ID); err != nil {
 		t.Fatal(err)
 	}
-	started := <-runtime.starts
+	started := awaitSshStart(t, runtime.starts)
 	runtime.timeout <- time.Now()
 	status := waitSshState(t, manager, scope, profile.ID, "error")
 	if status.Code != "SSH_START_TIMEOUT" {
 		t.Fatal(status)
 	}
-	<-started.process.killed
+	awaitNativeSignal(t, started.process.killed, "SSH stop did not terminate the owned child")
 	initial, err := manager.start(scope, profile.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second := <-runtime.starts
+	second := awaitSshStart(t, runtime.starts)
 	manager.stopAll(false)
 	_, _ = io.WriteString(second.output, "debug1: remote forward success for: listen 127.0.0.1:18765, connect 127.0.0.1:22\n")
 	waitSshState(t, manager, scope, profile.ID, "stopped")

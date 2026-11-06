@@ -6,8 +6,8 @@
   },
   "upstream": {
     "repository": "https://github.com/siteboon/claudecodeui",
-    "version": "1.37.3",
-    "commit": "70e57859b6224ff0eb0539fcde7d13a3186c9c93"
+    "version": "1.37.6",
+    "commit": "c17c2f621bc7fb57f906c59c67128a1d7c4996e4"
   },
   "publication": "Fresh source snapshot; upstream license and notices retained. Credentials, state, deployment helpers, QA evidence, dependency trees and local binaries are not included."
 }

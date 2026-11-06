@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "recipient_fingerprint": null,
+  "private_key_stored_off_source": false,
+  "independent_custodian_verified": false,
+  "decrypt_challenge_passed": false,
+  "verified_at": null,
+  "evidence_reference": null,
+  "operator_note": "Keep the private key/passphrase off the source host and out of this repository. Custodian must decrypt a generated nonsecret challenge on the isolated recovery host. Only public fingerprint, evidence reference and result belong here; pin this file SHA256 in config."
+}

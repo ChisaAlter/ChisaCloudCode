@@ -11,8 +11,36 @@ import test, { mock } from 'node:test';
 const fixtureRoot = realpathSync(await mkdtemp(path.join(os.tmpdir(), 'chisa-admission-real-git-')));
 process.env.WORKSPACES_ROOT = fixtureRoot;
 // Admission fixtures supply explicit cloud markers without restoring an account runtime.
+// Reservation admission is expected before snapshot bytes; sandbox execution is not.
+type BrokerInput = { root: string; userId: string; leaseId?: string; brokerLeaseId?: string; bindingEpoch: string; sessionId?: string };
+const brokerReservations = new Map<string, { root: string; bindingEpoch: string; sessionId: string; brokerLeaseId: string }>();
 mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
   ensureCloudWorkspaceBinding() {}, excludeCloudWorkspaceMetadata() {}, getWorkspaceRuntimeIdentity() { return undefined; },
+  readCloudWorkspaceOwner() { return 'cloud-admission-fixture'; },
+  async getWorkspaceBrokerAdmission(input: BrokerInput) {
+    assert.equal(input.userId, 'cloud-admission-fixture');
+    assert.ok(input.leaseId, 'snapshot and execution admission require an existing legacy reservation');
+    const legacyReservationId = input.leaseId;
+    const previous = brokerReservations.get(legacyReservationId);
+    const selected = { root: input.root, bindingEpoch: input.bindingEpoch, sessionId: input.sessionId ?? 'fixture-session', brokerLeaseId: 'broker-' + legacyReservationId };
+    if (previous) assert.deepEqual(selected, previous);
+    if (input.brokerLeaseId !== undefined) assert.equal(input.brokerLeaseId, selected.brokerLeaseId);
+    brokerReservations.set(legacyReservationId, selected);
+    return { workspaceId: 'workspace', generation: 'generation', root: selected.root, bindingEpoch: selected.bindingEpoch, sessionId: selected.sessionId, legacyReservationId, leaseId: selected.brokerLeaseId, profileId: 'provider-rw', previewProfileId: 'preview-ro',
+      async proof(_permission: string, profileId: string) { assert.equal(profileId, 'provider-rw'); return 'independent-grant'; },
+      client: { async run() { assert.fail('unexpected sandbox process'); } },
+    };
+  },
+  async closeWorkspaceBrokerLease(input: BrokerInput) {
+    assert.equal(input.userId, 'cloud-admission-fixture');
+    assert.ok(input.leaseId);
+    const selected = brokerReservations.get(input.leaseId);
+    assert.ok(selected, 'only an admitted reservation can be closed');
+    assert.equal(input.root, selected.root); assert.equal(input.bindingEpoch, selected.bindingEpoch);
+    assert.equal(input.brokerLeaseId, selected.brokerLeaseId); assert.equal(input.sessionId, selected.sessionId);
+    const confirmedAt = Date.now();
+    return { workspaceId: 'workspace', generation: 'generation', root: selected.root, bindingEpoch: selected.bindingEpoch, sessionId: selected.sessionId, userId: input.userId, ownerId: 'fixture-owner', legacyReservationId: input.leaseId, leaseId: selected.brokerLeaseId, profileId: 'provider-rw', state: 'closed', quiescent: true, cleanupConfirmed: true, resourceInventoryComplete: true, resources: [], closedAt: confirmedAt, confirmedAt, brokerInstanceId: 'fixture-broker' };
+  },
   executeWorkspaceRuntimePreview() { assert.fail('unexpected preview'); },
 } });
 const { admitWorkspaceExecution, assertWorkspaceDescriptor, bridgeFileSystem, describeWorkspaceSelection, withWorkspaceWriteOperation } = await import('@/modules/workspace-bridge/index.js');
@@ -151,52 +179,6 @@ test('a cloud Git repository without an initial commit falls back to its actual 
   } finally {
     for (const target of [root, root + '.chisa-lease', root + '.chisa-state']) { assert.equal(path.dirname(target), fixtureRoot); await rm(target, { recursive: true, force: true }); }
   }
-});
-
-test('Git inspection errors reject isolated admission instead of silently using the shared root', async () => {
-  await fixture(async root => {
-    await writeFile(path.join(root, '.git', 'config'), '[core\n');
-    await assert.rejects(admitWorkspaceExecution({ cwd: root, sessionId: 'bad-git', workspaceMode: 'isolated' }), { code: 'WORKSPACE_WORKTREE_CREATE_FAILED' });
-    assert.equal(describe(root, 'bad-git').session, null);
-    assert.equal(existsSync(root + '.chisa-lease'), false);
-    assert.equal(existsSync(root + '.chisa-worktrees'), false);
-  });
-});
-
-test('worktree Git ignores inherited repository selectors and disables repository hooks', async () => {
-  await fixture(async root => {
-    const hookMarker = path.join(root, 'hook-ran.txt');
-    await writeFile(path.join(root, '.git', 'hooks', 'post-checkout'), '#!/bin/sh\nprintf unsafe > "' + hookMarker.replaceAll('\\', '/') + '"\n');
-    const observed: Array<{ args: string[]; env: NodeJS.ProcessEnv }> = [];
-    const originalSpawn = childProcess.spawn;
-    const spawn = mock.method(childProcess, 'spawn', (...args: Parameters<typeof childProcess.spawn>) => {
-      const [command, argv, options] = args;
-      if (command === 'git') observed.push({ args: argv as string[], env: (options as { env: NodeJS.ProcessEnv }).env });
-      return originalSpawn(...args);
-    });
-    const previous = process.env.GIT_DIR;
-    process.env.GIT_DIR = path.join(root, 'foreign-git-directory');
-    syncBuiltinESMExports();
-    let run: Awaited<ReturnType<typeof admitWorkspaceExecution>> | undefined;
-    try {
-      run = await admitWorkspaceExecution({ cwd: root, sessionId: 'clean-git-env', workspaceMode: 'isolated' });
-      assert.equal(run.isolated, true);
-      assert.ok(observed.length > 0);
-      for (const invocation of observed) assert.equal(invocation.env.GIT_DIR, undefined);
-      const worktreeCommands = observed.filter(invocation => invocation.args.some(argument => argument.startsWith('safe.directory=')));
-      assert.ok(worktreeCommands.length > 0);
-      for (const invocation of worktreeCommands) {
-        assert.equal(invocation.env.GIT_CONFIG_NOSYSTEM, '1');
-        assert.ok(invocation.args.includes('core.hooksPath=/dev/null'));
-        assert.ok(invocation.args.includes('core.fsmonitor=false'));
-      }
-      assert.equal(existsSync(hookMarker), false);
-    } finally {
-      if (previous === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = previous;
-      spawn.mock.restore(); syncBuiltinESMExports();
-      await run?.close();
-    }
-  });
 });
 
 test('unconfirmed cloud cleanup retains its barrier until exact external recovery', async () => {

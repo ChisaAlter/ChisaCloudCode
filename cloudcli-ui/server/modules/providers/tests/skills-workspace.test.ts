@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -20,16 +20,73 @@ process.env.DATABASE_PATH = path.join(bootstrap, 'auth.db');
 await fs.writeFile(process.env.DATABASE_PATH, '');
 const { closeConnection, initializeDatabase, getConnection, projectsDb, sessionsDb } = await import('@/modules/database/index.js');
 // Selected skills fixtures own explicit cloud markers and no restored account runtime.
-const { assertCloudWorkspaceOwner } = await import('@/modules/workspace-runtime/index.js');
-mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
+let ownership: Pick<typeof import('@/modules/workspace-runtime/index.js'),'assertCloudWorkspaceOwner'|'readCloudWorkspaceOwner'>;
+const assertCloudWorkspaceOwner: typeof ownership.assertCloudWorkspaceOwner = (...args)=>ownership.assertCloudWorkspaceOwner(...args);
+const readCloudWorkspaceOwner: typeof ownership.readCloudWorkspaceOwner = (...args)=>ownership.readCloudWorkspaceOwner(...args);
+type BrokerInput = Parameters<typeof import('@/modules/workspace-runtime/index.js').getWorkspaceBrokerAdmission>[0];
+type BrokerReservation = { brokerLeaseId: string; runAttempts: number; closed: boolean };
+let materializing: { root: string; bindingEpoch: string; sessionId: string; ownerId: string; reservations: Map<string, BrokerReservation> } | undefined;
+const runtimeMock = mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
   assertCloudWorkspaceOwner,
   ensureCloudWorkspaceBinding() {}, excludeCloudWorkspaceMetadata() {}, getWorkspaceRuntimeIdentity() { return undefined; },
+  async getWorkspaceBrokerAdmission(input: BrokerInput) {
+    if (!materializing) assert.fail('skill discovery must not start a broker lease');
+    const scope = materializing;
+    assert.equal(input.userId, 'skills-fixture-account');
+    assert.equal(input.root, scope.root);
+    assert.equal(input.bindingEpoch, scope.bindingEpoch);
+    assert.equal(input.sessionId, scope.sessionId);
+    assert.ok(input.leaseId, 'materialization must reserve before broker admission');
+    const legacyReservationId = input.leaseId;
+    const reservation = scope.reservations.get(legacyReservationId) ?? { brokerLeaseId: 'broker-' + legacyReservationId, runAttempts: 0, closed: false };
+    assert.equal(reservation.closed, false);
+    assert.notEqual(legacyReservationId, scope.sessionId);
+    assert.notEqual(reservation.brokerLeaseId, legacyReservationId);
+    assert.notEqual(reservation.brokerLeaseId, scope.sessionId);
+    if (input.brokerLeaseId !== undefined) assert.equal(input.brokerLeaseId, reservation.brokerLeaseId);
+    scope.reservations.set(legacyReservationId, reservation);
+    return { workspaceId: 'skills-fixture-workspace', generation: 'skills-fixture-generation', ownerId: scope.ownerId,
+      root: scope.root, bindingEpoch: scope.bindingEpoch, sessionId: scope.sessionId, legacyReservationId, leaseId: reservation.brokerLeaseId, profileId: 'provider-rw',
+      async proof() { assert.fail('skill materialization must not request a process grant'); },
+      client: { async run() { reservation.runAttempts++; assert.fail('skill discovery must not start a process'); } },
+    };
+  },
+  async closeWorkspaceBrokerLease(input: Parameters<typeof import('@/modules/workspace-runtime/index.js').closeWorkspaceBrokerLease>[0]) {
+    assert.equal(input.userId,'skills-fixture-account');
+    assert.ok(materializing, 'only fixture materialization may close a broker lease');
+    const scope = materializing;
+    assert.equal(input.root, scope.root);
+    assert.equal(input.bindingEpoch, scope.bindingEpoch);
+    assert.equal(input.sessionId, scope.sessionId);
+    const reservation = scope.reservations.get(input.leaseId);
+    assert.ok(reservation, 'only the exact admitted reservation can close');
+    assert.equal(input.brokerLeaseId, reservation.brokerLeaseId);
+    assert.equal(reservation.closed, false);
+    assert.equal(reservation.runAttempts, 0, 'complete empty inventory requires no attempted process runs');
+    reservation.closed = true;
+    const confirmedAt = Date.now();
+    // This fixture never starts a process; the tracked reservation has no resources.
+    return { workspaceId: 'skills-fixture-workspace', generation: 'skills-fixture-generation', ownerId: scope.ownerId, userId: input.userId,
+      state: 'closed', legacyReservationId: input.leaseId, leaseId: reservation.brokerLeaseId, root: scope.root, bindingEpoch: scope.bindingEpoch, sessionId: scope.sessionId,
+      profileId: 'provider-rw', quiescent: true, cleanupConfirmed: true, resourceInventoryComplete: true, resources: [], closedAt: confirmedAt, confirmedAt, brokerInstanceId: 'skills-fixture-broker' };
+  },
+  readCloudWorkspaceOwner,
   executeWorkspaceRuntimePreview() { assert.fail('unexpected preview'); }, createWorkspaceRuntimeService() { assert.fail('unexpected restore'); },
 } });
 const { admitWorkspaceExecution, describeWorkspaceSelection } = await import('@/modules/workspace-bridge/index.js');
-const { providerSkillsService } = await import('../services/skills.service.js');
+const { workspaceSelectionScope } = await import('@/modules/workspaces/index.js');
+const actualProviderSkillsService = (await import('../services/skills.service.js')).providerSkillsService;
+function inOwnerScope<T>(run: () => T): T {
+  let result!: T;let failure: unknown;
+  workspaceSelectionScope({ query: {},body: {},user: { id: 'skills-fixture-account' } } as unknown as Request,{} as Response,error=>{if(error)failure=error;else result=run();});
+  if(failure)throw failure;return result;
+}
+const providerSkillsService = { listProviderSkills(...args: Parameters<typeof actualProviderSkillsService.listProviderSkills>) { return inOwnerScope(()=>actualProviderSkillsService.listProviderSkills(...args)); } };
 const { providerRegistry } = await import('../provider.registry.js');
 const { default: providerRouter } = await import('../provider.routes.js');
+// Existing consumers retain the mock functions; future imports expose the real
+// public ownership reader without loading bridge consumers before the mock.
+runtimeMock.restore();ownership = await import('@/modules/workspace-runtime/index.js');
 await initializeDatabase();
 after(async () => {
   closeConnection();
@@ -77,19 +134,34 @@ async function withFixture(run: (fixture: {
   projectsDb.createProjectPath(foreign);
   const projectId = projectsDb.getProjectPath(root)!.project_id;
   const current = () => selector(describeWorkspaceSelection({ projectId, sourceRoot: root }).cloudReplica);
+  const accountRoot = path.resolve(WORKSPACES_ROOT);
+  const owner = createHash('sha256').update(accountRoot + '\0skills-fixture-account').digest('hex').slice(0,24);
+  const previousWorkspaceRoot = process.env.WORKSPACES_ROOT;process.env.WORKSPACES_ROOT = accountRoot;
   const bind = async (epoch = 'first', _retiredPort = 19081) => {
-    await fs.writeFile(path.join(root, '.chisa-bridge.json'), JSON.stringify({ protocol: 3, root, owner: 'cloud-skills-fixture', bindingEpoch: epoch }));
+    await fs.writeFile(path.join(root, '.chisa-bridge.json'), JSON.stringify({ protocol: 3, root, owner, bindingEpoch: epoch }));
   };
   mock.method(os, 'homedir', () => home);
+  const runtimeStateDirectory = path.join(home,'.chisa-workspace-runtime');await fs.mkdir(runtimeStateDirectory,{recursive:true});
+  await fs.writeFile(path.join(runtimeStateDirectory,createHash('sha256').update(accountRoot).digest('hex').slice(0,24)+'.json'),JSON.stringify({version:1,root:accountRoot,userId:'skills-fixture-account',owner}),{mode:0o600});
+  assert.equal(readCloudWorkspaceOwner(root),'skills-fixture-account');
   try {
-    await run({ root, repo, foreign, home, sessionId, projectId, current, bind, materialize: async () => {
-      const execution = await admitWorkspaceExecution({ cwd: root, sessionId, workspaceMode: 'isolated' });
-      await execution.close();
-      const descriptor = describeWorkspaceSelection({ projectId, sourceRoot: root, sessionId }).session;
-      assert.ok(descriptor);
-      return descriptor;
-    } });
+    await inOwnerScope(()=>run({ root, repo, foreign, home, sessionId, projectId, current, bind, materialize: async () => {
+      assert.equal(materializing, undefined);
+      const { bindingEpoch } = JSON.parse(await fs.readFile(path.join(root, '.chisa-bridge.json'), 'utf8')) as { bindingEpoch: string };
+      const scope = { root, bindingEpoch, sessionId, ownerId: owner, reservations: new Map<string, BrokerReservation>() };
+      materializing = scope;
+      try {
+        const execution = await admitWorkspaceExecution({ cwd: root, sessionId, workspaceMode: 'isolated' });
+        await execution.close();
+        assert.ok(scope.reservations.size > 0, 'session materialization must admit its reservation before checking Git');
+        for (const reservation of scope.reservations.values()) assert.equal(reservation.closed, true);
+        const descriptor = describeWorkspaceSelection({ projectId, sourceRoot: root, sessionId }).session;
+        assert.ok(descriptor);
+        return descriptor;
+      } finally { materializing = undefined; }
+    } }));
   } finally {
+    if(previousWorkspaceRoot===undefined)delete process.env.WORKSPACES_ROOT;else process.env.WORKSPACES_ROOT=previousWorkspaceRoot;
     mock.restoreAll();
     sessionsDb.deleteSessionById(sessionId);
     assert.equal(path.dirname(directory), path.resolve(WORKSPACES_ROOT));
@@ -98,7 +170,7 @@ async function withFixture(run: (fixture: {
 }
 
 async function withServer(run: (baseUrl: string) => Promise<void>) {
-  const app = express().use('/api/providers', providerRouter);
+  const app = express().use((request,_response,next)=>{(request as Request & { user: { id: string } }).user={ id: 'skills-fixture-account' };next();}).use(workspaceSelectionScope).use('/api/providers', providerRouter);
   app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
     response.status(error instanceof AppError ? error.statusCode : 500).json({
       error: { code: error instanceof AppError ? error.code : 'INTERNAL_ERROR' },

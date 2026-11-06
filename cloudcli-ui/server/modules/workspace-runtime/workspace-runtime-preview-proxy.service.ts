@@ -6,7 +6,7 @@ import { AppError } from '@/shared/index.js';
 
 import { resolveWorkspaceRuntimePreviewAccess, retainWorkspaceRuntimePreviewConnection } from './workspace-runtime-preview-access.service.js';
 
-const blockedRequestHeaders = new Set(['authorization', 'cookie', 'proxy-authorization', 'proxy-connection', 'forwarded', 'referer', 'origin',
+const blockedRequestHeaders = new Set(['authorization', 'x-chisa-preview-ticket', 'cookie', 'proxy-authorization', 'proxy-connection', 'forwarded', 'referer', 'origin',
   'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-real-ip', 'host', 'connection', 'upgrade', 'keep-alive', 'te', 'trailer', 'transfer-encoding']);
 const blockedResponseHeaders = new Set(['set-cookie', 'clear-site-data', 'service-worker-allowed', 'content-security-policy', 'content-security-policy-report-only',
   'access-control-allow-credentials', 'access-control-allow-origin', 'report-to', 'reporting-endpoints', 'nel', 'refresh', 'connection', 'upgrade', 'keep-alive', 'transfer-encoding', 'trailer']);
@@ -76,7 +76,7 @@ export async function proxyWorkspaceRuntimePreview(request: IncomingMessage, res
     let upstream: http.ClientRequest;
     try {
       upstream = http.request({ host: target.host, port: target.port, method: request.method, path: upstreamPath,
-        headers: upstreamHeaders(request, target.host + ':' + target.port, false), signal: cancellation.signal });
+        headers: { ...upstreamHeaders(request, target.host + ':' + target.port, false),'X-Chisa-Preview-Ticket': target.ticket }, signal: cancellation.signal });
     } catch (error) { finish(error); return; }
     request.once('aborted', close); response.once('close', close);
     response.once('finish', () => finish());
@@ -119,7 +119,7 @@ export async function proxyWorkspaceRuntimePreviewUpgrade(request: IncomingMessa
   let upstream: http.ClientRequest;
   try {
     upstream = http.request({ host: target.host, port: target.port, method: 'GET', path: upstreamPath,
-      headers: upstreamHeaders(request, target.host + ':' + target.port, true), signal: cancellation.signal });
+      headers: { ...upstreamHeaders(request, target.host + ':' + target.port, true),'X-Chisa-Preview-Ticket': target.ticket }, signal: cancellation.signal });
   } catch (error) { release(); throw error; }
   socket.once('close', () => { close(); release(); });
   socket.once('error', close);

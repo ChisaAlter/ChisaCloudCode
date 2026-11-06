@@ -5,7 +5,7 @@ import { GitBranchIcon, PencilIcon } from 'lucide-react';
 import { AccountAvatar } from '@/modules/auth';
 import type { AuthUserProfile, ChatMessage, ClaudePermissionSuggestion, PermissionGrantResult, LLMProvider,DiffLine,Project } from '@/shared/types';
 import { formatUsageLimitText, stripProposedPlanEnvelope } from '@/modules/chat/utils/chatFormatting';
-import { ToolRenderer, ToolErrorDisplay, SubagentPanel, shouldHideToolResult } from '@/modules/chat/tools';
+import { ToolRenderer, ToolErrorDisplay, SubagentPanel, WorkflowPanel, shouldHideToolResult } from '@/modules/chat/tools';
 import { LLMProviderLogo } from '@/shared/ui';
 import { Reasoning, ReasoningContent, ReasoningTrigger } from '@/modules/chat/transcript/Reasoning';
 import ChatMessageImages from '@/modules/chat/transcript/ChatMessageImages';
@@ -13,6 +13,7 @@ import ChatMessageFiles from '@/modules/chat/transcript/ChatMessageFiles';
 import { Markdown } from '@/modules/chat/transcript/Markdown';
 import StreamingMarkdown from '@/modules/chat/transcript/StreamingMarkdown';
 import MessageCopyControl from '@/modules/chat/transcript/MessageCopyControl';
+import MessageModelLabel from '@/modules/chat/transcript/MessageModelLabel';
 import MessageSpeakControl from '@/modules/chat/transcript/MessageSpeakControl';
 import { useIsExportingTranscript } from '@/modules/chat/context/TranscriptRenderContext';
 import { MemoryCitations } from '@/modules/chat/transcript/MemoryCitations';
@@ -43,7 +44,8 @@ type MessageComponentProps = {
   onForkFromMessage?: (message: ChatMessage) => void;
 };
 
-const COPY_HIDDEN_TOOL_NAMES = new Set(['Bash', 'Edit', 'Write', 'ApplyPatch']);
+const COPY_HIDDEN_TOOL_NAMES = new Set(['Bash', 'PowerShell', 'mcp__workspace__run_command', 'Edit', 'Write', 'ApplyPatch']);
+const INLINE_COMMAND_TOOL_NAMES = new Set(['Bash', 'PowerShell', 'mcp__workspace__run_command']);
 
 /**
  * Rendered by chat's ChatMessagesPane and ToolGroupContainer to draw one
@@ -165,11 +167,41 @@ const MessageComponent = memo(({ message, accountUser = null, prevMessage, creat
             </div>
           )}
         </div>
+      ) : message.compact ? (
+        /* A compaction: one row, its numbers, and its summary folded into it */
+        <div className="w-full">
+          <div className="flex items-center gap-2 py-0.5">
+            <span
+              className={`inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full ${
+                message.compact.phase === 'running'
+                  ? 'animate-pulse bg-amber-400 dark:bg-amber-500'
+                  : message.compact.phase === 'failed'
+                    ? 'bg-red-400 dark:bg-red-500'
+                    : 'bg-gray-400 dark:bg-gray-500'
+              }`}
+            />
+            <span className="text-xs text-gray-500 dark:text-gray-400">
+              {message.content || t('chat:misc.compacted', 'Compacted')}
+            </span>
+          </div>
+          {message.compactSummary && (
+            <details className="ml-3.5 mt-0.5">
+              <summary className="cursor-pointer text-xs text-gray-500 hover:text-foreground dark:text-gray-400">
+                {t('chat:misc.compactionSummary', 'full summary')}
+              </summary>
+              <div className="mt-1">
+                <Markdown className="prose prose-sm prose-gray max-w-none font-serif dark:prose-invert">
+                  {message.compactSummary}
+                </Markdown>
+              </div>
+            </details>
+          )}
+        </div>
       ) : message.isTaskNotification ? (
         /* Compact task notification on the left */
         <div className="w-full">
           <div className="flex items-center gap-2 py-0.5">
-            <span className={`inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full ${message.taskStatus === 'completed' ? 'bg-green-400 dark:bg-green-500' : 'bg-amber-400 dark:bg-amber-500'}`} />
+            <span className={`inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full ${message.taskNotificationStatus === 'completed' ? 'bg-green-400 dark:bg-green-500' : 'bg-amber-400 dark:bg-amber-500'}`} />
             <span className="text-xs text-gray-500 dark:text-gray-400">{message.content}</span>
           </div>
         </div>
@@ -209,18 +241,35 @@ const MessageComponent = memo(({ message, accountUser = null, prevMessage, creat
 
           <div className="w-full">
 
-            {message.isSubagentContainer ? (
+            {message.isToolUse && message.toolName === 'Workflow' ? (
+              /* A workflow launch owns its whole card too. The anchor is what
+                 the background-tasks strip scrolls to. */
+              <div id={`tool-result-${message.toolId}`} className="scroll-mt-4">
+                <WorkflowPanel
+                  toolInput={message.toolInput}
+                  toolResult={message.toolResult}
+                  workflow={message.workflow}
+                  taskStatus={message.taskStatus}
+                  onFileOpen={onFileOpen}
+                  createDiff={createDiff}
+                  selectedProject={selectedProject}
+                />
+              </div>
+            ) : message.isSubagentContainer ? (
               /* A spawned agent owns its whole card — header, timeline and
                  result — so it never goes through the tool input/result pair. */
-              <SubagentPanel
-                toolInput={message.toolInput}
-                toolResult={message.toolResult}
-                subagent={message.subagent}
-                activity={message.subagentActivity}
-                onFileOpen={onFileOpen}
-                createDiff={createDiff}
-                selectedProject={selectedProject}
-              />
+              <div id={`tool-result-${message.toolId}`} className="scroll-mt-4">
+                <SubagentPanel
+                  toolInput={message.toolInput}
+                  toolResult={message.toolResult}
+                  subagent={message.subagent}
+                  taskStatus={message.taskStatus}
+                  activity={message.subagentActivity}
+                  onFileOpen={onFileOpen}
+                  createDiff={createDiff}
+                  selectedProject={selectedProject}
+                />
+              </div>
             ) : message.isToolUse ? (
               <>
                 <div className="flex flex-col">
@@ -232,23 +281,28 @@ const MessageComponent = memo(({ message, accountUser = null, prevMessage, creat
                 </div>
 
                 {message.toolInput && (
-                  <ToolRenderer
-                    toolName={message.toolName || 'UnknownTool'}
-                    toolInput={message.toolInput}
-                    toolResult={message.toolResult}
-                    toolId={message.toolId}
-                    mode="input"
-                    onFileOpen={onFileOpen}
-                    createDiff={createDiff}
-                    selectedProject={selectedProject}
-                    showRawParameters={showRawParameters}
-                    rawToolInput={typeof message.toolInput === 'string' ? message.toolInput : undefined}
-                    toolStatus={message.toolStatus}
-                  />
+                  // Bash draws its output inside this row rather than in the
+                  // result section below, so for a backgrounded command this is
+                  // the row the background-tasks strip scrolls to.
+                  <div id={INLINE_COMMAND_TOOL_NAMES.has(String(message.toolName || '')) ? `tool-result-${message.toolId}` : undefined} className="scroll-mt-4">
+                    <ToolRenderer
+                      toolName={message.toolName || 'UnknownTool'}
+                      toolInput={message.toolInput}
+                      toolResult={message.toolResult}
+                      toolId={message.toolId}
+                      mode="input"
+                      onFileOpen={onFileOpen}
+                      createDiff={createDiff}
+                      selectedProject={selectedProject}
+                      showRawParameters={showRawParameters}
+                      rawToolInput={typeof message.toolInput === 'string' ? message.toolInput : undefined}
+                      toolStatus={message.toolStatus}
+                    />
+                  </div>
                 )}
 
                 {/* Tool Result Section — Bash renders its output inside the command row above. */}
-                {message.toolResult && message.toolName !== 'Bash' && !shouldHideToolResult(message.toolName || 'UnknownTool', message.toolResult) && (
+                {message.toolResult && !INLINE_COMMAND_TOOL_NAMES.has(String(message.toolName || '')) && !shouldHideToolResult(message.toolName || 'UnknownTool', message.toolResult) && (
                   message.toolResult.isError ? (
                     // Error results — collapsed red row that expands to the content
                     <div id={`tool-result-${message.toolId}`} className="scroll-mt-4">
@@ -370,6 +424,11 @@ const MessageComponent = memo(({ message, accountUser = null, prevMessage, creat
                 {shouldShowAssistantCopyControl && (
                   <MessageSpeakControl content={assistantCopyContent} />
                 )}
+                {/* Which model actually answered, as the provider recorded it
+                    on this row. Provenance rather than an affordance, so unlike
+                    copy and speak it is not gated on the copy control, and an
+                    exported transcript keeps it wherever the footer renders. */}
+                <MessageModelLabel model={message.model} />
                 {!isGrouped && <span>{formattedTime}</span>}
               </div>
             )}

@@ -3,19 +3,42 @@ import { execFile } from 'node:child_process';
 import { chmod, mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { mock } from 'node:test';
+import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 
-import { closeConnection, initializeDatabase } from '@/modules/database/index.js';
-import { createCodexRuntime } from '@/modules/providers/list/codex/codex-runtime.provider.js';
-import { CodexSessionsProvider } from '@/modules/providers/list/codex/codex-sessions.provider.js';
-import { runProviderProcess } from '@/modules/providers/services/provider-process.service.js';
-import { cursorRuntime } from '@/modules/providers/list/cursor/cursor-runtime.provider.js';
-import { opencodeRuntime } from '@/modules/providers/list/opencode/opencode-runtime.provider.js';
-import { CursorSessionsProvider } from '@/modules/providers/list/cursor/cursor-sessions.provider.js';
-import { OpenCodeSessionsProvider } from '@/modules/providers/list/opencode/opencode-sessions.provider.js';
-import { createProviderRuntimeService } from '@/modules/providers/services/provider-runtime.service.js';
+import { closeConnection, initializeDatabase, userDb } from '@/modules/database/index.js';
 import type { IProvider } from '@/shared/index.js';
+
+const realAssets = await import('@/modules/assets/index.js');
+let fixtureStore: ReturnType<typeof realAssets.createImageAssetService>;
+// Route to the isolated real store; ownership, metadata and byte verification
+// remain the production implementation rather than an authorization stub.
+mock.module('@/modules/assets/index.js', { namedExports: {
+  ...realAssets,
+  authorizeStoredAttachmentPaths: (...args: Parameters<typeof realAssets.authorizeStoredAttachmentPaths>) => fixtureStore.authorizeAttachmentPaths(...args),
+  readStoredAttachmentAsset: (...args: Parameters<typeof realAssets.readStoredAttachmentAsset>) => fixtureStore.openStoredAsset(...args),
+} });
+const realAttachments = await import('@/modules/providers/services/provider-attachments.service.js');
+let fixtureAttachments: ReturnType<typeof realAttachments.createProviderAttachmentsService>;
+// The adapter must recognize the same isolated upload root that admission
+// authorized; keep its real snapshot reader and immutable staging implementation.
+mock.module('@/modules/providers/services/provider-attachments.service.js', { namedExports: {
+  ...realAttachments,
+  providerAttachmentsService: {
+    readImages: (...args: Parameters<typeof realAttachments.providerAttachmentsService.readImages>) => fixtureAttachments.readImages(...args),
+    readFiles: (...args: Parameters<typeof realAttachments.providerAttachmentsService.readFiles>) => fixtureAttachments.readFiles(...args),
+    stage: (...args: Parameters<typeof realAttachments.providerAttachmentsService.stage>) => fixtureAttachments.stage(...args),
+  },
+} });
+const { createCodexRuntime } = await import('@/modules/providers/list/codex/codex-runtime.provider.js');
+const { CodexSessionsProvider } = await import('@/modules/providers/list/codex/codex-sessions.provider.js');
+const { runProviderProcess } = await import('@/modules/providers/services/provider-process.service.js');
+const { cursorRuntime } = await import('@/modules/providers/list/cursor/cursor-runtime.provider.js');
+const { opencodeRuntime } = await import('@/modules/providers/list/opencode/opencode-runtime.provider.js');
+const { CursorSessionsProvider } = await import('@/modules/providers/list/cursor/cursor-sessions.provider.js');
+const { OpenCodeSessionsProvider } = await import('@/modules/providers/list/opencode/opencode-sessions.provider.js');
+const { createProviderRuntimeService } = await import('@/modules/providers/services/provider-runtime.service.js');
 
 const runFile = promisify(execFile);
 
@@ -64,6 +87,16 @@ for (const provider of ['codex', 'cursor', 'opencode'] as const) {
         process.env.DATABASE_PATH = path.join(root, 'app.db');
         await writeFile(process.env.DATABASE_PATH, '');
         await initializeDatabase();
+        const ownerId = Number(userDb.createUser('provider-tree-owner', 'fixture-hash').id);
+        const assetsRoot = path.join(root, 'assets');
+        fixtureStore = realAssets.createImageAssetService({ assetsDir: assetsRoot });
+        fixtureAttachments = realAttachments.createProviderAttachmentsService({
+          assetsRoot, stagingParent: root, readStoredAsset: fixtureStore.openStoredAsset,
+        });
+        await fixtureStore.inventory();
+        const stagedAttachment = path.join(assetsRoot, '.staging', `${randomUUID()}.upload`);
+        await writeFile(stagedAttachment, '%PDF-1.7\nfixture brief');
+        const files = await fixtureStore.saveUploads([{ path: stagedAttachment, originalname: 'brief.pdf', mimetype: 'application/pdf' }], ownerId, 'files');
         await runFile('git', ['init', execution]);
         const source = `
 const fs = require('node:fs');
@@ -119,7 +152,6 @@ if (process.env.CHISA_TEST_HOLD === '1') { process.on('SIGTERM',()=>{}); setInte
           resolveProviderSessionId: () => null, resolveResumeModel: async () => 'fake-model',
           getProviderModels: async () => ({ OPTIONS: [], DEFAULT: 'fake-model' }),
           getSessionSource: () => ({ project_path: root, workspace_mode: 'isolated', provider }),
-          authorizeRun() {},
           // This fixture uses the real host process-tree supervisor and each
           // adapter's trusted fake executable factory; Docker has a separate
           // actual-admission fixture and must not replace this factory.
@@ -147,7 +179,8 @@ if (process.env.CHISA_TEST_HOLD === '1') { process.on('SIGTERM',()=>{}); setInte
             };
           },
         });
-        pending = service.run(provider, 'fixture', { sessionId: 'app-tree', files: [{ path: path.join(root, 'brief.pdf'), name: 'brief.pdf', mimeType: 'application/pdf' }] }, {
+        pending = service.run(provider, 'fixture', { sessionId: 'app-tree', files }, {
+          userId: ownerId,
           isWebSocketWriter: true,
           send(message: any) {
             if (message.kind === 'complete') assert.equal(closed, true);

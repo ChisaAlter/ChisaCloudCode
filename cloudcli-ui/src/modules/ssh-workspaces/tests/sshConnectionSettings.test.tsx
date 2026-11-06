@@ -2,13 +2,22 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 import { SshAgentProvider, SshConnectionSettings } from '@/modules/ssh-workspaces';
-import { startAuthSession } from '@/shared/authToken';
+import { acknowledgeAuthSession, clearAuthToken, getAuthSessionSnapshot, initializeAuthSession, startAuthSession } from '@/shared/authToken';
 import { FrontendBridge } from '@/shared/chisa';
 
 const native = vi.hoisted(() => ({ call: vi.fn() }));
 vi.mock('mygo-runtime', () => native);
-beforeEach(() => { vi.stubGlobal('mygo', {}); native.call.mockReset(); });
-afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+beforeEach(async () => {
+  await initializeAuthSession();
+  await clearAuthToken(getAuthSessionSnapshot());
+  const encode = (value: unknown) => btoa(JSON.stringify(value)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const current = await startAuthSession(`${encode({ alg: 'HS256' })}.${encode({ userId: 1, iat: 1_700_000_000, exp: 4_102_444_800 })}.signature`, getAuthSessionSnapshot());
+  expect(current).not.toBeNull();
+  acknowledgeAuthSession(current!);
+  vi.stubGlobal('mygo', {});
+  native.call.mockReset();
+});
+afterEach(async () => { cleanup(); await clearAuthToken(getAuthSessionSnapshot()); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 const profile = { id: 'one', name: 'Laptop', sshHost: 'vps.example', sshPort: 22, sshUser: 'forward', keyPath: 'C:\\keys\\tunnel', knownHostsPath: 'C:\\keys\\hosts', remotePort: 18765, localPort: 22, accountBinding: 'opaque', serviceUrl: 'https://cloud.example' };
 const status = { profileId: 'one', state: 'forwarding', generation: 2, outerConnected: true, verified: false };
 
@@ -51,7 +60,6 @@ test('failed preflight shows actual missing prerequisites without claiming succe
 
 test('fresh HTTPS Agent hides all SSH key and port requirements and delegates default preparation natively', async () => {
   const relay = { ...profile, mode: 'agent', agentTransport: 'relay' };
-  startAuthSession('current.payload.signature');
   let prepared = false;
   const registered = { ...status, registrationState: 'registered' };
   // Native Ensure persists its returned profile; later polling must observe that same saved state.
@@ -77,7 +85,6 @@ test('closing settings while native Ensure is pending preserves registration in 
   const relay = { ...profile, mode: 'agent', agentTransport: 'relay' };
   let finish!: (result: unknown) => void;
   const pending = new Promise(resolve => { finish = resolve; });
-  startAuthSession('current.payload.signature');
   native.call.mockImplementation(async (method: string) => method === 'FrontendBridge.GetSshTunnelProfiles' ? { ok: true, profiles: [relay], statuses: [{ ...status, state: 'stopped' }] } : method === 'FrontendBridge.EnsureSshAgent' ? pending : { ok: true });
   const view = render(<SshAgentProvider accountId="one"><SshConnectionSettings /></SshAgentProvider>);
   await openPanel();

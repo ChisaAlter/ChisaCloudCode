@@ -2,6 +2,8 @@ import { Database } from 'better-sqlite3';
 
 import {
   APP_CONFIG_TABLE_SCHEMA_SQL,
+  AUTH_SESSIONS_TABLE_SCHEMA_SQL,
+  AUTH_VERSION_TRIGGER_SCHEMA_SQL,
   LAST_SCANNED_AT_SQL,
   NOTIFICATION_CHANNEL_ENDPOINTS_TABLE_SCHEMA_SQL,
   PROJECTS_TABLE_SCHEMA_SQL,
@@ -16,6 +18,7 @@ import {
   SESSIONS_TABLE_SCHEMA_SQL,
   SSH_PROJECT_TARGETS_TABLE_SCHEMA_SQL,
   USER_PREFERENCES_TABLE_SCHEMA_SQL,
+  USER_PREFERENCE_CAS_TABLE_SCHEMA_SQL,
   USER_NOTIFICATION_PREFERENCES_TABLE_SCHEMA_SQL,
   VAPID_KEYS_TABLE_SCHEMA_SQL,
 } from '@/modules/database/schema.js';
@@ -543,6 +546,19 @@ const addSessionProjectOwnershipColumn = (db: Database): void => {
     WHERE provider_session_id IS NULL OR session_id <> provider_session_id ${forked}`);
 };
 
+/**
+ * Adds the reasoning-effort metadata columns to the custom-model library.
+ *
+ * Existing rows stay NULL on purpose: no effort levels were ever declared for
+ * them, and a guessed list could offer levels the model rejects. Those models
+ * keep hiding the composer's Reasoning section until the user declares levels.
+ */
+const addProviderModelEffortColumns = (db: Database): void => {
+  const columnNames = getTableInfo(db, 'provider_models').map((column) => column.name);
+  addColumnToTableIfNotExists(db, 'provider_models', columnNames, 'effort_values', 'TEXT DEFAULT NULL');
+  addColumnToTableIfNotExists(db, 'provider_models', columnNames, 'effort_default', 'TEXT DEFAULT NULL');
+};
+
 const ensureProjectsForSessionPaths = (db: Database): void => {
   if (!tableExists(db, 'sessions')) {
     return;
@@ -588,6 +604,12 @@ export const runMigrations = (db: Database) => {
 
     addColumnToTableIfNotExists(db, 'users', userColumnNames, 'display_name', 'TEXT');
     addColumnToTableIfNotExists(db, 'users', userColumnNames, 'avatar_data_url', 'TEXT');
+    // Additive authentication upgrade; old JWTs are governed separately by an explicit compatibility deadline.
+    db.transaction(() => {
+      addColumnToTableIfNotExists(db, 'users', userColumnNames, 'auth_version', 'INTEGER NOT NULL DEFAULT 0');
+      db.exec(AUTH_SESSIONS_TABLE_SCHEMA_SQL);
+      db.exec(AUTH_VERSION_TRIGGER_SCHEMA_SQL);
+    })();
 
     addColumnToTableIfNotExists(db, 'users', userColumnNames, 'git_name', 'TEXT');
     addColumnToTableIfNotExists(db, 'users', userColumnNames, 'git_email', 'TEXT');
@@ -615,7 +637,9 @@ export const runMigrations = (db: Database) => {
     if (tableExists(db, 'claude_model_connections')) {
       addColumnToTableIfNotExists(db, 'claude_model_connections', getTableInfo(db, 'claude_model_connections').map(column => column.name), 'auth_type', "TEXT NOT NULL DEFAULT 'api_key'");
     }
+    addProviderModelEffortColumns(db);
     db.exec(USER_PREFERENCES_TABLE_SCHEMA_SQL);
+    db.exec(USER_PREFERENCE_CAS_TABLE_SCHEMA_SQL);
     db.exec(SESSION_DRAFTS_TABLE_SCHEMA_SQL);
     db.exec(SUPERSEDED_PROVIDER_SESSIONS_TABLE_SCHEMA_SQL);
     addSupersededTranscriptPathColumn(db);

@@ -1,12 +1,12 @@
-import { existsSync, lstatSync, realpathSync } from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 import type { admitWorkspaceExecution } from '@/modules/workspace-bridge/index.js';
 import { prepareProviderCodeCache, stageProviderCli } from '@/modules/providers/services/provider-code-cache.service.js';
 import { prepareProviderProfile } from '@/modules/providers/services/provider-profile.service.js';
-import { AppError, normalizeAttachmentDescriptors } from '@/shared/index.js';
-import type { LLMProvider, ProviderProcessEvent, ProviderProcessJob, ProviderProcessRunner } from '@/shared/index.js';
+import { AppError } from '@/shared/index.js';
+import type { LLMProvider, ProviderProcessEvent, ProviderProcessJob, ProviderProcessRunner, ProviderTrustedSlot } from '@/shared/index.js';
+
+import { bindProviderSlotOperation, prepareProviderSlot } from './provider-slot.service.js';
 
 type RuntimeMount = { source: string; target: string; writable: boolean };
 type WorkspaceExecution = Awaited<ReturnType<typeof admitWorkspaceExecution>>;
@@ -15,81 +15,70 @@ type ContainerRuntime = {
   env: Record<string, string>;
   args: string[];
   cli?: string;
+  command?: string;
+  slot?: ProviderTrustedSlot;
   finish?(mode: 'publish' | 'discard' | 'retain'): Promise<void>;
 };
 type ContainerProviderDependencies = {
   sessionId?: string;
+  userId?: string;
+  /** Recheck the caller's captured session before any delayed provider launch. */
+  assertActive?: () => void;
   resolveModelExecutable?(provider: Exclude<LLMProvider, 'claude'>, job: ProviderProcessJob): string | undefined;
   prepareRuntime(provider: Exclude<LLMProvider, 'claude'>, attachments: unknown, job: ProviderProcessJob, signal?: AbortSignal): ContainerRuntime | Promise<ContainerRuntime>;
   adaptJob(job: ProviderProcessJob, runtime: ContainerRuntime): ProviderProcessJob;
 };
 
 const CODE = '/runtime/provider-code';
-const HOME = '/runtime/provider-state/home';
-const PROVIDER_ENV_KEYS = new Set([
-  'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_API_KEY', 'CODEX_BASE_URL',
-  'CURSOR_API_KEY', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL',
-  'GOOGLE_GENERATIVE_AI_API_KEY', 'GROQ_API_KEY', 'OPENROUTER_API_KEY',
-  'AZURE_OPENAI_API_KEY', 'AZURE_OPENAI_ENDPOINT', 'AWS_REGION', 'AWS_DEFAULT_REGION',
-  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
-  'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy',
-]);
 
 function runtimeError(message: string) {
   return new AppError(message, { code: 'WORKSPACE_PROVIDER_RUNTIME_UNAVAILABLE', statusCode: 503 });
 }
 
-function canonical(filename: string) {
-  const resolved = path.resolve(filename);
-  if (!existsSync(resolved) || realpathSync(resolved) !== resolved || lstatSync(resolved).isSymbolicLink()) throw runtimeError('The provider runtime path is not a canonical installed file.');
-  return resolved;
+function workspacePath(value: string,execution: WorkspaceExecution): string {
+  const root = path.resolve(execution.executionRoot ?? execution.cwd);
+  const resolved = path.resolve(value);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) throw runtimeError('Provider paths must belong to the admitted execution root.');
+  const relative = path.relative(root,resolved).split(path.sep).join('/');
+  return relative ? '/workspace/' + relative : '/workspace';
 }
-
-function addMount(mounts: RuntimeMount[], source: string, target: string, writable = false) {
-  if (!existsSync(source)) return;
-  const mount = { source: canonical(source), target, writable };
-  if (mounts.some((existing) => existing.target === target)) throw runtimeError('The provider runtime has overlapping mount destinations.');
-  mounts.push(mount);
-}
-
-function executableOnPath(command: string) {
-  for (const directory of (process.env.PATH || '').split(path.delimiter).filter(Boolean)) {
-    const candidate = path.join(directory, command);
-    if (!existsSync(candidate)) continue;
-    const resolved = realpathSync(candidate);
-    if (!lstatSync(resolved).isFile()) continue;
-    return resolved;
+function mappedText(text: string,runtime: ContainerRuntime,execution: WorkspaceExecution): string {
+  let mapped = text;
+  for (const asset of runtime.slot?.assets ?? []) {
+    mapped = mapped.split(asset.originalPath).join(asset.target);
+    mapped = mapped.split(asset.originalPath.split(path.sep).join('/')).join(asset.target);
   }
-  throw runtimeError('The selected provider CLI is not installed in the sandbox runtime.');
+  const root = path.resolve(execution.executionRoot ?? execution.cwd);
+  // CLI adapters include workspace and attachment paths in their final prompt
+  // argument. Replace only the admitted root and exact verified attachment names.
+  mapped = mapped.split(root + path.sep).join('/workspace/');
+  mapped = mapped.split(root).join('/workspace');
+  mapped = mapped.split(root.split(path.sep).join('/')).join('/workspace');
+  return mapped;
 }
-
-function providerCliMount(provider: Exclude<LLMProvider, 'claude' | 'codex'>, mounts: RuntimeMount[]) {
-  const executable = executableOnPath(provider === 'cursor' ? 'cursor-agent' : 'opencode');
-  const staged = stageProviderCli(executable);
-  mounts.push(staged.mount);
-  return staged.executable;
-}
-
-async function workerRuntime(provider: Exclude<LLMProvider, 'claude'>, attachments: unknown, job: ProviderProcessJob, signal?: AbortSignal, sessionId?: string, modelExecutable?: string): Promise<ContainerRuntime> {
-  if (process.platform !== 'linux') throw runtimeError('Bound VPS provider execution requires the Linux container runtime.');
-  const mounts: RuntimeMount[] = [prepareProviderCodeCache()];
-  const env: Record<string, string> = { HOME, PATH: `${CODE}:/usr/local/bin:/usr/bin:/bin`, LANG: 'C.UTF-8' };
-  for (const [key, value] of Object.entries(process.env)) if (PROVIDER_ENV_KEYS.has(key) && typeof value === 'string') env[key] = value;
-  if (provider === 'codex') env.CODEX_HOME = `${HOME}/.codex`;
-  if (provider === 'opencode') { env.XDG_DATA_HOME = `${HOME}/.local/share`; env.XDG_CONFIG_HOME = `${HOME}/.config`; }
-  // Assets keep their verified original paths so persisted provider transcripts
-  // retain clickable upload references and Codex image validation stays intact.
-  const assets = path.join(os.homedir(), '.cloudcli', 'assets');
-  for (const item of normalizeAttachmentDescriptors(attachments)) {
-    const filename = path.resolve(item.path);
-    if (path.dirname(filename) !== assets || !existsSync(filename) || !lstatSync(filename).isFile()) throw runtimeError('Only verified uploaded attachment files may enter the provider sandbox.');
-    if (!mounts.some((mount) => mount.target === filename)) addMount(mounts, filename, filename);
+function adaptSandboxJob(job: ProviderProcessJob,runtime: ContainerRuntime,execution: WorkspaceExecution): ProviderProcessJob {
+  if (job.kind === 'codex') {
+    const input = typeof job.input === 'string' ? mappedText(job.input,runtime,execution) : job.input.map(item => {
+      if (item.type === 'text') return { ...item,text: mappedText(item.text,runtime,execution) };
+      const asset = runtime.slot?.assets.find(asset => asset.originalPath === path.resolve(item.path));
+      if (!asset) throw runtimeError('Codex image input is not a verified attachment in the selected slot.');
+      return { ...item,path: asset.target };
+    });
+    return { ...job,executable: runtime.cli,env: undefined,threadOptions: { ...job.threadOptions,workingDirectory: workspacePath(typeof job.threadOptions.workingDirectory === 'string' ? job.threadOptions.workingDirectory : execution.cwd,execution) },input };
   }
-  const cli = modelExecutable ? (() => { const staged = stageProviderCli(modelExecutable); mounts.push(staged.mount); return staged.executable; })() : provider === 'codex' ? undefined : providerCliMount(provider, mounts);
-  const args = [`${CODE}/app/provider-process.worker.js`, '--stdio'];
-  const profile = await prepareProviderProfile(provider, sessionId ?? (job.kind === 'codex' ? job.providerSessionId ?? 'direct' : 'direct'), job, signal);
-  mounts.push(...profile.mounts);
-  return { mounts, env, args, cli, finish: profile.finish };
+  const args = job.args.map((argument,index) => ['--dir','--cwd','-C'].includes(job.args[index - 1]) ? workspacePath(argument,execution) : mappedText(argument,runtime,execution));
+  return { ...job,command: runtime.cli!,cwd: workspacePath(job.cwd,execution),args,env: Object.fromEntries(Object.entries(job.env ?? {}).filter(([key]) => key === 'OPENCODE_PERMISSION')) };
+}
+async function workerRuntime(provider: Exclude<LLMProvider, 'claude'>,attachments: unknown,job: ProviderProcessJob,execution: WorkspaceExecution,dependencies: Partial<ContainerProviderDependencies>,signal?: AbortSignal): Promise<ContainerRuntime> {
+  if (!dependencies.userId || !dependencies.sessionId) throw runtimeError('The admitted provider requires an authenticated owner and app session.');
+  const slot = await prepareProviderSlot({ provider,userId: dependencies.userId,sessionId: dependencies.sessionId,root: execution.executionRoot ?? execution.cwd,attachments,signal,assertActive: dependencies.assertActive });
+  try {
+    prepareProviderCodeCache(slot);
+    const cli = stageProviderCli(dependencies.resolveModelExecutable?.(provider,job),slot).executable;
+    const profile = await prepareProviderProfile(provider,dependencies.sessionId,job,signal,slot);
+    signal?.throwIfAborted();dependencies.assertActive?.();
+    return { mounts: slot.mounts,env: slot.environment,args: slot.args,command: slot.command,cli,slot,finish: profile.finish };
+  } catch (error) { await slot.finish('retain');throw error; }
 }
 
 /**
@@ -99,19 +88,39 @@ async function workerRuntime(provider: Exclude<LLMProvider, 'claude'>, attachmen
  */
 export function createContainerProviderRunner(execution: WorkspaceExecution, provider: Exclude<LLMProvider, 'claude'>, attachments: unknown, overrides: Partial<ContainerProviderDependencies> = {}): ProviderProcessRunner {
   const dependencies: ContainerProviderDependencies = {
-    prepareRuntime: (selected, assets, job, signal) => workerRuntime(selected, assets, job, signal, overrides.sessionId, overrides.resolveModelExecutable?.(selected, job)),
-    adaptJob: (job, runtime) => job.kind === 'codex'
-      ? { ...job, executable: runtime.cli, env: undefined }
-      : { ...job, command: runtime.cli!, env: Object.fromEntries(Object.entries(job.env ?? {}).filter(([key]) => key === 'OPENCODE_PERMISSION')) },
+    prepareRuntime: (selected,assets,job,signal) => workerRuntime(selected,assets,job,execution,overrides,signal),
+    adaptJob: (job,runtime) => adaptSandboxJob(job,runtime,execution),
     ...overrides,
   };
   return async (job, handlers, signal) => {
     signal?.throwIfAborted();
+    dependencies.assertActive?.();
     const runtime = await dependencies.prepareRuntime(provider, attachments, job, signal);
-    const safeJob = dependencies.adaptJob(job, runtime);
+    let safeJob: ProviderProcessJob;
+    try { signal?.throwIfAborted();dependencies.assertActive?.();safeJob = dependencies.adaptJob(job,runtime); }
+    catch (error) { await runtime.finish?.('retain');throw error; }
     let child: Awaited<ReturnType<WorkspaceExecution['spawnProcess']>>;
-    try { child = await execution.spawnProcess({ command: `${CODE}/node`, args: runtime.args, cwd: execution.cwd, env: runtime.env, runtimeMounts: runtime.mounts, signal }); }
-    catch (error) { await runtime.finish?.('discard'); throw error; }
+    try {
+      signal?.throwIfAborted();
+      dependencies.assertActive?.();
+      child = await execution.spawnProcess({ command: runtime.command ?? `${CODE}/node`, args: runtime.args, cwd: execution.cwd, env: runtime.env, runtimeMounts: runtime.mounts, signal });
+    } catch (error) { await runtime.finish?.('retain'); throw error; }
+    try { if (runtime.slot) bindProviderSlotOperation(runtime.slot,child.operationId); }
+    catch (error) { try { await child.close(); } finally { await runtime.finish?.('retain'); } throw error; }
+    // The launcher may yield while a session is revoked. Do not send the model
+    // job or subscribe to its output until that captured proof is rechecked.
+    try { signal?.throwIfAborted(); dependencies.assertActive?.(); }
+    catch (error) {
+      try { await child.close(); }
+      catch (cleanupError) {
+        await runtime.finish?.('retain');
+        throw Object.assign(new Error('Provider sandbox cleanup was not confirmed.', { cause: cleanupError }), {
+          processTeardownError: true, workspaceCleanupError: true, primaryError: error,
+        });
+      }
+      await runtime.finish?.('discard');
+      throw error;
+    }
     let terminal: { code: number | null; error?: { name: string; message: string } } | undefined;
     let failure: unknown;
     let buffer = '';

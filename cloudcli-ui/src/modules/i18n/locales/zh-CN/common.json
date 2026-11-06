@@ -34,7 +34,9 @@
     "failed": "失败",
     "pending": "待处理",
     "completed": "已完成",
-    "inProgress": "进行中"
+    "inProgress": "进行中",
+    "reconnecting": "正在重新连接...",
+    "chatConnectionLost": "聊天连接已断开，正在重新连接..."
   },
   "messages": {
     "savedSuccessfully": "保存成功",
@@ -96,6 +98,8 @@
     "createProjectDesktop": "点击侧边栏中的文件夹图标以创建新项目",
     "newSession": "新会话",
     "untitledSession": "未命名会话",
+    "renameSessionHint": "{{title}}（双击重命名）",
+    "renameSessionLabel": "会话标题",
     "projectFiles": "项目文件",
     "createProjectAction": "添加项目",
     "browseProjectsAction": "浏览对话和项目"
@@ -270,7 +274,8 @@
       "showSidebar": "显示侧边栏",
       "settings": "设置",
       "updateAvailable": "有可用更新",
-      "closeSidebar": "关闭侧边栏"
+      "closeSidebar": "关闭侧边栏",
+      "resizeSidebar": "调整侧边栏宽度"
     },
     "startingUpdate": "正在启动更新…",
     "updateStartedRestarting": "更新已启动，服务器似乎正在重启以应用更新。",
@@ -357,6 +362,35 @@
     "browseFolders": "浏览文件夹",
     "closeLoginModal": "关闭登录窗口",
     "pluginLoadFailed": "插件加载失败：{{error}}"
+  },
+  "workflow": {
+    "title": "工作流",
+    "status": { "running": "运行中", "completed": "已完成", "failed": "失败", "stopped": "未返回结果" },
+    "stoppedHint": "本次运行已结束，工作流尚未返回结果",
+    "phases": "阶段",
+    "agents": "智能体",
+    "agentsFinished_one": "{{count}} 个智能体中已完成 {{finished}} 个",
+    "agentsFinished_other": "{{count}} 个智能体中已完成 {{finished}} 个",
+    "agentsFailed": "{{count}} 个失败",
+    "agentsProgress_one": "{{finished}}/{{count}} 个智能体",
+    "agentsProgress_other": "{{finished}}/{{count}} 个智能体",
+    "agentStatus": { "queued": "排队中", "running": "运行中", "completed": "已完成", "failed": "失败", "stopped": "未返回结果" },
+    "agentTokens": "{{tokens}} 个 Token",
+    "agentToolCalls_one": "{{count}} 次工具调用",
+    "agentToolCalls_other": "{{count}} 次工具调用",
+    "agentTimelineLoading": "正在读取智能体步骤…",
+    "agentTimelineEmpty": "暂无记录",
+    "agentTimelineUnavailable": "无法读取步骤：{{reason}}",
+    "usage": "{{toolUses}} 次工具调用 · {{elapsed}}",
+    "currentAgent": "当前：{{label}}",
+    "result": "结果",
+    "script": "脚本",
+    "backgroundTasks": "后台任务",
+    "backgroundAgent": "智能体",
+    "backgroundCommand": "命令",
+    "stopTask": "停止",
+    "taskRowNotLoaded": "已在本次对话中启动，点击加载",
+    "taskOfAgent": "由本会话的智能体启动"
   },
   "cancel": "取消"
 }

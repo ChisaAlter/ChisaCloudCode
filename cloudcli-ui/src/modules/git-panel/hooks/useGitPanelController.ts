@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { useWorkspaceGitApi, useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
-import type { FileOpenHandler, GitApiErrorResponse, GitCommitSummary, GitDiffMap, GitOperationResponse, GitPanelView, GitRemoteStatus, GitStatusResponse, Project } from '@/shared/types';
+import type { FileOpenHandler, GitApiErrorResponse, GitCommitSummary, GitDiffMap, GitFileDiffResponse, GitOperationResponse, GitPanelView, GitRemoteStatus, GitStatusResponse, Project } from '@/shared/types';
 import { GIT_STATUS_OBSERVED_EVENT } from '@/shared/constants';
-import { useSelectedProvider } from '@/modules/git-panel/hooks/useSelectedProvider';
+import { useSelectedProvider } from '@/shared/hooks/useSelectedProvider';
 
 const DEFAULT_BRANCH = 'main';
 // High enough for the commit graph to show meaningful branch structure.
@@ -26,6 +26,8 @@ type GitPanelController = {
   branches: string[];
   localBranches: string[];
   remoteBranches: string[];
+  /** Full remote-tracking names (`origin/main`) — the Compare tab offers them as bases. */
+  remoteRefs: string[];
   recentCommits: GitCommitSummary[];
   commitDiffs: GitDiffMap;
   commitDiffErrors: Record<string, string>;
@@ -62,14 +64,11 @@ type GitPanelController = {
   openFile: (filePath: string) => Promise<void>;
 };
 
-type GitDiffResponse = GitApiErrorResponse & {
-  diff?: string;
-};
-
 type GitBranchesResponse = GitApiErrorResponse & {
   branches?: string[];
   localBranches?: string[];
   remoteBranches?: string[];
+  remoteRefs?: string[];
 };
 
 type GitCommitsResponse = GitApiErrorResponse & {
@@ -188,6 +187,10 @@ export function useGitPanelController({
   const [remoteStatus, setRemoteStatus] = useState<GitRemoteStatus | null>(null);
   const [localBranches, setLocalBranches] = useState<string[]>([]);
   const [remoteBranches, setRemoteBranches] = useState<string[]>([]);
+  // Unambiguous remote-tracking refs for the Compare tab's base selector;
+  // `remoteBranches` strips the remote prefix and drops names shadowed by a
+  // local branch, so it cannot serve as a diff base.
+  const [remoteRefs, setRemoteRefs] = useState<string[]>([]);
   const [isCreatingBranch, setIsCreatingBranch] = useState(false);
   // The branch list and header share one pending indicator until the native handback finishes.
   const [isBranchBusy, setIsBranchBusy] = useState(false);
@@ -249,7 +252,7 @@ export function useGitPanelController({
 
       try {
         const response = await git.diff(projectId, filePath, { signal });
-        const data = await readJson<GitDiffResponse>(response, signal);
+        const data = await readJson<GitFileDiffResponse>(response, signal);
 
         if (
           signal?.aborted ||
@@ -337,18 +340,21 @@ export function useGitPanelController({
         setBranches(data.branches);
         setLocalBranches(data.localBranches ?? data.branches);
         setRemoteBranches(data.remoteBranches ?? []);
+        setRemoteRefs(data.remoteRefs ?? []);
         return;
       }
 
       setBranches([]);
       setLocalBranches([]);
       setRemoteBranches([]);
+      setRemoteRefs([]);
     } catch (error) {
       if (signal?.aborted || isAbortError(error) || selectedProjectIdRef.current !== projectId || request !== branchesRequestRef.current) return;
       console.error('Error fetching branches:', error);
       setBranches([]);
       setLocalBranches([]);
       setRemoteBranches([]);
+      setRemoteRefs([]);
     }
   }, [git, selectedProject]);
 
@@ -429,7 +435,7 @@ export function useGitPanelController({
     try {
       const data = await readWithAbort(async () => {
         const response = await git.commitDiff(projectId, commitHash, { signal: controller.signal });
-        return readJson<GitDiffResponse>(response, controller.signal);
+        return readJson<GitFileDiffResponse>(response, controller.signal);
       }, controller.signal);
       if (!isCurrent()) return;
       if (data.error || typeof data.diff !== 'string') {
@@ -854,6 +860,7 @@ export function useGitPanelController({
     setBranches([]);
     setLocalBranches([]);
     setRemoteBranches([]);
+    setRemoteRefs([]);
     setGitStatus(null);
     setRemoteStatus(null);
     setGitDiff({});
@@ -907,6 +914,7 @@ export function useGitPanelController({
     branches,
     localBranches,
     remoteBranches,
+    remoteRefs,
     recentCommits,
     commitDiffs,
     commitDiffErrors,

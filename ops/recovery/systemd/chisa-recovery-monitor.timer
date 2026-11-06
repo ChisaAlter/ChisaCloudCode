@@ -1,0 +1,11 @@
+[Unit]
+Description=Chisa recovery gate monitoring
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=15
+Unit=chisa-recovery-monitor.service
+
+[Install]
+WantedBy=timers.target

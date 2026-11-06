@@ -15,22 +15,47 @@ process.env.DATABASE_PATH = path.join(bootstrap, 'auth.db');
 await writeFile(process.env.DATABASE_PATH, '');
 const { closeConnection, initializeDatabase, projectsDb, sessionsDb } = await import('@/modules/database/index.js');
 // Selector fixtures use explicit cloud identity without account runtime restoration.
-const { assertCloudWorkspaceOwner } = await import('@/modules/workspace-runtime/index.js');
-mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
+let realOwnership: Pick<typeof import('@/modules/workspace-runtime/index.js'),'assertCloudWorkspaceOwner'>;
+type FixtureAdmission = { userId: string;root: string;leaseId?: string;brokerLeaseId?: string;bindingEpoch: string;sessionId?: string };
+const enrolled = new Set<string>();
+const leases = new Map<string,{ root: string;bindingEpoch: string;sessionId: string;brokerLeaseId: string }>();
+let materializing = false;
+const rejectSandbox = () => assert.fail('selector-only fixture must never dispatch a sandbox process');
+const runtimeMock=mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
   // These selector fixtures deliberately use synthetic protocol-3 identities;
   // account authorization is exercised with real persisted metadata separately.
   assertCloudWorkspaceOwner(candidate: string, userId: string | number | null, accounts?: string[]) {
     if (candidate && path.basename(candidate).startsWith('.chisa-chat-')) return;
-    assertCloudWorkspaceOwner(candidate, userId, accounts);
+    realOwnership.assertCloudWorkspaceOwner(candidate, userId, accounts);
   },
   ensureCloudWorkspaceBinding() {}, excludeCloudWorkspaceMetadata() {}, getWorkspaceRuntimeIdentity() { return undefined; },
   executeWorkspaceRuntimePreview() { assert.fail('unexpected preview'); }, createWorkspaceRuntimeService() { assert.fail('unexpected restore'); },
+  async getWorkspaceBrokerAdmission(input: FixtureAdmission) {
+    assert.equal(materializing,true,'only explicit fixture materialization may admit a lease');
+    assert.equal(input.userId,'selector-fixture-user');assert.ok(enrolled.has(input.root));assert.ok(input.leaseId);
+    const selected={root:input.root,bindingEpoch:input.bindingEpoch,sessionId:input.sessionId??'fixture-session',brokerLeaseId:'broker-'+input.leaseId};
+    const previous=leases.get(input.leaseId);if(previous)assert.deepEqual(selected,previous);
+    if(input.brokerLeaseId!==undefined)assert.equal(input.brokerLeaseId,selected.brokerLeaseId);
+    leases.set(input.leaseId,selected);
+    return { ...selected,legacyReservationId:input.leaseId,leaseId:selected.brokerLeaseId,workspaceId:'selector-workspace',generation:'selector-generation',profileId:'worker',root:input.root,
+      proof:rejectSandbox,client:{run:rejectSandbox,stream:rejectSandbox,writeStdin:rejectSandbox,status:rejectSandbox,cancel:rejectSandbox,reconcile:rejectSandbox} };
+  },
+  async closeWorkspaceBrokerLease(input: FixtureAdmission) {
+    assert.equal(materializing,true);assert.equal(input.userId,'selector-fixture-user');assert.ok(input.leaseId);
+    const selected=leases.get(input.leaseId);assert.ok(selected);assert.equal(input.root,selected.root);assert.equal(input.bindingEpoch,selected.bindingEpoch);assert.equal(input.sessionId,selected.sessionId);assert.equal(input.brokerLeaseId,selected.brokerLeaseId);
+    // Every process/proof method above fails: the complete inventory is truly empty.
+    leases.delete(input.leaseId);
+    return { state:'closed',legacyReservationId:input.leaseId,leaseId:selected.brokerLeaseId,root:input.root,bindingEpoch:input.bindingEpoch,quiescent:true,cleanupConfirmed:true,resourceInventoryComplete:true,resources:[] };
+  },
+  readCloudWorkspaceOwner() { return 'selector-fixture-user'; },
 } });
 const { admitWorkspaceExecution, describeWorkspaceSelection } = await import('@/modules/workspace-bridge/index.js');
 const { providerModelsService, sessionsService } = await import('@/modules/providers/index.js');
 const { handleChatConnection, runDetachedChatTurn } = await import('../services/chat-websocket.service.js');
 const { chatRunRegistry } = await import('../services/chat-run-registry.service.js');
 const { connectedClients } = await import('../services/websocket-state.service.js');
+runtimeMock.restore();
+realOwnership=await import('@/modules/workspace-runtime/index.js');
 await initializeDatabase();
 after(async () => {
   closeConnection();
@@ -75,6 +100,7 @@ async function withGateway(
   const bind = async (epoch: string) => {
     await writeFile(path.join(cwd, '.chisa-bridge.json'), JSON.stringify({ protocol: 3, root: cwd, owner: 'cloud-chat-fixture', bindingEpoch: epoch }));
   };
+  enrolled.add(cwd);
   if (bound) await bind('first-epoch');
   const sessionId = 'app-workspace-' + randomUUID();
   const otherSessionId = 'app-other-' + randomUUID();
@@ -88,11 +114,14 @@ async function withGateway(
   const socket = createSocket();
   const runs: Array<{ command: string; options: AnyRecord }> = [];
   const aborts: string[] = [];
-  const dependencies: Parameters<typeof handleChatConnection>[2] = { runtime: {
+  const dependencies: Parameters<typeof handleChatConnection>[2] = { isSessionActive: () => true, runtime: {
     hasRuntime: () => true,
     run: async (_provider, command, options) => { runs.push({ command, options }); },
     abort: async (_provider, id) => { aborts.push(id); return true; },
     resolveToolApproval: () => {},
+    hasBackgroundWork: () => false,
+    hasBackgroundTask: () => false,
+    stopBackgroundTask: async () => false,
     getPendingApprovalsForSession: () => [],
   } };
   handleChatConnection(socket as never, { user: { id: 1 } } as never, dependencies);
@@ -105,14 +134,19 @@ async function withGateway(
         await listener(JSON.stringify(data));
       },
       materialize: async (id = sessionId) => {
-        const execution = await admitWorkspaceExecution({ cwd, sessionId: id, workspaceMode: 'isolated' });
-        await execution.close();
+        materializing=true;
+        try {
+          const execution = await admitWorkspaceExecution({ cwd, sessionId: id, workspaceMode: 'isolated' });
+          await execution.close();
+        } finally { materializing=false; }
         const descriptor = describeWorkspaceSelection({ projectId: project.project_id, sourceRoot: cwd, sessionId: id }).session;
         assert.ok(descriptor);
         return descriptor;
       },
     });
   } finally {
+    enrolled.delete(cwd);for(const [id,lease] of leases)if(lease.root===cwd)leases.delete(id);
+    materializing=false;
     mock.restoreAll();
     connectedClients.clear();
     chatRunRegistry.clearAll();
@@ -147,6 +181,72 @@ test('bound sends require a complete selector before model persistence, edits or
     assert.equal(anchors.mock.callCount(), 0);
     assert.equal(model.mock.callCount(), 0);
     assert.equal(effort.mock.callCount(), 0);
+    assert.deepEqual(runs, []);
+  });
+});
+
+test('missing live-session hook denies chat actions despite forged frame authorization fields', async () => {
+  await withGateway(async ({ sessionId, workspace, socket, frame, runs, aborts, dependencies }) => {
+    delete dependencies.isSessionActive;
+    const anchors = mock.method(sessionsService, 'resolveEditAnchor', async () => { assert.fail('Missing guard must not read history'); });
+    const model = mock.method(providerModelsService, 'setSessionModel', () => { assert.fail('Missing guard must not persist model'); });
+    const lookups = mock.method(dependencies.runtime, 'hasRuntime', () => { assert.fail('Missing guard must not resolve runtime'); });
+    for (const type of ['chat.send', 'chat.edit-send', 'chat.abort', 'chat.stop-task', 'chat.subscribe', 'chat.permission-response']) {
+      await frame({ type, sessionId, ...workspace, anchorId: 'turn', taskId: 'task', requestId: 'approval',
+        userId: 1, isSessionActive: true, content: 'reject', options: { model: 'forged', isSessionActive: true } });
+      assert.equal(socket.frames.at(-1)?.code, 'UNAUTHORIZED');
+      assert.equal(chatRunRegistry.getRun(sessionId), undefined);
+    }
+    assert.equal(anchors.mock.callCount(), 0);
+    assert.equal(model.mock.callCount(), 0);
+    assert.equal(lookups.mock.callCount(), 0);
+    assert.deepEqual(runs, []);
+    assert.deepEqual(aborts, []);
+    assert.equal(socket.frames.some(message => message.kind === 'history_truncated'), false);
+  });
+});
+
+test('retained preview checks capture the gateway login independently from socket liveness and frame options', async () => {
+  await withGateway(async ({ sessionId, workspace, socket, frame, dependencies }) => {
+    let active = true;
+    let captured: (() => void) | undefined;
+    dependencies.isAuthSessionActive = () => active;
+    const run: typeof dependencies.runtime.run = async (_provider, _command, _options, writer) => {
+      captured = writer.assertAuthSessionActive;
+      assert.ok(captured);
+      captured();
+    };
+    mock.method(dependencies.runtime, 'run', run);
+    await frame({ type: 'chat.send', sessionId, ...workspace, content: 'preview', options: { isAuthSessionActive: true, assertAuthSessionActive: 'forged' } });
+    assert.ok(captured);
+    socket.readyState = 3;
+    assert.doesNotThrow(captured, 'a healthy persistent login survives a disconnected transport');
+    active = false;
+    assert.throws(captured, { code: 'UNAUTHORIZED' });
+    dependencies.isAuthSessionActive = () => true;
+    assert.throws(captured, { code: 'UNAUTHORIZED' }, 'a replacement login or gateway callback cannot retarget an already captured preview');
+  });
+});
+
+test('revoked edit anchor await denies before history, model persistence or run registration', async () => {
+  await withGateway(async ({ sessionId, workspace, socket, frame, runs, dependencies }) => {
+    let active = true;
+    dependencies.isSessionActive = () => active;
+    const model = mock.method(providerModelsService, 'setSessionModel', () => {});
+    const effort = mock.method(providerModelsService, 'setSessionEffort', () => {});
+    const rewind = mock.method(sessionsService, 'rewindSessionForEdit', async () => {});
+    mock.method(sessionsService, 'providerRewindsForEdit', () => true);
+    const anchors = mock.method(sessionsService, 'resolveEditAnchor', async () => {
+      await Promise.resolve();
+      active = false;
+      return { supported: true, found: true, resumeThroughId: null };
+    });
+    await frame({ type: 'chat.edit-send', sessionId, ...workspace, anchorId: 'turn', content: 'revoked', options: { model: 'forged', effort: 'high' } });
+    expectRejection(socket, 'UNAUTHORIZED', sessionId);
+    assert.equal(anchors.mock.callCount(), 1);
+    assert.equal(model.mock.callCount(), 0);
+    assert.equal(effort.mock.callCount(), 0);
+    assert.equal(rewind.mock.callCount(), 0);
     assert.deepEqual(runs, []);
   });
 });

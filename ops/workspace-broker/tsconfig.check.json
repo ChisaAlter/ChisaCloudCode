@@ -1,0 +1,10 @@
+{
+  "extends": "../../cloudcli-ui/server/tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "typeRoots": ["../../cloudcli-ui/node_modules/@types"]
+  },
+  "include": ["../../cloudcli-ui/server/modules/workspace-broker/**/*.ts"],
+  "exclude": []
+}

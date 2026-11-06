@@ -81,7 +81,7 @@ func probeServerHTTP(ctx context.Context, connection *serverConnection, client *
 	result := map[string]any{"mode": mode, "round": round}
 	serverConnectionMu.RLock()
 	current := apiConnection == connection && connection.authenticated && connection.ctx.Err() == nil
-	accessToken := connection.accessToken
+	accessToken, revision := connection.accessToken, connection.tokenRevision
 	serverConnectionMu.RUnlock()
 	if !current {
 		result["error"] = "connection-changed"
@@ -108,7 +108,10 @@ func probeServerHTTP(ctx context.Context, connection *serverConnection, client *
 			trace.complete()
 			serverConnectionMu.Lock()
 			if apiConnection == connection && connection.ctx.Err() == nil && ctx.Err() == nil {
-				recordNativeRefreshedToken(connection, response.Header, response.StatusCode)
+				err = recordNativeRefreshedToken(connection, response.Header, response.StatusCode, accessToken, revision)
+				if err != nil {
+					result["code"] = "SESSION_SAVE_FAILED"
+				}
 			}
 			serverConnectionMu.Unlock()
 		}

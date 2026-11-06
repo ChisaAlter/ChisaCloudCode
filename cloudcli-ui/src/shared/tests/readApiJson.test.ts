@@ -56,6 +56,34 @@ describe('readApiJson', () => {
     expect(apiError.status).toBe(500);
   });
 
+  it.each([
+    ['text/plain', 'error code: 502'],
+    ['text/html', '<html><body>Bad Gateway</body></html>'],
+    ['application/json', ''],
+  ])('retains HTTP status for a non-JSON %s gateway response', async (contentType, body) => {
+    const error = await failure(readApiJson(new Response(body, { status: 502, headers: { 'Content-Type': contentType } })));
+    expect(error).toBeInstanceOf(ApiRequestError);
+    expect(error).toMatchObject({ message: 'Request failed (502)', status: 502 });
+    expect((error as Error).message).not.toContain('Unexpected');
+    if (body) expect((error as Error).message).not.toContain(body);
+  });
+
+  it('rejects malformed successful JSON without leaking the response body', async () => {
+    const error = await failure(readApiJson(new Response('<html>upstream failure</html>', { status: 200 })));
+    expect(error).toBeInstanceOf(ApiRequestError);
+    expect(error).toMatchObject({ message: 'Invalid JSON response (200)', code: 'INVALID_JSON_RESPONSE', status: 200 });
+  });
+
+  it('preserves cancellation during body consumption', async () => {
+    const controller = new AbortController();
+    const response = new Response(new ReadableStream({ start(stream) {
+      controller.signal.addEventListener('abort', () => stream.error(new DOMException('Cancelled', 'AbortError')));
+    } }));
+    const result = failure(readApiJson(response));
+    controller.abort();
+    expect(await result).toMatchObject({ name: 'AbortError' });
+  });
+
   it('uses the HTTP status text when the envelope has neither error nor details', async () => {
     const error = await failure(readApiJson(jsonResponse({ success: false }, 502)));
     expect(error).toBeInstanceOf(ApiRequestError);

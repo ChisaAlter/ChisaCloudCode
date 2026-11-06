@@ -1,5 +1,4 @@
 import { spawn } from 'node:child_process';
-import { constants, promises as fs } from 'node:fs';
 import path from 'node:path';
 
 import { createSdkMcpServer, query as sdkQuery, tool } from '@anthropic-ai/claude-agent-sdk';
@@ -8,6 +7,7 @@ import { z } from 'zod';
 import { prepareProjectRuntime, matchesProjectExtensionPermission } from '@/modules/project-runtime/index.js';
 import type { ChatAttachmentDescriptor, ProjectRuntimeLaunchContext, SshProjectTarget, WorkspaceDescriptor } from '@/shared/index.js';
 import { AppError, getGlobalImageAssetsDir, normalizeAttachmentDescriptors } from '@/shared/index.js';
+import { authorizeStoredAttachmentPaths, readStoredAttachmentAsset } from '@/modules/assets/index.js';
 
 import type { admitWorkspaceExecution } from './workspace-bridge.service.js';
 
@@ -29,8 +29,13 @@ function matchesProjectPermission(rule: string, toolName: string): boolean {
   return matchesProjectExtensionPermission(rule, toolName) || permissionAliases[shortName]?.includes(rule) === true;
 }
 
-function projectTools(admission: Admission, readOnly: boolean, signal: AbortSignal, attachments: ChatAttachmentDescriptor[], context?: Awaited<ReturnType<typeof prepareProjectRuntime>>) {
-  const execute = (request: Record<string, unknown>) => admission.execute(request, signal);
+function projectTools(admission: Admission, readOnly: boolean, signal: AbortSignal, attachments: ChatAttachmentDescriptor[], attachmentOwnerId: string, assertCurrent: () => void, context?: Awaited<ReturnType<typeof prepareProjectRuntime>>) {
+  const execute = async (request: Record<string, unknown>) => {
+    assertCurrent();
+    const response = await admission.execute(request, signal);
+    assertCurrent();
+    return response;
+  };
   const result = async (request: Record<string, unknown>) => {
     try { return { content: [{ type: 'text' as const, text: JSON.stringify(await execute(request)) }] }; }
     catch (error) { return { isError: true, content: [{ type: 'text' as const, text: error instanceof Error ? error.message : String(error) }] }; }
@@ -40,7 +45,9 @@ function projectTools(admission: Admission, readOnly: boolean, signal: AbortSign
     tool('read_file', 'Read a Windows project file and its SHA256 hash; use this hash when writing. Binary files support base64.', { path: z.string(), encoding: z.enum(['utf8', 'base64']).default('utf8') }, async a => {
       try {
         const r = await execute({ op: 'read', path: a.path });
-        return { content: [{ type: 'text' as const, text: JSON.stringify({ content: a.encoding === 'base64' ? r.b64 : new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(r.b64!, 'base64')), encoding: a.encoding, hash: r.hash, ...(context ? { projectRules: await context.rulesForPath(a.path) } : {}) }) }] };
+        const projectRules = context ? await context.rulesForPath(a.path) : undefined;
+        assertCurrent();
+        return { content: [{ type: 'text' as const, text: JSON.stringify({ content: a.encoding === 'base64' ? r.b64 : new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(r.b64!, 'base64')), encoding: a.encoding, hash: r.hash, ...(context ? { projectRules } : {}) }) }] };
       } catch (error) { return { isError: true, content: [{ type: 'text' as const, text: error instanceof Error ? error.message : String(error) }] }; }
     }),
     tool('read_image', 'Visually inspect a PNG, JPEG, GIF or WebP image in the Windows project. Use relative or /workspace paths.', { path: z.string() }, async a => {
@@ -59,33 +66,17 @@ function projectTools(admission: Admission, readOnly: boolean, signal: AbortSign
     tool('search_files', 'Search filenames or text inside the Windows project.', { path: z.string().default('/workspace'), query: z.string(), content: z.boolean().default(false) }, a => result({ op: a.content ? 'grep' : 'search', path: a.path, query: a.query })),
     ...(attachments.length ? [tool('read_attachment', 'Read only a file explicitly attached to this turn in the VPS upload store. This does not read or execute any other VPS file.', { path: z.string(), encoding: z.enum(['utf8', 'base64']).default('utf8') }, async a => {
       try {
-        admission.assertCurrent(); signal.throwIfAborted();
+        assertCurrent();
         const candidate = path.resolve(a.path);
         const descriptor = attachments.find(item => path.resolve(item.path) === candidate);
         const store = path.resolve(getGlobalImageAssetsDir());
         if (!descriptor || path.dirname(candidate) !== store) throw new Error('Attachment was not supplied with this turn.');
-        const inspected = await fs.lstat(candidate);
-        if (inspected.isSymbolicLink() || !inspected.isFile() || inspected.nlink !== 1) throw new Error('Linked attachments are not supported.');
-        const canonicalStore = await fs.realpath(store);
-        if (path.dirname(await fs.realpath(candidate)) !== canonicalStore) throw new Error('Attachment is outside the upload store.');
-        const handle = await fs.open(candidate, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-        try {
-          const stats = await handle.stat();
-          if (!stats.isFile() || stats.nlink !== 1 || stats.dev !== inspected.dev || stats.ino !== inspected.ino) throw new Error('Attachment changed while opening; attach it again.');
-          if (stats.size > 8 * 1024 * 1024) throw new Error('Attachments are limited to 8 MiB.');
-          const bytes = Buffer.alloc(8 * 1024 * 1024 + 1);
-          let length = 0;
-          while (length < bytes.length) {
-            signal.throwIfAborted();
-            const read = await handle.read(bytes, length, bytes.length - length, length);
-            if (!read.bytesRead) break;
-            length += read.bytesRead;
-          }
-          if (length > 8 * 1024 * 1024) throw new Error('Attachment exceeds the size limit.');
-          admission.assertCurrent(); signal.throwIfAborted();
-          const content = bytes.subarray(0, length);
-          return { content: [{ type: 'text' as const, text: JSON.stringify({ content: a.encoding === 'base64' ? content.toString('base64') : new TextDecoder('utf-8', { fatal: true }).decode(content), encoding: a.encoding }) }] };
-        } finally { await handle.close(); }
+        // Recheck persisted owner and integrity at tool execution; admission-time path checks cannot authorize a later replacement.
+        const stored = await readStoredAttachmentAsset(path.basename(candidate), attachmentOwnerId, 'files');
+        if (stored.bytes.length > 8 * 1024 * 1024) throw new Error('Attachments are limited to 8 MiB.');
+        assertCurrent();
+        const content = stored.bytes;
+        return { content: [{ type: 'text' as const, text: JSON.stringify({ content: a.encoding === 'base64' ? content.toString('base64') : new TextDecoder('utf-8', { fatal: true }).decode(content), encoding: a.encoding }) }] };
       } catch (error) { return { isError: true, content: [{ type: 'text' as const, text: error instanceof Error ? error.message : String(error) }] }; }
     })] : []),
     ...(!readOnly ? [
@@ -98,11 +89,19 @@ function projectTools(admission: Admission, readOnly: boolean, signal: AbortSign
 
 /** The Claude bridge keeps the SDK/credentials/history on the VPS while its sole project tools execute over the pinned Windows SSH target. */
 export function sshWorkspaceQuery(input: Parameters<typeof sdkQuery>[0], target: SshProjectTarget, admit: typeof admitWorkspaceExecution): ReturnType<typeof sdkQuery> {
-  const options = { ...input.options } as NonNullable<typeof input.options> & { chisaSessionId?: string; workspaceMode?: string; chisaWorkspaceDescriptor?: unknown; chisaAttachments?: unknown; chisaPrepareLaunch?: (cwd: string) => Promise<void>; chisaProjectRuntime?: ProjectRuntimeLaunchContext };
+  const options = { ...input.options } as NonNullable<typeof input.options> & { chisaSessionId?: string; workspaceMode?: string; chisaWorkspaceDescriptor?: unknown; chisaAttachments?: unknown; chisaPrepareLaunch?: (cwd: string) => Promise<void>; chisaAssertActive?: () => void; chisaAssertAuthActive?: () => void; chisaProjectRuntime?: ProjectRuntimeLaunchContext };
   const prepareLaunch = options.chisaPrepareLaunch;
   delete options.chisaPrepareLaunch;
   // Consume on the original options too: an internal preparation callback must never be replayed or reach the SDK.
   if (input.options) delete (input.options as typeof options).chisaPrepareLaunch;
+  // This closure is installed only by authenticated server composition; it never belongs in SDK/client options.
+  const assertActive = options.chisaAssertActive;
+  delete options.chisaAssertActive;
+  if (input.options) delete (input.options as typeof options).chisaAssertActive;
+  // SSH does not create cloud preview reservations, but server-private login
+  // guards must still be consumed rather than forwarded into the SDK.
+  delete options.chisaAssertAuthActive;
+  if (input.options) delete (input.options as typeof options).chisaAssertAuthActive;
   const launch = options.chisaProjectRuntime;
   delete options.chisaProjectRuntime;
   if (input.options) delete (input.options as typeof options).chisaProjectRuntime;
@@ -111,7 +110,7 @@ export function sshWorkspaceQuery(input: Parameters<typeof sdkQuery>[0], target:
   delete options.chisaSessionId;
   delete options.chisaWorkspaceDescriptor;
   delete options.workspaceMode;
-  const attachments = normalizeAttachmentDescriptors(options.chisaAttachments);
+  let attachments = normalizeAttachmentDescriptors(options.chisaAttachments);
   delete options.chisaAttachments;
   let readOnly = options.permissionMode === 'plan';
   let projectContext: Awaited<ReturnType<typeof prepareProjectRuntime>> | undefined;
@@ -124,10 +123,14 @@ export function sshWorkspaceQuery(input: Parameters<typeof sdkQuery>[0], target:
   let active: ReturnType<typeof sdkQuery> | undefined;
   let processExit: Promise<void> | undefined;
   let cleanup: Promise<void> | undefined;
+  const assertCurrent = () => {
+    controller.signal.throwIfAborted();
+    assertActive?.();
+    admission?.assertCurrent();
+  };
   const customSpawn = options.spawnClaudeCodeProcess;
   options.spawnClaudeCodeProcess = spawnOptions => {
-    controller.signal.throwIfAborted();
-    admission?.assertCurrent();
+    assertCurrent();
     if (customSpawn) {
       const child = customSpawn(spawnOptions);
       processExit = child.exitCode !== null ? Promise.resolve() : new Promise<void>((resolve, reject) => {
@@ -152,21 +155,38 @@ export function sshWorkspaceQuery(input: Parameters<typeof sdkQuery>[0], target:
   const stream = (async function* () {
     let failure: unknown;
     let cleanupFailure: unknown;
+    // Bound preparation as a whole, rather than allowing each tiny remote
+    // configuration read its own full transport budget. Clear before SDK
+    // launch so long model turns and their later tools keep the run lifetime.
+    const startupTimer = setTimeout(() => controller.abort(new AppError('本地项目准备超时，消息尚未开始模型执行。请检查桌面连接后重试。', {
+      code: 'PROJECT_RUNTIME_TIMEOUT', statusCode: 504,
+    })), 60_000);
+    startupTimer.unref?.();
     try {
-      controller.signal.throwIfAborted();
+      assertCurrent();
       admission = await admit({ cwd: target.anchorPath, sessionId, workspaceMode: 'shared', readOnly,
         signal: controller.signal, expectedWorkspace });
+      assertCurrent();
+      if (attachments.length) {
+        attachments = await authorizeStoredAttachmentPaths(attachments, target.ownerId);
+        assertCurrent();
+      }
       if (launch) {
         const descriptor: WorkspaceDescriptor = { workspaceId: sessionId ? `${target.workspaceId}:session:${sessionId}` : target.workspaceId, generation: target.generation,
           projectId: target.projectId, kind: sessionId ? 'session' : 'cloudReplica', ...(sessionId ? { sessionId } : {}),
           rootPath: target.anchorPath, sourceRoot: target.anchorPath, sourceMode: 'ssh', displayPath: target.rootPath,
           requestedMode: 'shared', effectiveMode: 'shared', phase: 'running', publicationState: 'integrated',
           capabilities: { read: true, write: !readOnly, git: true, shell: !readOnly, preview: false, integrate: false, cloudExecutionIndependentOfDesktop: false } };
-        projectContext = await prepareProjectRuntime({ launch, descriptor, execute: admission.execute,
-          assertCurrent: admission.assertCurrent, signal: controller.signal, options });
+        projectContext = await prepareProjectRuntime({ launch, descriptor, execute: async (...args) => {
+          assertCurrent();
+          const response = await admission!.execute(...args);
+          assertCurrent();
+          return response;
+        }, assertCurrent, signal: controller.signal, options });
+        assertCurrent();
         readOnly = options.permissionMode === 'plan';
       }
-      const tools = projectTools(admission, readOnly, controller.signal, attachments, projectContext);
+      const tools = projectTools(admission, readOnly, controller.signal, attachments, target.ownerId, assertCurrent, projectContext);
       options.cwd = target.anchorPath;
       options.tools = ['AskUserQuestion', 'ExitPlanMode', 'TodoWrite'];
       options.mcpServers = { ...projectContext?.mcpServers, ...(projectContext ? { project_context: projectContext.server } : {}), workspace: tools.server };
@@ -174,6 +194,13 @@ export function sshWorkspaceQuery(input: Parameters<typeof sdkQuery>[0], target:
       const allowedRules = [...(options.allowedTools ?? [])];
       const deniedRules = [...(options.disallowedTools ?? [])];
       const permissionHandler = options.canUseTool;
+      const askPermission: NonNullable<typeof options.canUseTool> = async (name, toolInput, context) => {
+        assertCurrent();
+        const decision = permissionHandler ? await permissionHandler(name, toolInput, context)
+          : { behavior: 'deny' as const, message: 'No permission handler is available for this tool.' };
+        assertCurrent();
+        return decision;
+      };
       const toolNames = tools.names.map(name => `mcp__workspace__${name}`);
       options.allowedTools = [...new Set([...allowedRules.filter(name => !name.startsWith('mcp__workspace__')), ...toolNames.filter(name => {
         if (deniedRules.some(rule => matchesProjectPermission(rule, name)) || projectContext?.askTools.some(rule => matchesProjectPermission(rule, name))) return false;
@@ -183,28 +210,28 @@ export function sshWorkspaceQuery(input: Parameters<typeof sdkQuery>[0], target:
       })])];
       options.disallowedTools = [...new Set([...deniedRules, ...toolNames.filter(name => deniedRules.some(rule => matchesProjectPermission(rule, name)))])];
       options.canUseTool = async (name, toolInput, context) => {
-        if (!name.startsWith('mcp__workspace__')) {
-          return permissionHandler ? permissionHandler(name, toolInput, context) : { behavior: 'deny', message: 'No permission handler is available for this tool.' };
-        }
+        assertCurrent();
+        if (!name.startsWith('mcp__workspace__')) return askPermission(name, toolInput, context);
         if (!toolNames.includes(name)) return { behavior: 'deny', message: 'The selected project does not expose this tool.' };
         if (deniedRules.some(rule => matchesProjectPermission(rule, name))) return { behavior: 'deny', message: 'Tool disallowed by settings' };
         const requiresAsk = projectContext?.askTools.some(rule => matchesProjectPermission(rule, name));
         if (!requiresAsk && (options.allowedTools!.includes(name) || allowedRules.some(rule => matchesProjectPermission(rule, name)))) return { behavior: 'allow', updatedInput: toolInput };
-        return permissionHandler ? permissionHandler(name, toolInput, context) : { behavior: 'deny', message: 'Windows writes and commands require an explicit permission decision.' };
+        return askPermission(name, toolInput, context);
       };
       options.settingSources = [];
       options.env = { ...options.env, CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' };
       const previousPrompt = options.systemPrompt;
       const previous = previousPrompt && typeof previousPrompt === 'object' && 'append' in previousPrompt ? previousPrompt.append ?? '' : '';
       options.systemPrompt = { type: 'preset', preset: 'claude_code', append: previous + '\nClaude Code runs on the VPS. Source files, Git, builds and tests are on a Windows computer reached by SSH. Use only the workspace project tools. /workspace is a virtual path for file tools; run_command executes Windows PowerShell in the actual selected directory, so use relative shell paths. Project configuration and instructions are loaded by the cloud project context resolver when enabled; use project_context for skills and scoped rules. Unsupported hooks and settings are reported rather than executed on the VPS. Do not run commands or read project files on the VPS. Use read_attachment only for the explicitly attached VPS files listed in this turn. Use read_image to inspect project screenshots; reference project images with relative or /workspace paths, not Windows absolute/file URLs. ' + (readOnly ? 'This session permits file inspection only; shell commands and writes are unavailable.' : 'Report actual Windows command exit codes and output. Do not retry an interrupted mutation without checking its result.') };
-      admission.assertCurrent();
+      assertCurrent();
       if (prepareLaunch) await prepareLaunch(options.cwd);
-      controller.signal.throwIfAborted();
-      admission.assertCurrent();
+      assertCurrent();
+      clearTimeout(startupTimer);
       active = sdkQuery({ ...input, options });
-      for await (const event of active) { projectContext?.observe(event); yield event; }
-    } catch (error) { failure = error; }
+      for await (const event of active) { assertCurrent(); projectContext?.observe(event); yield event; }
+    } catch (error) { failure = controller.signal.aborted ? controller.signal.reason ?? error : error; }
     finally {
+      clearTimeout(startupTimer);
       cleanup = (async () => {
         try {
           active?.close();

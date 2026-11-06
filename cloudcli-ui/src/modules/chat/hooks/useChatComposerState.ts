@@ -10,17 +10,19 @@ import type {
   TouchEvent,
 } from 'react';
 import { useDropzone } from 'react-dropzone';
+import { useTranslation } from 'react-i18next';
 
-import { api } from '@/shared/api';
+import { api, ApiRequestError } from '@/shared/api';
 import { useWorkspaceExecutionScope } from '@/shared/context/WorkspaceScopeContext';
 import { assertQueuedExecutionWorkspace, resolveExecutionWorkspace } from '@/modules/chat/utils/workspaceExecution';
 import { getAuthSessionVersion } from '@/shared/authToken';
 import { getServerConnectionVersion } from '@/shared/chisa';
 import { PROVIDER_PERMISSION_PREFERENCE_KEYS } from '@/shared/constants';
 import { readUserPreference } from '@/shared/userSettings';
-import type { CommandModalPayload, CostCommandData, HelpCommandData, MarkSessionProcessing, ModelCommandData, QueuedDraft, SessionActivityMap, StatusCommandData,QueuedSendOptions,ChatAttachment,ChatMessage,PendingPermissionRequest,PermissionMode,SessionEstablishedContext,Project,ProjectSession,LLMProvider,SlashCommand } from '@/shared/types';
+import type { BackgroundSendChoice, BackgroundSendPrompt, CommandModalPayload, CostCommandData, HelpCommandData, MarkSessionProcessing, ModelCommandData, QueuedDraft, SessionActivityMap, StatusCommandData,QueuedSendOptions,ChatAttachment,ChatMessage,PendingPermissionRequest,PermissionMode,SessionEstablishedContext,Project,ProjectSession,LLMProvider,SlashCommand,WorkspaceDescriptor } from '@/shared/types';
 import { grantClaudeToolPermission } from '@/modules/chat/utils/chatPermissions';
 import {
+  appendQueuedMessage,
   clearQueuedMessage,
   hydrateChatDrafts,
   isChatDraftPending,
@@ -28,15 +30,15 @@ import {
   readQueuedMessage,
   subscribeToChatDrafts,
   writeDraftText,
-  writeQueuedMessage,
 } from '@/shared/chatDrafts';
 import { escapeRegExp } from '@/modules/chat/utils/chatFormatting';
+import { describeBackgroundTask, ownBackgroundTasks } from '@/modules/chat/utils/backgroundTasks';
 import { useFileMentions } from '@/modules/chat/hooks/useFileMentions';
 import { useInputHistory } from '@/modules/chat/hooks/useInputHistory';
 import { useSlashCommands } from '@/modules/chat/hooks/useSlashCommands';
 
 type UseChatComposerStateArgs = {
-  isActive: boolean;
+  isActive?: boolean;
   selectedProject: Project | null;
   selectedSession: ProjectSession | null;
   currentSessionId: string | null;
@@ -93,19 +95,83 @@ type ComposerSubmission = QueuedDraft & {
   createdSessionContext?: SessionEstablishedContext | null;
 };
 
+type SubmitOptions = {
+  // Expanded custom-command bodies are messages, even when they begin with a slash.
+  skipCommandInterception?: boolean;
+};
+
 const createFakeSubmitEvent = () => {
   return { preventDefault: () => undefined } as unknown as FormEvent<HTMLFormElement>;
 };
 
+// Native transports and test doubles can settle after abort. Race every awaited
+// preparation locally as well, and never resume its continuation after cancel.
+const awaitPreparation = <T,>(operation: Promise<T>, signal: AbortSignal): Promise<T> => {
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const aborted = () => reject(signal.reason ?? new Error('已取消发送准备'));
+    signal.addEventListener('abort', aborted, { once: true });
+    operation.then(value => {
+      signal.removeEventListener('abort', aborted);
+      if (signal.aborted) reject(signal.reason);
+      else resolve(value);
+    }, error => {
+      signal.removeEventListener('abort', aborted);
+      reject(error);
+    });
+  });
+};
+
 const MAX_ATTACHMENT_COUNT = 10;
 const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+const PREPARATION_BUDGET_MS = 30_000;
+const PREPARATION_REQUEST_TIMEOUT_MS = 15_000;
+
+type PendingSubmission = {
+  scopeRevision: number;
+  conversationRevision: number;
+  queued: boolean;
+  authVersion: number;
+  connectionVersion: number;
+  controller: AbortController;
+  workspace: WorkspaceDescriptor | null | undefined;
+  targetSessionId: string | null;
+  workspaceChanged: boolean;
+  promotedWorkspace?: WorkspaceDescriptor;
+  authoritativeWorkspace?: { projectId: string; workspaceId: string; generation: string };
+  queueCommitted?: boolean;
+  remainingMs: number;
+};
+
+const sameExecutionIdentity = (left: WorkspaceDescriptor, right: WorkspaceDescriptor) => (
+  left.projectId === right.projectId && left.workspaceId === right.workspaceId
+  && left.generation === right.generation && left.kind === right.kind
+  && left.sessionId === right.sessionId && left.sourceMode === right.sourceMode
+);
+
+// An isolated session may appear for the first time during preflight. Its
+// authoritative lineage is checked by resolveExecutionWorkspace before dispatch.
+const matchesPendingWorkspace = (submission: PendingSubmission, current: WorkspaceDescriptor | null | undefined) => {
+  if (current === null) return true;
+  const pinned = submission.workspace;
+  if (!pinned || !current) return pinned === current;
+  if (sameExecutionIdentity(pinned, current)) return true;
+  if (pinned.kind !== 'cloudReplica' || current.kind !== 'session' || current.projectId !== pinned.projectId
+    || current.sessionId !== submission.targetSessionId || current.sourceRoot !== pinned.rootPath
+    || current.sourceMode !== pinned.sourceMode) return false;
+  if (submission.authoritativeWorkspace && (submission.authoritativeWorkspace.workspaceId !== current.workspaceId
+    || submission.authoritativeWorkspace.generation !== current.generation)) return false;
+  if (submission.promotedWorkspace) return sameExecutionIdentity(submission.promotedWorkspace, current);
+  submission.promotedWorkspace = current;
+  return true;
+};
 
 const isImageAttachment = (attachment: ChatAttachment) => {
   if (attachment.mimeType?.startsWith('image/')) return true;
   return /\.(gif|jpe?g|png|svg|webp)$/i.test(attachment.path || attachment.name || '');
 };
 
-const uploadAttachmentFiles = async (files: File[]): Promise<unknown[]> => {
+const uploadAttachmentFiles = async (files: File[], signal?: AbortSignal): Promise<unknown[]> => {
   if (files.length === 0) {
     return [];
   }
@@ -115,7 +181,9 @@ const uploadAttachmentFiles = async (files: File[]): Promise<unknown[]> => {
     formData.append('files', file);
   });
 
-  const response = await api.assets.uploadFiles(formData);
+  signal?.throwIfAborted();
+  const response = await api.assets.uploadFiles(formData, { signal });
+  signal?.throwIfAborted();
 
   if (!response.ok) {
     const body = await response.json().catch(() => null);
@@ -142,6 +210,24 @@ const restoreQueuedDraft = (sessionKey: string): QueuedDraft | null => {
     : null;
 };
 
+// Whether the card already shows this stored queued message. Send options are
+// not compared: the card does not show them.
+const showsQueuedMessage = (card: QueuedDraft, stored: QueuedDraft): boolean => (
+  card.content === stored.content
+  && JSON.stringify(card.uploadedAttachments ?? []) === JSON.stringify(stored.uploadedAttachments ?? [])
+);
+
+// Whether a stored queued message is the card's message with more added after
+// it (by this tab or another one), rather than a different message: only then
+// do the card's browser files still belong to it. A card holds browser files
+// only for attachments it uploaded, and every upload gets its own descriptor,
+// so the stored message must start with the card's descriptors.
+const extendsQueuedMessage = (card: QueuedDraft, stored: QueuedDraft): boolean => {
+  const cardUploads = card.uploadedAttachments ?? [];
+  const storedUploads = stored.uploadedAttachments ?? [];
+  return JSON.stringify(storedUploads.slice(0, cardUploads.length)) === JSON.stringify(cardUploads);
+};
+
 const getNotificationSessionSummary = (
   selectedSession: ProjectSession | null,
   fallbackInput: string,
@@ -160,8 +246,20 @@ const getNotificationSessionSummary = (
   return normalizedFallback.length > 80 ? `${normalizedFallback.slice(0, 77)}...` : normalizedFallback;
 };
 
+/**
+ * Enter that CONFIRMS an IME candidate must not also submit.
+ *
+ * `event.isComposing` alone is not enough: Safari fires `compositionend` BEFORE the confirming
+ * Enter's `keydown`, so the flag is already `false` by the time the handler runs. Chrome and
+ * Firefox fire it after, which is why the naive guard looks correct on those two and the bug
+ * reads as Safari-only. A tight window after `compositionend` covers it — that sequence is
+ * synchronous (microseconds), while a human pressing Enter a second time takes >= 100ms and
+ * never lands inside it.
+ */
+const SAFARI_IME_RACE_WINDOW_MS = 30;
+
 export function useChatComposerState({
-  isActive,
+  isActive = true,
   selectedProject,
   selectedSession,
   currentSessionId,
@@ -172,6 +270,7 @@ export function useChatComposerState({
   currentProviderModel,
   currentProviderEffort,
   isLoading,
+  processingSessions,
   canAbortSession,
   tokenBudget,
   sendMessage,
@@ -185,6 +284,7 @@ export function useChatComposerState({
   setIsUserScrolledUp,
   setPendingPermissionRequests,
 }: UseChatComposerStateArgs) {
+  const { t } = useTranslation('chat');
   // The composer text together with the chat scope it belongs to. They are one
   // state rather than a value plus a ref because they have to move in lockstep:
   // on a session switch there is one commit where the scope has already changed
@@ -229,6 +329,7 @@ export function useChatComposerState({
     ((
       event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>,
       queuedSubmission?: ComposerSubmission,
+      submitOptions?: SubmitOptions,
     ) => Promise<void>) | null
   >(null);
   // Text or attachment edits invalidate an async submit before it can clear
@@ -236,10 +337,12 @@ export function useChatComposerState({
   const draftRevisionRef = useRef(0);
   // The active submission token prevents double Enter while upload/session
   // allocation is pending; a different scope can still start its own send.
-  const pendingSubmitRef = useRef<{ scopeRevision: number } | null>(null);
-  // Match the visible preparation indicator to its conversation; old async
-  // completions must not clear a newer conversation's preparation state.
-  const [preparingScopeRevision, setPreparingScopeRevision] = useState<number | null>(null);
+  const pendingSubmitRef = useRef<PendingSubmission | null>(null);
+  // Status belongs to one submission so a late completion cannot replace a
+  // newer attempt's spinner or leak feedback into another conversation.
+  const [preparationState, setPreparationState] = useState<{ submission: PendingSubmission; stage: string } | null>(null);
+  // A failed preparation stays beside the draft until retry or conversation change.
+  const [sendErrorState, setSendErrorState] = useState<{ conversationRevision: number; message: string } | null>(null);
   // Async work must not navigate or update a composer that has been removed.
   const mountedRef = useRef(true);
   const inputValueRef = useRef(input);
@@ -255,20 +358,73 @@ export function useChatComposerState({
   const draftScopeRef = useRef(draftScope);
   draftScopeRef.current = draftScope;
   const serverConnectionVersion = getServerConnectionVersion();
+  const authSessionVersion = getAuthSessionVersion();
   const executionWorkspace = useWorkspaceExecutionScope();
-  const workspaceIdentity = executionWorkspace === undefined ? 'legacy' : executionWorkspace === null ? 'unavailable'
-    : JSON.stringify([executionWorkspace.projectId, executionWorkspace.workspaceId, executionWorkspace.generation]);
+  // Availability is polling state, not conversation identity. Keep the latest
+  // descriptor separately and pin each preparation to its original workspace.
+  const executionWorkspaceRef = useRef(executionWorkspace);
+  executionWorkspaceRef.current = executionWorkspace;
   const workspacePath = selectedProject?.fullPath || selectedProject?.path || '';
   const resolvedPermissionMode = resolvePermissionModeForProvider(provider, permissionMode);
-  const submissionScope = JSON.stringify([selectedProjectId, workspacePath, workspaceIdentity, sessionKey, provider, resolvedPermissionMode, serverConnectionVersion]);
+  const conversationScope = JSON.stringify([selectedProjectId, sessionKey, draftScope, authSessionVersion, serverConnectionVersion]);
+  const conversationScopeRef = useRef({ value: conversationScope, revision: 0 });
+  if (conversationScopeRef.current.value !== conversationScope) {
+    conversationScopeRef.current = { value: conversationScope, revision: conversationScopeRef.current.revision + 1 };
+  }
+  const submissionScope = JSON.stringify([conversationScope, workspacePath, provider, resolvedPermissionMode]);
   const submissionScopeRef = useRef({ value: submissionScope, revision: 0 });
   if (submissionScopeRef.current.value !== submissionScope) {
     submissionScopeRef.current = { value: submissionScope, revision: submissionScopeRef.current.revision + 1 };
   }
+  // Remember an observed replacement even if polling later restores A (A→B→A).
+  const pendingSubmission = pendingSubmitRef.current;
+  if (pendingSubmission && pendingSubmission.conversationRevision === conversationScopeRef.current.revision
+    && !matchesPendingWorkspace(pendingSubmission, executionWorkspace)) pendingSubmission.workspaceChanged = true;
+
+  useEffect(() => {
+    const pending = pendingSubmitRef.current;
+    if (pending && pending.scopeRevision !== submissionScopeRef.current.revision
+      && (!pending.queued || pending.authVersion !== getAuthSessionVersion()
+        || pending.connectionVersion !== getServerConnectionVersion())) {
+      pending.controller.abort(new Error('发送设置已变化，请确认后重试'));
+    }
+  }, [submissionScope]);
+  useEffect(() => {
+    const pending = pendingSubmitRef.current;
+    if (pending?.workspaceChanged) pending.controller.abort(new Error('工作区已变化，请确认后重试'));
+  }, [executionWorkspace]);
   const editingAnchorId = editingState?.scopeRevision === submissionScopeRef.current.revision ? editingState.anchorId : null;
   const setEditingAnchorId = useCallback((anchorId: string | null) => {
     setEditingState(anchorId ? { scopeRevision: submissionScopeRef.current.revision, anchorId } : null);
   }, []);
+  // Composition is tracked on `window` in the capture phase rather than on the textarea, so a
+  // composition that starts in one field and ends after focus moves still closes cleanly.
+  const isComposingRef = useRef(false);
+  const lastCompositionEndAtRef = useRef(0);
+
+  useEffect(() => {
+    const onStart = () => {
+      isComposingRef.current = true;
+    };
+    const onEnd = () => {
+      isComposingRef.current = false;
+      lastCompositionEndAtRef.current = performance.now();
+    };
+    // `blur` does not bubble, but a capture-phase listener on `window` still sees it on the way
+    // down — otherwise a composition abandoned by clicking away would stay open forever.
+    const onBlur = () => {
+      isComposingRef.current = false;
+    };
+    window.addEventListener('compositionstart', onStart, true);
+    window.addEventListener('compositionend', onEnd, true);
+    window.addEventListener('blur', onBlur, true);
+    return () => {
+      window.removeEventListener('compositionstart', onStart, true);
+      window.removeEventListener('compositionend', onEnd, true);
+      window.removeEventListener('blur', onBlur, true);
+    };
+  }, []);
+
   const setInput = useCallback<Dispatch<SetStateAction<string>>>((next) => {
     draftRevisionRef.current++;
     const value = typeof next === 'function' ? next(inputValueRef.current) : next;
@@ -285,7 +441,10 @@ export function useChatComposerState({
   }, []);
   useEffect(() => {
     mountedRef.current = true;
-    return () => { mountedRef.current = false; };
+    return () => {
+      mountedRef.current = false;
+      pendingSubmitRef.current?.controller.abort(new Error('发送准备已结束'));
+    };
   }, []);
 
   // Recall writes go through the same pair of stores a send reads: the state
@@ -307,6 +466,12 @@ export function useChatComposerState({
     }
     return restoreQueuedDraft(sessionKey);
   });
+  // Which session the in-memory `queuedDraft` belongs to, so editing or
+  // deleting the card clears that session's queued message. On a session
+  // switch there is one commit where `sessionKey` already points at the new
+  // session while `queuedDraft` still holds the old session's draft.
+  const queuedDraftSessionRef = useRef<string | null>(sessionKey);
+
   const handleBuiltInCommand = useCallback(
     (result: CommandExecutionResult) => {
       const { action, data } = result;
@@ -401,17 +566,18 @@ export function useChatComposerState({
     const connectionVersion = getServerConnectionVersion();
 
     // Defer submit to next tick so the command text is reflected in UI before dispatching.
+    // The expanded body is the message itself: it skips slash-command interception.
     setTimeout(() => {
       if (mountedRef.current && submissionScopeRef.current.revision === scopeRevision
         && draftRevisionRef.current === draftRevision && getAuthSessionVersion() === authVersion
         && getServerConnectionVersion() === connectionVersion && handleSubmitRef.current) {
-        handleSubmitRef.current(createFakeSubmitEvent());
+        handleSubmitRef.current(createFakeSubmitEvent(), undefined, { skipCommandInterception: true });
       }
     }, 0);
   }, [addMessage, setInput]);
 
   const executeCommand = useCallback(
-    async (command: SlashCommand, rawInput?: string, options?: { preserveInput?: boolean }) => {
+    async (command: SlashCommand, rawInput?: string, options?: { preserveInput?: boolean; signal?: AbortSignal; onStage?: (stage: string) => void }) => {
       if (!command || !selectedProject) {
         return false;
       }
@@ -427,12 +593,21 @@ export function useChatComposerState({
 
       try {
         const effectiveInput = rawInput ?? input;
-        const commandMatch = effectiveInput.match(new RegExp(`${escapeRegExp(command.name)}\\s*(.*)`));
-        const args =
-          commandMatch && commandMatch[1] ? commandMatch[1].trim().split(/\s+/) : [];
+        // Everything typed after the command name is its argument text, line
+        // breaks included (`[\s\S]`, unlike `.`), trimmed as the Claude Code CLI
+        // does. `$ARGUMENTS` gets it verbatim; `$1`, `$2`, … get its tokens.
+        // The name must open the input and end at whitespace or the end: a pick
+        // from the slash menu passes the whole composer, where the name may
+        // appear later or inside a longer word ("see /echo2 …" has no arguments).
+        const commandMatch = effectiveInput
+          .trimStart()
+          .match(new RegExp(`^${escapeRegExp(command.name)}(?=\\s|$)([\\s\\S]*)`));
+        const rawArgs = commandMatch ? commandMatch[1].trim() : '';
+        const args = rawArgs ? rawArgs.split(/\s+/) : [];
 
         const targetSessionId = currentSessionId || selectedSession?.id || undefined;
-        const workspace = await resolveExecutionWorkspace(executionWorkspace, selectedProject.projectId, targetSessionId);
+        const workspace = await resolveExecutionWorkspace(executionWorkspace, selectedProject.projectId, targetSessionId, options);
+        options?.signal?.throwIfAborted();
         if (!current()) return false;
         const context = {
           ...workspace,
@@ -444,12 +619,15 @@ export function useChatComposerState({
           tokenUsage: tokenBudget,
         };
 
+        options?.onStage?.('正在准备命令…');
         const response = await api.commands.execute({
           commandName: command.name,
           commandPath: command.path,
           args,
+          rawArgs,
           context,
-        });
+        }, { signal: options?.signal });
+        options?.signal?.throwIfAborted();
 
         if (!response.ok) {
           let errorMessage = `Failed to execute command (${response.status})`;
@@ -463,7 +641,12 @@ export function useChatComposerState({
         }
 
         const result = (await response.json()) as CommandExecutionResult;
+        options?.signal?.throwIfAborted();
         if (!current()) return false;
+        const pending = pendingSubmitRef.current;
+        if (pending?.controller.signal === options?.signal && pending?.workspaceChanged) {
+          throw new Error('工作区已变化，请确认后重试');
+        }
         if (workspace && (result.workspace?.projectId !== workspace.projectId || result.workspace?.workspaceId !== workspace.workspaceId || result.workspace?.generation !== workspace.generation)) {
           throw new Error('命令返回的工作区已变化，请刷新后重试');
         }
@@ -478,6 +661,7 @@ export function useChatComposerState({
         }
         return true;
       } catch (error) {
+        if (options?.signal) throw error;
         if (!current()) return false;
         const message = error instanceof Error ? error.message : 'Unknown error';
         console.error('Error executing command:', error);
@@ -679,9 +863,117 @@ export function useChatComposerState({
     selectedSession,
   ]);
 
+  // Read at send time through a ref: the map changes on every poll, and a
+  // submit handler rebuilt that often would re-render the whole composer.
+  const processingSessionsRef = useRef(processingSessions);
+  useEffect(() => {
+    processingSessionsRef.current = processingSessions;
+  }, [processingSessions]);
+
+  // Sending over background work asks first. The dialog is rendered by the
+  // composer; the submit awaits the user's choice through this resolver.
+  const [backgroundSendPrompt, setBackgroundSendPrompt] = useState<BackgroundSendPrompt | null>(null);
+  const backgroundSendResolverRef = useRef<((choice: BackgroundSendChoice) => void) | null>(null);
+
+  const askBeforeSendingOverBackgroundWork = useCallback(
+    (work: string[]) => new Promise<BackgroundSendChoice>((resolve) => {
+      // Only one prompt at a time: a stale one is answered "cancel".
+      backgroundSendResolverRef.current?.('cancel');
+      backgroundSendResolverRef.current = resolve;
+      setBackgroundSendPrompt({ work });
+    }),
+    [],
+  );
+
+  const resolveBackgroundSendPrompt = useCallback((choice: BackgroundSendChoice) => {
+    const resolve = backgroundSendResolverRef.current;
+    backgroundSendResolverRef.current = null;
+    setBackgroundSendPrompt(null);
+    resolve?.(choice);
+  }, []);
+
+  // A prompt cannot move to another conversation or survive an unmounted composer.
+  useEffect(() => () => {
+    backgroundSendResolverRef.current?.('cancel');
+    backgroundSendResolverRef.current = null;
+    setBackgroundSendPrompt(null);
+  }, [submissionScope]);
+
+  // The server appends against its current queue; this card only mirrors the acknowledged result.
+  const queueMessage = useCallback(async (durableDraft: QueuedDraft, queuedSessionKey: string, originScopeRevision: number) => {
+    const authVersion = getAuthSessionVersion();
+    const connectionVersion = getServerConnectionVersion();
+    const scopeRevision = originScopeRevision;
+    const accountCurrent = () => mountedRef.current && authVersion === getAuthSessionVersion()
+      && connectionVersion === getServerConnectionVersion();
+    const composerCurrent = () => accountCurrent() && submissionScopeRef.current.revision === scopeRevision;
+    // Consume only the submitted text; edits made during upload or in another session remain intact.
+    const consumedOpenDraft = composerCurrent() && inputValueRef.current === durableDraft.content;
+    if (consumedOpenDraft) {
+      setInput('');
+      setAttachedFiles([]);
+      setFileErrors(new Map());
+      resetCommandMenuState();
+      setIsTextareaExpanded(false);
+      if (textareaRef.current) textareaRef.current.style.height = 'auto';
+    } else if (!composerCurrent() && readDraftText(queuedSessionKey) === durableDraft.content) {
+      writeDraftText(queuedSessionKey, '');
+    }
+    try {
+      const { queuedMessage, appended } = await appendQueuedMessage(queuedSessionKey, {
+        content: durableDraft.content,
+        options: durableDraft.options,
+        attachments: durableDraft.uploadedAttachments,
+      });
+      if (!accountCurrent()) return false;
+      recordSentMessage(durableDraft.content, queuedSessionKey);
+      if (!composerCurrent()) return true;
+      queuedDraftSessionRef.current = queuedSessionKey;
+      const queuedCard: QueuedDraft = {
+        content: queuedMessage.content,
+        attachments: durableDraft.attachments,
+        uploadedAttachments: queuedMessage.attachments,
+        options: queuedMessage.options,
+      };
+      setQueuedDraft(previous => ({
+        ...queuedCard,
+        attachments: appended && previous && extendsQueuedMessage(previous, queuedCard)
+          ? [...previous.attachments, ...queuedCard.attachments]
+          : queuedCard.attachments,
+      }));
+      return true;
+    } catch (error) {
+      if (!accountCurrent()) return false;
+      const withTypedSince = (typedSince: string) => [durableDraft.content, typedSince].filter(part => part.trim()).join('\n\n');
+      const errorMessage = error instanceof ApiRequestError && error.code === 'QUEUED_MESSAGE_NOT_COMBINABLE'
+        ? t('input.queue.notCombinable')
+        : `Failed to queue message: ${error instanceof Error ? error.message : String(error)}`;
+      addMessage({ type: 'error', content: errorMessage, timestamp: new Date() });
+      if (composerCurrent()) {
+        if (consumedOpenDraft) {
+          setInput(withTypedSince(inputValueRef.current));
+          setAttachedFiles(current => [...durableDraft.attachments, ...current]);
+        }
+      } else {
+        const saved = readDraftText(queuedSessionKey);
+        if (saved !== durableDraft.content) writeDraftText(queuedSessionKey, withTypedSince(saved));
+      }
+      return false;
+    }
+  }, [addMessage, recordSentMessage, resetCommandMenuState, setAttachedFiles, setInput, t]);
+
+  const cancelPreparingSend = useCallback(() => {
+    const submission = preparationState?.submission;
+    if (submission && !submission.queueCommitted && pendingSubmitRef.current === submission
+      && submission.conversationRevision === conversationScopeRef.current.revision) {
+      submission.controller.abort(new Error('已取消发送准备'));
+    }
+  }, [preparationState]);
+
   const submitContent = useCallback(
     async (
       queuedSubmission?: ComposerSubmission,
+      submitOptions?: SubmitOptions,
     ) => {
       const currentInput = queuedSubmission?.content ?? inputValueRef.current;
       const currentAttachments = queuedSubmission?.attachments ?? attachedFiles;
@@ -699,18 +991,83 @@ export function useChatComposerState({
 
       const scopeRevision = submissionScopeRef.current.revision;
       if (pendingSubmitRef.current?.scopeRevision === scopeRevision) return false;
-      const submission = { scopeRevision };
+      pendingSubmitRef.current?.controller.abort(new Error('发送准备已结束'));
+      const conversationRevision = conversationScopeRef.current.revision;
+      const controller = new AbortController();
+      const submission: PendingSubmission = {
+        scopeRevision, conversationRevision, queued: isLoading, authVersion: getAuthSessionVersion(),
+        connectionVersion: getServerConnectionVersion(), controller, workspace: executionWorkspace,
+        targetSessionId: queuedSubmission?.targetSessionId || selectedSession?.id || currentSessionId || null,
+        workspaceChanged: false, remainingMs: PREPARATION_BUDGET_MS,
+      };
       pendingSubmitRef.current = submission;
-      setPreparingScopeRevision(scopeRevision);
+      setPreparationState({ submission, stage: '正在准备发送…' });
+      setSendErrorState(null);
       const authVersion = getAuthSessionVersion();
       const connectionVersion = getServerConnectionVersion();
       const draftRevision = draftRevisionRef.current;
       const submittedDraftScope = draftScopeRef.current;
-      const scopeCurrent = () => mountedRef.current
-        && submissionScopeRef.current.revision === scopeRevision
+      const conversationCurrent = () => mountedRef.current
+        && conversationScopeRef.current.revision === conversationRevision
         && getAuthSessionVersion() === authVersion
         && getServerConnectionVersion() === connectionVersion;
-      const draftCurrent = () => scopeCurrent() && draftRevisionRef.current === draftRevision;
+      const scopeCurrent = () => conversationCurrent() && submissionScopeRef.current.revision === scopeRevision;
+      const queueAccountCurrent = () => mountedRef.current && getAuthSessionVersion() === authVersion
+        && getServerConnectionVersion() === connectionVersion;
+      const draftCurrent = () => {
+        controller.signal.throwIfAborted();
+        if (submission.workspaceChanged || (conversationCurrent() && !matchesPendingWorkspace(submission, executionWorkspaceRef.current))) {
+          throw new Error('工作区已变化，请确认后重试');
+        }
+        // A queued follow-up keeps its original target while navigation or
+        // typing continues; queueMessage merges/restores that origin's draft.
+        if (submission.queued) return queueAccountCurrent();
+        if (scopeCurrent() && draftRevisionRef.current !== draftRevision) throw new Error('草稿已修改，请重新发送');
+        return scopeCurrent() && draftRevisionRef.current === draftRevision;
+      };
+      const onStage = (stage: string) => {
+        if (pendingSubmitRef.current === submission && conversationCurrent()) setPreparationState({ submission, stage });
+      };
+      // Charge only active work to the shared budget; no timer runs while a
+      // background-task choice is waiting for the user. Uploads may use 30s.
+      const prepare = async <T,>(stage: string, operation: () => Promise<T>, limitMs = PREPARATION_REQUEST_TIMEOUT_MS): Promise<T> => {
+        if (!draftCurrent()) throw new Error('发送设置已变化，请确认后重试');
+        onStage(stage);
+        const started = Date.now();
+        const timer = setTimeout(() => controller.abort(new Error(`${stage.replace(/…$/, '')}超时，请检查连接后重试`)), Math.max(0, Math.min(limitMs, submission.remainingMs)));
+        try {
+          const result = await awaitPreparation(operation(), controller.signal);
+          if (!draftCurrent()) throw new Error('发送设置已变化，请确认后重试');
+          return result;
+        } finally {
+          clearTimeout(timer);
+          submission.remainingMs -= Date.now() - started;
+        }
+      };
+      const resolveWorkspace = (target: string) => prepare('正在确认工作区…', async () => {
+        const workspace = await resolveExecutionWorkspace(executionWorkspace, selectedProject.projectId, target, { signal: controller.signal, onStage });
+        const pinned = submission.authoritativeWorkspace;
+        if (workspace && ((pinned && (pinned.projectId !== workspace.projectId || pinned.workspaceId !== workspace.workspaceId
+          || pinned.generation !== workspace.generation)) || (submission.promotedWorkspace
+          && (submission.promotedWorkspace.workspaceId !== workspace.workspaceId || submission.promotedWorkspace.generation !== workspace.generation)))) {
+          throw new Error('工作区已变化，请确认后重试');
+        }
+        if (workspace) submission.authoritativeWorkspace = workspace;
+        return workspace;
+      });
+      const uploadFiles = () => prepare('正在上传附件…', () => uploadAttachmentFiles(currentAttachments, controller.signal), PREPARATION_BUDGET_MS);
+      // Queue append is a durable handoff. Once it starts, Cancel must not claim
+      // the mutation was undone or invite an unsafe duplicate append.
+      const commitQueue = async (draft: QueuedDraft, target: string) => {
+        if (!draftCurrent()) return false;
+        submission.queueCommitted = true;
+        onStage('正在确认排队结果…');
+        const queued = await queueMessage(draft, target, scopeRevision);
+        if (!queued && conversationCurrent() && pendingSubmitRef.current === submission) {
+          setSendErrorState({ conversationRevision, message: '排队消息未确认，草稿已保留，请刷新状态后确认排队结果' });
+        }
+        return queued;
+      };
       let handedToSocket = false;
 
       try {
@@ -720,78 +1077,32 @@ export function useChatComposerState({
         // Upload attached files now so the queued record contains durable image
         // descriptors that can be sent even if another session is open later.
         if (isLoading) {
-          // A run can restart in the tiny gap between scheduling and flushing a
-          // queued submission. Put the same durable draft back without uploading
-          // its files again.
-          if (queuedSubmission) {
-            if (!sessionKey) return false;
-            const workspace = await resolveExecutionWorkspace(executionWorkspace, selectedProject.projectId, sessionKey);
-            if (!draftCurrent()) return false;
-            assertQueuedExecutionWorkspace(queuedSubmission.options?.workspace, workspace);
-            await writeQueuedMessage(sessionKey, {
-              content: queuedSubmission.content,
-              options: queuedSubmission.options,
-              attachments: previouslyUploadedAttachments,
-            });
-            if (!scopeCurrent()) return true;
-            setQueuedDraft(queuedSubmission);
-            return;
-          }
-
           const queuedSessionKey = sessionKey;
           if (!queuedSessionKey) throw new Error('排队消息尚未关联会话，请等待会话加载完成。');
-          const uploadedAttachments = await uploadAttachmentFiles(currentAttachments);
+          let uploadedAttachments = previouslyUploadedAttachments;
+          if (uploadedAttachments.length === 0 && currentAttachments.length > 0) {
+            uploadedAttachments = await uploadFiles();
+          }
+          const workspace = await resolveWorkspace(queuedSessionKey);
           if (!draftCurrent()) return false;
-          const workspace = await resolveExecutionWorkspace(executionWorkspace, selectedProject.projectId, queuedSessionKey);
-          if (!draftCurrent()) return false;
-
-          const durableDraft: QueuedDraft = {
+          if (queuedSubmission) assertQueuedExecutionWorkspace(queuedSubmission.options?.workspace, workspace);
+          return await commitQueue({
             content: currentInput,
             attachments: currentAttachments,
             uploadedAttachments,
             options: workspace ? { ...submittedOptions, workspace } : submittedOptions,
-          };
-          // Do not clear the user's input until the server owns this queue.
-          await writeQueuedMessage(queuedSessionKey, {
-            content: durableDraft.content,
-            options: durableDraft.options,
-            attachments: durableDraft.uploadedAttachments,
-          });
-
-          // Recorded under the session the message was queued FOR, and before
-          // the session-switch return below — the queued text must be
-          // recallable even when it dispatches without this composer.
-          recordSentMessage(currentInput, queuedSessionKey);
-
-          if (!scopeCurrent()) return true;
-
-          setQueuedDraft(durableDraft);
-          // A newer draft typed during the queue acknowledgement stays intact.
-          if (!draftCurrent()) return true;
-          setInput('');
-          inputValueRef.current = '';
-          setAttachedFiles([]);
-          setFileErrors(new Map());
-          resetCommandMenuState();
-          setIsTextareaExpanded(false);
-          if (textareaRef.current) {
-            textareaRef.current.style.height = 'auto';
-          }
-          if (submittedDraftScope) {
-            writeDraftText(submittedDraftScope, '');
-          }
-          return;
+          }, queuedSessionKey);
         }
 
         // Intercept slash commands only when "/" is the first input character.
         // Also accept exact "help" as a convenience alias for users who expect CLI-style help.
         const commandInput = currentInput.trimEnd();
         const isHelpAlias = commandInput.trim().toLowerCase() === 'help';
-        if (commandInput.startsWith('/') || isHelpAlias) {
-          const firstSpace = commandInput.indexOf(' ');
+        if (!submitOptions?.skipCommandInterception && (commandInput.startsWith('/') || isHelpAlias)) {
+          const firstWhitespace = commandInput.search(/\s/);
           const commandName = isHelpAlias
             ? '/help'
-            : firstSpace > 0 ? commandInput.slice(0, firstSpace) : commandInput;
+            : firstWhitespace > 0 ? commandInput.slice(0, firstWhitespace) : commandInput;
           const matchedCommand =
             slashCommands.find((cmd: SlashCommand) => cmd.name === commandName) ||
             (commandName === '/help'
@@ -803,7 +1114,7 @@ export function useChatComposerState({
                 } as SlashCommand)
               : undefined);
           if (matchedCommand && matchedCommand.type !== 'skill') {
-            const executed = await executeCommand(matchedCommand, isHelpAlias ? '/help' : commandInput, { preserveInput: true });
+            const executed = await prepare('正在准备命令…', () => executeCommand(matchedCommand, isHelpAlias ? '/help' : commandInput, { preserveInput: true, signal: controller.signal, onStage }));
             if (!executed || !draftCurrent()) return false;
             recordSentMessage(currentInput);
             setInput('');
@@ -823,7 +1134,7 @@ export function useChatComposerState({
 
         let uploadedAttachments = previouslyUploadedAttachments;
         if (uploadedAttachments.length === 0 && currentAttachments.length > 0) {
-          uploadedAttachments = await uploadAttachmentFiles(currentAttachments);
+          uploadedAttachments = await uploadFiles();
           if (!draftCurrent()) return false;
         }
 
@@ -843,29 +1154,32 @@ export function useChatComposerState({
           // the backend's isolated default (or SSH's forced shared mode) stays.
           let workspaceMode: 'isolated' | 'shared' | undefined;
           try {
-            const settingsResponse = await api.projectSettings(selectedProject.projectId);
-            const settingsBody = (await settingsResponse.json()) as {
-              data?: { settings?: { workspaceMode?: string | null } };
-            };
+            const settingsBody = await prepare('正在读取会话设置…', async () => {
+              const settingsResponse = await api.projectSettings(selectedProject.projectId, { signal: controller.signal });
+              controller.signal.throwIfAborted();
+              return await settingsResponse.json() as { data?: { settings?: { workspaceMode?: string | null } } };
+            });
             const requestedMode = settingsBody.data?.settings?.workspaceMode;
             if (requestedMode === 'isolated' || requestedMode === 'shared') {
               workspaceMode = requestedMode;
             }
           } catch {
+            controller.signal.throwIfAborted();
             workspaceMode = undefined;
           }
           if (!draftCurrent()) return false;
-          try {
-            const response = await api.providers.createSession({
-              provider,
-              projectPath: resolvedProjectPath,
-              initialMessage: messageContent,
-              ...(workspaceMode ? { workspaceMode } : {}),
+          {
+            const body = await prepare('正在创建会话…', async () => {
+              const response = await api.providers.createSession({
+                provider,
+                projectPath: resolvedProjectPath,
+                initialMessage: messageContent,
+                ...(workspaceMode ? { workspaceMode } : {}),
+              }, { signal: controller.signal });
+              controller.signal.throwIfAborted();
+              if (!response.ok) throw new Error(`Failed to create session (${response.status})`);
+              return response.json();
             });
-            if (!response.ok) {
-              throw new Error(`Failed to create session (${response.status})`);
-            }
-            const body = await response.json();
             if (!draftCurrent()) return false;
             targetSessionId = body?.data?.sessionId || null;
             // A blank server name would leave the session unlabeled, so the local
@@ -876,26 +1190,10 @@ export function useChatComposerState({
             if (returnedSessionName) {
               createdSessionName = returnedSessionName;
             }
-          } catch (error) {
-            if (!scopeCurrent()) return false;
-            const message = error instanceof Error ? error.message : 'Unknown error';
-            console.error('Session creation failed:', error);
-            addMessage({
-              type: 'error',
-              content: `Failed to start a new session: ${message}`,
-              timestamp: new Date(),
-            });
-            return;
           }
 
-          if (!targetSessionId) {
-            addMessage({
-              type: 'error',
-              content: 'Failed to start a new session: no session id returned.',
-              timestamp: new Date(),
-            });
-            return;
-          }
+          if (!targetSessionId) throw new Error('Failed to start a new session: no session id returned.');
+          submission.targetSessionId = targetSessionId;
 
           // Freeze the composer's effective mode onto the new session so the
           // project-default fallback cannot replace a mode the user picked
@@ -909,9 +1207,36 @@ export function useChatComposerState({
           };
         }
 
-        const workspace = await resolveExecutionWorkspace(executionWorkspace, selectedProject.projectId, targetSessionId);
+        submission.targetSessionId = targetSessionId;
+        let workspace = await resolveWorkspace(targetSessionId);
         if (!draftCurrent()) return false;
         if (queuedSubmission) assertQueuedExecutionWorkspace(queuedSubmission.options?.workspace, workspace);
+        // Starting a new turn can replace the process that owns background work.
+        // Recheck the original draft and workspace after the user answers the dialog.
+        const backgroundActivity = processingSessionsRef.current?.get(targetSessionId);
+        if (backgroundActivity?.background) {
+          const work = ownBackgroundTasks(backgroundActivity.tasks ?? []).map(task => describeBackgroundTask(task, t));
+          onStage('等待确认后台任务…');
+          let choice: BackgroundSendChoice;
+          try {
+            choice = await awaitPreparation(askBeforeSendingOverBackgroundWork(work), controller.signal);
+          } finally {
+            if (pendingSubmitRef.current === submission) resolveBackgroundSendPrompt('cancel');
+          }
+          if (!draftCurrent()) return false;
+          if (choice === 'cancel') throw new Error('已取消发送准备');
+          workspace = await resolveWorkspace(targetSessionId);
+          if (!draftCurrent()) return false;
+          if (queuedSubmission) assertQueuedExecutionWorkspace(queuedSubmission.options?.workspace, workspace);
+          if (choice === 'queue') {
+            return await commitQueue({
+              content: currentInput,
+              attachments: currentAttachments,
+              uploadedAttachments,
+              options: workspace ? { ...submittedOptions, workspace } : submittedOptions,
+            }, targetSessionId);
+          }
+        }
         const attachmentRecords = uploadedAttachments as ChatAttachment[];
         const userMessage: ChatMessage = {
           type: 'user',
@@ -928,6 +1253,14 @@ export function useChatComposerState({
         // One message shape for every provider. The backend resolves the
         // provider, project path, and provider-native resume id from the
         // session row; `options` only carries composer-level preferences.
+        // Final guard and handoff are synchronous: no cancel, poll, or reply
+        // continuation may slip between identity validation and the socket.
+        if (!draftCurrent()) return false;
+        const currentWorkspace = executionWorkspaceRef.current;
+        if (workspace && currentWorkspace && !sameExecutionIdentity(executionWorkspace!, currentWorkspace)
+          && (workspace.workspaceId !== currentWorkspace.workspaceId || workspace.generation !== currentWorkspace.generation)) {
+          throw new Error('工作区已变化，请确认后重试');
+        }
         sendMessage({
           // Replacing an already-sent message is its own frame: it changes the
           // shape of the conversation, so it gets validated separately and can
@@ -975,23 +1308,22 @@ export function useChatComposerState({
         if (createdSessionContext) onSessionEstablished?.(targetSessionId, createdSessionContext);
         return true;
       } catch (error) {
-        if (scopeCurrent()) {
-          addMessage({
-            type: 'error',
-            content: `${handedToSocket ? '消息已交给聊天连接，界面更新未完成，请先刷新状态，勿重复发送' : isLoading ? '排队消息未确认，草稿已保留，请先刷新状态再决定是否重试' : '消息未发送，草稿已保留'}：${error instanceof Error ? error.message : String(error)}`,
-            timestamp: new Date(),
-          });
+        if (conversationCurrent()) {
+          const message = `${handedToSocket ? '消息已交给聊天连接，界面更新未完成，请先刷新状态，勿重复发送' : isLoading ? '排队消息未确认，草稿已保留，请先刷新状态再决定是否重试' : '消息未发送，草稿已保留'}：${error instanceof Error ? error.message : String(error)}`;
+          if (pendingSubmitRef.current === submission) setSendErrorState({ conversationRevision, message });
+          addMessage({ type: 'error', content: message, timestamp: new Date() });
         }
         return false;
       } finally {
         if (pendingSubmitRef.current === submission) {
           pendingSubmitRef.current = null;
-          if (mountedRef.current) setPreparingScopeRevision(null);
+          if (mountedRef.current) setPreparationState(null);
         }
       }
     },
     [
       selectedSession,
+      askBeforeSendingOverBackgroundWork,
       attachedFiles,
       buildSendOptions,
       currentSessionId,
@@ -1002,6 +1334,8 @@ export function useChatComposerState({
       onSessionProcessing,
       onSessionEstablished,
       provider,
+      queueMessage,
+      resolveBackgroundSendPrompt,
       recordSentMessage,
       resetCommandMenuState,
       scrollToBottom,
@@ -1014,15 +1348,17 @@ export function useChatComposerState({
       setInput,
       setIsUserScrolledUp,
       slashCommands,
+      t,
     ],
   );
 
   const handleSubmit = useCallback(async (
     event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>,
     queuedSubmission?: ComposerSubmission,
+    submitOptions?: SubmitOptions,
   ) => {
     event.preventDefault();
-    await submitContent(queuedSubmission);
+    await submitContent(queuedSubmission, submitOptions);
   }, [submitContent]);
 
   useEffect(() => {
@@ -1030,7 +1366,8 @@ export function useChatComposerState({
   }, [handleSubmit]);
 
   // The VPS dispatcher owns sending. While the card is visible, periodically
-  // reconcile only its removal so the UI notices when the server claims it.
+  // reconcile it with the server, so the UI notices when the server claims it
+  // or another tab adds to it.
   useEffect(() => {
     if (!sessionKey || !queuedDraft) {
       return;
@@ -1041,41 +1378,64 @@ export function useChatComposerState({
       if (!cancelled && !isChatDraftPending(sessionKey) && !readQueuedMessage(sessionKey)) {
         setQueuedDraft(null);
       }
+      // Another tab may have added to the queued message; the card shows what
+      // will be sent, so it follows the server's copy.
+      const stored = cancelled ? null : restoreQueuedDraft(sessionKey);
+      if (stored) {
+        setQueuedDraft((card) => {
+          if (!card || showsQueuedMessage(card, stored)) {
+            return card;
+          }
+          // This tab's browser files stay with its part of the message, so
+          // editing the card still brings them back into the composer.
+          return extendsQueuedMessage(card, stored) ? { ...stored, attachments: card.attachments } : stored;
+        });
+      }
     };
     const timer = setInterval(() => void reconcile(), 5_000);
+    // A hidden tab's timers are throttled (to about once a minute after a few
+    // minutes), so its card can be far behind; catch up as soon as it is shown.
+    const reconcileWhenShown = () => {
+      if (document.visibilityState === 'visible') {
+        void reconcile();
+      }
+    };
+    document.addEventListener('visibilitychange', reconcileWhenShown);
     return () => {
       cancelled = true;
       clearInterval(timer);
+      document.removeEventListener('visibilitychange', reconcileWhenShown);
     };
   }, [queuedDraft, sessionKey]);
 
   const cancelQueuedDraft = useCallback(async (edit: boolean) => {
-    if (!queuedDraft || !sessionKey) return;
+    const owner = queuedDraftSessionRef.current;
+    if (!queuedDraft || !owner || owner !== sessionKey) return;
     const scopeRevision = submissionScopeRef.current.revision;
-    if (pendingSubmitRef.current?.scopeRevision === scopeRevision) return;
-    const operation = { scopeRevision };
-    pendingSubmitRef.current = operation;
-    const draftRevision = draftRevisionRef.current;
     const authVersion = getAuthSessionVersion();
+    const connectionVersion = getServerConnectionVersion();
     const current = () => mountedRef.current && submissionScopeRef.current.revision === scopeRevision
-      && getAuthSessionVersion() === authVersion;
+      && getAuthSessionVersion() === authVersion && getServerConnectionVersion() === connectionVersion;
+    // Start the clear before exposing editable text, so a re-queue waits behind it on the server.
+    const clearing = clearQueuedMessage(owner);
+    setQueuedDraft(null);
+    const previousInput = inputValueRef.current;
+    if (edit) {
+      setInput(queuedDraft.content);
+      setAttachedFiles(queuedDraft.attachments);
+      textareaRef.current?.focus();
+    }
     try {
-      await clearQueuedMessage(sessionKey);
-      if (!current()) return;
-      setQueuedDraft(null);
-      if (edit && draftRevisionRef.current === draftRevision) {
-        setInput(queuedDraft.content);
-        setAttachedFiles(queuedDraft.attachments);
-        textareaRef.current?.focus();
-      }
+      await clearing;
     } catch (error) {
-      if (current()) addMessage({
-        type: 'error',
-        content: `未确认取消排队消息，请勿重复发送：${error instanceof Error ? error.message : String(error)}`,
-        timestamp: new Date(),
-      });
-    } finally {
-      if (pendingSubmitRef.current === operation) pendingSubmitRef.current = null;
+      if (!current()) return;
+      setQueuedDraft(queuedDraft);
+      // Restore the card on failure; avoid a duplicate editable copy if nothing newer was typed.
+      if (edit && inputValueRef.current === queuedDraft.content) {
+        setInput(previousInput);
+        setAttachedFiles([]);
+      }
+      addMessage({ type: 'error', content: `未确认取消排队消息，请勿重复发送：${error instanceof Error ? error.message : String(error)}`, timestamp: new Date() });
     }
   }, [addMessage, queuedDraft, sessionKey, setAttachedFiles, setInput]);
   const editQueuedDraft = useCallback(() => { void cancelQueuedDraft(true); }, [cancelQueuedDraft]);
@@ -1128,10 +1488,16 @@ export function useChatComposerState({
     writeDraftText(draftScope, inputState.value);
   }, [inputState, draftScope]);
 
+  // The card is never written back to storage: the server owns the queued
+  // message, and this page's copy of it may already be out of date (sent, or
+  // added to from another tab). Queueing appends on the server; editing and
+  // deleting clear it there.
+
   // Switching sessions swaps in that session's queued draft. Browser File
   // objects are local to the mounted composer, while their already-uploaded
   // descriptors restore from storage and remain sendable.
   useEffect(() => {
+    queuedDraftSessionRef.current = sessionKey;
     if (!sessionKey) {
       setQueuedDraft(null);
       return;
@@ -1201,7 +1567,9 @@ export function useChatComposerState({
       }
 
       if (event.key === 'Enter') {
-        if (event.nativeEvent.isComposing) {
+        const endedJustNow =
+          performance.now() - lastCompositionEndAtRef.current < SAFARI_IME_RACE_WINDOW_MS;
+        if (event.nativeEvent.isComposing || isComposingRef.current || endedJustNow) {
           return;
         }
 
@@ -1386,8 +1754,14 @@ export function useChatComposerState({
     getInputProps,
     isDragActive,
     openAttachmentPicker: open,
-    isPreparingSend: preparingScopeRevision === submissionScopeRef.current.revision,
+    isPreparingSend: preparationState?.submission.conversationRevision === conversationScopeRef.current.revision,
+    canCancelPreparation: preparationState?.submission.conversationRevision === conversationScopeRef.current.revision && !preparationState.submission.queueCommitted,
+    preparationStage: preparationState?.submission.conversationRevision === conversationScopeRef.current.revision ? preparationState.stage : null,
+    sendError: sendErrorState?.conversationRevision === conversationScopeRef.current.revision ? sendErrorState.message : null,
+    cancelPreparingSend,
     handleSubmit,
+    backgroundSendPrompt,
+    resolveBackgroundSendPrompt,
     queuedDraft,
     editQueuedDraft,
     deleteQueuedDraft,

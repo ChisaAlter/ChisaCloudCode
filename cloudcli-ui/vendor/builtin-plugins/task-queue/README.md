@@ -13,6 +13,25 @@ A CloudCLI tab plugin that gives [task-queue-mcp](https://github.com/TadMSTR/tas
 - **CloudCLI** ([claudecodeui](https://github.com/siteboon/claudecodeui)) with permission-gated plugin env passthrough — see [How the plugin receives its env vars](#how-the-plugin-receives-its-env-vars).
 - **Node.js 20+**
 
+## Claude subscription attribution in ChisaCloudCode
+
+Direct launches set `CLAUDE_CODE_ENTRYPOINT=chisacloudcode` after loading the agent's environment file. This is a temporary workaround for the reported headless subscription-window weighting in [claude-code#97074](https://github.com/anthropics/claude-code/issues/97074#issuecomment-6426128541), not a confirmed reduction in token counts or a guaranteed quota saving.
+
+Run-as agents still use their authorized `sudo -n -u <user> <launcher>` command. Their launch result includes an attribution warning because `sudo` and the external launcher can clear or overwrite the plugin environment. Neither `sudo --preserve-env` nor changing the command to `sudo env ...` is safe to assume with an existing command-specific sudoers grant.
+
+The operator who owns `/usr/local/sbin/forge/<launcher>` must add the assignment **after all credential/environment loading, immediately before every final Claude invocation**. Use `chisacloudcode` for a launcher dedicated to this app. If task-dispatcher or other tools share it, choose a truthful launcher/tool label such as `forge-task-launcher` for all callers, or coordinate an explicit caller-origin contract with its owner; any custom tool label meets the reported workaround, but the environment flag alone does not verify quota savings:
+
+```sh
+# Keep the existing user checks, credential loading, Claude path and arguments.
+# Add this immediately before the launcher's existing exec:
+export CLAUDE_CODE_ENTRYPOINT=chisacloudcode
+# Existing line, unchanged: exec "$claude_bin" ...
+```
+
+If the launcher invokes `env -i`, put `CLAUDE_CODE_ENTRYPOINT=chisacloudcode` in that final command's explicit environment instead. Apply the same rule inside a container or another user switch. Setting it before `source agent.env`, in the plugin host, or before `sudo` cannot guarantee the final value. Do not bypass the launcher, broaden sudoers, or forward credentials to solve attribution.
+
+Validate without a model call by substituting a local stub for the final Claude executable in an isolated copy of the launcher: have the stub assert the entrypoint, arguments and selected identity. For a normal subsequent Claude run, inspect its transcript's `entrypoint` field; it should be `chisacloudcode`. This repository does not contain the external Forge launchers and cannot patch or verify them automatically.
+
 ## Architecture
 
 Four moving parts. **Every read and every write goes through task-queue-mcp's HTTP API** (since v0.11.0, which needs task-queue-mcp v0.11.0 or later). The backend only watches the queue directory to learn *when* to re-read.

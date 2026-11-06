@@ -24,6 +24,16 @@ export default function StepReview({
 }: StepReviewProps) {
   const { t } = useTranslation();
 
+  const targetPath = useMemo(() => {
+    if (!formState.githubUrl.trim()) return formState.workspacePath;
+    const remote = formState.githubUrl.trim().replace(/\/+$/, '');
+    const leaf = remote.split('/').pop()?.replace(/\.git$/, '') || '';
+    let name = leaf;
+    try { name = decodeURIComponent(leaf); } catch { /* Server reports malformed URLs before mutation. */ }
+    const separator = formState.workspacePath.includes('\\') && !formState.workspacePath.includes('/') ? '\\' : '/';
+    return formState.workspacePath.replace(/[\\/]+$/, '') + separator + name;
+  }, [formState.githubUrl, formState.workspacePath]);
+
   const authenticationLabel = useMemo(() => {
     if (formState.tokenMode === 'stored' && formState.selectedGithubToken) {
       return `${t('projectWizard.step3.usingStoredToken')} ${selectedTokenName || t('common:misc.unknownProvider')}`;
@@ -64,7 +74,7 @@ export default function StepReview({
           <div className="flex justify-between text-sm">
             <span className="text-gray-600 dark:text-gray-400">{t('projectWizard.step3.path')}</span>
             <span className="break-all font-mono text-xs text-gray-900 dark:text-white">
-              {formState.workspacePath}
+              {targetPath}
             </span>
           </div>
 

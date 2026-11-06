@@ -1,6 +1,6 @@
 import { runProviderProcess } from '@/modules/providers/services/provider-process.service.js';
 import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
-import { appendFilesInputTag, appendImagesInputTag, normalizeAttachmentDescriptors, createCompleteMessage, createNormalizedMessage, flattenPromptForWindowsShell } from '@/shared/index.js';
+import { appendFilesInputTag, appendImagesInputTag, normalizeAttachmentDescriptors, createCompleteMessage, createNormalizedMessage, flattenPromptForWindowsShell, stripAnsiSequences } from '@/shared/index.js';
 import type { AnyRecord, ProviderRuntimeContext, ProviderRuntimeWriter } from '@/shared/index.js';
 
 type CursorRun = { controller: AbortController; completion: Promise<void>; cleanupError?: unknown };
@@ -99,7 +99,8 @@ export function createCursorRuntime(runProcess: typeof runProviderProcess = runP
             for (const line of lines) processLine(line.trim());
           },
           stderr(text) {
-            if (!suppressTrust(text) && !controller.signal.aborted) ws.send(createNormalizedMessage({ kind: 'error', content: text, sessionId: capturedSessionId || sessionId || null, provider: 'cursor' }));
+            const content = stripAnsiSequences(text);
+            if (content.trim() && !suppressTrust(content) && !controller.signal.aborted) ws.send(createNormalizedMessage({ kind: 'error', content, sessionId: capturedSessionId || sessionId || null, provider: 'cursor' }));
           },
         }, controller.signal);
         if (stdoutBuffer.trim()) processLine(stdoutBuffer.trim());

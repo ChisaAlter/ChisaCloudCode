@@ -1,0 +1,55 @@
+//----------------- WORKSPACE BROKER CONTRACT ------------
+/** Broker operator-only manifest. Never derive it from an API request. Roots, mounts,
+ * profiles and issuer keys must live outside the API's readable/writeable scope. */
+export type WorkspaceBrokerConfiguration = {
+  registryDirectory: string;
+  audience: string;
+  authorityKeys: Array<{ keyId: string; publicKey: string; owners: string[] }>;
+  controlledRoots: Array<{ id: string; ownerId: string; path: string }>;
+  workspaces: Array<{ id: string; ownerId: string; rootId: string; relativePath: string; generation: string;
+    network: { name: string; internal: boolean };
+    profiles: string[];
+    mounts?: Array<{ rootId: string; relativePath: string; target: string; readOnly: boolean }>;
+    legacy?: { resourceId: string; name: string; network: string; mounts: Array<{ source: string; target: string; readOnly: boolean }> };
+  }>;
+  profiles: Array<{ id: string; imageDigest: string; uid: number; gid: number; memoryBytes: number; nanoCpus: number;
+    pidsLimit: number; tmpfsBytes: number; timeoutMs: number; maxOutputBytes: number; maxStdinBytes: number;
+    readOnlyWorkspace: boolean; environmentKeys: string[];
+  }>;
+  maxOperations?: number;
+};
+/** Semantic daemon dependency of workspace-broker. Only the restricted adapter implements
+ * this in deployment; fake engines exercise the exact same persistence and admission logic.
+ * Null inspection means a successful daemon 404 for that exact object, never timeout. */
+export type WorkspaceBrokerEngine = {
+  createSandbox(input: { name: string; imageDigest: string; labels: Record<string,string>; networkId: string;
+    uid: number; gid: number; memoryBytes: number; nanoCpus: number; pidsLimit: number; tmpfsBytes: number;
+    mounts: Array<{ source: string; target: string; readOnly: boolean }>; command: string[]; cwd: string;
+    environment: Record<string,string>; readOnlyWorkspace: boolean }): Promise<string>;
+  startContainer(id: string): Promise<void>;
+  inspectContainer(id: string): Promise<null | { id: string; name: string; imageDigest: string; labels: Record<string,string>;
+    running: boolean; restarting: boolean; exitCode: number; networkId: string; address: string;
+    uid: string; privileged: boolean; hostPid: boolean; readOnlyRootfs: boolean; capDrop: string[];
+    securityOpt: string[]; memoryBytes: number; nanoCpus: number; pidsLimit: number;
+    mounts: Array<{ source: string; target: string; readOnly: boolean }>; restartPolicy: string }>;
+  listWorkspaceContainers(workspaceKey: string): Promise<string[]>;
+  removeContainer(id: string): Promise<void>;
+  attachContainer(id: string): Promise<import('node:stream').Duplex>;
+  createExec(id: string, input: { command: string[]; cwd: string; environment: Record<string,string>; uid: string }): Promise<string>;
+  startExec(id: string): Promise<import('node:stream').Duplex>;
+  inspectExec(id: string): Promise<{ running: boolean; exitCode: number }>;
+  logs(id: string, maxBytes: number): Promise<Buffer>;
+  inspectNetwork(id: string): Promise<null | { id: string; name: string; driver: string; scope: string; internal: boolean;
+    defaultBridge: boolean; labels: Record<string,string> }>;
+  createNetwork(input: { name: string; labels: Record<string,string>; internal: boolean }): Promise<string>;
+  retireContainer(id: string): Promise<void>;
+};
+/** API business operation accepted only after independent signature verification.
+ * Unknown input keys reject. Paths, images, Docker arguments and resource policy are absent. */
+export type WorkspaceBrokerRunRequest = { operationId: string; workspaceId: string; generation: string; leaseId: string;
+  profileId: string; command: string[]; cwd?: string; environment?: Record<string,string>; previewPort?: number };
+/** Exec never chooses a new sandbox. It inherits the exact parent owner, generation,
+ * lease, resource policy and immutable container; cancellation removes the parent sandbox. */
+export type WorkspaceBrokerExecRequest = { operationId: string; parentOperationId: string; command: string[];
+  cwd?: string; environment?: Record<string,string> };
+// ---------------------------

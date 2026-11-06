@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 
 import { act, renderHook, waitFor } from '@testing-library/react';
-import { afterEach, beforeEach, test, vi } from 'vitest';
+import { beforeEach, test, vi } from 'vitest';
 
 import { resetUserPreferences, writeUserPreference } from '@/shared/userSettings';
 
@@ -55,9 +55,8 @@ beforeEach(() => {
   resetUserPreferences();
 });
 
-afterEach(() => {
-  vi.resetModules();
-});
+// Keep the hook and the statically imported preference writer on the same singleton.
+// Resetting the module registry here creates a second store that cannot observe the writer above.
 
 test('each provider gets its own model from its own storage key', async () => {
   localStorage.setItem('claude-model', 'claude-stored');

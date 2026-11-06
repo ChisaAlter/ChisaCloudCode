@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { createProjectContentResolver } from '../project-runtime-content.service.js';
@@ -112,6 +113,60 @@ test('malformed or unsafe present configuration fails while ENOENT remains norma
   await assert.rejects(fixture({ '.claude/skills/alias/SKILL.md': skill('description: Alias\nfirst: &shared [one, two]\nsecond: *shared') }).resolver.resolve(), { code: 'PROJECT_RUNTIME_CONFIG_INVALID' });
   const current = createProjectContentResolver({ assertCurrent() {}, async read() { throw Object.assign(new Error('absent'), { code: 'ENOENT' }); }, async list() { throw Object.assign(new Error('absent'), { code: 'ENOENT' }); } });
   assert.equal((await current.resolve()).instructions, '');
+});
+
+test('malformed optional skill frontmatter does not block chat or healthy skills and never activates', async () => {
+  for (const invalid of [skill('name: github-task\ndescription: Order the board: "next"', 'INVALID SKILL BODY'), '---\nname: github-task\nINVALID SKILL BODY', '---js\nmodule.exports = {}\n---\nINVALID SKILL BODY']) {
+    const current = fixture({
+      'CLAUDE.md': 'Mandatory project guidance',
+      '.claude/skills/github-task/SKILL.md': invalid,
+      '.claude/skills/check/SKILL.md': skill('description: Verify changes', 'Healthy skill body'),
+    });
+    const result = await current.resolver.resolve({ prompt: 'What else can you fix?' });
+    assert.match(result.instructions, /Mandatory project guidance/);
+    assert.doesNotMatch(JSON.stringify(result), /INVALID SKILL BODY|module\.exports/);
+    assert.deepEqual(result.skills.find(item => item.name === 'github-task')?.unsupported, ['invalid YAML frontmatter']);
+    assert.match(result.warnings.join('\n'), /\.claude\/skills\/github-task\/SKILL\.md: invalid YAML frontmatter/);
+    assert.ok(result.sources.some(source => source.path === '.claude/skills/github-task/SKILL.md'));
+    assert.match((await current.resolver.activateSkill('check')).body, /Healthy skill body/);
+    await assert.rejects(current.resolver.activateSkill('github-task'), { code: 'PROJECT_RUNTIME_SKILL_UNSUPPORTED' });
+    await assert.rejects(current.resolver.resolve({ prompt: '/github-task next' }), { code: 'PROJECT_RUNTIME_SKILL_UNSUPPORTED' });
+  }
+});
+
+test('invalid skill diagnostic names never shadow healthy commands or require command-shaped directory names', async () => {
+  for (const [healthy, invalid, command] of [['a', 'b', 'b'], ['z', 'a', 'a'], ['healthy', 'foo.bar', 'valid'], ['healthy', '中文', 'valid']]) {
+    const current = fixture({
+      [`.claude/skills/${healthy}/SKILL.md`]: skill('name: ' + command + '\ndescription: Healthy', 'HEALTHY BODY'),
+      [`.claude/skills/${invalid}/SKILL.md`]: skill('name: other\ndescription: Broken: "header"', 'INVALID BODY'),
+    });
+    const result = await current.resolver.resolve();
+    assert.equal(result.skills.length, 1);
+    assert.deepEqual(result.skills[0].unsupported, []);
+    assert.match((await current.resolver.activateSkill(command)).body, /HEALTHY BODY/);
+    assert.match(result.warnings.join('\n'), /invalid YAML frontmatter/);
+  }
+});
+
+test('folded skill descriptions preserve colon text while malformed mandatory frontmatter still blocks loading', async () => {
+  const current = fixture({ '.claude/skills/github-task/SKILL.md': skill('name: github-task\ndescription: >-\n  Order the board: "next"', 'Manage task instructions') });
+  assert.equal((await current.resolver.resolve()).skills[0].description, 'Order the board: "next"');
+  assert.match((await current.resolver.activateSkill('github-task')).body, /Manage task instructions/);
+  for (const source of ['CLAUDE.md', '.claude/rules/mandatory.md']) {
+    await assert.rejects(fixture({ [source]: skill('description: Mandatory: "policy"', 'Required guidance') }).resolver.resolve(), { code: 'PROJECT_RUNTIME_CONFIG_INVALID' });
+  }
+});
+
+test('the GitHub plugin ships installable skill metadata in both source and packaged assets', async () => {
+  for (const asset of ['vendor/builtin-plugins/claude-github-issue/skill/SKILL.md', 'public/builtin-plugins/claude-github-issue/skill/SKILL.md']) {
+    const content = await readFile(new URL('../../../../' + asset, import.meta.url), 'utf8');
+    const current = fixture({ '.claude/skills/github-task/SKILL.md': content });
+    const metadata = (await current.resolver.resolve()).skills[0];
+    assert.equal(metadata.name, 'github-task', asset);
+    assert.match(metadata.description, /Plan board: "ułóż plan"/);
+    assert.deepEqual(metadata.unsupported, [], asset);
+    assert.match((await current.resolver.activateSkill('github-task')).body, /# github-task skill/);
+  }
 });
 
 test('nested rules are stable and scoped paths match only their root-relative targets', async () => {

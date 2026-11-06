@@ -98,7 +98,7 @@ type DialogContentProps = {
   animationClassName?: string;
 } & React.HTMLAttributes<HTMLDivElement>;
 
-const FOCUSABLE_SELECTOR = 'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+const FOCUSABLE_SELECTOR = 'a[href]:not([tabindex="-1"]), button:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), select:not([disabled]):not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])';
 
 /** Focus-trapped panel of Dialog, used by the chat, command-palette, sidebar and skills modules. */
 export const DialogContent = React.forwardRef<HTMLDivElement, DialogContentProps>(
@@ -169,7 +169,9 @@ export const DialogContent = React.forwardRef<HTMLDivElement, DialogContentProps
       if (open && contentRef.current) {
         // Small delay to let the portal render
         requestAnimationFrame(() => {
-          const first = contentRef.current?.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
+          if (!contentRef.current || contentRef.current.contains(document.activeElement)) return;
+          const preferred = contentRef.current.querySelector<HTMLElement>('[data-dialog-autofocus]');
+          const first = preferred ?? contentRef.current.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
           first?.focus();
         });
       }

@@ -1,0 +1,11 @@
+[Unit]
+Description=Chisa hourly recovery attempt (requires separate writer fencing)
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=60
+Persistent=true
+Unit=chisa-recovery-backup.service
+
+[Install]
+WantedBy=timers.target

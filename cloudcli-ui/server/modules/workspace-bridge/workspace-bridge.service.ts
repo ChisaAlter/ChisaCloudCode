@@ -1,21 +1,21 @@
-import { chownSync, existsSync, lstatSync, realpathSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chownSync, existsSync, lstatSync, realpathSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { isIP } from 'node:net';
 import { Readable } from 'node:stream';
-import { setTimeout as delay } from 'node:timers/promises';
 
 import { createSdkMcpServer, query as sdkQuery, tool } from '@anthropic-ai/claude-agent-sdk';
 import type { SpawnedProcess } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import type { RequestHandler } from 'express';
 
-import type { FileTreeFileSystem, ProjectRuntimeLaunchContext, SessionWorkspaceMode, WorkspaceDescriptor, WorkspaceResolution, WorkspaceGitFileSystem, WorkspaceRuntimePreviewReservation } from '@/shared/index.js';
+import type { AuthenticatedHttpRequest, FileTreeFileSystem, ProjectRuntimeLaunchContext, SessionWorkspaceMode, WorkspaceDescriptor, WorkspaceResolution, WorkspaceGitFileSystem, WorkspaceRuntimePreviewReservation } from '@/shared/index.js';
+import { isAuthSessionActive } from '@/modules/auth/index.js';
 import { prepareProjectRuntime, matchesProjectExtensionPermission as projectPermissionMatches } from '@/modules/project-runtime/index.js';
 import { createWorkspaceChangesService } from '@/modules/workspace-changes/index.js';
-import { ensureCloudWorkspaceBinding, excludeCloudWorkspaceMetadata, executeWorkspaceRuntimePreview, getWorkspaceRuntimeIdentity } from '@/modules/workspace-runtime/index.js';
+import { closeWorkspaceBrokerLease, ensureCloudWorkspaceBinding, excludeCloudWorkspaceMetadata, executeWorkspaceRuntimePreview, getWorkspaceBrokerAdmission, getWorkspaceRuntimeIdentity, readCloudWorkspaceOwner } from '@/modules/workspace-runtime/index.js';
 import { AppError, WORKSPACES_ROOT, getWorkspaceSyncNetwork, isWorkspaceSyncRecoveryOnly } from '@/shared/index.js';
 
 import { ensureReplicaIdentity, readSessionIdentity, recordSessionIdentity, setSessionPublication } from './workspace-identity.service.js';
@@ -23,7 +23,8 @@ import { cloudWriterGateAvailable, claimCloudWriterLease, releaseCloudWriterLeas
 import { readWorkspaceIntegration, beginWorkspaceIntegration, recoverWorkspaceIntegrationLease, clearWorkspaceIntegration } from './workspace-integration-guard.service.js';
 import { copyPinnedSessionSnapshot, isolatedSessionGitRuntime } from './session-snapshot.service.js';
 import { spawnWorkspaceProcess } from './workspace-process.service.js';
-import { sharedSessionGitRuntime } from './session-objects.service.js';
+import { confirmWorkspaceBrokerCleanup } from './workspace-broker-cleanup.service.js';
+import { prepareWorkspaceBrokerGitRuntime } from './workspace-broker-git.service.js';
 import { admitSshWorkspace, assertSshProjectOwner, describeSshWorkspace, resolveSshProjectTarget, runSshWorkspaceOperation, verifySshProject, withSshWorkspaceGitRead, withSshWorkspaceWrite } from './ssh-workspace-execution.service.js';
 import { sshWorkspaceQuery } from './ssh-workspace-query.service.js';
 
@@ -32,7 +33,7 @@ type RpcStats = { size: number; mtime: number; mode: number; dir: boolean; symli
 type RpcResult = Partial<RpcStats> & { ok?: boolean; error?: string; code?: string; localGitRead?: boolean; gitBranch?: boolean; snapshotPinned?: boolean; releasedRunId?: string; bindingEpoch?: string; b64?: string; hash?: string; path?: string; entries?: Array<{ name: string; dir: boolean; stats?: RpcStats }>; results?: RpcResult[]; stdout?: string; stderr?: string; exitCode?: number; truncated?: boolean };
 type FileTreeReadRequest = { op: 'stat' | 'lstat' | 'list' | 'realpath'; path: string; includeStats?: boolean };
 type PendingFileTreeRead = { request: FileTreeReadRequest; resolve(result: RpcResult): void; reject(error: unknown): void };
-type WorkspaceRequestScope = { signal: AbortSignal; deadline: number; id: string; userId: string | number | null };
+type WorkspaceRequestScope = { signal: AbortSignal; deadline: number; id: string; userId: string | number | null; assertAuthActive?: () => void };
 
 const requestScopes = new AsyncLocalStorage<WorkspaceRequestScope>();
 const workspaceChanges = createWorkspaceChangesService();
@@ -57,7 +58,15 @@ export const workspaceRequestScope: RequestHandler = (request, response, next) =
   response.once('finish', finish);
   if (request.aborted || deadline <= Date.now()) cancel();
   const user = (request as typeof request & { user?: { id?: string | number; userId?: string | number } }).user;
-  requestScopes.run({ signal: cancellation.signal, deadline, id: randomUUID(), userId: user?.id ?? user?.userId ?? null }, next);
+  const userId = user?.id ?? user?.userId ?? null;
+  const captured = (request as AuthenticatedHttpRequest).authSession;
+  const authSession = captured ? Object.freeze({ ...captured }) : undefined;
+  const assertAuthActive = authSession ? () => {
+    if (String(userId) !== String(authSession.userId) || !isAuthSessionActive(authSession.id, authSession.userId, authSession.version)) {
+      throw new AppError('Authentication session has ended', { code: 'UNAUTHORIZED', statusCode: 401 });
+    }
+  } : undefined;
+  requestScopes.run({ signal: cancellation.signal, deadline, id: randomUUID(), userId, assertAuthActive }, next);
 };
 
 function operationSignal(signal?: AbortSignal): AbortSignal | undefined {
@@ -151,6 +160,11 @@ function resolveWorkspaceBinding(candidate: string): Binding | null {
 /** The workspace catalog requires explicit selectors for bound project replicas. */
 export function isWorkspaceBound(sourceRoot: string): boolean { return resolveWorkspaceBinding(sourceRoot) !== null; }
 
+/** Provider composition selects private SDK staging or operator slot mapping from the existing trusted binding without creating catalog/session state. Admission still revalidates owner, root and generation before dispatch. */
+export function getWorkspaceAttachmentMode(sourceRoot: string): 'host' | 'slot' {
+  return resolveWorkspaceBinding(sourceRoot)?.vps ? 'slot' : 'host';
+}
+
 function workspacePhase(root: string, binding: Binding | null): WorkspaceDescriptor['phase'] {
   if (workspaceIntegrationIntent(root)) return 'recovery';
   if (binding && isWorkspaceSyncRecoveryOnly(root)) return 'recovery';
@@ -237,10 +251,20 @@ export async function integrateWorkspaceSession(input: { descriptor: WorkspaceDe
     if (state.status !== 'idle') intent = { ...identity, operationId: state.operationId, previewId: state.previewId, expectedSourceRevision: state.sourceRevision, expectedTargetRevision: state.targetRevision };
   }
   const selectedIntent = intent;
-  const integration: IntegrationScope | undefined = selectedIntent ? { intent: selectedIntent, adopted: new Map() } : undefined;
+  const integration: IntegrationScope | undefined = selectedIntent ? { intent: selectedIntent, adopted: new Map(), hostRecoveryOnly: false } : undefined;
+  const retainedWrites = new Map<string, WorkspaceWriteScope>();
   if (integration) {
     for (const root of roots) {
-      if (integrationReservations.has(root) || exclusiveWorkspaceWrites.has(root) || workspaceOperations.has(root) || preparedWorkspaceWorkers.has(root) || preparedPreviewStartups.has(root) || preparedWorkspaceReservations.has(root) || retainedWorkspacePreviews.has(root) || sharedWorkspaceExecutions.has(root) || executionReservations.has(root)) throw new AppError('Workspace is still in use; integration recovery must wait for exact teardown', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+      if (integrationReservations.has(root) || workspaceOperations.has(root) || preparedWorkspaceWorkers.has(root) || preparedPreviewStartups.has(root) || preparedWorkspaceReservations.has(root) || retainedWorkspacePreviews.has(root) || sharedWorkspaceExecutions.has(root) || executionReservations.has(root)) throw new AppError('Workspace is still in use; integration recovery must wait for exact teardown', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+      const retained = exclusiveWorkspaceWrites.get(root);
+      if (retained) {
+        // An interrupted integration retains its durable leases and local fences.
+        // Only its fully drained, inactive scopes may transfer to this exact intent.
+        if (!pending || retained.active || !retained.operationsDrained || !retained.integration || !sameIntegration(retained.integration, pending) || !retained.lease) throw new AppError('Workspace writer teardown is not confirmed for this integration', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+        refreshedBinding(retained.binding);
+        assertCurrentWorkspaceLease(retained.binding, retained.lease);
+        retainedWrites.set(root, retained);
+      }
     }
     for (const root of roots) integrationReservations.set(root, integration);
   }
@@ -297,12 +321,24 @@ export async function integrateWorkspaceSession(input: { descriptor: WorkspaceDe
         // witness still verifies the exact run and process birth on this retry.
         const inactiveLeaseId = active?.id ?? readLease(root === sourceBinding.root ? sourceBinding : sessionBinding)?.id;
         const adopted = recoverWorkspaceIntegrationLease(root, pending, { inactiveLeaseId });
+        const retained = retainedWrites.get(root);
         if (adopted) {
-          if (adopted.owner !== 'claude') throw new AppError('Integration reservation owner changed', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+          if (adopted.owner !== 'claude' || (retained && adopted.id !== retained.lease!.id)) throw new AppError('Integration reservation owner changed', { code: 'WORKSPACE_BUSY', statusCode: 409 });
           const lease: WorkspaceLease = { ...adopted, owner: 'claude' };
           integration.adopted.set(root, lease); activeWorkspaceLeases.set(root, lease);
-        }
+        } else if (retained) throw new AppError('Retained integration reservation disappeared', { code: 'WORKSPACE_BUSY', statusCode: 409 });
       }
+      // Linux recovery permanently fenced the old broker lease. Its exact
+      // native witness permits only the retained host Git journal to resume.
+      if (pending && integration.adopted.size !== roots.length) throw new AppError('Both original integration reservations must remain available for exact recovery', { code: 'WORKSPACE_RECOVERY_REQUIRED', statusCode: 409 });
+      integration.hostRecoveryOnly = process.platform === 'linux' && integration.adopted.size === roots.length;
+      // Both exact witnesses must succeed before either old local fence moves.
+      // integrationReservations remains held across this synchronous handoff.
+      for (const [root, retained] of retainedWrites) {
+        if (exclusiveWorkspaceWrites.get(root) !== retained || retained.active || !retained.operationsDrained) throw new AppError('Integration writer changed during recovery', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+        assertCurrentWorkspaceLease(retained.binding, integration.adopted.get(root)!);
+      }
+      for (const [root, retained] of retainedWrites) if (exclusiveWorkspaceWrites.get(root) === retained) exclusiveWorkspaceWrites.delete(root);
       return execute();
     });
   } finally {
@@ -314,10 +350,7 @@ type GitProcessResult = { code: number | null; stdout: string; stderr: string };
 
 function runGit(args: string[], cwd: string, signal?: AbortSignal): Promise<GitProcessResult> {
   return new Promise((resolve, reject) => {
-    // Workspace Git must not inherit another repository or execute configured hooks.
-    const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.toUpperCase().startsWith('GIT_')));
-    const env = { ...inherited, LC_ALL: 'C', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null' };
-    const child = spawn('git', ['-c', 'safe.directory=' + path.resolve(cwd), '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], signal, windowsHide: true });
+    const child = spawn('git', ['-c', 'safe.directory=' + path.resolve(cwd), ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'], signal, windowsHide: true });
     let stdout = '';
     let stderr = '';
     let failure: Error | undefined;
@@ -372,6 +405,7 @@ async function createSessionWorktree(binding: Binding, sessionId: string, assert
     }
     // A retained legacy workspace can still be edited, but cannot acquire a
     // fabricated baseline from its already-modified files.
+    assertPinned();
     const identity = readSessionIdentity(binding.root, worktreeRoot, sessionId, binding.bindingEpoch);
     if (!identity) recordSessionIdentity({ sourceRoot: binding.root, executionRoot: worktreeRoot, sessionId, bindingEpoch: binding.bindingEpoch, requestedMode: 'isolated', effectiveMode: 'isolated' });
     else if (identity.effectiveMode !== 'isolated') throw new AppError('Session execution mode changed', { code: 'WORKSPACE_SELECTION_MISMATCH', statusCode: 409 });
@@ -381,12 +415,7 @@ async function createSessionWorktree(binding: Binding, sessionId: string, assert
   if (existsSync(worktreeRoot)) throw new AppError('Session worktree path already exists; recover it from Worktrees before starting again', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
 
   const repository = await runGit(['rev-parse', '--show-toplevel'], binding.root, signal);
-  if (repository.code !== 0 || !repository.stdout.trim()) {
-    if (repository.code !== 0 && /fatal: not a git repository(?: \(or any of the parent directories\))?:/i.test(repository.stderr)) return null;
-    throw new AppError('Could not inspect the Git repository for an isolated session', {
-      code: 'WORKSPACE_WORKTREE_CREATE_FAILED', statusCode: 503, details: repository.stderr.trim(),
-    });
-  }
+  if (repository.code !== 0 || !repository.stdout.trim()) return null;
   // A marker on a repository subdirectory would make the sibling worktree
   // path ambiguous. Keep that case on the shared-write path until a
   // repository-root-aware worktree mapping is available.
@@ -403,7 +432,6 @@ async function createSessionWorktree(binding: Binding, sessionId: string, assert
   if (head.code !== 0) return null;
   const branch = `chisa/session-private/${sessionWorktreeName(sessionId)}/work`;
   mkdirSync(parent, { recursive: true, mode: 0o700 });
-  if (!lstatSync(parent).isDirectory() || realpathSync(parent) !== parent) throw new AppError('The session worktree directory is not canonical', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
   if (process.platform !== 'win32' && process.getuid?.() === 0) chownSync(parent, 1000, 1000);
   assertPinned();
   const created = await runGit(['worktree', 'add', '--no-checkout', '-b', branch, worktreeRoot, 'HEAD'], binding.root, signal);
@@ -451,6 +479,7 @@ function virtualPath(binding: Binding, candidate: string): string {
 }
 
 function checkRpcResult(result: RpcResult, statusCode?: number): RpcResult {
+  if (!result || typeof result !== 'object' || Array.isArray(result) || typeof result.ok !== 'boolean') throw new AppError('Workspace worker returned an invalid structured result', { code: 'WORKSPACE_RESPONSE_INVALID', statusCode: 503 });
   if (statusCode !== undefined || result.error) {
     const code = result.code || 'WORKSPACE_OPERATION_FAILED';
     // Filesystem existence errors remain errno errors for existing callers.
@@ -464,9 +493,9 @@ async function desktopControl(_binding: Binding, _request: Record<string, unknow
   throw new AppError('Local workspace synchronization has been removed. Open the project through its cloud account workspace.', { code: 'LOCAL_WORKSPACE_REMOVED', statusCode: 409 });
 }
 
-type WorkspaceLease = { owner: 'claude' | 'sync-needed' | 'pi' | 'sync'; id: string; epoch: string; pid?: number; processStartTime?: string; bootId?: string; mayWrite?: boolean; cleanupPending?: string[]; previews?: string[]; writerGate?: boolean; integrationOperation?: string };
+type WorkspaceLease = { owner: 'claude' | 'sync-needed' | 'pi' | 'sync'; id: string; epoch: string; pid?: number; processStartTime?: string; bootId?: string; pidNamespace?: string; brokerLeaseId?: string; brokerSessionId?: string; brokerPreviewProfileId?: string; mayWrite?: boolean; cleanupPending?: string[]; previews?: string[]; writerGate?: boolean; integrationOperation?: string; integrationPeerChanged?: true };
 
-type IntegrationScope = { intent: NonNullable<ReturnType<typeof readWorkspaceIntegration>>; adopted: Map<string, WorkspaceLease> };
+type IntegrationScope = { intent: NonNullable<ReturnType<typeof readWorkspaceIntegration>>; adopted: Map<string, WorkspaceLease>; hostRecoveryOnly: boolean };
 const integrationScopes = new AsyncLocalStorage<IntegrationScope>();
 const integrationReservations = new Map<string, IntegrationScope>();
 const activeWorkspaceLeases = new Map<string, WorkspaceLease>();
@@ -543,7 +572,7 @@ function saveLease(binding: Binding, lease: WorkspaceLease): void {
 function claimWorkspace(binding: Binding): WorkspaceLease {
   requireWorkspaceAdmission(binding);
   const processStat = process.platform === 'linux' ? readFileSync('/proc/self/stat', 'utf8') : '';
-  const identity = process.platform === 'linux' ? { processStartTime: processStat.slice(processStat.lastIndexOf(')') + 2).trim().split(/\s+/)[19], bootId: readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() } : {};
+  const identity = process.platform === 'linux' ? { processStartTime: processStat.slice(processStat.lastIndexOf(')') + 2).trim().split(/\s+/)[19], bootId: readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(), pidNamespace: readlinkSync('/proc/self/ns/pid') } : {};
   const lease: WorkspaceLease = { owner: 'claude', id: randomUUID(), epoch: binding.bindingEpoch, pid: process.pid, ...identity, mayWrite: false };
   if (!binding.isolated && cloudWriterGateAvailable(binding.root, binding.bindingEpoch)) {
     lease.writerGate = true;
@@ -583,9 +612,8 @@ function claimWorkspace(binding: Binding): WorkspaceLease {
 async function releaseWorkspace(binding: Binding, lease: WorkspaceLease, prepared: boolean): Promise<void> {
   if (workspaceIntegrationIntent(binding.root)) throw new AppError('Session integration has not been confirmed; recover the exact pending operation before resuming synchronization', { code: 'WORKSPACE_RECOVERY_REQUIRED', statusCode: 409 });
   // Retain the barrier after disconnection; desktop recovery checks that the run ended.
-  const latest = readLease(binding);
-  const mayWrite = !prepared || (latest?.id === lease.id ? latest.mayWrite !== false : true);
-  if (!latest || latest.id !== lease.id || latest.epoch !== lease.epoch || latest.owner !== lease.owner || latest.pid !== lease.pid || latest.processStartTime !== lease.processStartTime || latest.bootId !== lease.bootId) throw new AppError('Workspace reservation changed before cleanup', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+  const latest = assertCurrentWorkspaceLease(binding, lease);
+  const mayWrite = !prepared || latest.mayWrite !== false;
   if (latest.previews?.length) throw new AppError('A workspace preview is still running', { code: 'WORKSPACE_BUSY', statusCode: 409 });
   if (lease.writerGate) {
     releaseCloudWriterLease(binding.root, lease);
@@ -596,13 +624,15 @@ async function releaseWorkspace(binding: Binding, lease: WorkspaceLease, prepare
     if (latest.cleanupPending?.length) throw new AppError('Workspace container cleanup failed; remove the retained session worktree before continuing', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
     const jobMarker = path.join(leaseDirectory(binding), 'sync-job.json');
     if (existsSync(jobMarker)) throw new AppError('A remote synchronization command has not confirmed exit; remove the retained session worktree before continuing', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
-    rmSync(leaseDirectory(binding), { recursive: true });
+    if (process.platform === 'linux') releaseCloudWriterLease(binding.root,lease,true);
+    else { await closeBrokerReservation(binding, lease); rmSync(leaseDirectory(binding), { recursive: true }); }
     if (activeWorkspaceLeases.get(binding.root)?.id === lease.id) activeWorkspaceLeases.delete(binding.root);
     return;
   }
-  saveLease(binding, { ...latest, mayWrite, owner: 'sync-needed' });
-  if (activeWorkspaceLeases.get(binding.root)?.id === lease.id) activeWorkspaceLeases.delete(binding.root);
-  if (latest.cleanupPending?.length) throw new AppError('Workspace container cleanup failed; use Sync now to stop it safely before continuing', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
+  await closeBrokerReservation(binding, lease);
+  const closed = assertCurrentWorkspaceLease(binding, lease);
+  saveLease(binding, { ...closed, mayWrite: mayWrite || closed.mayWrite !== false, owner: 'sync-needed' });
+  if (closed.cleanupPending?.length) throw new AppError('Workspace container cleanup failed; use Sync now to stop it safely before continuing', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
   const jobMarker = path.join(leaseDirectory(binding), 'sync-job.json');
   if (existsSync(jobMarker)) throw new AppError('A remote synchronization command has not confirmed exit; use Sync now before continuing', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
   const receipt = await desktopControl(binding, { op: 'sync_end', runId: lease.id, changed: mayWrite }, undefined, true);
@@ -617,7 +647,13 @@ async function releaseWorkspace(binding: Binding, lease: WorkspaceLease, prepare
 
 function assertCurrentWorkspaceLease(binding: Binding, expected: WorkspaceLease | null): WorkspaceLease {
   const lease = readLease(binding);
-  if (!expected || !lease || lease.id !== expected.id || lease.epoch !== expected.epoch || lease.owner !== expected.owner) throw new AppError('Workspace reservation changed during execution', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 409 });
+  if (!expected || !lease || lease.id !== expected.id || lease.epoch !== expected.epoch || lease.owner !== expected.owner
+    || lease.pid !== expected.pid || lease.processStartTime !== expected.processStartTime || lease.bootId !== expected.bootId || lease.pidNamespace !== expected.pidNamespace
+    || (expected.brokerLeaseId !== undefined && lease.brokerLeaseId !== expected.brokerLeaseId)
+    || (expected.brokerSessionId !== undefined && lease.brokerSessionId !== expected.brokerSessionId)
+    || (expected.brokerPreviewProfileId !== undefined && lease.brokerPreviewProfileId !== expected.brokerPreviewProfileId)
+    || lease.integrationPeerChanged !== expected.integrationPeerChanged
+    || (expected.integrationOperation !== undefined && lease.integrationOperation !== expected.integrationOperation)) throw new AppError('Workspace reservation changed during execution', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 409 });
   return lease;
 }
 
@@ -630,39 +666,9 @@ function recordContainer(binding: Binding, name: string, pending: boolean, expec
 }
 
 function checkWorkspaceRequest(): void {
-  requestScopes.getStore()?.signal.throwIfAborted();
-}
-
-async function removeWorkspaceContainer(name: string): Promise<void> {
-  const deadline = Date.now() + 10_000;
-  const signal = AbortSignal.timeout(10_000);
-  const run = (args: string[]) => new Promise<{ code: number | null; output: string; diagnostic: string }>((resolve, reject) => {
-    const child = spawn('docker', args, { stdio: ['ignore', 'pipe', 'pipe'], signal, killSignal: 'SIGKILL' });
-    let output = '';
-    let diagnostic = '';
-    let failure: Error | undefined;
-    child.stdout.on('data', (chunk: Buffer) => { if (output.length < 65_536) output += chunk.toString().slice(0, 65_536 - output.length); });
-    child.stderr.on('data', (chunk: Buffer) => { if (diagnostic.length < 2048) diagnostic += chunk.toString().slice(0, 2048 - diagnostic.length); });
-    child.on('error', error => { failure = error; });
-    child.on('close', code => { if (failure) reject(failure); else resolve({ code, output, diagnostic }); });
-  });
-  for (;;) {
-    const removed = await run(['rm', '--force', name]);
-    if (removed.code === 0) return;
-    // Docker --rm may already be removing this exact container. A successful
-    // daemon query must prove absence; transient presence is retried only within
-    // this cleanup's original budget, while its durable lease remains held.
-    const remaining = await run(['ps', '--all', '--filter', `name=^/${name}$`, '--format', '{{.Names}}']);
-    const present = remaining.output.trim();
-    if (remaining.code === 0 && !present) return;
-    if (remaining.code === 0 && present === name && !signal.aborted && deadline - Date.now() > 100) {
-      await delay(100, undefined, { signal });
-      continue;
-    }
-    const diagnostic = removed.diagnostic + '\n' + remaining.diagnostic;
-    const reason = /permission denied|access is denied/i.test(diagnostic) ? 'permission-denied' : /cannot connect|connection refused|daemon is not running|error during connect/i.test(diagnostic) ? 'daemon-unavailable' : present ? 'container-still-present' : 'daemon-query-failed';
-    throw new AppError('Workspace container cleanup was not confirmed', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503, details: { removeExitCode: removed.code, queryExitCode: remaining.code, reason } });
-  }
+  const scope = requestScopes.getStore();
+  scope?.signal.throwIfAborted();
+  scope?.assertAuthActive?.();
 }
 
 const preparedWorkspaceWorkers = new Map<string, Promise<RpcResult>>();
@@ -678,10 +684,13 @@ async function stopOwnedPreviews(binding: Binding, lease: WorkspaceLease): Promi
   if (assertCurrentWorkspaceLease(binding, lease).previews?.length) throw new AppError('Preview cleanup could not be confirmed', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
 }
 
-function workspaceNetwork(root: string): string {
-  const network = getWorkspaceSyncNetwork(root);
-  if (!network) throw new AppError('The account workspace network is unavailable', { code: 'WORKSPACE_RUNTIME_UNAVAILABLE', statusCode: 503 });
-  return network;
+function workspaceBrokerUser(root: string): string {
+  const identity = getWorkspaceRuntimeIdentity(root);
+  const owner = identity?.userId ?? readCloudWorkspaceOwner(root);
+  if (!owner) throw new AppError('Workspace broker requires a persisted account identity', { code: 'WORKSPACE_BROKER_UNAVAILABLE', statusCode: 503 });
+  const principal = requestScopes.getStore()?.userId;
+  if (principal !== undefined && principal !== null && String(principal) !== owner) throw new AppError('Workspace does not belong to the current account', { code: 'WORKSPACE_FORBIDDEN', statusCode: 403 });
+  return owner;
 }
 
 async function waitPreparedPreviewStartups(root: string): Promise<void> {
@@ -702,6 +711,13 @@ function admittedWorkspaceLease(binding: Binding): WorkspaceLease | null {
   return current;
 }
 
+function assertBrokerExecutionAllowed(root: string): void {
+  const integration = integrationScopes.getStore();
+  if (integration?.hostRecoveryOnly && (root === integration.intent.sourceRoot || root === integration.intent.executionRoot)) {
+    throw new AppError('Recovered integration is restricted to its retained host Git journal', { code: 'WORKSPACE_RECOVERY_REQUIRED', statusCode: 409 });
+  }
+}
+
 function workspaceRequestReadOnly(request: Record<string, unknown>): boolean {
   return ['stat', 'lstat', 'list', 'batch', 'realpath', 'read', 'search', 'grep', 'preview_status'].includes(String(request.op))
     || (request.op === 'exec' && request.readOnly === true);
@@ -713,7 +729,32 @@ function rejectBorrowedPreparedReservation(binding: Binding, lease: WorkspaceLea
   }
 }
 
-function releasePreparedWorkerLease(binding: Binding, lease: WorkspaceLease): void {
+async function closeBrokerReservation(binding: Binding, lease: WorkspaceLease): Promise<void> {
+  const receipt = await closeWorkspaceBrokerLease({ userId: workspaceBrokerUser(binding.root), root: binding.root, leaseId: lease.id, brokerLeaseId: lease.brokerLeaseId, bindingEpoch: lease.epoch, sessionId: lease.brokerSessionId ?? binding.sessionId });
+  if (!receipt || receipt.state !== 'closed' || receipt.legacyReservationId !== lease.id || (lease.brokerLeaseId && receipt.leaseId !== lease.brokerLeaseId) || receipt.root !== binding.root || receipt.bindingEpoch !== lease.epoch || !receipt.quiescent || !receipt.cleanupConfirmed || receipt.resourceInventoryComplete !== true) {
+    throw new AppError('Workspace broker closure was not confirmed', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
+  }
+  const current = assertCurrentWorkspaceLease(binding, lease);
+  if (current.cleanupPending?.length || current.previews?.length || existsSync(path.join(leaseDirectory(binding), 'sync-job.json'))) {
+    throw new AppError('Workspace changed before broker release was committed', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
+  }
+}
+
+async function admitBrokerReservation(binding: Binding, lease: WorkspaceLease, sessionId?: string | null): Promise<void> {
+  const admission = await getWorkspaceBrokerAdmission({ userId: workspaceBrokerUser(binding.root), root: binding.root, leaseId: lease.id, brokerLeaseId: lease.brokerLeaseId, bindingEpoch: lease.epoch, sessionId: lease.brokerSessionId ?? binding.sessionId ?? sessionId ?? undefined });
+  if (admission.legacyReservationId !== lease.id || admission.bindingEpoch !== lease.epoch || admission.root !== binding.root || !admission.leaseId || !admission.sessionId
+    || (lease.brokerLeaseId !== undefined && admission.leaseId !== lease.brokerLeaseId)
+    || (lease.brokerSessionId !== undefined && admission.sessionId !== lease.brokerSessionId)
+    || (lease.brokerPreviewProfileId !== undefined && admission.previewProfileId !== lease.brokerPreviewProfileId)) {
+    throw new AppError('Workspace broker admission changed reservation', { code: 'WORKSPACE_UNAVAILABLE', statusCode: 503 });
+  }
+  const latest = assertCurrentWorkspaceLease(binding, lease);
+  const selectors = { brokerLeaseId: admission.leaseId, brokerSessionId: admission.sessionId, brokerPreviewProfileId: admission.previewProfileId };
+  saveLease(binding, { ...latest, ...selectors });
+  Object.assign(lease, selectors);
+}
+
+async function releasePreparedWorkerLease(binding: Binding, lease: WorkspaceLease): Promise<void> {
   binding = refreshedBinding(binding);
   const current = readLease(binding);
   if (!current || current.id !== lease.id || current.epoch !== lease.epoch || current.owner !== 'claude'
@@ -721,12 +762,13 @@ function releasePreparedWorkerLease(binding: Binding, lease: WorkspaceLease): vo
     throw new AppError('Workspace cleanup was not confirmed after execution', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
   }
   if (current.previews?.length) throw new AppError('Workspace preview is still active', { code: 'WORKSPACE_BUSY', statusCode: 409 });
-  if (lease.writerGate) releaseCloudWriterLease(binding.root, lease);
-  else rmSync(leaseDirectory(binding), { recursive: true });
+  if (lease.writerGate || process.platform === 'linux') releaseCloudWriterLease(binding.root, lease, !lease.writerGate);
+  else { await closeBrokerReservation(binding, lease); rmSync(leaseDirectory(binding), { recursive: true }); }
   if (activeWorkspaceLeases.get(binding.root)?.id === lease.id) activeWorkspaceLeases.delete(binding.root);
 }
 
 async function vpsWorker(binding: Binding, request: Record<string, unknown>, signal?: AbortSignal): Promise<RpcResult> {
+  assertBrokerExecutionAllowed(binding.root);
   signal = operationSignal(signal);
   signal?.throwIfAborted();
   // Queue only prepared execution: native callers already hold their Go lock,
@@ -739,20 +781,20 @@ async function vpsWorker(binding: Binding, request: Record<string, unknown>, sig
     const current = admittedWorkspaceLease(binding);
     rejectBorrowedPreparedReservation(binding, current);
     const readOnly = workspaceRequestReadOnly(request);
-    // Idle snapshot reads do not transfer ownership. A prepared native write
-    // claims synchronously before Docker can yield to a new model run.
-    const lease = current ?? (readOnly ? null : claimWorkspace(binding));
-    if (lease && !readOnly && lease.mayWrite !== true) saveLease(binding, { ...lease, mayWrite: true });
+    // Ordinary file snapshots stay lease-free. Git reads need the exact staging
+    // reservation because isolated metadata is hidden by the broker and staging
+    // cannot be rewritten while another sandbox consumes its fixed mount slot.
+    const gitRead = readOnly && request.op === 'exec' && existsSync(path.join(binding.root,'.git'));
+    const lease = current ?? (readOnly && !gitRead ? null : claimWorkspace(binding));
     if (!current && lease) preparedWorkspaceReservations.set(binding.root, lease.id);
-    try {
-      return await completeWithCleanup(() => runVPSWorker(binding, request, lease, signal), async () => {
-        // Native execution is already prepared; its later explicit sync handles
-        // handback. Calling sync_begin/sync_end here would recurse into its lock.
-        if (!current && lease) releasePreparedWorkerLease(binding, lease);
-      }, signal);
-    } finally {
-      if (!current && lease && preparedWorkspaceReservations.get(binding.root) === lease.id) preparedWorkspaceReservations.delete(binding.root);
-    }
+    return completeWithCleanup(() => runVPSWorker(binding, request, lease, signal), async () => {
+      // Native execution is already prepared; its later explicit sync handles
+      // handback. Keep the local barrier when native/broker cleanup is uncertain.
+      if (!current && lease) {
+        await releasePreparedWorkerLease(binding, lease);
+        if (preparedWorkspaceReservations.get(binding.root) === lease.id) preparedWorkspaceReservations.delete(binding.root);
+      }
+    }, signal);
   });
   preparedWorkspaceWorkers.set(binding.root, operation);
   try { return await operation; }
@@ -760,66 +802,66 @@ async function vpsWorker(binding: Binding, request: Record<string, unknown>, sig
 }
 
 async function runVPSWorker(binding: Binding, request: Record<string, unknown>, lease: WorkspaceLease | null, signal?: AbortSignal): Promise<RpcResult> {
+  assertBrokerExecutionAllowed(binding.root);
   // The kernel enforces read-only commands; command text is never used to guess writes.
   const readOnly = workspaceRequestReadOnly(request);
   const name = 'chisa-rpc-' + randomUUID();
-  let gitRuntime: ReturnType<typeof isolatedSessionGitRuntime> | undefined;
-  if (binding.isolated) {
-    const metadata = JSON.parse(readFileSync(path.join(binding.root, '.chisa-session.json'), 'utf8')) as { sourceRoot: string; branch: string };
-    gitRuntime = isolatedSessionGitRuntime(binding.root, metadata.sourceRoot, metadata.branch, readOnly);
-  } else if (lease) gitRuntime = sharedSessionGitRuntime(binding.root, leaseDirectory(binding), readOnly, true);
-  recordContainer(binding, name, true, lease);
-  const args = ['run', '--rm', '--interactive', '--name', name,
-    '--network=' + (workspaceNetwork(binding.root)),
-    '--label', 'chisa.workspace-root=' + createHash('sha256').update(binding.root).digest('hex'),
-    '--user=1000:1000', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-    '--pids-limit=256', '--memory=2g', '--hostname=workspace', '--workdir=/workspace', '--read-only',
-    '--tmpfs=/tmp:rw,size=512m', '--tmpfs=/home/chisa:rw,size=512m',
-    '--volume', binding.root + (readOnly ? ':/workspace:ro' : ':/workspace:rw'),
-    ...(gitRuntime?.mounts ?? []),
-    ...Object.entries(gitRuntime?.environment ?? {}).map(([key, value]) => `--env=${key}=${value}`),
-    '--mount', 'type=bind,src=/dev/null,dst=/workspace/.chisa-bridge.json,readonly',
-    ...(binding.isolated ? ['--mount', 'type=bind,src=/dev/null,dst=/workspace/.chisa-session.json,readonly', '--mount', `type=bind,src=${path.join(binding.root, '.git')},dst=/workspace/.git,readonly`] : []),
-    '--env=HOME=/home/chisa', '--env=TZ=UTC',
-    'localhost/chisa-workspace:3', 'python3', '/opt/chisa/workspace.py'];
-  return completeWithCleanup(() => new Promise<RpcResult>((resolve, reject) => {
-      const deadline = Math.min(Date.now() + 650_000, requestScopes.getStore()?.deadline ?? Infinity);
-      const timeout = AbortSignal.timeout(Math.max(0, deadline - Date.now()));
-      const cancellation = operationSignal(signal);
-      const child = spawn('docker', args, { stdio: ['pipe', 'pipe', 'pipe'], killSignal: 'SIGKILL', signal: cancellation ? AbortSignal.any([cancellation, timeout]) : timeout });
-      const chunks: Buffer[] = []; let length = 0; let diagnostic = '';
-      let processError: Error | undefined;
-      child.stdout.on('data', (chunk: Buffer) => {
-        length += chunk.length;
-        if (length > 24 * 1024 * 1024) { processError = new Error('Workspace response exceeds its limit'); child.kill('SIGKILL'); }
-        else chunks.push(chunk);
-      });
-      child.stderr.on('data', (chunk: Buffer) => { if (diagnostic.length < 4096) diagnostic += chunk.toString(); });
-      // Wait for the Docker client to exit before removing its container.
-      child.on('error', error => { processError = error; });
-      child.on('close', code => {
-        if (processError) { reject(processError); return; }
-        if (code !== 0) { console.error('[workspace-vps]', diagnostic); reject(new AppError('VPS workspace could not start', { code: 'WORKSPACE_UNAVAILABLE', statusCode: 503 })); return; }
-        try { resolve(checkRpcResult(JSON.parse(Buffer.concat(chunks).toString()) as RpcResult)); }
-        catch (error) { reject(error); }
-      });
-      child.stdin.on('error', () => {});
-      child.stdin.end(JSON.stringify(request));
-    }), async () => {
-      try { await removeWorkspaceContainer(name); if (!readOnly && gitRuntime) { const current = assertCurrentWorkspaceLease(binding, lease); if (!current.cleanupPending?.includes(name)) throw new AppError('Workspace container reservation changed before object publication', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 409 }); await gitRuntime.publish(); } recordContainer(binding, name, false, lease); }
-      catch (error) {
-        let current = readLease(binding);
-        const absent = !current;
-        if (!current) current = claimWorkspace(binding);
-        if (absent || (lease && current.id === lease.id && current.epoch === lease.epoch && current.owner === lease.owner)) saveLease(binding, {
-          ...current, owner: 'sync-needed', cleanupPending: [...new Set([...(current.cleanupPending ?? []), name])],
-        });
-        throw new AppError('Workspace container cleanup failed; recover the cloud runtime before starting another task', {
-          code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503,
-          details: { errorName: error instanceof Error ? error.name : 'Error', transportCode: error && typeof error === 'object' && 'code' in error ? error.code : undefined },
-        });
+  const capturedRequest = requestScopes.getStore();
+  const capturedExecution = executionScopes.getStore();
+  const assertActive = () => {
+    signal?.throwIfAborted();
+    capturedRequest?.signal.throwIfAborted();
+    capturedRequest?.assertAuthActive?.();
+    refreshedBinding(binding);
+    if (capturedExecution?.binding.root === binding.root) assertExactExecution(capturedExecution, name);
+    if (lease) assertCurrentWorkspaceLease(binding, lease);
+  };
+  assertActive();
+  let gitRuntime: Awaited<ReturnType<typeof prepareWorkspaceBrokerGitRuntime>>;
+  if (lease) {
+    await admitBrokerReservation(binding, lease);
+    assertActive();
+    const metadata = binding.isolated ? JSON.parse(readFileSync(path.join(binding.root, '.chisa-session.json'), 'utf8')) as { sourceRoot: string; branch: string } : undefined;
+    gitRuntime = await prepareWorkspaceBrokerGitRuntime({ root: binding.root, sourceRoot: metadata?.sourceRoot, branch: metadata?.branch, leaseDirectory: leaseDirectory(binding), readOnly });
+    try {
+      assertActive();
+      if (!readOnly) saveLease(binding, { ...assertCurrentWorkspaceLease(binding, lease), mayWrite: true });
+    } catch (error) { gitRuntime?.close(); throw error; }
+  }
+  const deadline = Math.min(Date.now() + 650_000, requestScopes.getStore()?.deadline ?? Infinity);
+  const timeout = AbortSignal.timeout(Math.max(0, deadline - Date.now()));
+  const cancellation = operationSignal(signal);
+  const child = await spawnWorkspaceProcess({ command: 'python3', args: ['/opt/chisa/workspace.py'], cwd: binding.root,
+    env: gitRuntime?.environment, signal: cancellation ? AbortSignal.any([cancellation,timeout]) : timeout }, {
+    root: binding.root, name, readOnly, userId: workspaceBrokerUser(binding.root), leaseId: lease?.id, brokerLeaseId: lease?.brokerLeaseId,
+    bindingEpoch: binding.bindingEpoch, sessionId: lease?.brokerSessionId ?? binding.sessionId, purpose: 'worker', gitMounts: gitRuntime?.mounts ?? [],
+    assertActive,
+    record: pending => recordContainer(binding,name,pending,lease),
+    notStarted() { gitRuntime?.close(); },
+    async publish() {
+      if (!readOnly && gitRuntime) {
+        const current = assertCurrentWorkspaceLease(binding,lease);
+        if (!current.cleanupPending?.includes(name)) throw new AppError('Workspace broker reservation changed before object publication', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 409 });
+        await gitRuntime.publish();
+        const published = assertCurrentWorkspaceLease(binding, lease);
+        if (!published.cleanupPending?.includes(name)) throw new AppError('Workspace broker reservation changed after object publication', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 409 });
       }
-    });
+      gitRuntime?.close();
+    },
+  });
+  const chunks: Buffer[] = []; let length = 0; let diagnostic = ''; let responseError: Error | undefined;
+  child.stdout.on('data',(chunk: Buffer) => {
+    length += chunk.length;
+    if (length > 24 * 1024 * 1024) { responseError ??= new AppError('Workspace response exceeds its limit', { code: 'WORKSPACE_RESPONSE_LIMIT', statusCode: 503 }); void child.close().catch(() => {}); }
+    else chunks.push(chunk);
+  });
+  child.stderr.on('data',(chunk: Buffer) => { if (diagnostic.length < 4096) diagnostic += chunk.toString().slice(0,4096-diagnostic.length); });
+  child.stdin.end(JSON.stringify(request));
+  const result = await child.completion;
+  assertActive();
+  if (responseError) throw responseError;
+  if (result.code !== 0) throw new AppError('VPS workspace could not start', { code: 'WORKSPACE_UNAVAILABLE', statusCode: 503, details: { exitCode: result.code, diagnostic } });
+  return checkRpcResult(JSON.parse(Buffer.concat(chunks).toString()) as RpcResult);
 }
 
 function syncTransportBinding(candidate: string, bindingEpoch: string): Binding {
@@ -840,12 +882,15 @@ function syncTransportBinding(candidate: string, bindingEpoch: string): Binding 
 }
 
 /** Startup completion and preview lifetime are separate: only confirmed container removal releases its writer. */
-export function prepareSyncTransportPreview(candidate: string, bindingEpoch: string): WorkspaceRuntimePreviewReservation {
+export async function prepareSyncTransportPreview(candidate: string, bindingEpoch: string): Promise<WorkspaceRuntimePreviewReservation> {
+  const assertAuthActive = executionScopes.getStore()?.assertAuthActive ?? requestScopes.getStore()?.assertAuthActive;
+  if (!assertAuthActive) throw new AppError('Preview requires an authenticated login session', { code: 'PREVIEW_AUTH_REQUIRED', statusCode: 401 });
+  assertAuthActive();
   const binding = syncTransportBinding(candidate, bindingEpoch);
+  assertBrokerExecutionAllowed(binding.root);
   const current = admittedWorkspaceLease(binding);
   rejectBorrowedPreparedReservation(binding, current);
   const lease = current ?? claimWorkspace(binding);
-  if (lease.mayWrite !== true) saveLease(binding, { ...lease, mayWrite: true });
   let settled!: () => void;
   let startupFinished = false;
   let released = false;
@@ -863,19 +908,36 @@ export function prepareSyncTransportPreview(candidate: string, bindingEpoch: str
     startups.delete(startup);
     if (startups.size === 0) preparedPreviewStartups.delete(binding.root);
   };
-  const releaseIdle = () => {
+  const releaseIdle = async () => {
     if (current || released || !startupFinished) return;
     const latest = assertCurrentWorkspaceLease(binding, lease);
     if (latest.previews?.length || latest.cleanupPending?.length) return;
-    releasePreparedWorkerLease(binding, lease);
+    await releasePreparedWorkerLease(binding, lease);
     released = true;
     if (preparedWorkspaceReservations.get(binding.root) === lease.id) preparedWorkspaceReservations.delete(binding.root);
   };
+  try {
+    await admitBrokerReservation(binding, lease);
+    assertAuthActive();
+    refreshedBinding(binding);
+    assertCurrentWorkspaceLease(binding, lease);
+    if (!lease.brokerPreviewProfileId) throw new AppError('Preview requires an operator-owned preview profile', { code: 'WORKSPACE_UNAVAILABLE', statusCode: 503 });
+    const admitted = assertCurrentWorkspaceLease(binding, lease);
+    if (admitted.mayWrite !== true) saveLease(binding, { ...admitted, mayWrite: true });
+  } catch (error) {
+    finishStartup();
+    await releaseIdle();
+    throw error;
+  }
+  const broker = Object.freeze({ leaseId: lease.brokerLeaseId!, legacyReservationId: lease.id, sessionId: lease.brokerSessionId!, profileId: lease.brokerPreviewProfileId });
   return {
     root: binding.root,
+    assertAuthActive,
+    broker,
     ...(lease.writerGate === true && lease.owner === 'claude' && Number.isInteger(lease.pid) && lease.pid! > 0 && lease.processStartTime && lease.bootId
-      ? { lease: Object.freeze({ owner: 'claude' as const, id: lease.id, epoch: lease.epoch, pid: lease.pid!, processStartTime: lease.processStartTime, bootId: lease.bootId, writerGate: true as const }) } : {}),
+      ? { lease: Object.freeze({ owner: 'claude' as const, id: lease.id, epoch: lease.epoch, pid: lease.pid!, processStartTime: lease.processStartTime, bootId: lease.bootId, pidNamespace: lease.pidNamespace, brokerLeaseId: broker.leaseId, brokerSessionId: broker.sessionId, brokerPreviewProfileId: broker.profileId, writerGate: true as const }) } : {}),
     retain(containerId, cleanup) {
+      assertAuthActive();
       if (startupFinished || released) throw new AppError('Preview startup reservation ended', { code: 'WORKSPACE_BUSY', statusCode: 409 });
       refreshedBinding(binding);
       const latest = assertCurrentWorkspaceLease(binding, lease);
@@ -888,6 +950,8 @@ export function prepareSyncTransportPreview(candidate: string, bindingEpoch: str
     async release(containerId, cleanupConfirmed) {
       if (released || removals.get(containerId) === 'released') return;
       refreshedBinding(binding);
+      if (cleanupConfirmed) await confirmWorkspaceBrokerCleanup({ userId: workspaceBrokerUser(binding.root), root: binding.root,
+        leaseId: broker.legacyReservationId, brokerLeaseId: broker.leaseId, bindingEpoch: binding.bindingEpoch, sessionId: broker.sessionId, profileId: broker.profileId, operationId: containerId });
       const latest = assertCurrentWorkspaceLease(binding, lease);
       if (removals.get(containerId) === 'recorded') {
         if (!cleanupConfirmed || latest.previews?.includes(containerId) || latest.cleanupPending?.includes(containerId)) throw new AppError('Preview cleanup changed before writer release', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 409 });
@@ -903,7 +967,7 @@ export function prepareSyncTransportPreview(candidate: string, bindingEpoch: str
         saveLease(binding, { ...latest, previews: latest.previews.filter(id => id !== containerId), cleanupPending: [...pending] });
         removals.set(containerId, 'recorded');
       }
-      releaseIdle();
+      await releaseIdle();
       removals.set(containerId, 'released');
       const previews = retainedWorkspacePreviews.get(binding.root);
       previews?.delete(containerId);
@@ -914,10 +978,12 @@ export function prepareSyncTransportPreview(candidate: string, bindingEpoch: str
       try {
         // Delivery callbacks run outside execution ALS; validate the captured exact lease.
         refreshedBinding(binding);
+        if (cleanupConfirmed && containerId) await confirmWorkspaceBrokerCleanup({ userId: workspaceBrokerUser(binding.root), root: binding.root,
+          leaseId: broker.legacyReservationId, brokerLeaseId: broker.leaseId, bindingEpoch: binding.bindingEpoch, sessionId: broker.sessionId, profileId: broker.profileId, operationId: containerId });
         const latest = assertCurrentWorkspaceLease(binding, lease);
         if (!cleanupConfirmed) saveLease(binding, { ...latest, cleanupPending: [...new Set([...(latest.cleanupPending ?? []), containerId ?? 'preview-startup-unconfirmed'])] });
       } finally { finishStartup(); }
-      if (cleanupConfirmed) releaseIdle();
+      if (cleanupConfirmed) await releaseIdle();
     },
   };
 }
@@ -934,7 +1000,7 @@ export async function executeSyncTransportWorker(candidate: string, bindingEpoch
 
 const workspaceOperations = new Map<string, Promise<unknown>>();
 type GitReadScope = { binding: Binding; cwd: string; native: boolean };
-type WorkspaceWriteScope = { binding: Binding; lease: WorkspaceLease | null; active: boolean; parent?: WorkspaceWriteScope };
+type WorkspaceWriteScope = { binding: Binding; lease: WorkspaceLease | null; active: boolean; operationsDrained: boolean; integration?: IntegrationScope['intent']; parent?: WorkspaceWriteScope };
 const gitReadScopes = new AsyncLocalStorage<GitReadScope>();
 const writeScopes = new AsyncLocalStorage<WorkspaceWriteScope>();
 const exclusiveWorkspaceWrites = new Map<string, WorkspaceWriteScope>();
@@ -1010,40 +1076,51 @@ export async function withWorkspaceWriteOperation<T>(cwd: string, operation: () 
   requireWorkspaceAdmission(binding);
   discardRecoveredExecution(binding);
   if (scopedWriteLease(binding)) return operation();
-  const adopted = integrationScopes.getStore()?.adopted.get(binding.root);
+  const integration = integrationScopes.getStore();
+  const adopted = integration?.adopted.get(binding.root);
   const currentLease = readLease(binding);
   if ((currentLease && (!adopted || currentLease.id !== adopted.id || currentLease.epoch !== adopted.epoch || currentLease.owner !== 'claude' || currentLease.pid !== process.pid)) || exclusiveWorkspaceWrites.has(binding.root) || workspaceOperations.has(binding.root) || preparedWorkspaceWorkers.has(binding.root) || sharedWorkspaceExecutions.has(binding.root) || executionReservations.has(binding.root)) {
     throw new AppError('Workspace is in use by a cloud task; wait for it to finish before changing Git.', { code: 'WORKSPACE_BUSY', statusCode: 409 });
   }
-  const scope: WorkspaceWriteScope = { binding, lease: binding.vps ? adopted ?? claimWorkspace(binding) : null, active: true, parent: writeScopes.getStore() };
+  const scope: WorkspaceWriteScope = { binding, lease: binding.vps ? adopted ?? claimWorkspace(binding) : null, active: true, operationsDrained: false, integration: integrationScopes.getStore()?.intent, parent: writeScopes.getStore() };
   exclusiveWorkspaceWrites.set(binding.root, scope);
   // A recovered integration keeps the original desktop run ID. Its original
   // sync_begin still owns that reservation; do not open a second run.
   let prepared = Boolean(adopted && !binding.isolated && !adopted.writerGate);
-  try {
-    return await completeWithCleanup(async () => {
-      if (binding.vps && !binding.cloud && !binding.isolated && !scope.lease?.writerGate && !adopted) {
-        await desktopControl(binding, { op: 'sync_begin', runId: scope.lease!.id });
-        prepared = true;
-      }
+  return completeWithCleanup(async () => {
+    if (scope.lease && !(adopted && integration?.hostRecoveryOnly)) await admitBrokerReservation(binding, scope.lease);
+    checkWorkspaceRequest();
+    refreshedBinding(binding);
+    if (scope.lease) assertCurrentWorkspaceLease(binding, scope.lease);
+    if (binding.vps && !binding.cloud && !binding.isolated && !scope.lease?.writerGate && !adopted) {
+      await desktopControl(binding, { op: 'sync_begin', runId: scope.lease!.id });
       checkWorkspaceRequest();
       refreshedBinding(binding);
-      // Worktrees performs host Git mutations inside this scope as well as RPC
-      // commands. Treat admission to a mutation scope as write-capable up front.
-      if (scope.lease) saveLease(binding, { ...readLease(binding)!, mayWrite: true });
-      return writeScopes.run(scope, operation);
-    }, async () => {
-      scope.active = false;
-      if (scope.lease) {
-        await preparedWorkspaceWorkers.get(binding.root)?.catch(() => {});
-        await waitPreparedPreviewStartups(binding.root);
-        await stopOwnedPreviews(binding, scope.lease);
-        await releaseWorkspace(binding, scope.lease, prepared);
-      }
-    });
-  } finally {
+      assertCurrentWorkspaceLease(binding, scope.lease);
+      prepared = true;
+    }
+    checkWorkspaceRequest();
+    refreshedBinding(binding);
+    // Host Git mutations are write-capable even before their first RPC.
+    if (scope.lease) saveLease(binding, { ...assertCurrentWorkspaceLease(binding, scope.lease), mayWrite: true });
+    const result = await writeScopes.run(scope, operation);
+    checkWorkspaceRequest();
+    refreshedBinding(binding);
+    if (scope.lease) assertCurrentWorkspaceLease(binding, scope.lease);
+    return result;
+  }, async () => {
+    scope.active = false;
+    if (scope.lease) {
+      await preparedWorkspaceWorkers.get(binding.root)?.catch(() => {});
+      await waitPreparedPreviewStartups(binding.root);
+      await stopOwnedPreviews(binding, scope.lease);
+      const current = assertCurrentWorkspaceLease(binding, scope.lease);
+      if (current.cleanupPending?.length || current.previews?.length || existsSync(path.join(leaseDirectory(binding), 'sync-job.json'))) throw new AppError('Workspace writer cleanup is not confirmed', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 503 });
+      scope.operationsDrained = true;
+      await releaseWorkspace(binding, scope.lease, prepared);
+    }
     if (exclusiveWorkspaceWrites.get(binding.root) === scope) exclusiveWorkspaceWrites.delete(binding.root);
-  }
+  });
 }
 
 function scopedWriteLease(binding: Binding): WorkspaceWriteScope | undefined {
@@ -1051,10 +1128,7 @@ function scopedWriteLease(binding: Binding): WorkspaceWriteScope | undefined {
   while (scope && scope.binding.root !== binding.root) scope = scope.parent;
   if (!scope) return undefined;
   if (!scope.active || exclusiveWorkspaceWrites.get(binding.root) !== scope) throw new AppError('Git operation reservation has ended', { code: 'WORKSPACE_BUSY', statusCode: 409 });
-  if (scope.lease) {
-    const lease = readLease(binding);
-    if (!lease || lease.id !== scope.lease.id || lease.epoch !== scope.lease.epoch || lease.owner !== 'claude') throw new AppError('Git operation reservation changed', { code: 'WORKSPACE_BUSY', statusCode: 409 });
-  }
+  if (scope.lease) assertCurrentWorkspaceLease(binding, scope.lease);
   return scope;
 }
 
@@ -1071,7 +1145,7 @@ function rejectExclusiveWorkspaceWrite(binding: Binding): void {
  * leave this barrier by switching to their retained session worktree first.
  */
 const sharedWorkspaceExecutions = new Map<string, Promise<void>>();
-type ExecutionReservation = { binding: Binding; lease: WorkspaceLease | null; active: boolean; readOnly: boolean; operations: Set<Promise<unknown>>; teardownConfirmed: boolean; assertSelection?: () => void };
+type ExecutionReservation = { binding: Binding; lease: WorkspaceLease | null; active: boolean; readOnly: boolean; operations: Set<Promise<unknown>>; teardownConfirmed: boolean; assertSelection?: () => void; assertActive?: () => void; assertAuthActive?: () => void };
 const executionReservations = new Map<string, ExecutionReservation>();
 const executionScopes = new AsyncLocalStorage<ExecutionReservation>();
 
@@ -1135,21 +1209,31 @@ async function rpc(binding: Binding, request: Record<string, unknown>, signal?: 
   if (scope.readOnly && workspaceRequestWrites(request)) throw new AppError('This task is read-only', { code: 'WORKSPACE_READ_ONLY', statusCode: 409 });
   const operation = executeRpc(binding, request, signal);
   scope.operations.add(operation);
-  try { return await operation; }
+  try { const result = await operation; assertExactExecution(scope); return result; }
   finally { scope.operations.delete(operation); }
 }
 
 async function executeRpc(binding: Binding, request: Record<string, unknown>, signal?: AbortSignal): Promise<RpcResult> {
   signal = operationSignal(signal);
   signal?.throwIfAborted();
+  checkWorkspaceRequest();
   binding = scopedGitReadBinding(binding.root) ?? refreshedBinding(binding);
-  if (binding.ssh) return runSshWorkspaceOperation(resolveSshProjectTarget(binding.root)!, request, signal);
+  assertBrokerExecutionAllowed(binding.root);
+  if (binding.ssh) {
+    const result = await runSshWorkspaceOperation(resolveSshProjectTarget(binding.root)!, request, signal);
+    checkWorkspaceRequest();
+    signal?.throwIfAborted();
+    refreshedBinding(binding);
+    return result;
+  }
   const gitRead = gitReadScopes.getStore();
   if (gitRead?.native && !workspaceRequestWrites(request)) {
     if (!['stat', 'lstat', 'read', 'realpath'].includes(String(request.op))) {
       throw new AppError('This read is not supported by the selected native Git source', { code: 'WORKSPACE_GIT_UNSUPPORTED', statusCode: 409 });
     }
     const result = await desktopControl(binding, { op: 'git_read', action: request.op, path: request.path }, signal);
+    checkWorkspaceRequest();
+    signal?.throwIfAborted();
     scopedGitReadBinding(binding.root);
     return result;
   }
@@ -1158,7 +1242,7 @@ async function executeRpc(binding: Binding, request: Record<string, unknown>, si
   if (!binding.vps) return desktopControl(binding, request, signal);
   if (String(request.op).startsWith('preview_')) {
     if (binding.cloud || binding.isolated || cloudWriterGateAvailable(binding.root, binding.bindingEpoch)) {
-      const reservation = request.op === 'preview_start' ? prepareSyncTransportPreview(binding.root, binding.bindingEpoch) : undefined;
+      const reservation = request.op === 'preview_start' ? await prepareSyncTransportPreview(binding.root, binding.bindingEpoch) : undefined;
       return executeWorkspaceRuntimePreview(binding.root, binding.bindingEpoch, request, reservation, signal);
     }
     if (request.op === 'preview_status') return desktopControl(binding, request, signal);
@@ -1170,7 +1254,7 @@ async function executeRpc(binding: Binding, request: Record<string, unknown>, si
   requireExecutionAccess(binding);
   const scope = scopedWriteLease(binding);
   if (scope?.lease) {
-    const current = readLease(binding)!;
+    const current = assertCurrentWorkspaceLease(binding, scope.lease);
     if (current.mayWrite !== true) saveLease(binding, { ...current, mayWrite: true });
     return String(request.op).startsWith('preview_') ? desktopControl(binding, request, signal) : runVPSWorker(binding, request, scope.lease, signal);
   }
@@ -1188,16 +1272,26 @@ async function executeRpc(binding: Binding, request: Record<string, unknown>, si
     const lease = current ?? claimWorkspace(binding);
     let prepared = Boolean(current);
     return completeWithCleanup(async () => {
+      await admitBrokerReservation(binding, lease);
+      signal?.throwIfAborted();
+      checkWorkspaceRequest();
+      binding = refreshedBinding(binding);
+      assertCurrentWorkspaceLease(binding, lease);
       if (!current && !binding.cloud && !binding.isolated && !lease.writerGate) {
         await desktopControl(binding, { op: 'sync_begin', runId: lease.id }, signal);
+        signal?.throwIfAborted();
+        checkWorkspaceRequest();
+        binding = refreshedBinding(binding);
+        assertCurrentWorkspaceLease(binding, lease);
         prepared = true;
       }
       signal?.throwIfAborted();
+      checkWorkspaceRequest();
       binding = refreshedBinding(binding);
-      const readOnly = ['stat', 'lstat', 'list', 'batch', 'realpath', 'read', 'search', 'grep', 'preview_status'].includes(String(request.op))
-        || (request.op === 'exec' && request.readOnly === true);
+      const readOnly = workspaceRequestReadOnly(request);
       // Mark before execution so cancellation or a failed write still follows full recovery.
-      if (!readOnly && lease.mayWrite !== true) saveLease(binding, { ...readLease(binding)!, mayWrite: true });
+      const latest = assertCurrentWorkspaceLease(binding, lease);
+      if (!readOnly && latest.mayWrite !== true) saveLease(binding, { ...latest, mayWrite: true });
       return String(request.op).startsWith('preview_') ? await desktopControl(binding, request, signal) : await vpsWorker(binding, request, signal);
     }, async () => {
       if (!current) {
@@ -1217,6 +1311,7 @@ async function fileCall(candidate: string, op: string, extra: Record<string, unk
   const binding = scopedGitReadBinding(candidate) ?? resolveWorkspaceBinding(candidate);
   if (!binding) return null;
   const result = await rpc(binding, { op, path: virtualPath(binding, candidate), ...extra });
+  checkWorkspaceRequest();
   scopedGitReadBinding(candidate);
   return result;
 }
@@ -1231,6 +1326,8 @@ export async function runWorkspaceCommand(cwd: string, command: string, args: st
     const argv = [command, ...(command === 'git' ? ['--literal-pathspecs', ...(options.readOnly ? ['--no-optional-locks'] : [])] : []),
       ...args.map(arg => arg === binding.root || arg.startsWith(binding.root + path.sep) ? virtualPath(binding, arg) : arg)];
     const result = await runSshWorkspaceOperation(target, { op: 'exec', path: virtualPath(binding, cwd), argv, timeoutSeconds: options.timeoutSeconds ?? 60 }, workspaceRequestSignal());
+    checkWorkspaceRequest();
+    refreshedBinding(binding);
     if (command === 'git' && args[0] === 'rev-parse' && args[1] === '--show-toplevel' && result.exitCode === 0) {
       const root = result.stdout?.trim().replace(/\\/g, '/').replace(/\/$/, '');
       const expected = target.rootPath.replace(/\\/g, '/').replace(/\/$/, '');
@@ -1420,9 +1517,14 @@ function workspaceRequestWrites(request: Record<string, unknown>): boolean {
   return !READ_ONLY_WORKSPACE_OPS.has(String(request.op));
 }
 
-function workspaceTools(binding: Binding, signal?: AbortSignal, readOnlySession = false, context?: Awaited<ReturnType<typeof prepareProjectRuntime>>) {
+function workspaceTools(binding: Binding, signal?: AbortSignal, readOnlySession = false, context?: Awaited<ReturnType<typeof prepareProjectRuntime>>, assertCurrent?: () => void) {
   const reservation = executionReservations.get(binding.root);
-  const call = (request: Record<string, unknown>) => reservation ? executionScopes.run(reservation, () => rpc(binding, request, signal)) : rpc(binding, request, signal);
+  const call = async (request: Record<string, unknown>) => {
+    assertCurrent?.();
+    const response = await (reservation ? executionScopes.run(reservation, () => rpc(binding, request, signal)) : rpc(binding, request, signal));
+    assertCurrent?.();
+    return response;
+  };
   async function result(request: Record<string, unknown>) {
     if (readOnlySession && workspaceRequestWrites(request)) {
       return { isError: true, content: [{ type: 'text' as const, text: '当前会话是只读检查模式，不能修改项目文件、运行写入命令或控制预览。' }] };
@@ -1436,7 +1538,9 @@ function workspaceTools(binding: Binding, signal?: AbortSignal, readOnlySession 
       try {
         const r = await call({ op: 'read', ...a });
         const content = a.encoding === 'base64' ? r.b64 : new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(r.b64!, 'base64'));
-        return { content: [{ type: 'text' as const, text: JSON.stringify({ content, encoding: a.encoding, hash: r.hash, ...(context ? { projectRules: await context.rulesForPath(a.path) } : {}) }) }] };
+        const projectRules = context ? await context.rulesForPath(a.path) : undefined;
+        assertCurrent?.();
+        return { content: [{ type: 'text' as const, text: JSON.stringify({ content, encoding: a.encoding, hash: r.hash, ...(context ? { projectRules } : {}) }) }] };
       } catch (e) { return { isError: true, content: [{ type: 'text' as const, text: e instanceof Error ? e.message : 'Read failed' }] }; }
     }),
     tool('write_file', 'Write a UTF-8 file. Existing files require the hash from read_file; new files require null.', { path: z.string(), content: z.string(), expectedHash: z.string().nullable() }, a => result({ op: 'write', path: a.path, b64: Buffer.from(a.content).toString('base64'), expectedHash: a.expectedHash })),
@@ -1448,7 +1552,7 @@ function workspaceTools(binding: Binding, signal?: AbortSignal, readOnlySession 
   ] });
 }
 
-type WorkspaceExecutionOptions = { cwd: string; sessionId?: string | null; workspaceMode?: SessionWorkspaceMode; readOnly?: boolean; signal?: AbortSignal; directExecution?: boolean; expectedWorkspace?: WorkspaceDescriptor };
+type WorkspaceExecutionOptions = { cwd: string; sessionId?: string | null; workspaceMode?: SessionWorkspaceMode; readOnly?: boolean; signal?: AbortSignal; directExecution?: boolean; expectedWorkspace?: WorkspaceDescriptor; assertActive?: () => void; assertAuthActive?: () => void };
 
 function checkExecutionRoot(candidate: string): void {
   const actual = existsSync(candidate) ? realpathSync(candidate) : path.resolve(candidate);
@@ -1456,18 +1560,21 @@ function checkExecutionRoot(candidate: string): void {
   if (actual === boundary) throw new AppError('Select a project before starting a task; the workspace root contains all projects', { code: 'WORKSPACE_PROJECT_REQUIRED', statusCode: 400 });
 }
 
-function assertExactExecution(reservation: ExecutionReservation): void {
+function assertExactExecution(reservation: ExecutionReservation, operationId?: string): void {
+  reservation.assertActive?.();
   reservation.assertSelection?.();
   requireWorkspaceAdmission(reservation.binding);
   refreshedBinding(reservation.binding);
   if (!reservation.active || executionReservations.get(reservation.binding.root) !== reservation) throw new AppError('Workspace execution reservation changed', { code: 'WORKSPACE_BUSY', statusCode: 409 });
   if (reservation.lease) {
     const current = readLease(reservation.binding);
-    if (!current || current.id !== reservation.lease.id || current.epoch !== reservation.lease.epoch || current.owner !== 'claude' || current.cleanupPending?.length) throw new AppError('Workspace execution lease changed', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+    if (!current || current.id !== reservation.lease.id || current.epoch !== reservation.lease.epoch || current.owner !== 'claude' || current.cleanupPending?.some(id => id !== operationId)) throw new AppError('Workspace execution lease changed', { code: 'WORKSPACE_BUSY', statusCode: 409 });
+    assertCurrentWorkspaceLease(reservation.binding, reservation.lease);
   }
 }
 
-async function migrateSessionBranch(binding: Binding, sessionId: string, signal?: AbortSignal): Promise<void> {
+async function migrateSessionBranch(binding: Binding, sessionId: string, assertPinned: () => void, signal?: AbortSignal): Promise<void> {
+  assertPinned();
   const file = path.join(binding.root, '.chisa-session.json');
   const metadata = JSON.parse(readFileSync(file, 'utf8')) as { sourceRoot: string; branch: string; [key: string]: unknown };
   const branch = `chisa/session-private/${sessionWorktreeName(sessionId)}/work`;
@@ -1475,17 +1582,22 @@ async function migrateSessionBranch(binding: Binding, sessionId: string, signal?
   const old = metadata.branch;
   if (old !== `chisa/session/${sessionWorktreeName(sessionId)}`) throw new AppError('The retained session branch identity changed', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
   const result = await runGit(['symbolic-ref', '--short', 'HEAD'], binding.root, signal);
+  assertPinned();
   if (result.code !== 0 || result.stdout.trim() !== old) throw new AppError('The retained session branch was changed manually; recover it before continuing', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
   const tip = await runGit(['rev-parse', 'HEAD'], binding.root, signal);
+  assertPinned();
   if (tip.code !== 0) throw new AppError('The retained session commit cannot be read', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
   // Keep the old ref as a recovery backup. update-ref's empty old value is CAS:
   // never replace another ref merely because a previous migration was stopped.
   const created = await runGit(['update-ref', `refs/heads/${branch}`, tip.stdout.trim(), ''], binding.root, signal);
+  assertPinned();
   if (created.code !== 0) {
     const existing = await runGit(['rev-parse', `refs/heads/${branch}`], binding.root, signal);
+    assertPinned();
     if (existing.code !== 0 || existing.stdout.trim() !== tip.stdout.trim()) throw new AppError('A conflicting private session branch already exists', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
   }
   const moved = await runGit(['symbolic-ref', 'HEAD', `refs/heads/${branch}`], binding.root, signal);
+  assertPinned();
   if (moved.code !== 0) throw new AppError('The session branch migration was not confirmed', { code: 'WORKSPACE_WORKTREE_CONFLICT', statusCode: 409 });
   writeFileSync(file + '.tmp', JSON.stringify({ ...metadata, branch }), { mode: 0o600 });
   renameSync(file + '.tmp', file);
@@ -1494,7 +1606,10 @@ async function migrateSessionBranch(binding: Binding, sessionId: string, signal?
 /** Providers use this admission before launch and await close after actual process/tool teardown. */
 export async function admitWorkspaceExecution(input: WorkspaceExecutionOptions) {
   const signal = operationSignal(input.signal);
-  signal?.throwIfAborted();
+  const activity = input.assertActive;
+  const assertAuthActive = input.assertAuthActive ?? requestScopes.getStore()?.assertAuthActive;
+  const assertActive = () => { signal?.throwIfAborted(); activity?.(); assertAuthActive?.(); };
+  assertActive();
   checkExecutionRoot(input.cwd);
   const ssh = resolveSshProjectTarget(input.cwd);
   if (ssh) {
@@ -1506,9 +1621,11 @@ export async function admitWorkspaceExecution(input: WorkspaceExecutionOptions) 
     if (input.sessionId) describeSshWorkspace(ssh, input.sessionId);
     const admission = await admitSshWorkspace(ssh, input.readOnly === true, signal);
     try {
+      assertActive();
       // Reserve before the probe so background Git cannot occupy the helper or
       // writer between verification and the first Claude turn.
       await verifySshProject(ssh, signal);
+      assertActive();
       if (input.expectedWorkspace) assertWorkspaceDescriptor(input.expectedWorkspace);
       if (input.sessionId) describeSshWorkspace(ssh, input.sessionId);
       signal?.throwIfAborted();
@@ -1516,13 +1633,22 @@ export async function admitWorkspaceExecution(input: WorkspaceExecutionOptions) 
     } catch (error) { await admission.close(); throw error; }
     return { ...admission, sourceCwd: ssh.anchorPath, cwd: ssh.anchorPath, sourceRoot: ssh.anchorPath, executionRoot: ssh.anchorPath,
       bound: true, isolated: false, readOnly: input.readOnly === true, bindingKind: 'ssh' as const,
-      execute: (request: Record<string, unknown>, cancellation?: AbortSignal) => admission.run(() => runSshWorkspaceOperation(ssh, request, operationSignal(cancellation ?? signal))),
+      assertCurrent() { assertActive(); admission.assertCurrent(); },
+      execute: (request: Record<string, unknown>, cancellation?: AbortSignal) => admission.run(async () => {
+        assertActive();
+        admission.assertCurrent();
+        const result = await runSshWorkspaceOperation(ssh, request, operationSignal(cancellation ?? signal));
+        assertActive();
+        admission.assertCurrent();
+        return result;
+      }),
       async spawnProcess(_processInput: Parameters<typeof spawnWorkspaceProcess>[0]): Promise<Awaited<ReturnType<typeof spawnWorkspaceProcess>>> { throw new AppError('SSH 项目不支持此提供商进程。', { code: 'WORKSPACE_PROVIDER_UNSUPPORTED', statusCode: 409 }); },
       revoke() {},
     };
   }
   ensureCloudWorkspaceBinding(input.cwd);
   let binding = resolveWorkspaceBinding(input.cwd);
+  if (binding) assertBrokerExecutionAllowed(binding.root);
   const readOnly = input.readOnly === true;
   const sourceCwd = input.cwd;
   const expected = input.expectedWorkspace;
@@ -1564,16 +1690,19 @@ export async function admitWorkspaceExecution(input: WorkspaceExecutionOptions) 
     discardRecoveredExecution(selected);
     rejectExclusiveWorkspaceWrite(selected);
     if (executionReservations.has(selected.root) || workspaceOperations.has(selected.root) || preparedWorkspaceWorkers.has(selected.root) || preparedPreviewStartups.has(selected.root)) throw new AppError('Workspace is in use by a task or operation', { code: 'WORKSPACE_BUSY', statusCode: 409 });
-    const next: ExecutionReservation = { binding: selected, lease: selected.vps ? claimWorkspace(selected) : null, active: true, readOnly, operations: new Set(), teardownConfirmed: false };
+    const next: ExecutionReservation = { binding: selected, lease: selected.vps ? claimWorkspace(selected) : null, active: true, readOnly, operations: new Set(), teardownConfirmed: false, assertActive, assertAuthActive };
     executionReservations.set(selected.root, next);
     return next;
   };
   const finish = async (owned: ExecutionReservation, synced: boolean) => {
     // Revoke new tools first, then wait every already admitted process/container.
     owned.active = false;
-    await Promise.allSettled([...owned.operations]);
-    await workspaceOperations.get(owned.binding.root)?.catch(() => {});
-    await preparedWorkspaceWorkers.get(owned.binding.root)?.catch(() => {});
+    const results = await Promise.allSettled([...owned.operations,
+      ...(workspaceOperations.has(owned.binding.root) ? [workspaceOperations.get(owned.binding.root)!] : []),
+      ...(preparedWorkspaceWorkers.has(owned.binding.root) ? [preparedWorkspaceWorkers.get(owned.binding.root)!] : []),
+    ]);
+    const uncertain = results.find(result => result.status === 'rejected' && (!owned.lease || result.reason?.workspaceCleanupError || result.reason?.code === 'WORKSPACE_CLEANUP_FAILED'));
+    if (uncertain?.status === 'rejected') throw uncertain.reason;
     await waitPreparedPreviewStartups(owned.binding.root);
     if (owned.lease) await stopOwnedPreviews(owned.binding, owned.lease);
     owned.teardownConfirmed = true;
@@ -1588,10 +1717,13 @@ export async function admitWorkspaceExecution(input: WorkspaceExecutionOptions) 
         binding = (await createSessionWorktree(binding, input.sessionId, assertSelection, signal))!;
       } else {
         sourceReservation = reserve(binding);
+        if (sourceReservation.lease) await admitBrokerReservation(binding, sourceReservation.lease, input.sessionId);
+        assertExactExecution(sourceReservation);
         // Even a lost/failed acknowledgement follows sync_end below; prepared
         // stays false until success so recovery treats the snapshot as possibly dirty.
         if (!binding.cloud && !sourceReservation.lease?.writerGate) {
           const result = await desktopControl(binding, { op: 'sync_begin', runId: sourceReservation.lease!.id, snapshot: true }, signal);
+          assertExactExecution(sourceReservation);
           if (result.snapshotPinned !== true || result.bindingEpoch !== binding.bindingEpoch) throw new AppError('Update the desktop client before creating an isolated workspace snapshot', { code: 'WORKSPACE_SNAPSHOT_UNSUPPORTED', statusCode: 409 });
         }
         prepared = true;
@@ -1602,7 +1734,10 @@ export async function admitWorkspaceExecution(input: WorkspaceExecutionOptions) 
           const previous = sourceReservation;
           binding = isolated;
           reservation = reserve(binding);
+          if (reservation.lease) await admitBrokerReservation(binding, reservation.lease, input.sessionId);
+          assertExactExecution(reservation);
           await finish(previous, true);
+          assertExactExecution(reservation);
           sourceReservation = undefined;
           prepared = false;
         } else {
@@ -1615,19 +1750,24 @@ export async function admitWorkspaceExecution(input: WorkspaceExecutionOptions) 
     if (binding && !reservation) {
       if (!binding.vps) releaseLocal = await acquireSharedWorkspaceExecution(binding.root, signal);
       reservation = reserve(binding);
+      if (reservation.lease) await admitBrokerReservation(binding, reservation.lease, input.sessionId);
+      assertExactExecution(reservation);
       if (binding.vps && !binding.cloud && !binding.isolated && !reservation.lease?.writerGate) {
         await desktopControl(binding, { op: 'sync_begin', runId: reservation.lease!.id, ...(readOnly ? { readOnly: true } : {}) }, signal);
+        assertExactExecution(reservation);
         prepared = true;
       }
     }
     if (binding?.isolated && reservation) {
-      await migrateSessionBranch(binding, binding.sessionId!, signal);
+      const retained = reservation;
+      await migrateSessionBranch(binding, binding.sessionId!, () => assertExactExecution(retained), signal);
+      assertExactExecution(reservation);
       const metadata = JSON.parse(readFileSync(path.join(binding.root, '.chisa-session.json'), 'utf8')) as { sourceRoot: string; branch: string };
       isolatedSessionGitRuntime(binding.root, metadata.sourceRoot, metadata.branch, true);
     }
     if (reservation) {
       assertExactExecution(reservation);
-      if (input.directExecution && !readOnly && reservation.lease) saveLease(binding!, { ...readLease(binding!)!, mayWrite: true });
+      if (input.directExecution && !readOnly && reservation.lease) saveLease(binding!, { ...assertCurrentWorkspaceLease(binding!, reservation.lease), mayWrite: true });
     }
     assertSelection();
     if (expected?.kind === 'session' && (binding?.root ?? path.resolve(input.cwd)) !== expected.rootPath) throw selectionMismatch();
@@ -1680,28 +1820,55 @@ export async function admitWorkspaceExecution(input: WorkspaceExecutionOptions) 
         const combined = signal && processInput.signal ? AbortSignal.any([signal, processInput.signal]) : signal ?? processInput.signal;
         const selected = owned.binding;
         const name = 'chisa-rpc-' + randomUUID();
-        let gitRuntime: ReturnType<typeof isolatedSessionGitRuntime> | undefined;
-        if (selected.isolated) {
-          const metadata = JSON.parse(readFileSync(path.join(selected.root, '.chisa-session.json'), 'utf8')) as { sourceRoot: string; branch: string };
-          gitRuntime = isolatedSessionGitRuntime(selected.root, metadata.sourceRoot, metadata.branch, readOnly);
-        } else gitRuntime = sharedSessionGitRuntime(selected.root, leaseDirectory(selected), readOnly);
-        if (!readOnly) saveLease(selected, { ...readLease(selected)!, mayWrite: true });
-        const child = spawnWorkspaceProcess({ ...processInput, env: { ...processInput.env, ...gitRuntime?.environment }, signal: combined }, {
-          root: selected.root, sourceRoot, workspacesRoot: realpathSync(WORKSPACES_ROOT), readOnly,
-          network: workspaceNetwork(selected.root), name, gitMounts: gitRuntime?.mounts ?? [], isolated: selected.isolated,
-          record: pending => recordContainer(selected, name, pending, owned.lease),
-          async remove() { await removeWorkspaceContainer(name); if (!readOnly && gitRuntime) { const current = assertCurrentWorkspaceLease(selected, owned.lease); if (!current.cleanupPending?.includes(name)) throw new AppError('Workspace container reservation changed before object publication', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 409 }); await gitRuntime.publish(); } },
-        });
-        owned.operations.add(child.completion);
-        void child.completion.finally(() => owned.operations.delete(child.completion)).catch(() => {});
-        return child;
+        let settle!: () => void;
+        // close() must see startup before the first await (Git snapshot/grant/
+        // run). A failed startup still settles this waiter; its exact pending
+        // cleanup remains in the lease and prevents premature release.
+        const startup = new Promise<void>(resolve => { settle = resolve; });
+        owned.operations.add(startup);
+        let gitRuntime: Awaited<ReturnType<typeof prepareWorkspaceBrokerGitRuntime>>;
+        try {
+          const metadata = selected.isolated ? JSON.parse(readFileSync(path.join(selected.root, '.chisa-session.json'), 'utf8')) as { sourceRoot: string; branch: string } : undefined;
+          gitRuntime = await prepareWorkspaceBrokerGitRuntime({ root: selected.root, sourceRoot: metadata?.sourceRoot, branch: metadata?.branch, leaseDirectory: leaseDirectory(selected), readOnly });
+          assertExactExecution(owned);
+          if (!readOnly) saveLease(selected, { ...assertCurrentWorkspaceLease(selected, owned.lease), mayWrite: true });
+          const child = await spawnWorkspaceProcess({ ...processInput, env: { ...processInput.env, ...gitRuntime?.environment }, signal: combined }, {
+            root: selected.root, readOnly, name, userId: workspaceBrokerUser(selected.root), leaseId: owned.lease.id, brokerLeaseId: owned.lease.brokerLeaseId,
+            bindingEpoch: selected.bindingEpoch, sessionId: owned.lease.brokerSessionId ?? selected.sessionId ?? input.sessionId ?? undefined,
+            purpose: processInput.runtimeMounts?.length ? 'provider' : 'shell', gitMounts: gitRuntime?.mounts ?? [],
+            assertActive: () => assertExactExecution(owned, name),
+            record: pending => recordContainer(selected, name, pending, owned.lease),
+            notStarted() { gitRuntime?.close(); },
+            async publish() {
+              if (!readOnly && gitRuntime) {
+                const current = assertCurrentWorkspaceLease(selected, owned.lease);
+                if (!current.cleanupPending?.includes(name)) throw new AppError('Workspace broker reservation changed before object publication', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 409 });
+                await gitRuntime.publish();
+                const published = assertCurrentWorkspaceLease(selected, owned.lease);
+                if (!published.cleanupPending?.includes(name)) throw new AppError('Workspace broker reservation changed after object publication', { code: 'WORKSPACE_CLEANUP_FAILED', statusCode: 409 });
+              }
+              gitRuntime?.close();
+            },
+          });
+          owned.operations.add(child.completion);
+          void child.completion.finally(() => owned.operations.delete(child.completion)).catch(() => {});
+          try { assertExactExecution(owned, name); }
+          catch (error) { try { await child.close(); } catch (cleanup) { throw combinedError(error, cleanup); } throw error; }
+          return child;
+        } catch (error) {
+          // A failure before broker dispatch may return this local staging slot;
+          // any recorded/uncertain operation keeps its slot for trusted recovery.
+          if (!readLease(selected)?.cleanupPending?.includes(name)) gitRuntime?.close();
+          throw error;
+        } finally { owned.operations.delete(startup); settle(); }
       },
       revoke() { if (owned) owned.active = false; },
       close() {
         return closePromise ??= (async () => {
-          try { if (owned) await finish(owned, prepared); }
-          catch (error) { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { workspaceCleanupError: true }); }
-          finally { releaseLocal?.(); }
+          try {
+            if (owned) await finish(owned, prepared);
+            releaseLocal?.();
+          } catch (error) { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { workspaceCleanupError: true }); }
         })();
       },
     };
@@ -1709,7 +1876,7 @@ export async function admitWorkspaceExecution(input: WorkspaceExecutionOptions) 
     let cleanup: unknown;
     try { if (reservation) await finish(reservation, prepared); } catch (failure) { cleanup = failure; }
     try { if (sourceReservation) await finish(sourceReservation, prepared); } catch (failure) { cleanup ??= failure; }
-    releaseLocal?.();
+    if (!cleanup) releaseLocal?.();
     if (cleanup) throw combinedError(error, cleanup);
     if (error instanceof Error && 'code' in error && error.code === 'WORKSPACE_BUSY') Object.assign(error, { workspaceAdmissionRejected: true });
     throw error;
@@ -1725,8 +1892,15 @@ export function workspaceQuery(input: Parameters<typeof sdkQuery>[0]): ReturnTyp
     ensureCloudWorkspaceBinding(input.options.cwd);
   }
   let binding = input.options?.cwd ? resolveWorkspaceBinding(input.options.cwd) : null;
+  if (binding) assertBrokerExecutionAllowed(binding.root);
   const options = input.options ?? {};
-  const sessionOptions = options as typeof options & { chisaSessionId?: unknown; sessionId?: unknown; workspaceMode?: unknown; chisaWorkspaceDescriptor?: WorkspaceDescriptor; chisaPrepareLaunch?: (cwd: string) => Promise<void>; chisaProjectRuntime?: ProjectRuntimeLaunchContext };
+  const sessionOptions = options as typeof options & { chisaSessionId?: unknown; sessionId?: unknown; workspaceMode?: unknown; chisaWorkspaceDescriptor?: WorkspaceDescriptor; chisaPrepareLaunch?: (cwd: string) => Promise<void>; chisaAssertActive?: () => void; chisaAssertAuthActive?: () => void; chisaProjectRuntime?: ProjectRuntimeLaunchContext };
+  // Authenticated server composition owns this closure; never forward it to the SDK.
+  // SSH consumes its own closure above, before this non-SSH path mutates options.
+  const assertActive = sessionOptions.chisaAssertActive;
+  delete sessionOptions.chisaAssertActive;
+  const assertAuthActive = sessionOptions.chisaAssertAuthActive;
+  delete sessionOptions.chisaAssertAuthActive;
   const launch = sessionOptions.chisaProjectRuntime;
   delete sessionOptions.chisaProjectRuntime;
   // Provider-only preparation runs after admission has selected the real execution cwd, never inside the SDK.
@@ -1746,9 +1920,15 @@ export function workspaceQuery(input: Parameters<typeof sdkQuery>[0]): ReturnTyp
   const cancelFromCaller = () => cancellation.abort(externalSignal?.reason);
   externalSignal?.addEventListener('abort', cancelFromCaller, { once: true });
   if (externalSignal?.aborted) cancelFromCaller();
+  let execution: Awaited<ReturnType<typeof admitWorkspaceExecution>> | undefined;
+  const assertCurrent = () => {
+    cancellation.signal.throwIfAborted();
+    assertActive?.();
+    execution?.assertCurrent();
+  };
   if (binding) {
     options.tools = ['AskUserQuestion', 'ExitPlanMode', 'TodoWrite'];
-    options.mcpServers = { workspace: workspaceTools(binding, cancellation.signal, readOnlySession) };
+    options.mcpServers = { workspace: workspaceTools(binding, cancellation.signal, readOnlySession, undefined, assertCurrent) };
     options.strictMcpConfig = true;
     options.allowedTools = ['list_files', 'read_file', 'write_file', 'search_files', 'run_command', 'start_preview', 'preview_status', 'stop_preview'].map(name => `mcp__workspace__${name}`);
     options.settingSources = [];
@@ -1760,10 +1940,8 @@ export function workspaceQuery(input: Parameters<typeof sdkQuery>[0]): ReturnTyp
   }
   const spawnProcess = options.spawnClaudeCodeProcess;
   let processExit: Promise<void> | undefined;
-  let execution: Awaited<ReturnType<typeof admitWorkspaceExecution>> | undefined;
   options.spawnClaudeCodeProcess = spawnOptions => {
-    cancellation.signal.throwIfAborted();
-    execution?.assertCurrent();
+    assertCurrent();
     if (spawnProcess) {
       const child: SpawnedProcess = spawnProcess(spawnOptions);
       processExit = new Promise<void>((resolve, reject) => {
@@ -1795,19 +1973,21 @@ export function workspaceQuery(input: Parameters<typeof sdkQuery>[0]): ReturnTyp
     let cleanupFailure: unknown;
     let cleanupFailed = false;
     try {
-      cancellation.signal.throwIfAborted();
+      assertCurrent();
       if (options.cwd) {
-        execution = await admitWorkspaceExecution({ cwd: options.cwd, sessionId, workspaceMode, readOnly: readOnlySession, signal: cancellation.signal, expectedWorkspace });
+        execution = await admitWorkspaceExecution({ cwd: options.cwd, sessionId, workspaceMode, readOnly: readOnlySession, signal: cancellation.signal, expectedWorkspace, assertActive, assertAuthActive });
+        assertCurrent();
         options.cwd = execution.cwd;
         binding = resolveWorkspaceBinding(execution.cwd);
         if (binding) {
           if (launch && execution && expectedWorkspace) {
             const descriptor = sessionId ? describeWorkspaceSelection({ projectId: expectedWorkspace.projectId, sourceRoot: execution.sourceRoot, sessionId }).session ?? expectedWorkspace : expectedWorkspace;
             projectContext = await prepareProjectRuntime({ launch, descriptor, execute: execution.execute,
-              assertCurrent: execution.assertCurrent, signal: cancellation.signal, options });
+              assertCurrent, signal: cancellation.signal, options });
+            assertCurrent();
             readOnlySession = options.permissionMode === 'plan';
           }
-          options.mcpServers = { ...projectContext?.mcpServers, ...(projectContext ? { project_context: projectContext.server } : {}), workspace: workspaceTools(binding, cancellation.signal, readOnlySession, projectContext) };
+          options.mcpServers = { ...projectContext?.mcpServers, ...(projectContext ? { project_context: projectContext.server } : {}), workspace: workspaceTools(binding, cancellation.signal, readOnlySession, projectContext, assertCurrent) };
           if (projectContext) {
             if (options.permissionMode === 'dontAsk') {
               const safeInspection = new Set(['mcp__workspace__list_files', 'mcp__workspace__read_file', 'mcp__workspace__search_files', 'mcp__workspace__preview_status']);
@@ -1819,15 +1999,26 @@ export function workspaceQuery(input: Parameters<typeof sdkQuery>[0]): ReturnTyp
         }
       }
       if (cancelled) return;
-      cancellation.signal.throwIfAborted();
-      execution?.assertCurrent();
+      assertCurrent();
       if (prepareLaunch && options.cwd) await prepareLaunch(options.cwd);
       if (cancelled) return;
-      cancellation.signal.throwIfAborted();
-      execution?.assertCurrent();
+      assertCurrent();
+      // Wrap after project preparation, which may compose its own permission handler.
+      const canUseTool = options.canUseTool;
+      if (canUseTool) options.canUseTool = async (...args) => {
+        assertCurrent();
+        const permission = await canUseTool(...args);
+        assertCurrent();
+        return permission;
+      };
       sdkStarted = true;
       active = sdkQuery({ ...input, options });
-      for await (const event of active) { projectContext?.observe(event); yield event; }
+      for await (const event of active) {
+        assertCurrent();
+        projectContext?.observe(event);
+        assertCurrent();
+        yield event;
+      }
     } catch (error) {
       primary = error;
       failed = true;
@@ -1861,6 +2052,14 @@ export function workspaceQuery(input: Parameters<typeof sdkQuery>[0]): ReturnTyp
         // An externally requested return skips code after finally. Every
         // iterator consumer must still observe the same cleanup confirmation.
         if (result.done) await cleanup;
+        return result;
+      };
+      if (property === 'stopTask') return async (taskId: string) => {
+        assertCurrent();
+        if (!active) throw new Error('Claude query is not running.');
+        // Stop only the requested task; the query still owns its process and lease.
+        const result = await active.stopTask(taskId);
+        assertCurrent();
         return result;
       };
       if (property === 'interrupt') return async () => {

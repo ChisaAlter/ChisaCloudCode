@@ -114,6 +114,7 @@ async function withGateway(
       socket as never,
       { user: { id: 1 } } as never,
       {
+        isSessionActive: () => true,
         runtime: {
           hasRuntime: () => true,
           run: async (runProvider: string, command: string, options: Record<string, unknown>) => {

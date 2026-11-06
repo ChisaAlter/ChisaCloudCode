@@ -31,8 +31,8 @@ Initial public release of `Scheduled Prompt`, a local-first CloudCLI / ClaudeCod
   - retry
 - Recent run history with `running`, `succeeded`, `failed`, and `missed` states
 - Workspace-scoped recurrence summaries and next-run previews
-- Initial user documentation in [README.md](README.md)
-- Quickstart and feature design artifacts under [specs/001-workspace-scheduled-prompts](specs/001-workspace-scheduled-prompts)
+- Initial user documentation in [README.md](/home/sorg/CloudCLI/cloudcli-cron/README.md)
+- Quickstart and feature design artifacts under [specs/001-workspace-scheduled-prompts](/home/sorg/CloudCLI/cloudcli-cron/specs/001-workspace-scheduled-prompts)
 
 ### Changed
 

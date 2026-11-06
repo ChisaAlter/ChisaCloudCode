@@ -1,0 +1,19 @@
+[Unit]
+Description=Chisa read-only recovery storage and certificate monitor
+After=docker.service
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/usr/bin/python3 -B /opt/chisa-recovery/recovery.py monitor --config /etc/chisa-recovery/config.json
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadOnlyPaths=/opt/chisacloudcode /opt/letsencrypt /etc/chisa-recovery /var/lib/chisa-recovery
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+# Exit 2 means missing/stale/failed gate. Configure OnFailure or journal routing
+# to a real operator destination and test delivery before production enablement.

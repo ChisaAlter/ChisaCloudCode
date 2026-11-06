@@ -7,10 +7,11 @@ import pty, { type IPty } from 'node-pty';
 import { WebSocket, type RawData } from 'ws';
 
 import { assertSshProjectOwner, resolveSshProjectTarget } from '@/modules/workspace-bridge/index.js';
-import { AppError, parseIncomingJsonObject } from '@/shared/index.js';
+import { AppError, parseIncomingJsonObject, stripAnsiSequences } from '@/shared/index.js';
 import type { AuthenticatedWebSocketRequest, WorkspaceDescriptor } from '@/shared/index.js';
 
 import { createSshCommandConsole } from './ssh-shell-process.service.js';
+import { readWebSocketUserId } from './websocket-identity.service.js';
 
 type WorkspaceAdmission = Awaited<ReturnType<typeof import('@/modules/workspace-bridge/index.js').admitWorkspaceExecution>>;
 type WorkspaceProcess = Awaited<ReturnType<WorkspaceAdmission['spawnProcess']>>;
@@ -40,7 +41,10 @@ type ShellIncomingMessage = {
   isPlainShell?: boolean;
   forceRestart?: boolean;
   bypassPermissions?: boolean;
+  colorScheme?: string;
 };
+
+type ShellColorScheme = 'light' | 'dark';
 
 type ShellSessionEntry = {
   key: string;
@@ -51,6 +55,7 @@ type ShellSessionEntry = {
   descriptor?: WorkspaceDescriptor;
   projectPath: string;
   sessionId: string | null;
+  claudeColorScheme: ShellColorScheme | null;
   urlDetectionBuffer: string;
   announcedAuthUrls: Set<string>;
   stopping: boolean;
@@ -67,12 +72,7 @@ const shellSessions = new Map<string, ShellSessionEntry>();
 const pendingInitializations = new Map<string, Promise<void>>();
 const PTY_SESSION_TIMEOUT = 30 * 60 * 1000;
 const SHELL_URL_PARSE_BUFFER_LIMIT = 32768;
-const ANSI_ESCAPE_SEQUENCE_REGEX = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))/g;
 const TRAILING_URL_PUNCTUATION_REGEX = /[)\]}>.,;:!?]+$/;
-
-function stripAnsiSequences(value: string): string {
-  return value.replace(ANSI_ESCAPE_SEQUENCE_REGEX, '');
-}
 
 function normalizeDetectedUrl(url: string): string | null {
   const cleanedUrl = url.trim().replace(TRAILING_URL_PUNCTUATION_REGEX, '');
@@ -123,6 +123,17 @@ function extractUrlsFromText(value: string): string[] {
   return Array.from(new Set([...directMatches, ...wrappedMatches]));
 }
 
+/**
+ * Tells the client which app theme the Claude CLI in its pty was launched for,
+ * so the Shell can suggest a restart once the app theme no longer matches it.
+ * Clients that predate this frame ignore unknown frame types.
+ */
+function sendClaudeColorScheme(ws: WebSocket, colorScheme: ShellColorScheme | null): void {
+  if (colorScheme && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'claude_theme', colorScheme }));
+  }
+}
+
 function shouldAutoOpenUrlFromOutput(value: string): boolean {
   const normalizedOutput = value.toLowerCase();
   return (
@@ -135,12 +146,14 @@ function shouldAutoOpenUrlFromOutput(value: string): boolean {
 }
 
 type ShellWebSocketDependencies = {
+  /** Gateway-owned check of the captured authentication session; absent checks deny access. */
+  isSessionActive?: () => boolean;
   resolveProviderSessionId: (
     sessionId: string,
     provider: string,
   ) => string | null | undefined;
   spawnPty?: typeof pty.spawn;
-  resolveSelectedWorkspace?: typeof import('@/modules/workspaces/index.js').resolveSelectedWorkspace;
+  resolveSelectedWorkspace?: typeof import('@/modules/workspaces/index.js').resolveSelectedWorkspaceForUser;
   isWorkspaceBound?: typeof import('@/modules/workspace-bridge/index.js').isWorkspaceBound;
   admitWorkspaceExecution?: typeof import('@/modules/workspace-bridge/index.js').admitWorkspaceExecution;
   sessionTimeoutMs?: number;
@@ -165,6 +178,14 @@ function readBoolean(value: unknown, fallback = false): boolean {
  */
 function readNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * Reads the app theme the Shell tab is painted in. Older clients send none and
+ * anything unexpected is ignored, which keeps the launch exactly as before.
+ */
+function readColorScheme(value: unknown): ShellColorScheme | null {
+  return value === 'light' || value === 'dark' ? value : null;
 }
 
 /**
@@ -210,14 +231,25 @@ function resolveResumeSessionId(
   return resolvedSessionId;
 }
 
+type ShellLaunch = {
+  command: string;
+  /**
+   * Whether the command starts a Claude CLI that paints in the app's colour
+   * scheme, so a later theme toggle can be applied by restarting it.
+   */
+  claudeFollowsAppTheme: boolean;
+};
+
 /**
  * Resolves provider command line for plain shell and agent-backed shell modes.
  */
 function buildShellCommand(
   message: ShellIncomingMessage,
   dependencies: ShellWebSocketDependencies,
+  projectPath: string,
   platform: NodeJS.Platform = os.platform(),
-): string {
+  followAppTheme = true,
+): ShellLaunch {
   const hasSession = readBoolean(message.hasSession);
   const initialCommand = readString(message.initialCommand);
   const provider = readString(message.provider, 'claude');
@@ -227,32 +259,34 @@ function buildShellCommand(
     (!!initialCommand && !hasSession) ||
     provider === 'plain-shell';
 
+  const otherProgram = (command: string): ShellLaunch => ({ command, claudeFollowsAppTheme: false });
+
   if (isPlainShell) {
-    return initialCommand;
+    return otherProgram(initialCommand);
   }
 
   if (provider === 'cursor') {
     if (resumeSessionId) {
-      return `cursor-agent --resume="${resumeSessionId}"`;
+      return otherProgram(`cursor-agent --resume="${resumeSessionId}"`);
     }
-    return 'cursor-agent';
+    return otherProgram('cursor-agent');
   }
 
   if (provider === 'codex') {
     if (resumeSessionId) {
       if (platform === 'win32') {
-        return `codex resume "${resumeSessionId}"; if ($LASTEXITCODE -ne 0) { codex }`;
+        return otherProgram(`codex resume "${resumeSessionId}"; if ($LASTEXITCODE -ne 0) { codex }`);
       }
-      return `codex resume "${resumeSessionId}" || codex`;
+      return otherProgram(`codex resume "${resumeSessionId}" || codex`);
     }
-    return 'codex';
+    return otherProgram('codex');
   }
 
   if (provider === 'opencode') {
     if (resumeSessionId) {
-      return `opencode --session "${resumeSessionId}"`;
+      return otherProgram(`opencode --session "${resumeSessionId}"`);
     }
-    return initialCommand || 'opencode';
+    return otherProgram(initialCommand || 'opencode');
   }
 
   // Launching with the flag is what unlocks "bypass permissions" in the CLI's
@@ -261,14 +295,218 @@ function buildShellCommand(
   const bypassFlag = readBoolean(message.bypassPermissions)
     ? ' --dangerously-skip-permissions'
     : '';
-  const command = initialCommand || `claude${bypassFlag}`;
+  // Theme files belong to the host PTY; container and SSH paths are owned by their runtimes.
+  const theme = followAppTheme
+    ? buildClaudeThemeLaunch(readColorScheme(message.colorScheme), projectPath)
+    : { flag: '', followsAppTheme: false };
+  const launchFlags = `${bypassFlag}${theme.flag}`;
   if (resumeSessionId) {
-    if (platform === 'win32') {
-      return `claude --resume "${resumeSessionId}"${bypassFlag}; if ($LASTEXITCODE -ne 0) { claude${bypassFlag} }`;
-    }
-    return `claude --resume "${resumeSessionId}"${bypassFlag} || claude${bypassFlag}`;
+    const command = platform === 'win32'
+      ? `claude --resume "${resumeSessionId}"${launchFlags}; if ($LASTEXITCODE -ne 0) { claude${launchFlags} }`
+      : `claude --resume "${resumeSessionId}"${launchFlags} || claude${launchFlags}`;
+    return { command, claudeFollowsAppTheme: theme.followsAppTheme };
   }
-  return command;
+  if (initialCommand) {
+    // A caller's own command (e.g. `claude /login`) is launched as given.
+    return otherProgram(initialCommand);
+  }
+  return { command: `claude${launchFlags}`, claudeFollowsAppTheme: theme.followsAppTheme };
+}
+
+// Claude Code's built-in theme ids (the `/theme` picker of CLI 2.1.280). A
+// `custom:<slug>` theme is valid too; any other value is ignored by the CLI.
+const CLAUDE_THEME_IDS = new Set([
+  'auto',
+  'dark',
+  'light',
+  'dark-daltonized',
+  'light-daltonized',
+  'dark-ansi',
+  'light-ansi',
+]);
+
+// Dark themes and their light counterparts. A light theme, `auto` (it asks the
+// terminal for its background, which xterm answers from the live theme) or a
+// custom theme is the user's own choice and is left alone.
+const LIGHT_CLAUDE_THEME_BY_DARK_THEME = new Map([
+  ['dark', 'light'],
+  ['dark-daltonized', 'light-daltonized'],
+  ['dark-ansi', 'light-ansi'],
+]);
+
+// The CLI refuses settings files over 2 MiB, so a bigger one holds no theme it
+// would use. The legacy global config (`~/.claude.json`) is not a settings file
+// and can grow to several MB; its cap is only there so a huge file is never
+// pulled into the server's memory.
+const MAX_CLAUDE_SETTINGS_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_CLAUDE_GLOBAL_CONFIG_FILE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Reads a config file only when it is a regular, non-empty file of sane size,
+ * else returns null. The project can be a cloned repository whose
+ * `.claude/settings.local.json` is a symlink to a FIFO or to a device such as
+ * /dev/zero: reading one would stall the server's event loop or exhaust its
+ * memory. `statSync` follows the symlink without opening the target. Empty
+ * files are skipped too: they hold no theme, and kernel pseudo-files (procfs,
+ * tracefs) report a size of 0 even when a read would block.
+ */
+function readRegularConfigFile(filePath: string, maxBytes = MAX_CLAUDE_SETTINGS_FILE_BYTES): string | null {
+  try {
+    const stats = fs.statSync(filePath);
+    if (!stats.isFile() || stats.size === 0 || stats.size > maxBytes) {
+      return null;
+    }
+    return fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reads the `theme` key of one Claude config file. A missing, unreadable,
+ * special (FIFO, device) or unparsable file, or a value the CLI would reject,
+ * counts as unset.
+ */
+function readClaudeThemeFile(filePath: string, maxBytes: number): string | null {
+  const text = readRegularConfigFile(filePath, maxBytes);
+  if (text === null) {
+    return null;
+  }
+  try {
+    const config: unknown = JSON.parse(text);
+    const theme = config && typeof config === 'object' ? (config as Record<string, unknown>).theme : undefined;
+    if (typeof theme !== 'string') {
+      return null;
+    }
+    return CLAUDE_THEME_IDS.has(theme) || theme.startsWith('custom:') ? theme : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Finds the theme Claude Code would start with in `projectPath`, read-only and
+ * in the CLI's own order: local, project and user settings, then the legacy
+ * global config key, then its "dark" default. Managed settings are not read:
+ * they outrank `--settings`, so no flag could change their theme anyway.
+ */
+function resolveClaudeTheme(projectPath: string): string {
+  const configDirOverride = process.env.CLAUDE_CONFIG_DIR;
+  const configHome = configDirOverride || path.join(os.homedir(), '.claude');
+  const legacyGlobalConfigPath = path.join(configHome, '.config.json');
+  const configFiles: Array<[string, number]> = [
+    [path.join(projectPath, '.claude', 'settings.local.json'), MAX_CLAUDE_SETTINGS_FILE_BYTES],
+    [path.join(projectPath, '.claude', 'settings.json'), MAX_CLAUDE_SETTINGS_FILE_BYTES],
+    [path.join(configHome, 'settings.json'), MAX_CLAUDE_SETTINGS_FILE_BYTES],
+    [
+      fs.existsSync(legacyGlobalConfigPath)
+        ? legacyGlobalConfigPath
+        : path.join(configDirOverride || os.homedir(), '.claude.json'),
+      MAX_CLAUDE_GLOBAL_CONFIG_FILE_BYTES,
+    ],
+  ];
+
+  for (const [filePath, maxBytes] of configFiles) {
+    const theme = readClaudeThemeFile(filePath, maxBytes);
+    if (theme) {
+      return theme;
+    }
+  }
+  return 'dark';
+}
+
+let hasLoggedThemeSettingsFileError = false;
+
+/**
+ * Returns a settings file that holds only `{"theme": theme}`, writing it when
+ * it is missing or differs. It lives in the app's own data folder
+ * (`~/.cloudcli`, like the chat assets); the user's Claude config is never
+ * written. The write goes through a temp file and a rename, so a CLI starting
+ * at the same time never reads half a file. Returns null, and logs once, when
+ * the file cannot be written (a read-only home, say): the launch then simply
+ * goes ahead without a theme.
+ */
+function ensureClaudeThemeSettingsFile(theme: string): string | null {
+  const contents = `${JSON.stringify({ theme })}\n`;
+  let tempPath: string | null = null;
+  try {
+    const filePath = path.join(os.homedir(), '.cloudcli', `claude-shell-theme-${theme}.json`);
+    // Anything but the expected regular file is replaced; the rename never
+    // opens what it replaces.
+    if (readRegularConfigFile(filePath) !== contents) {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      tempPath = `${filePath}.${process.pid}.tmp`;
+      fs.writeFileSync(tempPath, contents);
+      fs.renameSync(tempPath, filePath);
+    }
+    return filePath;
+  } catch (error) {
+    if (tempPath) {
+      // Asynchronous and unchecked: cleaning up must not throw into the launch.
+      fs.rm(tempPath, { force: true }, () => undefined);
+    }
+    if (!hasLoggedThemeSettingsFileError) {
+      hasLoggedThemeSettingsFileError = true;
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[WARN] Shell: cannot write the Claude theme settings file, launching without it: ${message}`);
+    }
+    return null;
+  }
+}
+
+/**
+ * Quotes one argument for the shell that runs the launch command. bash takes
+ * everything between single quotes literally, so a `'` closes the quote, adds
+ * an escaped one and reopens it. PowerShell (win32) single quotes are literal
+ * too, backslashes included; a quote is doubled, and PowerShell also treats
+ * the typographic single quotes as quote characters.
+ */
+function quoteShellArgument(value: string): string {
+  if (os.platform() === 'win32') {
+    return `'${value.replace(/['\u2018\u2019\u201A\u201B]/g, '$&$&')}'`;
+  }
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+type ClaudeThemeLaunch = {
+  flag: string;
+  /** Whether the CLI will paint in the app's colour scheme. */
+  followsAppTheme: boolean;
+};
+
+/**
+ * Claude Code paints its own colours in its own theme, dark by default, so in
+ * a light Shell tab its prompt rows became dark bands. Only a light tab gets a
+ * flag, and only when the user's theme is a dark one: it is swapped for the
+ * matching light variant. `--settings` applies it to this launch only. It is
+ * given a file path rather than inline JSON because PowerShell strips the
+ * JSON's double quotes when it passes an argument to a native program.
+ *
+ * The CLI follows the app theme when it gets that flag, when a dark tab runs a
+ * dark theme, and with `auto` (it asks the terminal, which xterm answers from
+ * the live theme). A light or custom theme the user chose, or a flag that
+ * could not be written, paints the same in either app theme, so restarting
+ * after a toggle would change nothing.
+ */
+function buildClaudeThemeLaunch(colorScheme: ShellColorScheme | null, projectPath: string): ClaudeThemeLaunch {
+  if (!colorScheme) {
+    return { flag: '', followsAppTheme: false };
+  }
+  const userTheme = resolveClaudeTheme(projectPath);
+  if (userTheme === 'auto') {
+    return { flag: '', followsAppTheme: true };
+  }
+  const lightTheme = LIGHT_CLAUDE_THEME_BY_DARK_THEME.get(userTheme);
+  if (!lightTheme) {
+    return { flag: '', followsAppTheme: false };
+  }
+  if (colorScheme === 'dark') {
+    return { flag: '', followsAppTheme: true };
+  }
+  const settingsPath = ensureClaudeThemeSettingsFile(lightTheme);
+  return settingsPath
+    ? { flag: ` --settings ${quoteShellArgument(settingsPath)}`, followsAppTheme: true }
+    : { flag: '', followsAppTheme: false };
 }
 
 function readEnvValue(env: NodeJS.ProcessEnv, key: string): string | undefined {
@@ -419,7 +657,7 @@ function emitSessionOutput(session: ShellSessionEntry, chunk: string): void {
 
 function startRetainedSession(input: {
   key: string; process: TerminalProcess; ws: WebSocket | null; projectPath: string; sessionId: string | null;
-  descriptor?: WorkspaceDescriptor; admission?: WorkspaceAdmission;
+  descriptor?: WorkspaceDescriptor; admission?: WorkspaceAdmission; claudeColorScheme: ShellColorScheme | null;
 }): ShellSessionEntry {
   let settle: () => void = () => {};
   const completion = new Promise<void>(resolve => { settle = resolve; });
@@ -498,7 +736,12 @@ export function handleShellConnection(
   console.log('[INFO] Shell websocket connected');
   const legacyTest = Boolean(dependencies.spawnPty && !dependencies.resolveSelectedWorkspace
     && !dependencies.isWorkspaceBound && !dependencies.admitWorkspaceExecution);
-  const ownerId = request?.user?.id ?? request?.user?.userId ?? request?.user?.username ?? 'authenticated';
+  const ownerId = readWebSocketUserId(request);
+  const assertActive = () => {
+    if (disconnected || ws.readyState !== WebSocket.OPEN || dependencies.isSessionActive?.() !== true) {
+      throw new AppError('Authentication session has ended', { code: 'UNAUTHORIZED', statusCode: 401 });
+    }
+  };
   const timeoutMs = dependencies.sessionTimeoutMs ?? PTY_SESSION_TIMEOUT;
   let activeSession: ShellSessionEntry | null = null;
   let connectionKey: string | null = null;
@@ -508,6 +751,8 @@ export function handleShellConnection(
     try {
       const data = parseShellMessage(rawMessage);
       if (!data?.type) throw new AppError('Invalid websocket payload', { code: 'INVALID_REQUEST', statusCode: 400 });
+      if (ownerId === null) throw new AppError('Authentication is required', { code: 'UNAUTHORIZED', statusCode: 401 });
+      assertActive();
       if (data.type !== 'init') {
         // Delayed input from a replaced socket cannot control its successor.
         if (!activeSession || activeSession.ws !== ws || activeSession.stopping || activeSession.exited) return;
@@ -533,10 +778,12 @@ export function handleShellConnection(
           if (!projectId.trim() || !workspaceId.trim() || !generation.trim()) {
             throw new AppError('projectId, workspaceId and generation are required', { code: 'WORKSPACE_SELECTOR_REQUIRED', statusCode: 400 });
           }
-          resolveSelected = dependencies.resolveSelectedWorkspace ?? (await import('@/modules/workspaces/index.js')).resolveSelectedWorkspace;
-          descriptor = resolveSelected(projectId, { workspaceId, generation, ...(requestedSessionId ? { sessionId: requestedSessionId } : {}) });
+          resolveSelected = dependencies.resolveSelectedWorkspace ?? (await import('@/modules/workspaces/index.js')).resolveSelectedWorkspaceForUser;
+          assertActive();
+          descriptor = resolveSelected(projectId, ownerId, { workspaceId, generation, ...(requestedSessionId ? { sessionId: requestedSessionId } : {}) });
           if (!descriptor.capabilities.shell) throw new AppError('Shell is unavailable for this workspace', { code: 'WORKSPACE_SHELL_UNAVAILABLE', statusCode: 409 });
           checkBound = dependencies.isWorkspaceBound ?? (await import('@/modules/workspace-bridge/index.js')).isWorkspaceBound;
+          assertActive();
           isBound = checkBound(descriptor.sourceRoot);
         }
         const projectPath = descriptor?.rootPath ?? path.resolve(readString(data.projectPath, process.cwd()));
@@ -544,13 +791,14 @@ export function handleShellConnection(
         const hasSession = readBoolean(data.hasSession);
         const provider = readString(data.provider, 'claude');
         const initialCommand = readString(data.initialCommand);
+        const colorScheme = readColorScheme(data.colorScheme);
         const isPlainShell = readBoolean(data.isPlainShell) || (!!initialCommand && !hasSession) || provider === 'plain-shell';
         // A full digest prevents commands with a common prefix sharing a process.
         const commandIdentity = createHash('sha256').update(JSON.stringify({ provider, isPlainShell, initialCommand,
           hasSession, bypassPermissions: readBoolean(data.bypassPermissions) })).digest('hex');
         const key = JSON.stringify(descriptor
           ? [String(ownerId), descriptor.projectId, descriptor.workspaceId, descriptor.generation, descriptor.sessionId ?? null, commandIdentity]
-          : ['injected-legacy', projectPath, sessionId, commandIdentity]);
+          : ['injected-legacy', String(ownerId), projectPath, sessionId, commandIdentity]);
         if (connectionKey && connectionKey !== key) {
           throw new AppError('A shell connection cannot change its workspace or command', { code: 'SHELL_WORKSPACE_MISMATCH', statusCode: 409 });
         }
@@ -562,8 +810,9 @@ export function handleShellConnection(
         try {
           if (disconnected || ws.readyState !== WebSocket.OPEN) return;
           const validateWorkspace = () => {
+            assertActive();
             if (!descriptor || !resolveSelected) return;
-            const latest = resolveSelected(descriptor.projectId, { workspaceId: descriptor.workspaceId,
+            const latest = resolveSelected(descriptor.projectId, ownerId, { workspaceId: descriptor.workspaceId,
               generation: descriptor.generation, ...(descriptor.sessionId ? { sessionId: descriptor.sessionId } : {}) });
             if (!sameWorkspace(descriptor, latest) || !latest.capabilities.shell
               || checkBound?.(latest.sourceRoot) !== isBound) {
@@ -591,6 +840,7 @@ export function handleShellConnection(
               sendReady(ws, existing);
               sendFrame(ws, { type: 'output', data: '\x1b[36m[Reconnected to existing session]\x1b[0m\r\n' });
               existing.buffer.forEach(chunk => sendFrame(ws, { type: 'output', data: chunk }));
+              sendClaudeColorScheme(ws, existing.claudeColorScheme);
               return;
             }
           }
@@ -599,7 +849,10 @@ export function handleShellConnection(
             catch { throw new Error('Invalid project path'); }
           }
           const selectedMessage = { ...data, ...(sessionId ? { sessionId } : {}) };
-          const shellCommand = buildShellCommand(selectedMessage, dependencies, isBound ? 'linux' : os.platform());
+          const { command: shellCommand, claudeFollowsAppTheme } = buildShellCommand(
+            selectedMessage, dependencies, projectPath, isBound ? 'linux' : os.platform(), !isBound && descriptor?.sourceMode !== 'ssh',
+          );
+          const claudeColorScheme = claudeFollowsAppTheme ? colorScheme : null;
           let terminal: TerminalProcess;
           let admission: WorkspaceAdmission | undefined;
           try {
@@ -611,6 +864,7 @@ export function handleShellConnection(
               terminal = createSshCommandConsole(descriptor, initialCommand);
             } else if (isBound && descriptor) {
               const admit = dependencies.admitWorkspaceExecution ?? (await import('@/modules/workspace-bridge/index.js')).admitWorkspaceExecution;
+              validateWorkspace();
               admission = await admit({ cwd: descriptor.rootPath, sessionId: descriptor.sessionId,
                 workspaceMode: descriptor.effectiveMode, directExecution: true, expectedWorkspace: descriptor });
               validateWorkspace();
@@ -638,21 +892,23 @@ export function handleShellConnection(
               terminal = asPtyProcess((dependencies.spawnPty ?? pty.spawn)(shell, shellArgs, {
                 name: 'xterm-256color', cols: readNumber(data.cols, 80), rows: readNumber(data.rows, 24), cwd: projectPath,
                 env: { ...process.env, [prioritizedPath.key]: prioritizedPath.value,
-                  TERM: 'xterm-256color', COLORTERM: 'truecolor', FORCE_COLOR: '3' } }));
+                  TERM: 'xterm-256color', COLORTERM: 'truecolor', FORCE_COLOR: '3',
+                  ...(colorScheme ? { COLORFGBG: colorScheme === 'light' ? '0;15' : '15;0' } : {}) } }));
             }
           } catch (error) {
             if (admission) await admission.close();
             throw error;
           }
-          const session = startRetainedSession({ key, process: terminal, ws, projectPath, sessionId, descriptor, admission });
-          activeSession = session;
+          // Do not expose process output or controls until the post-spawn ownership/generation check succeeds.
+          const session = startRetainedSession({ key, process: terminal, ws: null, projectPath, sessionId, descriptor, admission, claudeColorScheme });
           if (disconnected || ws.readyState !== WebSocket.OPEN) {
-            session.ws = null;
             await stopSession(session);
             return;
           }
           try { validateWorkspace(); }
           catch (error) { await stopSession(session); throw error; }
+          session.ws = ws;
+          activeSession = session;
           sendReady(ws, session);
           const resumeSessionId = resolveResumeSessionId(selectedMessage, dependencies);
           const providerName = provider === 'cursor' ? 'Cursor' : provider === 'codex' ? 'Codex' : provider === 'opencode' ? 'OpenCode' : 'Claude';
@@ -663,6 +919,7 @@ export function handleShellConnection(
                 : `Starting new ${providerName} session in: ${projectPath}`;
           if (terminal.transport === 'pipe' && !sshConsole) welcome += '\r\n[Container pipe shell: no TTY, resize, or job control; Ctrl+C closes this shell. Provider CLIs require installation and authentication inside the container.]';
           sendFrame(ws, { type: 'output', data: `\x1b[36m${welcome}\x1b[0m\r\n` });
+          sendClaudeColorScheme(ws, claudeColorScheme);
         } finally {
           if (pendingInitializations.get(key) === pending) pendingInitializations.delete(key);
           releaseInitialization();

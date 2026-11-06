@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 
 import { afterEach, beforeEach, test, vi } from 'vitest';
 
+import type * as Api from '@/shared/api';
+import type * as AuthToken from '@/shared/authToken';
 import type * as ChatDraftsModule from '@/shared/chatDrafts';
 
 /**
@@ -16,13 +18,24 @@ import type * as ChatDraftsModule from '@/shared/chatDrafts';
 type SavedDraft = { scope: string; text: string; queuedMessage?: unknown };
 
 const savedDrafts: SavedDraft[] = [];
-const deletedScopes: string[] = [];
+const appendRequests: Array<{ scope: string; queuedMessage: unknown }> = [];
+const clearedScopes: string[] = [];
 let serverDrafts: unknown[] = [];
 let draftsRequestFailed = false;
-const requests = vi.hoisted(() => ({ drafts: vi.fn(), saveDraft: vi.fn(), deleteDraft: vi.fn() }));
-const loadedStores: Array<typeof ChatDraftsModule> = [];
+// Lets a test hold the drafts response, to land it after a later queue change.
+let draftsResponseGate: Promise<void> | null = null;
+// What the server answers to an append; by default it queues the message alone.
+let appendResponse: ((queuedMessage: unknown) => Response) | null = null;
+// Lets a test hold an append's answer, to make a queue change while it is in flight.
+let appendResponseGate: Promise<void> | null = null;
+// What the server answers to a clear.
+let clearStatus = 200;
 
-vi.mock('@/shared/api', () => ({
+const loadedStores: Array<typeof ChatDraftsModule> = [];
+const requests = vi.hoisted(() => ({ drafts: vi.fn(), saveDraft: vi.fn(), appendQueuedMessage: vi.fn(), clearQueuedMessage: vi.fn() }));
+
+vi.mock('@/shared/api', async (importOriginal) => ({
+  ...(await importOriginal<typeof Api>()),
   api: { user: requests },
 }));
 
@@ -37,8 +50,18 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
   headers: { 'Content-Type': 'application/json' },
 });
 
+async function replaceIdentity(auth: typeof AuthToken): Promise<void> {
+  const encode = (value: unknown) => btoa(JSON.stringify(value)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const token = `${encode({ alg: 'HS256' })}.${encode({ userId: 'new-account', iat: 1_700_000_000, exp: 4_102_444_800 })}.signature`;
+  const next = await auth.startAuthSession(token, auth.getAuthSessionSnapshot());
+  assert.ok(next, 'the fixture must commit the replacement identity before sending its drafts');
+  auth.acknowledgeAuthSession(next);
+}
+
 const loadStore = async (): Promise<typeof ChatDraftsModule> => {
   vi.resetModules();
+  const auth = await import('@/shared/authToken');
+  await auth.initializeAuthSession();
   const store = await import('@/shared/chatDrafts');
   loadedStores.push(store);
   return store;
@@ -46,22 +69,35 @@ const loadStore = async (): Promise<typeof ChatDraftsModule> => {
 
 beforeEach(() => {
   localStorage.clear();
+  sessionStorage.clear();
   savedDrafts.length = 0;
-  deletedScopes.length = 0;
+  appendRequests.length = 0;
+  clearedScopes.length = 0;
   serverDrafts = [];
   draftsRequestFailed = false;
+  draftsResponseGate = null;
+  appendResponse = null;
+  appendResponseGate = null;
+  clearStatus = 200;
   vi.resetAllMocks();
   requests.drafts.mockImplementation(async () => {
     if (draftsRequestFailed) throw new Error('offline');
-    return json({ success: true, drafts: serverDrafts });
+    const snapshot = serverDrafts;
+    await draftsResponseGate;
+    return json({ success: true, drafts: snapshot });
   });
   requests.saveDraft.mockImplementation(async (scope: string, draft: { text: string; queuedMessage?: unknown }) => {
     savedDrafts.push({ scope, ...draft });
     return json({ success: true });
   });
-  requests.deleteDraft.mockImplementation(async (scope: string) => {
-    deletedScopes.push(scope);
-    return json({ success: true });
+  requests.appendQueuedMessage.mockImplementation(async (scope: string, queuedMessage: unknown) => {
+    appendRequests.push({ scope, queuedMessage });
+    await appendResponseGate;
+    return appendResponse ? appendResponse(queuedMessage) : json({ success: true, queuedMessage, appended: false });
+  });
+  requests.clearQueuedMessage.mockImplementation(async (scope: string) => {
+    clearedScopes.push(scope);
+    return json({}, clearStatus);
   });
   vi.useFakeTimers();
 });
@@ -106,7 +142,9 @@ test('a chat with no session yet is scoped to its project', async () => {
   assert.equal(store.readDraftText('session-a'), '');
 });
 
-test('clearing draft text does not delete a queue belonging to the same scope', async () => {
+test('clearing a draft saves the empty text and leaves dropping the row to the server', async () => {
+  // Deleting the row from here would also delete a message queued for the
+  // scope from another tab; the server drops the row only when nothing is left.
   const store = await loadStore();
   store.writeDraftText('session-a', 'typed');
   await vi.advanceTimersByTimeAsync(1_500);
@@ -116,7 +154,6 @@ test('clearing draft text does not delete a queue belonging to the same scope', 
   await vi.advanceTimersByTimeAsync(1_500);
 
   assert.deepEqual(savedDrafts, [{ scope: 'session-a', text: '' }]);
-  assert.deepEqual(deletedScopes, []);
 });
 
 test('a draft written in one page load is readable synchronously in the next', async () => {
@@ -140,7 +177,7 @@ test('hydrate brings in a draft typed on another device', async () => {
 
 test('hydrate removes a mirrored queue after the server claims it', async () => {
   const store = await loadStore();
-  await store.writeQueuedMessage('session-a', { content: 'server-owned queue' });
+  await store.appendQueuedMessage('session-a', { content: 'server-owned queue' });
   assert.equal(store.readQueuedMessage('session-a')?.content, 'server-owned queue');
 
   serverDrafts = [];
@@ -170,50 +207,193 @@ test('a failed hydrate keeps the mirrored draft rather than blanking the compose
   assert.equal(store.readDraftText('session-a'), 'local work');
 });
 
-test('a queued message round-trips alongside the draft text', async () => {
+test('queueing goes to the server at once and keeps what it says is now queued', async () => {
+  // The server appended this to a message another tab had queued.
+  appendResponse = () => json({
+    success: true,
+    queuedMessage: { content: 'from the laptop\n\nsend this next', attachments: [] },
+    appended: true,
+  });
+  const store = await loadStore();
+  store.writeDraftText('session-a', 'still editing');
+
+  const result = await store.appendQueuedMessage('session-a', { content: 'send this next', attachments: [] });
+
+  assert.deepEqual(appendRequests, [{
+    scope: 'session-a',
+    queuedMessage: { content: 'send this next', attachments: [] },
+  }], 'queue actions persist without waiting for the draft debounce');
+  assert.deepEqual(result, {
+    queuedMessage: { content: 'from the laptop\n\nsend this next', attachments: [] },
+    appended: true,
+  });
+  assert.equal(store.readQueuedMessage('session-a')?.content, 'from the laptop\n\nsend this next');
+  assert.equal(store.readDraftText('session-a'), 'still editing');
+});
+
+test('a text save never carries the queued message, so it cannot bring back one already sent', async () => {
+  const store = await loadStore();
+  await store.appendQueuedMessage('session-a', { content: 'queued A', attachments: [] });
+
+  // The dispatcher sends "queued A" while the user types the next follow-up.
+  store.writeDraftText('session-a', 'typing the next one');
+  await vi.advanceTimersByTimeAsync(1_500);
+
+  assert.deepEqual(savedDrafts, [{ scope: 'session-a', text: 'typing the next one' }]);
+});
+
+test('hydrate takes the server\'s queued message even for a scope being typed into', async () => {
+  const store = await loadStore();
+  await store.appendQueuedMessage('session-a', { content: 'queued A', attachments: [] });
+  store.writeDraftText('session-a', 'typing');
+
+  // Claimed and sent; the server still has the older text.
+  serverDrafts = [{ scope: 'session-a', text: 'typ', queuedMessage: null }];
+  await store.hydrateChatDrafts();
+
+  assert.equal(store.readQueuedMessage('session-a'), null, 'the sent message leaves the card');
+  assert.equal(store.readDraftText('session-a'), 'typing', 'the text being typed stays');
+});
+
+test('a hydrate already in flight when a message is queued does not put back the older queue', async () => {
+  const store = await loadStore();
+  await store.appendQueuedMessage('session-a', { content: 'A', attachments: [] });
+
+  serverDrafts = [{ scope: 'session-a', text: '', queuedMessage: { content: 'A', attachments: [] } }];
+  let releaseDrafts!: () => void;
+  draftsResponseGate = new Promise((resolve) => { releaseDrafts = resolve; });
+  const hydrating = store.hydrateChatDrafts();
+
+  appendResponse = () => json({ success: true, queuedMessage: { content: 'A\n\nB', attachments: [] }, appended: true });
+  await store.appendQueuedMessage('session-a', { content: 'B', attachments: [] });
+  releaseDrafts();
+  await hydrating;
+
+  assert.equal(store.readQueuedMessage('session-a')?.content, 'A\n\nB');
+});
+
+test('a hydrate already in flight when the queued message is cleared does not bring it back', async () => {
+  const store = await loadStore();
+  await store.appendQueuedMessage('session-a', { content: 'A', attachments: [] });
+
+  serverDrafts = [{ scope: 'session-a', text: '', queuedMessage: { content: 'A', attachments: [] } }];
+  let releaseDrafts!: () => void;
+  draftsResponseGate = new Promise((resolve) => { releaseDrafts = resolve; });
+  const hydrating = store.hydrateChatDrafts();
+
+  store.clearQueuedMessage('session-a');
+  releaseDrafts();
+  await hydrating;
+
+  assert.equal(store.readQueuedMessage('session-a'), null);
+});
+
+test('a hydrate takes the server\'s text for a scope whose queue changed but which nobody typed into', async () => {
+  const store = await loadStore();
+  store.writeDraftText('session-a', 'older text');
+  await vi.advanceTimersByTimeAsync(1_500);
+
+  serverDrafts = [{ scope: 'session-a', text: 'typed on the phone', queuedMessage: null }];
+  let releaseDrafts!: () => void;
+  draftsResponseGate = new Promise((resolve) => { releaseDrafts = resolve; });
+  const hydrating = store.hydrateChatDrafts();
+  await store.appendQueuedMessage('session-a', { content: 'B', attachments: [] });
+  releaseDrafts();
+  await hydrating;
+
+  assert.equal(store.readDraftText('session-a'), 'typed on the phone');
+  assert.equal(store.readQueuedMessage('session-a')?.content, 'B');
+});
+
+test('a clear made while an append is being answered is sent after it, and the message queued again', async () => {
+  appendResponse = (queuedMessage) => json({ success: true, queuedMessage, appended: false });
+  const store = await loadStore();
+  let releaseAppend!: () => void;
+  appendResponseGate = new Promise((resolve) => { releaseAppend = resolve; });
+
+  const appending = store.appendQueuedMessage('session-a', { content: 'B', attachments: [] });
+  await vi.advanceTimersByTimeAsync(0);
+  store.clearQueuedMessage('session-a');
+  assert.deepEqual(clearedScopes, [], 'the clear waits for the append to be answered');
+  releaseAppend();
+  const result = await appending;
+
+  assert.deepEqual(clearedScopes, ['session-a']);
+  assert.equal(appendRequests.length, 2, 'the clear removed B on the server too, so B is queued again');
+  assert.equal(result.queuedMessage.content, 'B');
+  assert.equal(store.readQueuedMessage('session-a')?.content, 'B');
+});
+
+test('a clear that fails while an append is being answered does not queue the message twice', async () => {
+  appendResponse = () => json({ success: true, queuedMessage: { content: 'A\n\nB', attachments: [] }, appended: true });
+  clearStatus = 503;
+  const store = await loadStore();
+  let releaseAppend!: () => void;
+  appendResponseGate = new Promise((resolve) => { releaseAppend = resolve; });
+
+  const appending = store.appendQueuedMessage('session-a', { content: 'B', attachments: [] });
+  await vi.advanceTimersByTimeAsync(0);
+  store.clearQueuedMessage('session-a');
+  releaseAppend();
+  const result = await appending;
+
+  assert.equal(appendRequests.length, 1);
+  assert.equal(result.queuedMessage.content, 'A\n\nB', 'the server still holds both, so that is what is shown');
+  assert.equal(store.readQueuedMessage('session-a')?.content, 'A\n\nB');
+});
+
+test('a queue the server refuses rejects and changes nothing here', async () => {
+  appendResponse = () => json({ success: false, error: { message: 'A queued message needs text or attachments' } }, 400);
   const store = await loadStore();
 
-  store.writeDraftText('session-a', 'still editing');
-  await store.writeQueuedMessage('session-a', { content: 'send this next', attachments: [] });
+  await assert.rejects(
+    store.appendQueuedMessage('session-a', { content: 'B', attachments: [] }),
+    /needs text or attachments/,
+  );
+  assert.equal(store.readQueuedMessage('session-a'), null);
+});
 
-  assert.equal(store.readDraftText('session-a'), 'still editing');
-  assert.deepEqual(store.readQueuedMessage('session-a'), {
-    content: 'send this next',
-    attachments: [],
-  });
-  assert.equal(savedDrafts.length, 1, 'queue actions persist without waiting for the draft debounce');
-  assert.deepEqual(savedDrafts, [{
-    scope: 'session-a',
-    text: 'still editing',
-    queuedMessage: { content: 'send this next', attachments: [] },
-  }]);
+test('a refused queue carries the server\'s error code, so the composer can say why in the user\'s language', async () => {
+  appendResponse = () => json({
+    success: false,
+    error: { code: 'QUEUED_MESSAGE_NOT_COMBINABLE', message: 'A slash command runs as a turn of its own' },
+  }, 409);
+  const store = await loadStore();
+
+  await assert.rejects(
+    store.appendQueuedMessage('session-a', { content: '/compact', attachments: [] }),
+    { code: 'QUEUED_MESSAGE_NOT_COMBINABLE', status: 409, message: 'A slash command runs as a turn of its own' },
+  );
 });
 
 test('a queued message with neither text nor attachments reads as absent', async () => {
+  localStorage.setItem('chat-drafts', JSON.stringify({
+    'session-a': { text: '', queuedMessage: { content: '   ', attachments: [] } },
+  }));
   const store = await loadStore();
-
-  await store.writeQueuedMessage('session-a', { content: '   ', attachments: [] });
 
   assert.equal(store.readQueuedMessage('session-a'), null);
 });
 
 test('legacy image-only descriptors are still readable as attachments', async () => {
+  localStorage.setItem('chat-drafts', JSON.stringify({
+    'session-a': { text: '', queuedMessage: { content: '', images: [{ name: 'shot.png' }] } },
+  }));
   const store = await loadStore();
-
-  await store.writeQueuedMessage('session-a', { content: '', images: [{ name: 'shot.png' }] });
 
   assert.deepEqual(store.readQueuedMessage('session-a')?.attachments, [{ name: 'shot.png' }]);
 });
 
-test('clearing the queued message leaves the draft text alone', async () => {
+test('clearing the queued message tells the server at once and leaves the draft text alone', async () => {
   const store = await loadStore();
   store.writeDraftText('session-a', 'keep me');
-  await store.writeQueuedMessage('session-a', { content: 'queued' });
+  await store.appendQueuedMessage('session-a', { content: 'queued' });
 
   await store.clearQueuedMessage('session-a');
 
   assert.equal(store.readQueuedMessage('session-a'), null);
   assert.equal(store.readDraftText('session-a'), 'keep me');
+  assert.deepEqual(clearedScopes, ['session-a']);
 });
 
 test('subscribers are notified on a write', async () => {
@@ -319,47 +499,29 @@ test('same-scope writes wait for acknowledgement and an old acknowledgement cann
   assert.equal(store.isChatDraftPending('session-a'), false);
 });
 
-test('a queue acknowledgement failure keeps the local queue pending until an explicit retry succeeds', async () => {
-  const response = deferred<Response>();
-  requests.saveDraft.mockReturnValueOnce(response.promise);
+test('a refused append preserves the mirrored queue and never retries on a timer', async () => {
   const store = await loadStore();
-  const queued = { content: 'pending queue' };
-  const saving = store.writeQueuedMessage('session-a', queued);
-  assert.equal(store.writeQueuedMessage('session-a', { ...queued }), saving, 'concurrent identical queue actions share one write');
-  const rejected = assert.rejects(saving, /not confirmed \(500\)/);
-  await vi.advanceTimersByTimeAsync(0);
-  assert.equal(requests.saveDraft.mock.calls.length, 1);
-
-  response.resolve(json({}, 500));
+  await store.appendQueuedMessage('session-a', { content: 'existing' });
+  const response = deferred<Response>();
+  requests.appendQueuedMessage.mockReturnValueOnce(response.promise);
+  const saving = store.appendQueuedMessage('session-a', { content: 'new follow-up' });
+  const rejected = assert.rejects(saving, /not confirmed/);
+  response.resolve(json({ error: { message: 'not confirmed' } }, 500));
   await rejected;
-  await store.hydrateChatDrafts();
-  assert.equal(store.readQueuedMessage('session-a')?.content, queued.content);
-  assert.equal(store.isChatDraftPending('session-a'), true);
-  await vi.advanceTimersByTimeAsync(10_000);
-  assert.equal(requests.saveDraft.mock.calls.length, 1, 'failure alone must not requeue an unconfirmed action');
-
-  await store.writeQueuedMessage('session-a', queued);
-  assert.equal(requests.saveDraft.mock.calls.length, 2);
+  assert.equal(store.readQueuedMessage('session-a')?.content, 'existing');
   assert.equal(store.isChatDraftPending('session-a'), false);
+  await vi.advanceTimersByTimeAsync(10_000);
+  assert.equal(requests.appendQueuedMessage.mock.calls.length, 2);
 });
 
-test('queue cancellation is serialized after queue creation and a rejected cancellation stays pending', async () => {
-  const saved = deferred<Response>();
-  const deleted = deferred<Response>();
-  requests.saveDraft.mockReturnValueOnce(saved.promise);
-  requests.deleteDraft.mockReturnValueOnce(deleted.promise);
+test('a rejected queue cancellation stays pending and survives a stale hydrate', async () => {
   const store = await loadStore();
-  const saving = store.writeQueuedMessage('session-a', { content: 'first' });
+  await store.appendQueuedMessage('session-a', { content: 'first' });
+  const deleted = deferred<Response>();
+  requests.clearQueuedMessage.mockReturnValueOnce(deleted.promise);
   const cancellation = store.clearQueuedMessage('session-a');
   const rejected = assert.rejects(cancellation, /cannot cancel/);
-  await vi.advanceTimersByTimeAsync(0);
-  assert.equal(requests.deleteDraft.mock.calls.length, 0);
-
-  saved.resolve(json({ success: true }));
-  await saving;
-  await vi.advanceTimersByTimeAsync(0);
-  assert.equal(requests.deleteDraft.mock.calls.length, 1);
-  assert.equal(store.isChatDraftPending('session-a'), true, 'queue creation cannot acknowledge its cancellation');
+  assert.equal(store.isChatDraftPending('session-a'), true);
   deleted.resolve(json({ error: { message: 'cannot cancel' } }, 409));
   await rejected;
   serverDrafts = [{ scope: 'session-a', text: '', queuedMessage: { content: 'first' } }];
@@ -370,10 +532,10 @@ test('queue cancellation is serialized after queue creation and a rejected cance
 
 test('typing after queue acknowledgement does not resend a queue already claimed by the dispatcher', async () => {
   const store = await loadStore();
-  await store.writeQueuedMessage('session-a', { content: 'already queued' });
+  await store.appendQueuedMessage('session-a', { content: 'already queued' });
   store.writeDraftText('session-a', 'next thought');
   await vi.advanceTimersByTimeAsync(1_000);
-  const payload = requests.saveDraft.mock.calls[1][1];
+  const payload = requests.saveDraft.mock.calls[0][1];
   assert.deepEqual(payload, { text: 'next thought' });
   assert.equal(Object.prototype.hasOwnProperty.call(payload, 'queuedMessage'), false);
   serverDrafts = [{ scope: 'session-a', text: 'next thought', queuedMessage: null }];
@@ -400,35 +562,34 @@ test('an identity replacement invalidates a hydrate even before reset reaches th
   const store = await loadStore();
   const auth = await import('@/shared/authToken');
   const hydration = store.hydrateChatDrafts();
-  auth.startAuthSession('new.payload.signature');
+  await replaceIdentity(auth);
   response.resolve(json({ drafts: [{ scope: 'session-a', text: 'old identity' }] }));
   await hydration;
   assert.equal(store.readDraftText('session-a'), '');
   assert.equal(localStorage.getItem('chat-drafts'), null);
 });
 
-test.each(['reset', 'identity'])('%s invalidation cancels old waiters and never forwards their queued successor as the next user', async (mode) => {
+test.each(['reset', 'identity'])('%s invalidation cancels old waiters and never sends an old successor as the next user', async (mode) => {
   const oldResponse = deferred<Response>();
-  requests.saveDraft.mockReturnValueOnce(oldResponse.promise);
+  requests.appendQueuedMessage.mockReturnValueOnce(oldResponse.promise);
   const store = await loadStore();
   const auth = await import('@/shared/authToken');
-  const older = store.writeQueuedMessage('session-a', { content: 'old first' });
-  const successor = store.writeQueuedMessage('session-a', { content: 'old second' });
+  const older = store.appendQueuedMessage('session-a', { content: 'old first' });
+  const successor = store.appendQueuedMessage('session-a', { content: 'old second' });
   const canceledOlder = assert.rejects(older, { name: 'AbortError' });
   const canceledSuccessor = assert.rejects(successor, { name: 'AbortError' });
   await vi.advanceTimersByTimeAsync(0);
-  assert.equal(requests.saveDraft.mock.calls.length, 1);
+  assert.equal(requests.appendQueuedMessage.mock.calls.length, 1);
   if (mode === 'reset') {
-    auth.clearAuthToken();
+    await auth.clearAuthToken(auth.getAuthSessionSnapshot());
     store.resetChatDrafts();
   }
-  auth.startAuthSession('new.payload.signature');
-  await store.writeQueuedMessage('session-a', { content: 'new identity queue' });
+  await replaceIdentity(auth);
+  await store.appendQueuedMessage('session-a', { content: 'new identity queue' });
   await Promise.all([canceledOlder, canceledSuccessor]);
-
-  oldResponse.resolve(json({ success: true }));
+  oldResponse.resolve(json({ success: true, queuedMessage: { content: 'old first' }, appended: false }));
   await vi.advanceTimersByTimeAsync(0);
-  assert.deepEqual(requests.saveDraft.mock.calls.map(([, draft]) => draft.queuedMessage.content), ['old first', 'new identity queue']);
+  assert.deepEqual(requests.appendQueuedMessage.mock.calls.map(([, message]) => message.content), ['old first', 'new identity queue']);
   assert.equal(store.readQueuedMessage('session-a')?.content, 'new identity queue');
   assert.equal(store.isChatDraftPending('session-a'), false);
 });
@@ -437,7 +598,7 @@ test('a debounced write from the old identity is not replayed after login', asyn
   const store = await loadStore();
   const auth = await import('@/shared/authToken');
   store.writeDraftText('session-a', 'old identity draft');
-  auth.startAuthSession('new.payload.signature');
+  await replaceIdentity(auth);
   await vi.advanceTimersByTimeAsync(1_000);
   assert.equal(requests.saveDraft.mock.calls.length, 0);
   assert.equal(store.readDraftText('session-a'), '');

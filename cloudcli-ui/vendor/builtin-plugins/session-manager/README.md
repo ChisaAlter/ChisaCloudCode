@@ -13,6 +13,12 @@ A session management tab plugin for [CloudCLI](https://github.com/siteboon/claud
 - **Auto-refresh** — Optional 10-second polling with toggle
 - **Dark/light theme** — Automatically follows CloudCLI's theme setting
 
+## Screenshots
+
+| Dark Mode | Light Mode |
+|-----------|------------|
+| ![Dark](img/Dark.jpg) | ![Light](img/Light.jpg) |
+
 ## Installation
 
 ### Via CloudCLI Settings

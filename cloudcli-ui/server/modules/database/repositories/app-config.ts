@@ -43,11 +43,20 @@ export const appConfigDb = {
    * server restarts while being created automatically on first boot.
    */
   getOrCreateJwtSecret(): string {
-    let secret = appConfigDb.get('jwt_secret');
-    if (!secret) {
-      secret = crypto.randomBytes(64).toString('hex');
-      appConfigDb.set('jwt_secret', secret);
-    }
-    return secret;
+    const db = getConnection();
+    return db.transaction(() => {
+      // A storage error is not a missing key: never rotate a signing secret after a failed read.
+      const select = db.prepare('SELECT value FROM app_config WHERE key = ?');
+      let stored = select.get('jwt_secret') as { value: string } | undefined;
+      if (!stored) {
+        db.prepare('INSERT OR IGNORE INTO app_config (key, value) VALUES (?, ?)')
+          .run('jwt_secret', crypto.randomBytes(64).toString('hex'));
+        stored = select.get('jwt_secret') as { value: string } | undefined;
+      }
+      if (!stored || typeof stored.value !== 'string' || stored.value.length < 32) {
+        throw new Error('JWT signing key is unavailable or invalid');
+      }
+      return stored.value;
+    })();
   },
 };

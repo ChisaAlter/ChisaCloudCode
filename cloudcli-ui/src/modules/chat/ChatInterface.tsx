@@ -1,10 +1,13 @@
-import React, { useCallback, useEffect, useMemo, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ArrowDownIcon } from 'lucide-react';
 
 import { useTasksSettings } from '@/modules/task-master';
+import { usePaletteOpsRegister } from '@/modules/command-palette';
 import { useWebSocket } from '@/shared/context/WebSocketContext';
 import PermissionContext from '@/modules/chat/context/PermissionContext';
+import { MarkdownWorkspaceContext } from '@/modules/chat/context/MarkdownWorkspaceContext';
+import { TranscriptSessionContext } from '@/modules/chat/context/TranscriptSessionContext';
 import { api } from '@/shared/api';
 import type {
   ChatMessage,
@@ -30,6 +33,7 @@ import ComposerModelPicker from '@/modules/chat/composer/ComposerModelPicker';
 import { writeSelectedProvider } from '@/shared/selectedProvider';
 import CommandResultModal from '@/modules/chat/modals/CommandResultModal';
 import ChatStarterPrompts from '@/modules/chat/transcript/ChatStarterPrompts';
+import { TokenUsageButton, TokenUsageDialog } from '@/modules/token-usage';
 
 type ChatInterfaceProps = {
   isActive: boolean;
@@ -79,9 +83,14 @@ function ChatInterface({
   const {
     markSessionProcessing: onSessionProcessing,
     markSessionIdle: onSessionIdle,
+    markSessionBackground: onSessionBackground,
+    getSessionActivity,
   } = useSessionProtectionActions();
 
   const sessionStore = useSessionStore();
+  // Both the composer and transcript menu open cumulative request usage for this conversation.
+  const [tokenStatisticsOpen, setTokenStatisticsOpen] = useState(false);
+  const showTokenStatistics = useCallback(() => setTokenStatisticsOpen(true), []);
   // When each session's `chat.subscribe` was last sent; idle acks older than
   // a later local request are discarded as stale.
   const statusCheckSentAtRef = useRef(new Map<string, number>());
@@ -139,6 +148,7 @@ function ChatInterface({
     visibleMessageCount,
     visibleMessages,
     loadEarlierMessages,
+    revealMessage,
     loadAllMessages,
     loadFullTranscript,
     allMessagesLoaded,
@@ -204,6 +214,12 @@ function ChatInterface({
     openAttachmentPicker,
     handleSubmit,
     isPreparingSend,
+    preparationStage,
+    canCancelPreparation,
+    sendError,
+    cancelPreparingSend,
+    backgroundSendPrompt,
+    resolveBackgroundSendPrompt,
     queuedDraft,
     editQueuedDraft,
     deleteQueuedDraft,
@@ -222,7 +238,6 @@ function ChatInterface({
     isInputFocused,
     commandModalPayload,
     closeCommandModal,
-    showCostModal,
     editingAnchorId,
     beginEditMessage,
     cancelEditMessage,
@@ -289,10 +304,33 @@ function ChatInterface({
     statusCheckSentAtRef,
     onSessionProcessing,
     onSessionIdle,
+    onSessionBackground,
+    getSessionActivity,
     onWebSocketReconnect: handleWebSocketReconnect,
     requestLatestMessages,
     sessionStore,
   });
+
+  // Lets other modules (the quick settings Commands tab) hand text to the
+  // composer: append it after a separating space, then focus the textarea with
+  // the caret at the end once React has rendered the new value.
+  const insertComposerText = useCallback((text: string) => {
+    setInput((previous) => {
+      const separator = previous && !/\s$/.test(previous) ? ' ' : '';
+      return `${previous}${separator}${text}`;
+    });
+    window.requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      if (!textarea) {
+        return;
+      }
+      textarea.focus();
+      const caretPosition = textarea.value.length;
+      textarea.setSelectionRange(caretPosition, caretPosition);
+    });
+  }, [setInput, textareaRef]);
+
+  usePaletteOpsRegister({ insertComposerText });
 
   useEffect(() => {
     if (!canAbortSession) {
@@ -337,7 +375,7 @@ function ChatInterface({
   }, [onNavigateToSession, selectedSession?.id]);
 
   const { scheduledMessages, schedule: scheduleMessage, cancel: cancelScheduledMessage } =
-    useScheduledMessages(currentSessionId || selectedSession?.id || null);
+    useScheduledMessages(currentSessionId || selectedSession?.id || null, subscribe);
 
   /**
    * Hands the composer's current text to the server to send later, and clears
@@ -362,23 +400,23 @@ function ChatInterface({
     handlePermissionDecision,
   }), [pendingPermissionRequests, handlePermissionDecision]);
 
+  // Lets markdown image paths in the transcript resolve against this project.
+  const markdownWorkspaceValue = useMemo(() => ({
+    projectId: selectedProject?.projectId ?? null,
+  }), [selectedProject?.projectId]);
+
+  // Lets a workflow card fetch its agents' timelines for this session.
+  const transcriptSessionValue = useMemo(() => ({ sessionId: currentSessionId }), [currentSessionId]);
+
   // A composer pick becomes the default for new chats and, when a session is
   // open, is recorded against that session so reopening it restores this model.
-  const handleSelectComposerModel = useCallback(async (model: string) => {
-    try {
-      await selectProviderModel(provider, model, currentSessionId || selectedSession?.id || null);
-    } catch (error) {
-      console.error('Error changing the active session model:', error);
-    }
-  }, [currentSessionId, provider, selectProviderModel, selectedSession?.id]);
+  const handleSelectComposerModel = useCallback((model: string) => (
+    selectProviderModel(provider, model, currentSessionId || selectedSession?.id || null)
+  ), [currentSessionId, provider, selectProviderModel, selectedSession?.id]);
 
-  const handleSelectComposerEffort = useCallback(async (effort: string) => {
-    try {
-      await selectProviderEffort(provider, effort, currentSessionId || selectedSession?.id || null);
-    } catch (error) {
-      console.error('Error changing the active session reasoning effort:', error);
-    }
-  }, [currentSessionId, provider, selectProviderEffort, selectedSession?.id]);
+  const handleSelectComposerEffort = useCallback((effort: string) => (
+    selectProviderEffort(provider, effort, currentSessionId || selectedSession?.id || null)
+  ), [currentSessionId, provider, selectProviderEffort, selectedSession?.id]);
 
   // The new-chat picker must use the hook's selection API so an explicit
   // composer choice overrides project defaults, including cross-provider picks.
@@ -424,6 +462,8 @@ function ChatInterface({
     <PermissionContext.Provider value={permissionContextValue}>
       <div className="flex h-full min-h-0 min-w-0">
       <div className={`chat-conversation flex min-h-0 min-w-0 flex-1 flex-col ${isNewConversation ? 'chat-conversation--new' : ''}`}>
+        <MarkdownWorkspaceContext.Provider value={markdownWorkspaceValue}>
+        <TranscriptSessionContext.Provider value={transcriptSessionValue}>
         <ChatMessagesPane
           scrollContainerRef={scrollContainerRef}
           // Not redundant with the `scroll` listener. A first page is 20 rows,
@@ -457,6 +497,9 @@ function ChatInterface({
           visibleMessageCount={visibleMessageCount}
           visibleMessages={visibleMessages}
           loadEarlierMessages={loadEarlierMessages}
+          revealMessage={revealMessage}
+          backgroundTasks={sessionActivity?.tasks}
+          sendMessage={sendMessage}
           loadAllMessages={loadAllMessages}
           allMessagesLoaded={allMessagesLoaded}
           isLoadingAllMessages={isLoadingAllMessages}
@@ -475,8 +518,10 @@ function ChatInterface({
           onEditMessage={supportsMessageEditing && !isProcessing ? beginEditMessage : undefined}
           onForkFromMessage={supportsSessionForking ? handleForkFromMessage : undefined}
           onLoadFullTranscript={loadFullTranscript}
-          onShowTokenUsage={showCostModal}
+          onShowTokenUsage={showTokenStatistics}
         />
+        </TranscriptSessionContext.Provider>
+        </MarkdownWorkspaceContext.Provider>
 
         <div className="chat-composer-dock relative flex-shrink-0">
           {isUserScrolledUp && chatMessages.length > 0 && (
@@ -512,6 +557,7 @@ function ChatInterface({
           availableModelOptions={currentProviderModelOptions}
           onSelectModel={handleSelectComposerModel}
           modelsLoading={providerModelsLoading}
+          usageControl={(currentSessionId || selectedSession?.id) ? <TokenUsageButton sessionId={currentSessionId || selectedSession?.id} onClick={showTokenStatistics} /> : undefined}
           modelControl={isNewConversation ? (
             <ComposerModelPicker
               provider={provider}
@@ -536,8 +582,14 @@ function ChatInterface({
           onClearInput={handleClearInput}
           onSubmit={handleSubmit}
           isPreparingSend={isPreparingSend}
+          preparationStage={preparationStage}
+          canCancelPreparation={canCancelPreparation}
+          sendError={sendError}
+          onCancelPreparingSend={cancelPreparingSend}
           isDragActive={isDragActive}
           queuedDraft={queuedDraft}
+          backgroundSendPrompt={backgroundSendPrompt}
+          onResolveBackgroundSendPrompt={resolveBackgroundSendPrompt}
           onEditQueuedDraft={editQueuedDraft}
           onDeleteQueuedDraft={deleteQueuedDraft}
           attachedFiles={attachedFiles}
@@ -582,6 +634,7 @@ function ChatInterface({
       </div>
       </div>
 
+      {tokenStatisticsOpen && <TokenUsageDialog open={tokenStatisticsOpen} onOpenChange={setTokenStatisticsOpen} sessionId={currentSessionId || selectedSession?.id || null} />}
       <CommandResultModal
         payload={commandModalPayload}
         onClose={closeCommandModal}

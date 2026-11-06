@@ -1,0 +1,224 @@
+{
+  "generatedAt": "2026-10-31T21:34:07.918Z",
+  "source": {
+    "package": "minimatch",
+    "version": "10.2.6",
+    "parent": "eslint-plugin-import-x@4.17.1",
+    "rule": "no-internal-modules",
+    "behavior": "original makeRe(pattern).test(normalizedPath)",
+    "normalization": "consumer normalizeSep/backslash to slash before either matching API",
+    "sourceIndexSha256": "d224f71f20d7c206fcc5b7e9f747324c7698345a0b2c28d717dd9cf698306783"
+  },
+  "vectors": [
+    {
+      "pattern": "pkg/private/**",
+      "input": "pkg/private/key",
+      "expected": true
+    },
+    {
+      "pattern": "pkg/private/**",
+      "input": "@scope/pkg/private/key",
+      "expected": false
+    },
+    {
+      "pattern": "pkg/private/**",
+      "input": "alpha/item",
+      "expected": false
+    },
+    {
+      "pattern": "pkg/private/**",
+      "input": "beta/item",
+      "expected": false
+    },
+    {
+      "pattern": "pkg/private/**",
+      "input": "pkg/public/index",
+      "expected": false
+    },
+    {
+      "pattern": "pkg/private/**",
+      "input": "../forbidden/inner",
+      "expected": false
+    },
+    {
+      "pattern": "pkg/private/**",
+      "input": "pkg/private/key",
+      "expected": true
+    },
+    {
+      "pattern": "@scope/pkg/private/**",
+      "input": "pkg/private/key",
+      "expected": false
+    },
+    {
+      "pattern": "@scope/pkg/private/**",
+      "input": "@scope/pkg/private/key",
+      "expected": true
+    },
+    {
+      "pattern": "@scope/pkg/private/**",
+      "input": "alpha/item",
+      "expected": false
+    },
+    {
+      "pattern": "@scope/pkg/private/**",
+      "input": "beta/item",
+      "expected": false
+    },
+    {
+      "pattern": "@scope/pkg/private/**",
+      "input": "pkg/public/index",
+      "expected": false
+    },
+    {
+      "pattern": "@scope/pkg/private/**",
+      "input": "../forbidden/inner",
+      "expected": false
+    },
+    {
+      "pattern": "@scope/pkg/private/**",
+      "input": "pkg/private/key",
+      "expected": false
+    },
+    {
+      "pattern": "**/forbidden/**",
+      "input": "pkg/private/key",
+      "expected": false
+    },
+    {
+      "pattern": "**/forbidden/**",
+      "input": "@scope/pkg/private/key",
+      "expected": false
+    },
+    {
+      "pattern": "**/forbidden/**",
+      "input": "alpha/item",
+      "expected": false
+    },
+    {
+      "pattern": "**/forbidden/**",
+      "input": "beta/item",
+      "expected": false
+    },
+    {
+      "pattern": "**/forbidden/**",
+      "input": "pkg/public/index",
+      "expected": false
+    },
+    {
+      "pattern": "**/forbidden/**",
+      "input": "../forbidden/inner",
+      "expected": false
+    },
+    {
+      "pattern": "**/forbidden/**",
+      "input": "pkg/private/key",
+      "expected": false
+    },
+    {
+      "pattern": "!pkg/public/**",
+      "input": "pkg/private/key",
+      "expected": true
+    },
+    {
+      "pattern": "!pkg/public/**",
+      "input": "@scope/pkg/private/key",
+      "expected": true
+    },
+    {
+      "pattern": "!pkg/public/**",
+      "input": "alpha/item",
+      "expected": true
+    },
+    {
+      "pattern": "!pkg/public/**",
+      "input": "beta/item",
+      "expected": true
+    },
+    {
+      "pattern": "!pkg/public/**",
+      "input": "pkg/public/index",
+      "expected": false
+    },
+    {
+      "pattern": "!pkg/public/**",
+      "input": "../forbidden/inner",
+      "expected": true
+    },
+    {
+      "pattern": "!pkg/public/**",
+      "input": "pkg/private/key",
+      "expected": true
+    },
+    {
+      "pattern": "[a-z]*",
+      "input": "pkg/private/key",
+      "expected": false
+    },
+    {
+      "pattern": "[a-z]*",
+      "input": "@scope/pkg/private/key",
+      "expected": false
+    },
+    {
+      "pattern": "[a-z]*",
+      "input": "alpha/item",
+      "expected": false
+    },
+    {
+      "pattern": "[a-z]*",
+      "input": "beta/item",
+      "expected": false
+    },
+    {
+      "pattern": "[a-z]*",
+      "input": "pkg/public/index",
+      "expected": false
+    },
+    {
+      "pattern": "[a-z]*",
+      "input": "../forbidden/inner",
+      "expected": false
+    },
+    {
+      "pattern": "[a-z]*",
+      "input": "pkg/private/key",
+      "expected": false
+    },
+    {
+      "pattern": "{alpha,beta}/**",
+      "input": "pkg/private/key",
+      "expected": false
+    },
+    {
+      "pattern": "{alpha,beta}/**",
+      "input": "@scope/pkg/private/key",
+      "expected": false
+    },
+    {
+      "pattern": "{alpha,beta}/**",
+      "input": "alpha/item",
+      "expected": true
+    },
+    {
+      "pattern": "{alpha,beta}/**",
+      "input": "beta/item",
+      "expected": true
+    },
+    {
+      "pattern": "{alpha,beta}/**",
+      "input": "pkg/public/index",
+      "expected": false
+    },
+    {
+      "pattern": "{alpha,beta}/**",
+      "input": "../forbidden/inner",
+      "expected": false
+    },
+    {
+      "pattern": "{alpha,beta}/**",
+      "input": "pkg/private/key",
+      "expected": false
+    }
+  ]
+}

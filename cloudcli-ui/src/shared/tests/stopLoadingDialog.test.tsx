@@ -1,16 +1,30 @@
 import React, { useState } from 'react';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { afterEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 import { WebSocketProvider, useWebSocket } from '@/shared/context/WebSocketContext';
 import { BlockingOperationDialog } from '@/shared/ui/BlockingOperationDialog';
 import { SessionProtectionProvider, useProcessingSessions, useSessionProtectionActions } from '@/shared/context/SessionProtectionContext';
+import { acknowledgeAuthSession, clearAuthToken, getAuthSessionSnapshot, initializeAuthSession, startAuthSession } from '@/shared/authToken';
+import type * as Api from '@/shared/api';
 
 const auth = vi.hoisted(() => ({ token: 'fixture', user: { id: 1 }, isLoading: false }));
 const runningSessions = vi.hoisted(() => vi.fn());
-vi.mock('@/shared/api', () => ({ api: { runningSessions } }));
+vi.mock('@/shared/api', async importOriginal => ({
+  ...(await importOriginal<typeof Api>()),
+  api: { runningSessions, auth: { webSocketTicket: async () => Response.json({ ticket: 'a'.repeat(43), expiresAt: Math.floor(Date.now() / 1000) + 30 }) } },
+}));
 vi.mock('@/modules/auth', () => ({ useAuth: () => auth }));
-vi.mock('@/shared/authToken', () => ({ expireAuthSession: vi.fn(), getAuthSessionVersion: () => 0, isAuthTokenExpired: () => false }));
+beforeEach(async () => {
+  Reflect.deleteProperty(globalThis, 'mygo');
+  await initializeAuthSession();
+  await clearAuthToken(getAuthSessionSnapshot());
+  const encode = (value: unknown) => btoa(JSON.stringify(value)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const credential = `${encode({ alg: 'HS256' })}.${encode({ userId: 1, iat: 1_700_000_000, exp: 4_102_444_800 })}.signature`;
+  const current = await startAuthSession(credential, getAuthSessionSnapshot());
+  expect(current).not.toBeNull();
+  acknowledgeAuthSession(current!);
+});
 
 class FixtureSocket {
   static OPEN = 1;
@@ -34,12 +48,13 @@ function Controls() {
   }}>Stop</button><input aria-label="Next message" />{error && <p role="alert">{error}</p>}</>;
 }
 
-afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); FixtureSocket.instances = []; runningSessions.mockReset(); });
+afterEach(async () => { cleanup(); await clearAuthToken(getAuthSessionSnapshot()); vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); FixtureSocket.instances = []; runningSessions.mockReset(); });
 
-test('stop stays nonblocking until the matching session is confirmed stopped', () => {
+test('stop stays nonblocking until the matching session is confirmed stopped', async () => {
   vi.stubEnv('VITE_IS_PLATFORM', 'true');
   vi.stubGlobal('WebSocket', FixtureSocket);
   render(<WebSocketProvider><Controls /><BlockingOperationDialog /></WebSocketProvider>);
+  await act(async () => { for (let turn = 0; turn < 20; turn++) await Promise.resolve(); });
   const socket = FixtureSocket.instances[0]!;
   act(() => socket.onopen?.());
   fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
@@ -57,10 +72,11 @@ test('stop stays nonblocking until the matching session is confirmed stopped', (
   expect(screen.queryByRole('status')).toBeNull();
 });
 
-test('a stop protocol failure releases loading so the existing error UI can be used', () => {
+test('a stop protocol failure releases loading so the existing error UI can be used', async () => {
   vi.stubEnv('VITE_IS_PLATFORM', 'true');
   vi.stubGlobal('WebSocket', FixtureSocket);
   render(<WebSocketProvider><Controls /><BlockingOperationDialog /></WebSocketProvider>);
+  await act(async () => { for (let turn = 0; turn < 20; turn++) await Promise.resolve(); });
   const socket = FixtureSocket.instances[0]!;
   act(() => socket.onopen?.());
   fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
@@ -69,9 +85,10 @@ test('a stop protocol failure releases loading so the existing error UI can be u
   expect(screen.queryByRole('status')).toBeNull();
 });
 
-test('a closed socket rejects stop visibly without creating a false pending-stop notice', () => {
+test('a closed socket rejects stop visibly without creating a false pending-stop notice', async () => {
   vi.stubGlobal('WebSocket', FixtureSocket);
   render(<WebSocketProvider><Controls /><BlockingOperationDialog /></WebSocketProvider>);
+  await act(async () => { for (let turn = 0; turn < 20; turn++) await Promise.resolve(); });
   const socket = FixtureSocket.instances[0]!;
   socket.readyState = 3;
   fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
@@ -80,9 +97,10 @@ test('a closed socket rejects stop visibly without creating a false pending-stop
   expect(screen.queryByRole('status')).toBeNull();
 });
 
-test('a failed stop retry does not erase an earlier stop still awaiting acknowledgement', () => {
+test('a failed stop retry does not erase an earlier stop still awaiting acknowledgement', async () => {
   vi.stubGlobal('WebSocket', FixtureSocket);
   render(<WebSocketProvider><Controls /><BlockingOperationDialog /></WebSocketProvider>);
+  await act(async () => { for (let turn = 0; turn < 20; turn++) await Promise.resolve(); });
   const socket = FixtureSocket.instances[0]!;
   act(() => socket.onopen?.());
   fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
@@ -102,10 +120,11 @@ function ProcessingProbe() {
     <p data-testid="activity">{activity ? `${activity.statusText}:${activity.canInterrupt}` : 'idle'}</p></>;
 }
 
-function mountPolledStop() {
+async function mountPolledStop() {
   vi.useFakeTimers();
   vi.stubGlobal('WebSocket', FixtureSocket);
   render(<WebSocketProvider><SessionProtectionProvider><Controls /><ProcessingProbe /><BlockingOperationDialog /></SessionProtectionProvider></WebSocketProvider>);
+  await act(async () => { for (let turn = 0; turn < 20; turn++) await Promise.resolve(); });
   act(() => FixtureSocket.instances[0]!.onopen?.());
   fireEvent.click(screen.getByRole('button', { name: 'Hand back files' }));
   fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
@@ -115,7 +134,7 @@ test('file handback stays busy until a successful idle snapshot settles a lost t
   runningSessions.mockResolvedValueOnce(Response.json({ data: { sessions: [{ sessionId: 'active', statusText: 'workspace_finalizing' }] } }))
     .mockResolvedValueOnce(Response.json({ data: { sessions: [{ sessionId: 'active', statusText: 'workspace_finalizing' }] } }))
     .mockResolvedValue(Response.json({ data: { sessions: [] } }));
-  mountPolledStop();
+  await mountPolledStop();
   const input = screen.getByRole('textbox') as HTMLInputElement;
   fireEvent.change(input, { target: { value: 'saved draft while stopping' } });
   await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
@@ -132,7 +151,7 @@ test.each([{}, { sessions: [{}] }, { sessions: [{ sessionId: 123 }] }, { session
   runningSessions.mockResolvedValueOnce(Response.json({ data: { sessions: [{ sessionId: 'active' }] } }))
     .mockResolvedValueOnce(new Response('', { status: 499 }))
     .mockResolvedValue(Response.json({ data }));
-  mountPolledStop();
+  await mountPolledStop();
   await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
   expect(screen.getByRole('status').textContent).toContain('正在停止任务');
   expect(screen.getByTestId('activity').textContent).toBe('workspace_finalizing:false');
@@ -142,7 +161,7 @@ test('an idle snapshot requested before stop cannot settle it when its response 
   let finishOldSnapshot!: (response: Response) => void;
   runningSessions.mockImplementationOnce(() => new Promise<Response>(resolve => { finishOldSnapshot = resolve; }))
     .mockResolvedValue(Response.json({ data: { sessions: [] } }));
-  mountPolledStop();
+  await mountPolledStop();
   vi.setSystemTime(Date.now() + 12000);
   await act(async () => { finishOldSnapshot(Response.json({ data: { sessions: [] } })); });
   expect(screen.getByRole('status').textContent).toContain('正在停止任务');
@@ -155,7 +174,7 @@ test('an older running snapshot cannot revive a stop that a newer idle snapshot 
   let finishOldSnapshot!: (response: Response) => void;
   runningSessions.mockImplementationOnce(() => new Promise<Response>(resolve => { finishOldSnapshot = resolve; }))
     .mockResolvedValue(Response.json({ data: { sessions: [] } }));
-  mountPolledStop();
+  await mountPolledStop();
   vi.setSystemTime(Date.now() + 12000);
   await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
   expect(screen.queryByRole('status')).toBeNull();

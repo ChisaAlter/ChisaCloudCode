@@ -3,7 +3,7 @@ import { memo, useCallback, useMemo } from 'react';
 import type { Dispatch, RefObject, SetStateAction } from 'react';
 
 import { useAuth } from '@/modules/auth';
-import type { ChatMessage,
+import type { BackgroundTaskSummary, ChatMessage,
   Project,
   ProjectSession,
   LLMProvider,
@@ -18,6 +18,7 @@ import ProviderSelectionEmptyState from '@/modules/chat/transcript/ProviderSelec
 import ToolGroupContainer from '@/modules/chat/transcript/ToolGroupContainer';
 import LoadAllMessagesOverlay from '@/modules/chat/transcript/LoadAllMessagesOverlay';
 import ChatExportMenu from '@/modules/chat/transcript/ChatExportMenu';
+import { BackgroundTasksStrip } from '@/modules/chat/transcript/BackgroundTasksStrip';
 
 /**
  * How many of the newest rows mount with real content on the first commit,
@@ -56,6 +57,11 @@ type ChatMessagesPaneProps = {
   visibleMessageCount: number;
   visibleMessages: ChatMessage[];
   loadEarlierMessages: () => void;
+  revealMessage: (message: ChatMessage) => void;
+  /** The session's running background tasks from the activity map, for the strip to list ones whose rows are not loaded. */
+  backgroundTasks?: BackgroundTaskSummary[];
+  /** The chat websocket's send, which the background-tasks strip stops a task over. */
+  sendMessage: (message: unknown) => void;
   loadAllMessages: () => void;
   allMessagesLoaded: boolean;
   isLoadingAllMessages: boolean;
@@ -77,6 +83,16 @@ type ChatMessagesPaneProps = {
   /** Keeps token usage in the same quiet conversation menu as transcript exports. */
   onShowTokenUsage?: () => void;
 };
+
+/**
+ * Keys for the rows inside a collapsed tool group. They only have to be unique
+ * among that group's own rows (ToolGroupContainer disambiguates repeats), so
+ * they do not depend on the pane's per-render key map — and being a module
+ * function, the prop keeps its identity, which is what lets
+ * memo(ToolGroupContainer) skip a group on a stream tick that did not touch it.
+ */
+const getGroupedMessageKey = (message: ChatMessage): string =>
+  getIntrinsicMessageKey(message) ?? 'message-generated';
 
 /**
  * Rendered by chat's ChatInterface as the scrolling transcript: the message
@@ -111,6 +127,9 @@ function ChatMessagesPane({
   visibleMessageCount,
   visibleMessages,
   loadEarlierMessages,
+  revealMessage,
+  backgroundTasks,
+  sendMessage,
   loadAllMessages,
   allMessagesLoaded,
   isLoadingAllMessages,
@@ -176,7 +195,18 @@ function ChatMessagesPane({
       className="chat-messages-pane relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden pt-3 pb-3 sm:pt-4 sm:pb-4"
     >
       {chatMessages.length > 0 && (
-        <div className="chat-transcript-actions pointer-events-none sticky right-4 top-2 z-10 mx-auto flex w-full max-w-[49rem] justify-end px-4">
+        <div className="chat-transcript-actions pointer-events-none sticky right-4 top-2 z-10 mx-auto mb-2 flex w-full max-w-[49rem] items-start justify-between gap-2 px-4">
+          {/* Running background work stays in view while the transcript scrolls under it. */}
+          <div className="pointer-events-auto min-w-0 pl-4 sm:pl-0">
+            <BackgroundTasksStrip
+              messages={chatMessages}
+              tasks={backgroundTasks}
+              sessionId={selectedSession?.id || currentSessionId}
+              sendMessage={sendMessage}
+              onReveal={revealMessage}
+              onLoadAll={loadAllMessages}
+            />
+          </div>
           <div className="pointer-events-auto">
             <ChatExportMenu
               messages={chatMessages}
@@ -289,7 +319,7 @@ function ChatMessagesPane({
                       group={item}
                       prevMessage={groupPrevMessage}
                       createDiff={createDiff}
-                      getMessageKey={getMessageKey}
+                      getMessageKey={getGroupedMessageKey}
                       onFileOpen={onFileOpen}
                       onShowSettings={onShowSettings}
                       onGrantToolPermission={onGrantToolPermission}

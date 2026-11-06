@@ -17,6 +17,9 @@ const { assertCloudWorkspaceOwner } = await import('@/modules/workspace-runtime/
 mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
   assertCloudWorkspaceOwner,
   ensureCloudWorkspaceBinding() {}, excludeCloudWorkspaceMetadata() {}, getWorkspaceRuntimeIdentity() { return undefined; },
+  getWorkspaceBrokerAdmission() { assert.fail('local agent must not borrow a cloud broker lease'); },
+  closeWorkspaceBrokerLease() { assert.fail('local agent must not close a cloud broker lease'); },
+  readCloudWorkspaceOwner() { return undefined; },
   executeWorkspaceRuntimePreview() { assert.fail('unexpected preview'); }, createWorkspaceRuntimeService() { assert.fail('unexpected restore'); },
 } });
 const { describeWorkspaceSelection } = await import('@/modules/workspace-bridge/index.js');
@@ -89,11 +92,15 @@ async function withGateway(
     throw new Error('Private workspace transport must not be queried by chat');
   });
   const dependencies: Parameters<typeof handleChatConnection>[2] = {
+    isSessionActive: () => true,
     runtime: {
       hasRuntime: () => true,
       run: async (_provider, command) => { runs.push(command); },
       abort: async (_provider, sessionId) => { aborts.push(sessionId); return true; },
       resolveToolApproval: () => {},
+      hasBackgroundWork: () => false,
+      hasBackgroundTask: () => false,
+      stopBackgroundTask: async () => false,
       getPendingApprovalsForSession: () => [],
     },
   };

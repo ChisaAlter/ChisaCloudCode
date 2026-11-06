@@ -1,6 +1,6 @@
 {
   "name": "chisacloudcode",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "productName": "ChisaCloudCode",
   "description": "ChisaCloudCode desktop and server workspace",
   "type": "module",
@@ -18,7 +18,9 @@
     "scripts/",
     "README.md",
     "public/builtin-plugins/",
-    "vendor/builtin-plugins/"
+    "vendor/builtin-plugins/",
+    "vendor/eslint-plugin-import-x-4.17.1-chisa.1.tgz",
+    "vendor/eslint-plugin-import-x/"
   ],
   "scripts": {
     "dev": "concurrently --kill-others \"npm run server:dev\" \"npm run client\"",
@@ -83,10 +85,9 @@
     "@codemirror/theme-one-dark": "^6.1.2",
     "@iarna/toml": "^2.2.5",
     "@octokit/rest": "^22.0.0",
-    "@openai/codex": "0.153.4",
-    "@openai/codex-sdk": "^0.153.0",
+    "@openai/codex": "0.156.1",
+    "@openai/codex-sdk": "^0.156.0",
     "@replit/codemirror-minimap": "^0.5.2",
-    "@tailwindcss/typography": "^0.5.16",
     "@uiw/react-codemirror": "^4.23.13",
     "@vscode/ripgrep": "^1.17.1",
     "@xterm/addon-clipboard": "^0.1.0",
@@ -102,45 +103,46 @@
     "cmdk": "^1.1.1",
     "cors": "^2.8.5",
     "cross-spawn": "^7.0.3",
-    "dompurify": "^3.4.7",
-    "express": "^4.18.2",
+    "dompurify": "3.4.17",
+    "express": "4.22.3",
     "fuse.js": "^7.0.0",
     "gray-matter": "^4.0.3",
     "i18next": "^25.7.4",
     "ignore": "^7.0.6",
     "jsonwebtoken": "^9.0.2",
     "jszip": "^3.10.1",
-    "katex": "^0.16.25",
+    "katex": "0.18.2",
     "lucide-react": "^0.515.0",
-    "mermaid": "^11.16.1",
+    "mermaid": "12.2.0",
     "mime-types": "^3.0.1",
-    "multer": "^2.0.1",
+    "multer": "2.5.0",
     "mygo-runtime": "^0.1.22",
     "node-fetch": "^2.7.0",
-    "node-pty": "^1.2.0-beta.12",
+    "node-pty": "1.2.0-beta.12",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-dropzone": "^14.2.3",
     "react-error-boundary": "^4.1.2",
     "react-i18next": "^16.5.3",
     "react-markdown": "^10.1.0",
-    "react-router-dom": "^6.8.1",
-    "react-scan": "^0.5.7",
-    "react-syntax-highlighter": "^16.1.2",
-    "rehype-katex": "^7.0.1",
+    "react-router-dom": "7.18.5",
+    "react-syntax-highlighter": "16.1.2",
+    "rehype-katex": "7.0.1",
     "rehype-raw": "^7.0.0",
     "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.0",
     "remark-math": "^6.0.0",
+    "sharp": "0.35.5",
     "tailwind-merge": "^3.3.1",
     "web-push": "^3.6.7",
-    "ws": "^8.14.2",
-    "zod": "^4.3.6"
+    "ws": "8.22.1",
+    "zod": "4.6.7"
   },
   "devDependencies": {
-    "@commitlint/cli": "^20.5.0",
-    "@commitlint/config-conventional": "^20.5.0",
-    "@release-it/conventional-changelog": "^10.0.5",
+    "@commitlint/cli": "21.2.4",
+    "@commitlint/config-conventional": "21.2.4",
+    "@release-it/conventional-changelog": "12.0.2",
+    "@tailwindcss/typography": "0.5.20",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/react": "^16.3.2",
     "@types/better-sqlite3": "^7.6.13",
@@ -157,38 +159,63 @@
     "@vitejs/plugin-react": "^4.6.0",
     "@xterm/addon-search": "^0.15.0",
     "@xterm/addon-unicode11": "^0.8.0",
-    "auto-changelog": "^2.5.0",
     "autoprefixer": "^10.4.16",
     "concurrently": "^8.2.2",
     "esbuild": "^0.25.0",
-    "eslint": "^9.39.3",
-    "eslint-import-resolver-typescript": "^4.4.4",
-    "eslint-plugin-boundaries": "^6.0.2",
-    "eslint-plugin-import-x": "^4.16.1",
+    "eslint": "10.14.0",
+    "eslint-import-resolver-typescript": "4.4.5",
+    "eslint-plugin-boundaries": "7.4.0",
+    "eslint-plugin-import-x": "file:vendor/eslint-plugin-import-x-4.17.1-chisa.1.tgz",
     "eslint-plugin-tailwindcss": "^3.18.2",
     "husky": "^9.1.7",
     "js-yaml": "^4.3.0",
     "jsdom": "^26.1.0",
     "lint-staged": "^16.3.2",
     "luxon": "^3.7.2",
-    "node-gyp": "^10.0.0",
+    "node-gyp": "12.4.0",
     "oxlint": "^1.79.0",
     "oxlint-tsgolint": "^7.0.2001",
-    "postcss": "^8.4.32",
-    "release-it": "^19.0.5",
-    "sharp": "^0.34.2",
+    "postcss": "8.5.32",
+    "react-scan": "0.5.7",
+    "release-it": "21.1.2",
     "tailwindcss": "^3.4.0",
     "tsc-alias": "^1.8.16",
-    "tsx": "^4.21.0",
+    "tsx": "4.23.15",
     "typescript": "^5.9.3",
-    "vite": "^7.0.4",
-    "vitest": "^3.2.7"
+    "vite": "7.3.7",
+    "vitest": "4.1.12"
   },
   "lint-staged": {
     "src/**/*.{ts,tsx,js,jsx}": "oxlint",
     "server/**/*.{js,ts}": "oxlint"
   },
-  "optionalDependencies": {
-    "@nut-tree-fork/nut-js": "^4.2.6"
+  "allowScripts": {
+    "bcrypt@6.0.0": true,
+    "better-sqlite3@12.11.1": true,
+    "esbuild@0.25.12": true,
+    "esbuild@0.28.2": true,
+    "node-pty@1.2.0-beta.12": true,
+    "unrs-resolver@1.11.1": true,
+    "@vscode/ripgrep@1.17.1": true
+  },
+  "overrides": {
+    "rehype-katex@7.0.1": {
+      "katex": "0.18.2"
+    },
+    "micromark-extension-math@3.1.0": {
+      "katex": "0.18.2"
+    },
+    "get-uri@8.0.1": {
+      "basic-ftp": "6.2.4"
+    },
+    "@tailwindcss/typography@0.5.20": {
+      "postcss-selector-parser": "6.1.5"
+    },
+    "eslint@10.14.0": {
+      "minimatch": "11.0.3"
+    },
+    "@eslint/config-array@0.23.5": {
+      "minimatch": "11.0.3"
+    }
   }
 }

@@ -100,7 +100,7 @@ func TestSshAgentEnsureConcurrentForwardAndRegistrationAreSeparateAndPrivate(t *
 		go func() { _, err := m.ensure(s, p.ID, 2*time.Second); results <- err }()
 	}
 	a := <-agents
-	started := <-runtime.starts
+	started := awaitSshStart(t, runtime.starts)
 	select {
 	case <-registerStarted:
 		t.Fatal("registered before actual forward acknowledgement")
@@ -153,7 +153,7 @@ func TestSshAgentRegistrationRetryRetainsAgentAndGeneration(t *testing.T) {
 	result := make(chan error, 1)
 	go func() { _, err := m.ensure(s, p.ID, 2*time.Second); result <- err }()
 	<-agents
-	start := <-runtime.starts
+	start := awaitSshStart(t, runtime.starts)
 	acknowledgeAgent(t, start)
 	if err := <-result; err == nil {
 		t.Fatal("registration error became success")
@@ -199,7 +199,7 @@ func TestSshAgentNetworkRetryKeepsTokenAndStopCancelsBackoff(t *testing.T) {
 	}
 	_, _ = m.start(s, p.ID)
 	a := <-agents
-	first := <-runtime.starts
+	first := awaitSshStart(t, runtime.starts)
 	acknowledgeAgent(t, first)
 	waitRegistration(t, m, s, p.ID, "registered")
 	first.process.exit(errors.New("network"))
@@ -211,7 +211,7 @@ func TestSshAgentNetworkRetryKeepsTokenAndStopCancelsBackoff(t *testing.T) {
 		t.Fatal(d)
 	}
 	backoff <- time.Now()
-	second := <-runtime.starts
+	second := awaitSshStart(t, runtime.starts)
 	acknowledgeAgent(t, second)
 	waitRegistration(t, m, s, p.ID, "registered")
 	mu.Lock()
@@ -240,7 +240,7 @@ func TestSshAgentPermanentAuthenticationFailureDoesNotRetry(t *testing.T) {
 			testAgentDependencies(t, m)
 			p := testAgentProfile(t, m, s)
 			_, _ = m.start(s, p.ID)
-			start := <-r.starts
+			start := awaitSshStart(t, r.starts)
 			_, _ = io.WriteString(start.output, diagnostic+"\n")
 			start.process.exit(errors.New("ssh"))
 			waitSshState(t, m, s, p.ID, "error")
@@ -262,9 +262,9 @@ func TestSshAgentTimeoutIsNotSuccessAndPreflightDoesNotBlockStop(t *testing.T) {
 	if err == nil || sshErrorResponse(err)["code"] != "SSH_AGENT_READY_TIMEOUT" {
 		t.Fatal(err)
 	}
-	start := <-r.starts
+	start := awaitSshStart(t, r.starts)
 	_, _ = m.stop(s, p.ID)
-	<-start.process.killed
+	awaitNativeSignal(t, start.process.killed, "SSH stop did not terminate the owned child")
 	waitSshState(t, m, s, p.ID, "stopped")
 	entered, release := make(chan struct{}), make(chan struct{})
 	m.deps.agentPreflight = func() SshPreflight { close(entered); <-release; return SshPreflight{OK: true} }
@@ -378,6 +378,41 @@ func TestSshAgentRegistrationBodyTimeoutIsNotAccountChange(t *testing.T) {
 	}
 	if scope.ctx.Err() != nil {
 		t.Fatal("registration body timeout revoked account")
+	}
+}
+
+func TestSshNativeRefreshRejectsTruncatedOrOversizedSuccess(t *testing.T) {
+	for _, operation := range []string{"registration", "relay"} {
+		for _, bodyMode := range []string{"truncated", "oversized"} {
+			t.Run(operation+"/"+bodyMode, func(t *testing.T) {
+				fresh := testSessionToken(1, "fixture", "refresh")
+				c := nativeSessionFixture(t, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("X-Refreshed-Token", fresh)
+					if bodyMode == "truncated" {
+						w.Header().Set("Content-Length", "1024")
+						fmt.Fprint(w, `{}`)
+					} else {
+						fmt.Fprint(w, strings.Repeat("x", 64*1024+1))
+					}
+				})
+				token, revision := c.accessToken, c.tokenRevision
+				scope := mustSshScope(t)
+				ctx, cancel := context.WithTimeout(scope.ctx, 3*time.Second)
+				defer cancel()
+				var err error
+				if operation == "registration" {
+					err = registerSshAgent(ctx, scope, SshTunnelProfile{SshTunnelProfileInput: SshTunnelProfileInput{ID: strings.Repeat("a", 32), RemotePort: 18766, AgentTransport: "relay"}}, strings.Repeat("b", 64))
+				} else {
+					_, err = sshAgentServiceRequest(ctx, scope, strings.Repeat("b", 64), http.MethodGet, "/api/ssh-workspaces/agent/relay/poll", nil, 64*1024)
+				}
+				if err == nil || c.accessToken != token || c.tokenRevision != revision || apiConnection != c || !c.authenticated {
+					t.Fatal("incomplete SSH response committed a credential refresh")
+				}
+				if persisted, err := loadAccountCredential(c.serverKey); err != nil || persisted != token {
+					t.Fatal("incomplete SSH response changed the durable credential")
+				}
+			})
+		}
 	}
 }
 

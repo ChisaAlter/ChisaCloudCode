@@ -3,10 +3,11 @@ export { closeConnection, getConnection, getDatabasePath } from '@/modules/datab
 export { apiKeysDb } from '@/modules/database/repositories/api-keys.js';
 export { appConfigDb } from '@/modules/database/repositories/app-config.js';
 export { credentialsDb } from '@/modules/database/repositories/credentials.js';
-// Providers persists private per-user Messages endpoints and HiRoute connections.
+// claudeConnectionsDb: server-private per-user Messages endpoints consumed by Providers.
 export { claudeConnectionsDb } from '@/modules/database/repositories/claude-connections.db.js';
 // Providers owns profile-backed subscription metadata and per-user selections.
 export { claudeAccountsDb } from '@/modules/database/repositories/claude-accounts.db.js';
+// hirouteDb: private per-user gateway connections consumed by Providers.
 export { hirouteDb } from '@/modules/database/repositories/hiroute.db.js';
 export { githubTokensDb } from '@/modules/database/repositories/github-tokens.js';
 export { notificationChannelEndpointsDb } from '@/modules/database/repositories/notification-channel-endpoints.js';
@@ -28,7 +29,7 @@ export { projectsDb } from '@/modules/database/repositories/projects.db.js';
 export { sshProjectTargetsDb } from '@/modules/database/repositories/ssh-project-targets.db.js';
 export { pushSubscriptionsDb } from '@/modules/database/repositories/push-subscriptions.js';
 export { scanStateDb } from '@/modules/database/repositories/scan-state.db.js';
-// sessionDraftsDb: used by User for drafts, Scheduled Messages for queued turns, and WebSocket for terminal queue suspension.
+// sessionDraftsDb: used by User for drafts and Scheduled Messages for server-owned queued turns.
 export { sessionDraftsDb } from '@/modules/database/repositories/session-drafts.db.js';
 export type {
   QueuedSessionMessageRecord,
@@ -36,6 +37,8 @@ export type {
 } from '@/modules/database/repositories/session-drafts.db.js';
 export { sessionsDb } from '@/modules/database/repositories/sessions.db.js';
 export { userDb } from '@/modules/database/repositories/users.js';
+// Auth uses durable login-session revocation, independently of provider/chat session records.
+export { authSessionsDb } from '@/modules/database/repositories/auth-sessions.db.js';
 // userPreferencesDb: used by the User module to persist the settings that used to live in browser localStorage.
 export { userPreferencesDb } from '@/modules/database/repositories/user-preferences.db.js';
 export { vapidKeysDb } from '@/modules/database/repositories/vapid-keys.js';

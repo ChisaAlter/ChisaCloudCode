@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronUp, Gauge, LogOut, Settings } from 'lucide-react';
+import { BarChart3, ChevronUp, Gauge, LogOut, Settings } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
 import { useAuth } from '@/modules/auth/context/AuthContext';
@@ -7,6 +7,7 @@ import { AccountAvatar } from '@/modules/auth/AccountAvatar';
 import { AccountPopup } from '@/modules/auth/AccountPopup';
 import { ActionMenu } from '@/shared/ui';
 import type { AccountPopupSection } from '@/shared/types';
+import { TokenUsageDialog } from '@/modules/token-usage';
 
 /** Sidebar's footer and collapsed rail, plus the signed-out desktop shell, share this account menu. */
 export function AccountMenu({ onOpenSettings, collapsed = false }: { onOpenSettings?: () => void; collapsed?: boolean }) {
@@ -14,6 +15,8 @@ export function AccountMenu({ onOpenSettings, collapsed = false }: { onOpenSetti
   const { t } = useTranslation('auth');
   // Only the selected function mounts; opening the menu itself never requests quota data.
   const [section, setSection] = useState<AccountPopupSection | null>(null);
+  // Account totals remain available independently of the Claude subscription quota.
+  const [usageOpen, setUsageOpen] = useState(false);
   const accountName = user?.displayName || user?.username || t('accountMenu.guest');
 
   return <>
@@ -34,11 +37,13 @@ export function AccountMenu({ onOpenSettings, collapsed = false }: { onOpenSetti
           leading: <AccountAvatar user={user} />,
           onSelect: () => setSection('account'),
         },
-        { key: 'quota', label: t('accountMenu.usage'), icon: Gauge, showDividerBefore: true, onSelect: () => setSection('quota') },
+        ...(user ? [{ key: 'token-statistics', label: t('accountMenu.tokens'), icon: BarChart3, showDividerBefore: true, onSelect: () => setUsageOpen(true) }] : []),
+        { key: 'quota', label: t('accountMenu.usage'), icon: Gauge, showDividerBefore: !user, onSelect: () => setSection('quota') },
         { key: 'settings', label: t('accountMenu.settings'), icon: Settings, onSelect: () => onOpenSettings ? onOpenSettings() : setSection('settings') },
         ...(user ? [{ key: 'logout', label: t('logout.button'), icon: LogOut, showDividerBefore: true, onSelect: logout }] : []),
       ]}
     />
     <AccountPopup isOpen={section !== null} section={section ?? 'account'} onClose={() => setSection(null)} />
+    {usageOpen && <TokenUsageDialog open={usageOpen} onOpenChange={setUsageOpen} />}
   </>;
 }

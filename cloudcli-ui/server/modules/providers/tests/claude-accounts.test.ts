@@ -72,7 +72,9 @@ test('subscription ownership, CLI login, leases, switching and routes use only t
     assert.equal((await fetch(url)).status, 401);
     const single = await service.getState(first);
     assert.equal(single.defaultAccount?.email, 'global-default@example.test');
-    assert.equal(single.defaultAccount?.usage.windows.length, 2);
+    assert.equal(single.defaultAccount?.usage.failureKind, 'not-read');
+    assert.equal(fetchCount, 0);
+    assert.equal((await service.refresh(first)).defaultAccount?.usage.windows.length, 2);
     const defaultLease = service.captureLaunch(first);
     assert.equal(defaultLease?.accountId, 'default'); defaultLease?.release(); defaultLease?.release();
     profileEnv.CLAUDE_CODE_OAUTH_TOKEN = 'fixture-env-only-oauth';
@@ -142,7 +144,9 @@ test('subscription ownership, CLI login, leases, switching and routes use only t
     const selected = await data<ClaudeAccountsState>(await request('PUT', '/active', { id: task.accountId }));
     assert.equal(selected.route.kind, 'subscription');
     assert.equal(selected.activeId, task.accountId);
-    assert.equal(selected.accounts[0].usage.windows[0].usedPercent, 42);
+    assert.equal(selected.accounts[0].usage.failureKind, 'not-read');
+    assert.equal(fetchCount, baseCount);
+    assert.equal((await service.refresh(first)).accounts[0].usage.windows[0].usedPercent, 42);
     assert.equal(fetchCount, baseCount + 1);
     await service.getState(first);
     assert.equal(fetchCount, baseCount + 1);
@@ -239,6 +243,36 @@ test('quota supports both response families, coalesces refresh, honors cooldown 
   const changedResolve = resolveResponse as unknown as (response: globalThis.Response) => void;
   changedResolve(new globalThis.Response(JSON.stringify({ five_hour: { utilization: 88 } })));
   assert.equal((await changed).failureKind, 'account-changed');
+});
+
+test('quota snapshots retain cached failures and filter resets without reading remotely or reusing changed credentials', async () => {
+  let now = 2_000_000_000_000;
+  let calls = 0;
+  let limited = false;
+  const current = credentials(now, { expiresAt: now + 10_000_000 });
+  const quota = new ClaudeAccountQuotaService({ now: () => now, fetch: (async () => {
+    calls++;
+    return limited ? new Response('', { status: 429, headers: { 'retry-after': '120' } })
+      : new Response(JSON.stringify({ five_hour: { utilization: 42, resets_at: now + 100_000 } }));
+  }) as typeof fetch });
+  const key = '1:server:snapshot';
+  assert.equal(quota.peek(key, current).failureKind, 'not-read'); assert.equal(calls, 0);
+  await quota.read(key, () => current);
+  limited = true;
+  const failure = await quota.read(key, () => current, true);
+  assert.equal(failure.status, 'error'); assert.equal(failure.stale, true);
+  assert.deepEqual(quota.peek(key, current), failure);
+  assert.equal(quota.peek(key, { ...current, accessToken: 'fixture-replaced' }).failureKind, 'not-read');
+  assert.equal(quota.peek(key, { ...current, email: 'other@example.test' }).windows.length, 0);
+  assert.equal(quota.peek(key, { ...current, accessToken: null, refreshable: false }).failureKind, 'missing-credentials');
+  assert.equal(quota.peek(key, { ...current, accessToken: null }).failureKind, 'stale-token');
+  assert.equal(quota.peek(key, { ...current, accessToken: null, unavailable: true }).failureKind, 'credentials-unavailable');
+  now += 101_000;
+  const reset = quota.peek(key, current);
+  assert.equal(reset.windows.length, 0); assert.equal(reset.failureKind, 'rate-limited');
+  assert.equal(reset.retryAt, failure.retryAt); assert.equal(reset.checkedAt, failure.checkedAt);
+  quota.evict(key);
+  assert.equal(quota.peek(key, current).failureKind, 'not-read'); assert.equal(calls, 2);
 });
 
 test('CLI login teardown handles errors, superseded attempts and expiry without accepting late success', async () => {

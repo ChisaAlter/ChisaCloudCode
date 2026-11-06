@@ -34,7 +34,13 @@
     "loadingSessions": "加载会话中...",
     "unnamed": "未命名",
     "loading": "加载中...",
-    "showMore": "显示更多会话"
+    "showMore": "显示更多会话",
+    "select": "选择",
+    "selectAll": "全选",
+    "selectAllLoaded": "全选已加载",
+    "clearSelection": "清除选择",
+    "deleteSelected_one": "删除 {{count}} 个会话",
+    "deleteSelected_other": "删除 {{count}} 个会话"
   },
   "tooltips": {
     "viewEnvironments": "查看环境",
@@ -53,7 +59,8 @@
     "clearSearch": "清除搜索",
     "openCommandPalette": "打开命令面板",
     "attentionRequiredIndicator": "会话需要处理",
-    "processingSessionIndicator": "会话正在处理中"
+    "processingSessionIndicator": "会话正在处理中",
+    "backgroundWorkIndicator": "后台任务正在运行"
   },
   "navigation": {
     "chat": "聊天",
@@ -104,6 +111,7 @@
     "deleteProjectConfirm": "从侧边栏移除此项目？您的项目文件、记忆和会话数据不会被删除。",
     "enterProjectPath": "请输入项目路径",
     "deleteSessionFailed": "删除会话失败，请重试。",
+    "archiveSessionFailed": "归档会话失败，请重试。",
     "deleteSessionError": "删除会话时出错，请重试。",
     "renameSessionFailed": "重命名会话失败，请重试。",
     "renameSessionError": "重命名会话时出错，请重试。",
@@ -117,7 +125,9 @@
     "restoreProjectError": "恢复项目时出错，请重试。",
     "restoreSessionFailed": "恢复会话失败，请重试。",
     "restoreSessionError": "恢复会话时出错，请重试。",
-    "forkSessionError": "无法派生该会话，请重试。"
+    "forkSessionError": "无法派生该会话，请重试。",
+    "deleteSessionsPartialFailure_one": "{{total}} 个会话中有 {{count}} 个删除失败，请重试。",
+    "deleteSessionsPartialFailure_other": "{{total}} 个会话中有 {{count}} 个删除失败，请重试。"
   },
   "version": {
     "updateAvailable": "有可用更新",
@@ -139,7 +149,8 @@
     "archivedPlaceholder": "搜索已归档会话...",
     "runningPlaceholder": "搜索运行中的会话...",
     "archiveOnlyTooltip": "归档",
-    "runningTooltip": "运行中的会话"
+    "runningTooltip": "运行中的会话",
+    "modeMore": "更多"
   },
   "deleteConfirmation": {
     "deleteProject": "移除项目",
@@ -155,7 +166,16 @@
     "deleteSessionPermanently": "永久删除",
     "deleteAllData": "永久删除所有数据",
     "allConversationsDeleted": "项目将从侧边栏中移除。您的文件、记忆和会话数据将会保留。",
-    "cannotUndo": "您可以稍后重新添加此项目。"
+    "cannotUndo": "您可以稍后重新添加此项目。",
+    "confirmDeleteSessions": "您想如何处理",
+    "deleteSessions_one": "删除 {{count}} 个会话",
+    "deleteSessions_other": "删除 {{count}} 个会话",
+    "selectedSessions_one": "选中的 {{count}} 个会话",
+    "selectedSessions_other": "选中的 {{count}} 个会话",
+    "archiveSessions_one": "归档 {{count}} 个会话",
+    "archiveSessions_other": "归档 {{count}} 个会话",
+    "archiveSessionsNotice_one": "归档会将所选会话移出活动列表，但保留其历史记录。",
+    "archiveSessionsNotice_other": "归档会将所选会话移出活动列表，但保留其历史记录。"
   },
   "sessionMenu": {
     "options": "对话操作",

@@ -25,7 +25,7 @@ test('writer gate wrappers are Linux-only and never select legacy admission afte
       launch = (command, args, options) => {
         assert.equal(command, 'python3');
         assert.deepEqual(args.slice(0, 2), ['-I', '-c']);
-        assert.equal(options.timeout, 2500);
+        assert.equal(options.timeout, JSON.parse(String(options.input)).action.startsWith('release') ? 20_000 : 2500);
         assert.equal(options.killSignal, 'SIGKILL');
         assert.equal(options.maxBuffer, 65_536);
         assert.equal(options.shell, undefined);
@@ -101,6 +101,10 @@ def write_json(file, value):
 def call(root, action='available', lease=None, epoch=EPOCH, script=GATE):
     request = {'root': str(root), 'action': action, 'epoch': epoch}
     if lease is not None: request['lease'] = lease
+    # These tests isolate the original inode/flock/CAS durability contract. The
+    # separate trusted recovery suite exercises real root-owned Unix peers.
+    needle = 'try:\n    request = json.load(sys.stdin)'
+    script = script.replace(needle, "def trusted_workspace_cleanup(root, lease, purpose, operation=None): return {'quiescent':True}\n" + needle)
     result = subprocess.run([sys.executable, '-I', '-c', script], input=json.dumps(request), capture_output=True, text=True, timeout=5)
     if result.returncode != 0: raise AssertionError('helper failed: ' + result.stderr)
     return json.loads(result.stdout)
@@ -263,6 +267,14 @@ class GateTests(unittest.TestCase):
             self.error(call(root, 'claim', lease), 'WORKSPACE_BUSY')
             self.error(call(root, 'release', lease), 'WORKSPACE_WRITER_GATE_INVALID')
 
+    def test_isolated_release_cannot_bypass_an_enrolled_generation(self):
+        with fixture() as (root, cap, gen, guard, lease):
+            self.assertTrue(call(root, 'claim', lease)['available'])
+            self.error(call(root, 'release-isolated', lease), 'WORKSPACE_WRITER_GATE_INVALID')
+            self.assertEqual(json.loads(gen.read_text())['state'], 'dirty')
+            self.assertEqual(json.loads(state_path(root).read_text()), lease)
+            self.assertTrue(call(root, 'release', lease)['released'])
+
     def test_release_requires_exact_owner_run_epoch_and_process_birth(self):
         for key, value in [('owner', 'sync-needed'), ('id', 'other-run'), ('epoch', 'other-epoch'), ('pid', os.getpid() + 1), ('processStartTime', '0'), ('bootId', '00000000-0000-0000-0000-000000000000')]:
             with self.subTest(key=key), fixture() as (root, cap, gen, guard, lease):
@@ -273,6 +285,24 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(json.loads(gen.read_text())['state'], 'dirty')
                 self.assertEqual(json.loads(state_path(root).read_text()), lease)
 
+    def test_adopted_integration_selects_special_cleanup_only_under_exact_native_and_broker_cas(self):
+        for isolated in (False,True):
+            with self.subTest(isolated=isolated),fixture() as (root,cap,gen,guard,lease):
+                self.assertTrue(call(root,'claim',lease)['available'])
+                adopted={**lease,'pidNamespace':os.readlink('/proc/self/ns/pid'),'brokerLeaseId':'old-independent-lease','brokerSessionId':'old-session','integrationOperation':'operation-1','integrationPeerChanged':True}
+                write_json(state_path(root),adopted)
+                if isolated: cap.unlink(); gen.unlink()
+                action='release-isolated' if isolated else 'release'
+                needle='try:\n    request = json.load(sys.stdin)'
+                check="def trusted_workspace_cleanup(root,lease,purpose,operation=None):\n if purpose!='integration-writer-release': raise RuntimeError('wrong cleanup purpose')\n return {}\n"
+                script=GATE.replace(needle,check+needle)
+                def release(expected):
+                    result=subprocess.run([sys.executable,'-I','-c',script],input=json.dumps({'root':str(root),'epoch':EPOCH,'action':action,'lease':expected}),capture_output=True,text=True,timeout=5)
+                    self.assertEqual(result.returncode,0,result.stderr); return json.loads(result.stdout)
+                for key in ('pidNamespace','brokerLeaseId','brokerSessionId','integrationOperation','integrationPeerChanged'):
+                    altered={**adopted}; altered.pop(key)
+                    self.assertFalse(release(altered)['ok']); self.assertEqual(json.loads(state_path(root).read_text()),adopted)
+                self.assertTrue(release(adopted)['released']); self.assertFalse(state_path(root).parent.exists())
     def test_cleanup_jobs_unknown_state_and_rebinding_preserve_lease(self):
         for kind in ('cleanup', 'job', 'unknown', 'rebound', 'generation-owner'):
             with self.subTest(kind=kind), fixture() as (root, cap, gen, guard, lease):
@@ -312,9 +342,12 @@ class GateTests(unittest.TestCase):
             self.assertTrue(call(root, 'release', lease)['released'])
         with fixture() as (root, cap, gen, guard, lease):
             self.assertTrue(call(root, 'claim', lease)['available'])
-            needle = "os.rmdir(lease_name, dir_fd=parent)"
+            # Isolated lease removal now also uses the permanent guard helper.
+            # Target this enrolled-generation branch's exact unlink/fsync/rmdir
+            # window so the crash still occurs after complete generation+unlink.
+            needle = "os.unlink('state.json', dir_fd=lease_fd)\n        os.fsync(lease_fd)\n        os.rmdir(lease_name, dir_fd=parent)"
             self.assertEqual(GATE.count(needle), 1)
-            failed = GATE.replace(needle, "raise OSError('injected crash after state removal')")
+            failed = GATE.replace(needle, "os.unlink('state.json', dir_fd=lease_fd)\n        os.fsync(lease_fd)\n        raise OSError('injected crash after state removal')")
             self.error(call(root, 'release', lease, script=failed), 'WORKSPACE_WRITER_GATE_INVALID')
             self.assertEqual(json.loads(gen.read_text())['state'], 'complete')
             self.assertTrue(state_path(root).parent.is_dir())

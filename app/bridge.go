@@ -10,7 +10,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,9 +21,10 @@ import (
 type FrontendBridge struct{}
 
 type BridgeResponse struct {
-	Status  int               `json:"status"`
-	Headers map[string]string `json:"headers"`
-	BodyB64 string            `json:"bodyB64"`
+	Status            int                `json:"status"`
+	Headers           map[string]string  `json:"headers"`
+	BodyB64           string             `json:"bodyB64"`
+	SessionTransition *sessionTransition `json:"sessionTransition,omitempty"`
 }
 
 type FrontendErrorReport struct {
@@ -63,32 +63,44 @@ func (FrontendBridge) ReportFrontendError(report FrontendErrorReport) {
 var serverConnectionMu sync.RWMutex
 
 type bridgeRequest struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	connection *serverConnection
+	ctx           context.Context
+	cancel        context.CancelFunc
+	connection    *serverConnection
+	sessionHandle string
+	serverKey     string
+	tokenRevision uint64
+	accessToken   string
+	purpose       string
+	consumed      bool // protected by frontendRequestsMu
 }
 
 var bridgeRequests sync.Map
 var frontendRequestsMu sync.Mutex
 var frontendRequestsClosed bool
 
-// Reserve before sending so cancellation also works before HTTP forwarding starts.
-func (FrontendBridge) BeginServerRequest() string {
+// Old callers cannot bind a renderer identity and deliberately fail closed.
+func (FrontendBridge) BeginServerRequest() string { return "" }
+
+// Reserve before sending so cancellation also works before HTTP forwarding.
+// Identity and credential expectations are captured atomically, never inferred
+// later from whichever connection happens to be globally current.
+func (FrontendBridge) BeginServerRequestV2(handle, token string, revision uint64, purpose, key string) map[string]any {
 	serverConnectionMu.RLock()
 	defer serverConnectionMu.RUnlock()
 	frontendRequestsMu.Lock()
 	defer frontendRequestsMu.Unlock()
 	if frontendRequestsClosed {
-		return ""
+		return map[string]any{"ok": false, "code": "FRONTEND_CLOSED"}
 	}
-	if apiConnection == nil {
-		return ""
+	if code := reservationErrorLocked(apiConnection, handle, token, revision, purpose, key); code != "" {
+		return map[string]any{"ok": false, "code": code}
 	}
 	ctx, cancel := context.WithTimeout(apiConnection.ctx, serverRequestTimeout)
-	id := randHex(16)
-	bridgeRequests.Store(id, &bridgeRequest{ctx: ctx, cancel: cancel, connection: apiConnection})
+	id := randHex(24)
+	bridgeRequests.Store(id, &bridgeRequest{ctx: ctx, cancel: cancel, connection: apiConnection,
+		sessionHandle: handle, serverKey: key, tokenRevision: revision, accessToken: token, purpose: purpose})
 	context.AfterFunc(ctx, func() { bridgeRequests.Delete(id) })
-	return id
+	return map[string]any{"ok": true, "requestId": id}
 }
 
 // The window owns frontend reservations independently of the account connection.
@@ -125,7 +137,7 @@ func bridgeInterruptedResponse(ctx context.Context) BridgeResponse {
 }
 
 // ServerRequest forwards account APIs over the independently verified service connection.
-// path 为相对路径（/api/...）；headers 由前端传入（含 Authorization）。
+// path is an API-relative URL. Native owns the captured bearer credential.
 func (FrontendBridge) ServerRequest(id, method, path string, headers map[string]string, bodyB64 string) BridgeResponse {
 	started := time.Now()
 	resp := BridgeResponse{Status: 502, Headers: map[string]string{}, BodyB64: ""}
@@ -134,6 +146,13 @@ func (FrontendBridge) ServerRequest(id, method, path string, headers map[string]
 		return bridgeErrorResponse(499, "REQUEST_CANCELED", "请求已取消")
 	}
 	request := pending.(*bridgeRequest)
+	frontendRequestsMu.Lock()
+	if request.consumed || frontendRequestsClosed {
+		frontendRequestsMu.Unlock()
+		return bridgeErrorResponse(499, "REQUEST_CANCELED", "请求已使用或窗口已关闭")
+	}
+	request.consumed = true
+	frontendRequestsMu.Unlock()
 	defer request.cancel()
 	defer bridgeRequests.Delete(id)
 	if request.ctx.Err() != nil {
@@ -143,9 +162,22 @@ func (FrontendBridge) ServerRequest(id, method, path string, headers map[string]
 		path = "/" + path
 	}
 	endpoint, err := url.Parse(path)
-	if err != nil || endpoint.Host != "" || endpoint.Scheme != "" || !strings.HasPrefix(endpoint.Path, "/api/") {
+	if err != nil || endpoint.Host != "" || endpoint.Scheme != "" || endpoint.Fragment != "" || endpoint.RawPath != "" || !strings.HasPrefix(endpoint.Path, "/api/") || strings.Contains(endpoint.Path, "\\") || strings.Contains(endpoint.Path, "/../") || strings.Contains(endpoint.Path, "/./") {
 		resp.Status = 400
 		return resp
+	}
+	method = strings.ToUpper(method)
+	if !purposeAllows(request.purpose, method, endpoint.Path) {
+		return bridgeErrorResponse(403, "INVALID_REQUEST_PURPOSE", "请求用途不匹配")
+	}
+	if !validateBridgeCredentials(headers, endpoint, request.accessToken) {
+		return bridgeErrorResponse(403, "STALE_SERVER_SESSION", "请求凭据不匹配")
+	}
+	serverConnectionMu.RLock()
+	code := reservationErrorLocked(request.connection, request.sessionHandle, request.accessToken, request.tokenRevision, request.purpose, request.serverKey)
+	serverConnectionMu.RUnlock()
+	if code != "" {
+		return bridgeErrorResponse(409, code, "账号会话已改变")
 	}
 	if retiredWorkspaceSyncPath(endpoint.Path) {
 		return bridgeErrorResponse(http.StatusGone, cloudOnlyCode, cloudOnlyMessage)
@@ -171,10 +203,13 @@ func (FrontendBridge) ServerRequest(id, method, path string, headers map[string]
 		return resp
 	}
 	for k, v := range headers {
-		if strings.EqualFold(k, "Host") {
+		if strings.EqualFold(k, "Host") || strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Cookie") || strings.EqualFold(k, "Proxy-Authorization") {
 			continue
 		}
 		req.Header.Set(k, v)
+	}
+	if request.accessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+request.accessToken)
 	}
 	deadline, _ := request.ctx.Deadline()
 	req.Header.Set(workspaceDeadlineHeader, strconv.FormatInt(deadline.UnixMilli(), 10))
@@ -213,94 +248,67 @@ func (FrontendBridge) ServerRequest(id, method, path string, headers map[string]
 	}
 	trace.complete()
 	responseConnection := request.connection
-	if resp.Status == http.StatusOK && (endpoint.Path == "/api/auth/login" || endpoint.Path == "/api/auth/user") {
-		serverConnectionMu.Lock()
-		if apiConnection != request.connection {
-			serverConnectionMu.Unlock()
-			return bridgeErrorResponse(499, "CONNECTION_CHANGED", "账号连接已改变，请重新发起请求")
-		}
-		var payload struct {
-			Token              string          `json:"token"`
-			User               json.RawMessage `json:"user"`
-			InstancePath       string          `json:"instancePath"`
-			WorkspaceServerURL string          `json:"workspaceServerUrl"`
-		}
-		if json.Unmarshal(raw, &payload) == nil && len(payload.User) > 0 && string(payload.User) != "null" {
-			var account struct {
-				ID       json.RawMessage `json:"id,omitempty"`
-				Username string          `json:"username,omitempty"`
-			}
-			accountIdentity := ""
-			if json.Unmarshal(payload.User, &account) == nil && (len(account.ID) > 0 || account.Username != "") {
-				identity, _ := json.Marshal(account)
-				accountIdentity = string(identity)
-			}
-			if endpoint.Path == "/api/auth/user" {
-				payload.InstancePath = up.Header.Get("X-Chisa-Instance-Path")
-				payload.WorkspaceServerURL = up.Header.Get("X-Chisa-Workspace-Server-Url")
-			}
-			if (endpoint.Path == "/api/auth/login" && payload.Token != "") || (endpoint.Path == "/api/auth/user" && payload.InstancePath != "") {
-				cfg := store.config()
-				previousWorkspaceURL := cfg.WorkspaceServerURL
-				cfg.APIURL = request.connection.loginURL
-				cfg.WorkspaceServerURL = payload.WorkspaceServerURL
-				if payload.InstancePath != "" {
-					if !regexp.MustCompile(`^/instances/[a-zA-Z0-9_-]+$`).MatchString(payload.InstancePath) {
-						serverConnectionMu.Unlock()
-						return loginConnectionError()
-					}
-					origin, _ := url.Parse(request.connection.loginURL)
-					origin.Path = payload.InstancePath
-					cfg.APIURL = origin.String()
-				}
-				preserveConnection := endpoint.Path == "/api/auth/user" && apiConnection.authenticated &&
-					accountIdentity != "" && apiConnection.accountIdentity == accountIdentity &&
-					apiConnection.baseURL == cfg.APIURL && previousWorkspaceURL == cfg.WorkspaceServerURL
-				var next *serverConnection
-				if !preserveConnection {
-					next, err = newServerConnection(request.connection.loginURL, cfg.APIURL)
-					if err != nil {
-						serverConnectionMu.Unlock()
-						return loginConnectionError()
-					}
-				}
-				if err = store.updateConfig(cfg); err != nil {
-					if next != nil {
-						next.cancel()
-					}
-					serverConnectionMu.Unlock()
-					return loginConnectionError()
-				}
-				if next != nil {
-					next.authenticated = true
-					next.accountIdentity = accountIdentity
-					next.accessToken = payload.Token
-					if next.accessToken == "" {
-						next.accessToken = strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
-					}
-					replaceServerConnection(next)
-				} else if token := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer "); token != "" {
-					apiConnection.accessToken = token
-				}
-			} else if endpoint.Path == "/api/auth/user" {
-				if apiConnection.accountIdentity != accountIdentity {
-					resetSshAccountIdentity(apiConnection)
-				}
-				apiConnection.authenticated = true
-				apiConnection.accountIdentity = accountIdentity
-				apiConnection.accessToken = strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
-			}
-			resp.Headers["X-Chisa-Connection-Version"] = strconv.FormatUint(apiConnection.version, 10)
-			responseConnection = apiConnection
-		}
-		serverConnectionMu.Unlock()
-	}
 	serverConnectionMu.Lock()
-	if apiConnection != responseConnection || responseConnection.ctx.Err() != nil {
+	if apiConnection != responseConnection || responseConnection.ctx.Err() != nil || serverConnectionSwitching || request.ctx.Err() != nil {
 		serverConnectionMu.Unlock()
-		return bridgeErrorResponse(499, "CONNECTION_CHANGED", "账号连接已改变，请重新发起请求")
+		return bridgeErrorResponse(499, "STALE_SERVER_SESSION", "账号连接已改变，请重新发起请求")
 	}
-	recordNativeRefreshedToken(responseConnection, up.Header, resp.Status)
+	// A late response may finish its read, but cannot establish identity or
+	// replace credentials after another response has advanced the revision.
+	currentRevision := responseConnection.tokenRevision == request.tokenRevision
+	if resp.Status == http.StatusUnauthorized && (up.Header.Get("X-Auth-Error") == "invalid-token" || up.Header.Get("X-Auth-Error") == "session-expired") {
+		changed, revokeErr := revokeNativeSessionLocked(responseConnection, request.accessToken, request.tokenRevision)
+		if revokeErr != nil {
+			serverConnectionMu.Unlock()
+			return bridgeErrorResponse(502, "SESSION_SAVE_FAILED", "账号失效凭据未清除，请重试")
+		}
+		if changed {
+			resp.SessionTransition = transitionFor(request)
+		}
+	}
+	if resp.Status == http.StatusOK && (endpoint.Path == "/api/auth/login" || endpoint.Path == "/api/auth/user") {
+		if !currentRevision {
+			serverConnectionMu.Unlock()
+			return bridgeErrorResponse(409, "STALE_SERVER_SESSION", "账号凭据已刷新，请重新验证")
+		}
+		var changed bool
+		responseConnection, changed, err = commitBridgeAuthenticationLocked(request, endpoint.Path, up.Header, raw)
+		if err != nil {
+			serverConnectionMu.Unlock()
+			return loginConnectionError()
+		}
+		if changed {
+			resp.SessionTransition = transitionFor(request)
+		}
+		resp.Headers["X-Chisa-Connection-Version"] = strconv.FormatUint(responseConnection.version, 10)
+	} else if resp.Status >= 200 && resp.Status < 300 && up.Header.Get("X-Auth-Error") == "" {
+		token := strings.TrimSpace(up.Header.Get("X-Refreshed-Token"))
+		if endpoint.Path == "/api/auth/refresh" {
+			var payload struct {
+				Token string `json:"token"`
+			}
+			if json.Unmarshal(raw, &payload) != nil || !validSessionToken(payload.Token) {
+				serverConnectionMu.Unlock()
+				return bridgeErrorResponse(502, "INVALID_REFRESH_RESPONSE", "账号刷新响应无效")
+			}
+			token = payload.Token
+		}
+		if token != "" {
+			changed, refreshErr := commitRefreshedTokenLocked(responseConnection, request.accessToken, request.tokenRevision, token)
+			if refreshErr != nil {
+				serverConnectionMu.Unlock()
+				return bridgeErrorResponse(502, "SESSION_SAVE_FAILED", "账号凭据刷新未保存，请重试")
+			}
+			if changed {
+				resp.SessionTransition = transitionFor(request)
+			}
+		}
+	}
+	// Renderer must adopt only a native transition; a bare response header or
+	// explicit refresh payload cannot become a late credential writeback.
+	if resp.SessionTransition == nil {
+		delete(resp.Headers, "X-Refreshed-Token")
+	}
 	serverConnectionMu.Unlock()
 	// A verified account/instance login is the only moment the desktop knows the
 	// backend identity of the stored server paths, so legacy project entry
@@ -312,33 +320,39 @@ func (FrontendBridge) ServerRequest(id, method, path string, headers map[string]
 	return resp
 }
 
-// The caller holds serverConnectionMu and has checked the response's connection identity.
-func recordNativeRefreshedToken(connection *serverConnection, headers http.Header, status int) {
-	if connection == nil || !connection.authenticated || status < 200 || status >= 300 || headers.Get("X-Auth-Error") != "" {
-		return
-	}
-	if token := headers.Get("X-Refreshed-Token"); regexp.MustCompile(`^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$`).MatchString(token) {
-		connection.accessToken = token
-	}
-}
-
 func loginConnectionError() BridgeResponse {
 	return bridgeErrorResponse(502, "LOGIN_CONNECTION_SAVE_FAILED", "登录成功，但无法保存对应服务连接；请重试")
 }
 
 // ConnectServer verifies the account service without SSH or a stored account token.
-func (FrontendBridge) ConnectServer(rawURL string) map[string]any {
+func (FrontendBridge) ConnectServer(rawURL string) (result map[string]any) {
 	u, err := normalizeServiceURL(rawURL)
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error()}
 	}
 	serverConnectionMu.Lock()
+	if serverConnectionSwitching {
+		serverConnectionMu.Unlock()
+		return map[string]any{"ok": false, "code": "SERVER_SWITCH_IN_PROGRESS", "error": "服务切换正在进行"}
+	}
 	previous := apiConnection
 	next, err := newServerConnection(u, u)
+	if err == nil {
+		serverConnectionSwitching = true
+		cancelFrontendRequestsForSwitch()
+	}
 	serverConnectionMu.Unlock()
 	if err != nil {
 		return map[string]any{"ok": false, "error": err.Error()}
 	}
+	defer func() {
+		serverConnectionMu.Lock()
+		serverConnectionSwitching = false
+		if result != nil {
+			result["connection"] = connectionSnapshotLocked()
+		}
+		serverConnectionMu.Unlock()
+	}()
 	// Probe without holding the account lock so a slow server cannot freeze state reads.
 	adopted := false
 	defer func() {
@@ -375,11 +389,20 @@ func (FrontendBridge) ConnectServer(rawURL string) map[string]any {
 	if previous != nil && previous.loginURL == u {
 		return map[string]any{"ok": true, "serverUrl": u, "changed": false}
 	}
-	cfg := store.config()
+	// Save metadata first: if its replacement fails, the predecessor's durable
+	// credential must remain intact. A crash before the credential tombstone is
+	// safe because the old credential cannot restore under the new server key.
+	previousConfig := store.config()
+	cfg := previousConfig
 	cfg.LoginURL, cfg.APIURL, cfg.WorkspaceServerURL = u, u, ""
 	if err := store.updateConfig(cfg); err != nil {
-		next.cancel()
-		return map[string]any{"ok": false, "error": "账号服务配置保存失败"}
+		return map[string]any{"ok": false, "code": "SESSION_SAVE_FAILED", "error": "账号服务配置保存失败，请重试"}
+	}
+	if err := saveAccountCredential(nil); err != nil {
+		if rollbackErr := store.updateConfig(previousConfig); rollbackErr != nil {
+			return map[string]any{"ok": false, "code": "SESSION_SAVE_FAILED", "error": "账号凭据清除及配置回滚失败，请重试"}
+		}
+		return map[string]any{"ok": false, "code": "SESSION_SAVE_FAILED", "error": "账号凭据清除失败，请重试"}
 	}
 	replaceServerConnection(next)
 	adopted = true

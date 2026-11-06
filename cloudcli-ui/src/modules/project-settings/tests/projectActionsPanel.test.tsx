@@ -10,6 +10,8 @@ const transport = vi.hoisted(() => ({
   updateProjectAction: vi.fn(),
   deleteProjectAction: vi.fn(),
   runProjectAction: vi.fn(),
+  jobOutput: vi.fn(),
+  sourceMode: 'cloud' as 'cloud' | 'ssh',
 }));
 
 vi.mock('@/shared/api', () => ({
@@ -19,6 +21,7 @@ vi.mock('@/shared/api', () => ({
     updateProjectAction: transport.updateProjectAction,
     deleteProjectAction: transport.deleteProjectAction,
     workspaces: { runProjectAction: transport.runProjectAction },
+    sshWorkspaces: { jobOutput: transport.jobOutput },
   },
 }));
 
@@ -28,6 +31,7 @@ vi.mock('@/shared/context/WorkspaceScopeContext', () => ({
     workspaceId: 'workspace-1',
     generation: 'generation-1',
     kind: 'cloudReplica',
+    sourceMode: transport.sourceMode,
     rootPath: '/workspace/project',
     sourceRoot: '/workspace/project',
     requestedMode: 'isolated',
@@ -53,11 +57,13 @@ const ACTION: ProjectAction = {
 };
 
 beforeEach(() => {
+  transport.sourceMode = 'cloud';
   transport.projectActions.mockReset();
   transport.createProjectAction.mockReset();
   transport.updateProjectAction.mockReset();
   transport.deleteProjectAction.mockReset();
   transport.runProjectAction.mockReset();
+  transport.jobOutput.mockReset();
   transport.projectActions.mockResolvedValue(json({ data: { actions: [ACTION] } }));
   transport.runProjectAction.mockResolvedValue(json({
     actionId: ACTION.id,
@@ -86,6 +92,61 @@ test('runs a saved project action in the active workspace and shows its exit cod
   }));
   await screen.findByText(/退出码 0/);
   expect(screen.getByText(/build ok/)).toBeTruthy();
+});
+
+test('streams incremental SSH job output while a project action is running before completion', async () => {
+  transport.sourceMode = 'ssh';
+  let finishRun!: (response: Response) => void;
+  transport.runProjectAction.mockImplementationOnce(() => new Promise<Response>((resolve) => {
+    finishRun = resolve;
+  }));
+  transport.jobOutput.mockImplementation(async (body: { stream?: string; offset?: number }) => {
+    if (body.stream === 'stdout' && (body.offset ?? 0) === 0) {
+      return json({
+        ok: true,
+        jobId: 'job-action-1',
+        stream: 'stdout',
+        offset: 0,
+        total: 14,
+        chunk: btoa('step 1 running'),
+        eof: false,
+        state: 'running',
+        truncated: false,
+      });
+    }
+    return json({
+      ok: true,
+      jobId: 'job-action-1',
+      stream: body.stream ?? 'stdout',
+      offset: body.offset ?? 0,
+      total: body.offset ?? 0,
+      chunk: '',
+      eof: false,
+      state: 'running',
+      truncated: false,
+    });
+  });
+
+  render(<ProjectActionsPanel projectId="project-1" />);
+  await screen.findByText('Build');
+  fireEvent.click(screen.getByRole('button', { name: '运行' }));
+
+  const livePre = await screen.findByLabelText('项目操作实时输出');
+  expect(livePre.textContent).toContain('step 1 running');
+
+  finishRun(json({
+    actionId: ACTION.id,
+    command: ACTION.command,
+    exitCode: 0,
+    stdout: 'step 1 running\ndone',
+    stderr: '',
+    truncated: false,
+    durationMs: 120,
+    workspaceMode: 'bridged',
+  }));
+
+  await screen.findByText(/退出码 0/);
+  expect(screen.getByText(/step 1 running\s+done/)).toBeTruthy();
 });
 
 test('adds a new project action with a relative working directory', async () => {

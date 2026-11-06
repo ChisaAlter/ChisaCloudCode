@@ -1,21 +1,25 @@
 import {
-  expireAuthSession,
-  getAuthSessionVersion,
-  getStoredAuthToken,
-  storeAuthToken,
+  dispatchWithAuthSession, expireAuthSession, getAuthSessionSnapshot, getAuthSessionVersion,
+  initializeAuthSession, isCurrentAuthSession, storeAuthToken, subscribeToAuthSession,
 } from '@/shared/authToken';
 import { IS_PLATFORM } from '@/shared/utils';
-import { readVoiceConfig, voiceConfigHeaders } from '@/shared/voiceConfig';
-import type { BridgeResponse, WorkspaceDescriptor, WorkspaceSelector } from '@/shared/types';
-import { desktopHttpUrl, desktopWebSocketUrl, FrontendBridge, getServerConnectionVersion } from '@/shared/chisa';
+import { getVoiceConfigRevision, readVoiceConfig, voiceConfigHeaders } from '@/shared/voiceConfig';
+import type { AuthSessionSnapshot, BridgeResponse, TokenStatisticsRange, UserPreferenceTransaction, WorkspaceDescriptor, WorkspaceSelector } from '@/shared/types';
+import { acceptNativeSessionTransition, desktopHttpUrl, FrontendBridge, getServerConnectionVersion } from '@/shared/chisa';
 
 /** Auth distinguishes an actionable native service-connection failure from rejected credentials. */
 export class ServiceConnectionError extends Error {}
+
+const responseSessions = new WeakMap<Response, AuthSessionSnapshot>();
+/** Auth profile/login consumers verify the exact accepted response identity even if JSON parsing yields to another transition. */
+export function getResponseAuthSession(response: Response): AuthSessionSnapshot | undefined { return responseSessions.get(response); }
 
 // Headers are a plain record rather than the full `HeadersInit` union so the
 // defaults below can be merged with a caller's headers by spreading.
 export type ApiRequestOptions = Omit<RequestInit, 'headers'> & {
   headers?: Record<string, string>;
+  /** Plugin/voice callers capture their originating identity before async work; a replacement cannot adopt their operation. */
+  expectedSession?: AuthSessionSnapshot;
 };
 
 // Utility function for authenticated API calls
@@ -111,32 +115,38 @@ const chisaServerRequest = async (
   options: ApiRequestOptions,
 ): Promise<Response> => {
   options.signal?.throwIfAborted();
-  const token = getStoredAuthToken();
-  const authSessionVersion = getAuthSessionVersion();
-  const connectionVersion = getServerConnectionVersion();
+  const requestedSession = options.expectedSession ?? getAuthSessionSnapshot();
+  if (!isCurrentAuthSession(requestedSession)) throw new DOMException('Account session changed', 'AbortError');
+  const initial = await initializeAuthSession();
+  if (options.expectedSession && !isCurrentAuthSession(requestedSession)) throw new DOMException('Account session changed', 'AbortError');
+  const connection = await awaitNative(FrontendBridge.getApiConnection(), options.signal);
+  if (!connection.configured) throw new ServiceConnectionError('尚未设置账号服务，请打开账户设置填写 HTTPS 服务地址');
+  const purpose = url === '/api/auth/login' ? 'login' : url === '/api/auth/status' ? 'public-status'
+    : url === '/api/auth/user' && !connection.authenticated && connection.restorationToken ? 'restore' : 'api';
+  const expected = getAuthSessionSnapshot();
+  // A late native lookup may observe a newer account, but cannot upgrade an old UI operation into that account.
+  if (initial.nativeHandle && initial.nativeHandle !== connection.sessionHandle) throw new DOMException('Account session changed', 'AbortError');
   const headers: Record<string, string> = { ...(options.headers || {}) };
-  if (token) headers['Authorization'] = `Bearer ${token}`;
+  for (const key of Object.keys(headers)) if (key.toLowerCase() === 'authorization') delete headers[key];
   const assertCurrent = () => {
     options.signal?.throwIfAborted();
-    if (connectionVersion !== getServerConnectionVersion()) {
-      throw new DOMException('Server connection changed', 'AbortError');
-    }
-    if (authSessionVersion !== getAuthSessionVersion()) {
-      throw new DOMException('Account session changed', 'AbortError');
-    }
+    if (!isCurrentAuthSession(expected) || (options.expectedSession && !isCurrentAuthSession(requestedSession))
+      || getAuthSessionSnapshot().phase === 'switching') throw new DOMException('Account session changed', 'AbortError');
   };
-  const connection = await awaitNative(FrontendBridge.getApiConnection(), options.signal);
   assertCurrent();
-  if (!connection.configured) throw new ServiceConnectionError('尚未设置账号服务，请打开账户设置填写 HTTPS 服务地址');
   const { b64, contentType } = await awaitNative(toBridgeBody(options.body), options.signal);
   assertCurrent();
   if (contentType && !headers['Content-Type']) headers['Content-Type'] = contentType;
-  const reservation = FrontendBridge.beginServerRequest().then(id => {
-    if (id && (options.signal?.aborted || connectionVersion !== getServerConnectionVersion() || authSessionVersion !== getAuthSessionVersion())) void FrontendBridge.cancelServerRequest(id).catch(() => {});
-    return id;
+  const dispatched = await dispatchWithAuthSession(expected, () => FrontendBridge.beginServerRequest(connection, purpose,
+    purpose === 'api' ? expected.token ?? '' : purpose === 'restore' ? connection.restorationToken : ''), purpose !== 'api' || url === '/api/auth/user');
+  const reservation = dispatched.operation.then(result => {
+    if (result.requestId && (options.signal?.aborted || !isCurrentAuthSession(expected))) void FrontendBridge.cancelServerRequest(result.requestId).catch(() => {});
+    return result;
   });
-  const requestId = await awaitNative(reservation, options.signal);
-  if (!requestId) throw new ServiceConnectionError('账号服务连接已断开，请重新连接服务');
+  const reserved = await awaitNative(reservation, options.signal);
+  const requestId = reserved.requestId;
+  if (!reserved.ok || !requestId) throw new ServiceConnectionError(reserved.code === 'SERVER_SWITCH_IN_PROGRESS'
+    ? '正在切换账号服务，请等待连接完成后重试' : '账号服务会话已改变，请确认登录状态后重试');
   const cancel = () => { void FrontendBridge.cancelServerRequest(requestId).catch(() => {}); };
   try {
     assertCurrent();
@@ -151,8 +161,10 @@ const chisaServerRequest = async (
         .finally(() => options.signal?.removeEventListener('abort', abort));
     });
     assertCurrent();
-    FrontendBridge.recordConnectionVersion(br.headers['X-Chisa-Connection-Version'] ?? null);
-    return bridgeToResponse(br);
+    acceptNativeSessionTransition(br, connection);
+    const response = bridgeToResponse(br);
+    responseSessions.set(response, getAuthSessionSnapshot());
+    return response;
   } catch (error) {
     cancel();
     throw error;
@@ -169,24 +181,51 @@ const desktopAwareFetch = (path: string, init: RequestInit = {}): Promise<Respon
       signal: init.signal,
     });
   }
-  return fetch(path, init);
+  const expected = getAuthSessionSnapshot();
+  return dispatchWithAuthSession(expected, () => fetch(path, { ...init, cache: 'no-store' }), true).then(async admission => {
+    const response = await admission.operation;
+    if (!isCurrentAuthSession(admission.snapshot)) throw new DOMException('Account session changed', 'AbortError');
+    responseSessions.set(response, admission.snapshot);
+    return response;
+  });
 };
 
-export const authenticatedFetch = (
+export const authenticatedFetch = async (
   url: string,
   options: ApiRequestOptions = {},
 ): Promise<Response> => {
-  const token = getStoredAuthToken();
-  const authSessionVersion = getAuthSessionVersion();
-  const acceptResponse = (response: Response): Response => {
-    options.signal?.throwIfAborted();
-    if (authSessionVersion !== getAuthSessionVersion()) {
-      throw new DOMException('Account session changed', 'AbortError');
+  options.signal?.throwIfAborted();
+  const expected = options.expectedSession ?? getAuthSessionSnapshot();
+  if (!isCurrentAuthSession(expected)) throw new DOMException('Account session changed', 'AbortError');
+  const { expectedSession: _expectedSession, ...requestOptions } = options;
+  const acceptResponse = async (response: Response, dispatched: AuthSessionSnapshot): Promise<Response> => {
+    try {
+      options.signal?.throwIfAborted();
+      if (!isCurrentAuthSession(dispatched)) throw new DOMException('Account session changed', 'AbortError');
+      let expired = false;
+      if (!isChisaDesktop()) {
+        const refreshedToken = response.headers.get('X-Refreshed-Token');
+        if (response.ok && refreshedToken) await storeAuthToken(refreshedToken, dispatched);
+        options.signal?.throwIfAborted();
+        if (!isCurrentAuthSession(dispatched)) throw new DOMException('Account session changed', 'AbortError');
+        // Expiry checks the request's token revision: a stale 401 cannot end a refreshed/relogged session.
+        if (response.status === 401 && response.headers.get('X-Auth-Error')) expired = await expireAuthSession(dispatched);
+      }
+      options.signal?.throwIfAborted();
+      if (expired) {
+        // Preserve the status for classification while never returning the expired account's body.
+        await response.body?.cancel().catch(() => {});
+        const denied = new Response(null, { status: response.status, statusText: response.statusText, headers: response.headers });
+        responseSessions.set(denied, dispatched);
+        return denied;
+      }
+      if (!isCurrentAuthSession(dispatched)) throw new DOMException('Account session changed', 'AbortError');
+      responseSessions.set(response, dispatched);
+      return response;
+    } catch (error) {
+      await response.body?.cancel(error).catch(() => {});
+      throw error;
     }
-    const refreshedToken = response.headers.get('X-Refreshed-Token');
-    if (refreshedToken) storeAuthToken(refreshedToken);
-    if (response.headers.get('X-Auth-Error')) expireAuthSession();
-    return response;
   };
 
   const defaultHeaders: Record<string, string> = {};
@@ -196,20 +235,17 @@ export const authenticatedFetch = (
     defaultHeaders['Content-Type'] = 'application/json';
   }
 
-  if (!IS_PLATFORM && token) {
-    defaultHeaders['Authorization'] = `Bearer ${token}`;
-  }
-
-  if (isChisaDesktop()) {
-    return chisaServerRequest(url, { ...options, headers: { ...defaultHeaders, ...options.headers } }).then(acceptResponse);
-  }
-  return fetch(url, {
-    ...options,
-    headers: {
-      ...defaultHeaders,
-      ...options.headers,
-    },
-  }).then(acceptResponse);
+  if (isChisaDesktop()) return chisaServerRequest(url, { ...options, headers: { ...defaultHeaders, ...options.headers } });
+  return initializeAuthSession().then(async () => {
+    const admitted = await dispatchWithAuthSession(expected, current => {
+      options.signal?.throwIfAborted();
+      const headers: Record<string, string> = { ...defaultHeaders, ...options.headers };
+      for (const key of Object.keys(headers)) if (key.toLowerCase() === 'authorization') delete headers[key];
+      if (!IS_PLATFORM && current.token) headers.Authorization = `Bearer ${current.token}`;
+      return fetch(url, { ...requestOptions, cache: 'no-store', headers });
+    }, url === '/api/auth/user');
+    return acceptResponse(await admitted.operation, admitted.snapshot);
+  });
 };
 
 // ─── Request helpers ────────────────────────────────────────────────────────
@@ -260,9 +296,20 @@ export class ApiRequestError extends Error {
  * ApiRequestError carrying the server's machine-readable error code when one
  * is present. Accepts both legacy string envelopes (`error: 'message'`) and
  * the structured AppError envelope (`error: { code, message, details }`).
+ * Non-JSON gateway responses retain their HTTP status without exposing raw HTML.
  */
 export async function readApiJson<T>(response: Response): Promise<T> {
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch (cause) {
+    // Cancellation and transport read failures must keep their original semantics.
+    if (!(cause instanceof SyntaxError)) throw cause;
+    throw new ApiRequestError(response.ok ? `Invalid JSON response (${response.status})` : `Request failed (${response.status})`, {
+      code: 'INVALID_JSON_RESPONSE',
+      status: response.status,
+    });
+  }
   if (!response.ok || data.success === false) {
     const raw = data.error ?? data.details;
     const payload = raw && typeof raw === 'object' ? raw : {};
@@ -275,6 +322,37 @@ export async function readApiJson<T>(response: Response): Promise<T> {
   }
   return data as T;
 }
+
+/**
+ * Picks the server's human-readable message out of a failed response body, or
+ * null when it carries none. Accepts the legacy string envelope
+ * (`error: 'message'`), the structured AppError envelope
+ * (`error: { code, message, details }`) and a top-level `message`.
+ *
+ * The non-throwing counterpart of readApiJson, used by the auth and onboarding
+ * screens because they show their own localized message when the server gives
+ * none, by the plugins context for failed plugin list, install, update,
+ * uninstall and toggle calls, which all answer with the structured envelope,
+ * and by the chat drafts store to say why the server refused a queued message.
+ */
+export function readApiErrorMessage(body: unknown): string | null {
+  if (!body || typeof body !== 'object') {
+    return null;
+  }
+
+  const { error, message } = body as { error?: unknown; message?: unknown };
+  const candidates = [
+    error && typeof error === 'object' ? (error as { message?: unknown }).message : error,
+    message,
+  ];
+  // The body is unchecked JSON: anything but a non-blank string is skipped, as
+  // an object rendered as a React child throws and unmounts the screen.
+  const readable = candidates.find(
+    (candidate): candidate is string => typeof candidate === 'string' && candidate.trim() !== '',
+  );
+  return readable ?? null;
+}
+
 
 const PROVIDER_CONNECTION_CHANGED_EVENT = 'chisa:provider-connection-changed';
 
@@ -298,8 +376,8 @@ async function providerConnectionMutation(request: () => Promise<Response>, sour
 }
 
 // ─── URL builders ───────────────────────────────────────────────────────────
-// Exported for the consumers that cannot go through `authenticatedFetch`:
-// `EventSource` and `XMLHttpRequest` need a bare URL.
+// Central endpoint builders keep credential-free relative paths for streaming and file consumers.
+// Authenticated streaming admission resolves the captured native/web transport after identity checks.
 
 /**
  * Persisted messages for one session. Omitting `limit` requests the whole
@@ -364,6 +442,8 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
     connections: (options: ApiRequestOptions = {}) => get('/api/ssh-workspaces/connections', options),
     probe: (body: { connectionId: string; rootPath: string }, options: ApiRequestOptions = {}) => post('/api/ssh-workspaces/probe', body, options),
     recover: (body: { projectId: string; generation: string; cancel?: boolean }, options: ApiRequestOptions = {}) => post('/api/ssh-workspaces/recover', body, options),
+    jobOutput: (body: { projectId: string; generation?: string; jobId?: string; stream?: 'stdout' | 'stderr'; offset?: number; maxBytes?: number }, options: ApiRequestOptions = {}) =>
+      post('/api/ssh-workspaces/job-output', body, options),
   },
   workspaces: {
     resolve: (projectId: string, sessionId?: string, options: ApiRequestOptions = {}) =>
@@ -393,6 +473,18 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
       body: JSON.stringify({ username, password }),
     }),
     refresh: () => post('/api/auth/refresh'),
+    logout: (options: ApiRequestOptions = {}) => post('/api/auth/logout', {}, options),
+    /** The explicit logout outbox retries only its captured web credential after the authority has fenced normal dispatch. */
+    revokeCapturedWebSession: (token: string, serverKey: string): Promise<Response> => {
+      if (typeof location === 'undefined' || isChisaDesktop()) return Promise.reject(new Error('Captured web revocation is unavailable'));
+      const prefix = location.pathname.match(/^\/instances\/[a-zA-Z0-9_-]+(?=\/|$)/)?.[0] ?? '';
+      if (serverKey !== location.origin + prefix || !token || /[\r\n\0]/.test(token)) {
+        return Promise.reject(new Error('Captured revocation target does not match this web server'));
+      }
+      return fetch(prefix + '/api/auth/logout', { method: 'POST', cache: 'no-store', credentials: 'omit', redirect: 'error',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: '{}', signal: AbortSignal.timeout(8000) });
+    },
+    webSocketTicket: (path: string, options: ApiRequestOptions = {}) => post('/api/auth/ws-ticket', { path }, options),
     user: () => get('/api/auth/user', { signal: AbortSignal.timeout(15000) }),
     updateProfile: (displayName: string, avatarDataUrl: string | null) => authenticatedFetch('/api/auth/profile', {
       method: 'PATCH',
@@ -417,8 +509,8 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
     ),
   projectTaskmaster: (projectId: string) =>
     get(`/api/projects/${encodeURIComponent(projectId)}/taskmaster`),
-  projectSettings: (projectId: string) =>
-    get(`/api/projects/${encodeURIComponent(projectId)}/settings`),
+  projectSettings: (projectId: string, options: ApiRequestOptions = {}) =>
+    get(`/api/projects/${encodeURIComponent(projectId)}/settings`, options),
   projectContext: (projectId: string, options: ApiRequestOptions = {}) =>
     get(`/api/projects/${encodeURIComponent(projectId)}/context`, options),
   projectMemory: (projectId: string, options: ApiRequestOptions = {}) =>
@@ -445,20 +537,33 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
   deleteProject: (projectId: string, hardDelete = false) =>
     del(`/api/projects/${projectId}${query({ force: hardDelete })}`),
   createProject: (projectData: unknown) => post('/api/projects/create-project', projectData),
+  // Clone execution has its own identity; observing or retrying status never starts Git.
+  startCloneJob: (input: { path: string; githubUrl: string; githubTokenId?: string | number | null; newGithubToken?: string | null; requestId: string }, options: ApiRequestOptions = {}) =>
+    post('/api/projects/clone-jobs', input, options),
+  getCloneJob: (jobId: string, options: ApiRequestOptions = {}) =>
+    get(`/api/projects/clone-jobs/${encodeURIComponent(jobId)}`, options),
+  cancelCloneJob: (jobId: string, options: ApiRequestOptions = {}) =>
+    del(`/api/projects/clone-jobs/${encodeURIComponent(jobId)}`, undefined, options),
+  cancelCloneRequest: (requestId: string, options: ApiRequestOptions = {}) =>
+    del(`/api/projects/clone-jobs/by-request/${encodeURIComponent(requestId)}`, undefined, options),
   migrateLegacyProjectStars: (projectIds: string[]) =>
     post('/api/projects/migrate-legacy-stars', { projectIds }),
   toggleProjectStar: (projectId: string) =>
     post(`/api/projects/${encodeURIComponent(projectId)}/toggle-star`),
-  // EventSource cannot send an Authorization header, so the token rides along as
-  // a query parameter on the streaming endpoints below.
-  cloneProjectProgressUrl: (params: Record<string, QueryValue>) =>
-    streamingApiUrl(`/api/projects/clone-progress${query({ ...params, token: getStoredAuthToken() })}`),
+  // A clone is two requests: the details (GitHub token included) go in this
+  // POST body, and the returned `cloneId` is all the progress stream's URL
+  // carries — URLs land in access logs, proxy logs and browser history.
+  startProjectClone: (cloneRequest: {
+    path: string;
+    githubUrl: string;
+    githubTokenId: number | null;
+    newGithubToken: string | null;
+  }) => post('/api/projects/clone', cloneRequest),
+  // Authenticated stream consumers attach headers and reserve any native capability immediately before dispatch.
+  cloneProjectProgressUrl: ({ cloneId }: { cloneId: string }) =>
+    `/api/projects/clone-progress${query({ cloneId })}`,
   searchConversationsUrl: (searchQuery: string, limit = 50) =>
-    streamingApiUrl(`/api/providers/search/sessions${query({
-      q: searchQuery,
-      limit,
-      token: getStoredAuthToken(),
-    })}`),
+    `/api/providers/search/sessions${query({ q: searchQuery, limit })}`, 
 
   // Session endpoints. Provider/project metadata are resolved by the backend
   // from the session id.
@@ -484,6 +589,10 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
     post(`/api/providers/sessions/${encodeURIComponent(sessionId)}/fork`, body),
   renameSession: (sessionId: string, summary: string) =>
     put(`/api/providers/sessions/${sessionId}`, { summary }),
+  // What one agent of a workflow run did, read from its transcript on demand
+  // when its row in the workflow card is opened.
+  workflowAgentActivity: (sessionId: string, runId: string, agentId: string) =>
+    get(`/api/providers/sessions/${encodeURIComponent(sessionId)}/workflows/${encodeURIComponent(runId)}/agents/${encodeURIComponent(agentId)}`),
 
   // Scheduled messages: send a message to a session at a future time.
   scheduledMessages: {
@@ -545,6 +654,11 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
       get(`/api/git/file-with-diff${query({ project: projectId, file: filePath })}`),
     branches: (projectId: string, options: ApiRequestOptions = {}) =>
       get(`/api/git/branches${query({ project: projectId })}`, options),
+    branchDiff: (projectId: string, base: string, options: ApiRequestOptions = {}) =>
+      get(`/api/git/branch-diff${query({ project: projectId, base })}`, options),
+    // Include the pre-rename path so branch comparisons can diff a rename itself.
+    branchDiffFile: (projectId: string, base: string, filePath: string, oldPath?: string, options: ApiRequestOptions = {}) =>
+      get(`/api/git/branch-diff/file${query({ project: projectId, base, file: filePath, oldPath })}`, options),
     remoteStatus: (projectId: string, options: ApiRequestOptions = {}) =>
       get(`/api/git/remote-status${query({ project: projectId })}`, options),
     commits: (
@@ -638,6 +752,11 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
     capabilities: () => get('/api/providers/capabilities'),
     authStatus: (provider: string) =>
       get(`/api/providers/${encodeURIComponent(provider)}/auth/status`),
+    cliStatus: (provider: string) =>
+      get(`/api/providers/${encodeURIComponent(provider)}/cli`),
+    updateCli: (provider: string) =>
+      post(`/api/providers/${encodeURIComponent(provider)}/cli/update`),
+    claudeSettingsPermissions: () => get('/api/providers/claude/settings-permissions'),
 
     models: (provider: string) => get(`/api/providers/${provider}/models`),
     createModel: (provider: string, input: unknown) =>
@@ -646,6 +765,8 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
       patch(`/api/providers/${provider}/models/${recordId}`, input),
     deleteModel: (provider: string, recordId: string | number) =>
       del(`/api/providers/${provider}/models/${recordId}`),
+    setCustomModelsOnly: (provider: string, enabled: boolean) =>
+      put(`/api/providers/${provider}/models/custom-only`, { enabled }),
 
     createSession: (payload: {
       provider: string;
@@ -653,7 +774,7 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
       initialMessage?: unknown;
       /** Explicit project default; omitted keeps the backend's isolated default. */
       workspaceMode?: 'isolated' | 'shared';
-    }) => post('/api/providers/sessions', payload),
+    }, options: ApiRequestOptions = {}) => post('/api/providers/sessions', payload, options),
     sessionMessages: (
       sessionId: string,
       pagination: { limit?: number | null; offset?: number } = {},
@@ -661,6 +782,8 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
     ) => get(sessionMessagesUrl(sessionId, pagination), options),
     sessionTokenUsage: (sessionId: string) =>
       get(`/api/providers/sessions/${encodeURIComponent(sessionId)}/token-usage`),
+    tokenStatistics: (filters: { range: TokenStatisticsRange; timeZone: string; sessionId?: string | null }, options: ApiRequestOptions = {}) =>
+      get(`/api/providers/token-statistics${query(filters)}`, options),
     sessionActiveModel: (provider: string, sessionId: string) =>
       get(`/api/providers/${provider}/sessions/${encodeURIComponent(sessionId)}/active-model`),
     setSessionActiveModel: (provider: string, sessionId: string, model: string) =>
@@ -700,16 +823,17 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
     // the field entirely, which is what the server expects.
     list: (projectPath: string | undefined, workspace?: WorkspaceSelector & { projectId: string; sessionId?: string }, options: ApiRequestOptions = {}) =>
       post('/api/commands/list', { projectPath, ...workspace }, options),
-    execute: (payload: unknown) => post('/api/commands/execute', payload),
+    execute: (payload: unknown, options: ApiRequestOptions = {}) => post('/api/commands/execute', payload, options),
   },
 
   // Chat attachments, stored globally under ~/.cloudcli/assets
   assets: {
-    uploadFiles: (formData: FormData) =>
+    uploadFiles: (formData: FormData, options: ApiRequestOptions = {}) =>
       authenticatedFetch('/api/assets/files', {
         method: 'POST',
         headers: {}, // Let browser set Content-Type for FormData
         body: formData,
+        ...options,
       }),
     file: (storedName: string) => get(`/api/assets/files/${encodeURIComponent(storedName)}`),
     image: (filename: string, options: ApiRequestOptions = {}) =>
@@ -742,15 +866,25 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
     completeOnboarding: () => post('/api/user/complete-onboarding'),
 
     // Preferences and chat drafts live server-side so they follow the user
-    // from one device to another. `savePreferences` is a merge-patch: only the
-    // keys it is given are written.
-    preferences: () => get('/api/user/preferences'),
-    savePreferences: (updates: Record<string, unknown>) =>
-      patch('/api/user/preferences', updates),
+    // from one device to another. Preference writes use the durable CAS outbox.
+    preferences: (options: ApiRequestOptions = {}) => get('/api/user/preferences', options),
+    preferenceSnapshot: (options: ApiRequestOptions = {}) => get('/api/user/preferences', options),
+    /** The durable outbox uses field CAS and immutable replay IDs; it never falls back to the legacy unversioned PATCH. */
+    savePreferenceTransaction: (input: UserPreferenceTransaction, options: ApiRequestOptions = {}) =>
+      patch('/api/user/preferences/transactions', input, options),
+    /** @deprecated The unversioned endpoint returns 410 PREFERENCE_TRANSACTION_REQUIRED. Use the durable preference outbox; never infer revisions for an old payload. */
+    savePreferences: (updates: Record<string, unknown>, options: ApiRequestOptions = {}) =>
+      patch('/api/user/preferences', updates, options),
     drafts: () => get('/api/user/drafts'),
+    // Without `queuedMessage` only the text is written; the stored queued
+    // message is left as it is.
     saveDraft: (scope: string, draft: { text: string; queuedMessage?: unknown }) =>
       put('/api/user/drafts', { scope, ...draft }),
-    deleteDraft: (scope: string) => del('/api/user/drafts', { scope }),
+    // Appends to the scope's queued message on the server and returns the
+    // message that is now queued.
+    appendQueuedMessage: (scope: string, queuedMessage: unknown) =>
+      post('/api/user/drafts/queued-message', { scope, queuedMessage }),
+    clearQueuedMessage: (scope: string) => del('/api/user/drafts/queued-message', { scope }),
   },
 
   // Server-side settings: API keys, stored credentials, notifications, web push
@@ -772,9 +906,9 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
     toggleCredential: (credentialId: string, isActive: boolean) =>
       patch(`/api/settings/credentials/${credentialId}/toggle`, { isActive }),
 
-    notificationPreferences: () => get('/api/settings/notification-preferences'),
-    saveNotificationPreferences: (preferences: unknown) =>
-      put('/api/settings/notification-preferences', preferences),
+    notificationPreferences: (options: ApiRequestOptions = {}) => get('/api/settings/notification-preferences', options),
+    saveNotificationPreferences: (preferences: unknown, options: ApiRequestOptions = {}) =>
+      put('/api/settings/notification-preferences', preferences, options),
 
     push: {
       vapidPublicKey: () => get('/api/settings/push/vapid-public-key'),
@@ -785,29 +919,30 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
   },
 
   plugins: {
-    list: () => get('/api/plugins'),
-    install: (url: string) => post('/api/plugins/install', { url }),
-    uninstall: (name: string) => del(`/api/plugins/${encodeURIComponent(name)}`),
-    update: (name: string) => post(`/api/plugins/${encodeURIComponent(name)}/update`),
-    toggle: (name: string, enabled: boolean) =>
-      put(`/api/plugins/${encodeURIComponent(name)}/enable`, { enabled }),
+    list: (options: ApiRequestOptions = {}) => get('/api/plugins', options),
+    review: (name: string, options: ApiRequestOptions = {}) => get(`/api/plugins/${encodeURIComponent(name)}/review`, options),
+    install: (input: string | { name: string; expectedDigest: string; grantedPermissions: string[]; confirmed: true }, options: ApiRequestOptions = {}) =>
+      post('/api/plugins/install', typeof input === 'string' ? { url: input } : input, options),
+    uninstall: (name: string, options: ApiRequestOptions = {}) => del(`/api/plugins/${encodeURIComponent(name)}`, undefined, options),
+    update: (name: string, approval?: { expectedDigest: string; grantedPermissions: string[]; confirmed: true }, options: ApiRequestOptions = {}) =>
+      post(`/api/plugins/${encodeURIComponent(name)}/update`, approval, options),
+    toggle: (name: string, enabled: boolean, approval?: { expectedDigest: string; grantedPermissions: string[]; confirmed: true }, options: ApiRequestOptions = {}) =>
+      put(`/api/plugins/${encodeURIComponent(name)}/enable`, { enabled, ...approval }, options),
     // Plugin bundles/icons are fetched with auth headers and handed to the
     // browser as blobs, so a bare asset URL is never requested unauthenticated.
-    asset: (pluginName: string, assetFile: string) => get(pluginAssetPath(pluginName, assetFile)),
+    asset: (pluginName: string, assetFile: string, options: ApiRequestOptions = {}) => get(pluginAssetPath(pluginName, assetFile), options),
     // Exposed so the icon cache can key on the resolved asset path.
     assetUrl: pluginAssetPath,
     // Plugin frames and chat use the same authenticated account service.
-    webSocketUrl: (pluginName: string) => {
-      const token = getStoredAuthToken();
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      if (isChisaDesktop()) return desktopWebSocketUrl(`/plugin-ws/${encodeURIComponent(pluginName)}`, token);
-      const origin = `${protocol}//${window.location.host}`;
-      return `${origin}/plugin-ws/${encodeURIComponent(pluginName)}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+    webSocketUrl: async (pluginName: string) => {
+      const { resolveWebSocketAdmissionUrl } = await import('@/shared/webSocketAdmission');
+      return resolveWebSocketAdmissionUrl(`/plugin-ws/${encodeURIComponent(pluginName)}`);
     },
-    rpc: (pluginName: string, method: string, path: string, body?: unknown) =>
+    rpc: (pluginName: string, method: string, path: string, body?: unknown, options: ApiRequestOptions = {}) =>
       authenticatedFetch(
         `/api/plugins/${encodeURIComponent(pluginName)}/rpc/${String(path).replace(/^\//, '')}`,
         {
+          ...options,
           method: method || 'GET',
           ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         },
@@ -825,9 +960,10 @@ export function createWorkspaceApi(workspace?: Pick<WorkspaceDescriptor, 'projec
   },
 
   voice: {
-    health: () => get('/api/voice/health'),
-    transcribe: (formData: FormData, headers: Record<string, string> = {}) =>
+    health: (options: ApiRequestOptions = {}) => get('/api/voice/health', options),
+    transcribe: (formData: FormData, headers: Record<string, string> = {}, options: ApiRequestOptions = {}) =>
       authenticatedFetch('/api/voice/transcribe', {
+        ...options,
         method: 'POST',
         headers,
         body: formData,
@@ -860,40 +996,80 @@ function voiceDirectUrl(baseUrl: string, path: string): string {
  * drop cached synthesized audio.
  */
 export function voiceConfigSignature(): string {
-  return JSON.stringify(readVoiceConfig());
+  const session = getAuthSessionSnapshot();
+  return JSON.stringify([session.serverKey, session.userId, session.sessionInstanceId, getVoiceConfigRevision()]);
+}
+
+// Voice requests may target an external user-selected backend; account revocation must abort both direct and native/proxy requests.
+async function voiceRequest(expected: AuthSessionSnapshot, signal: AbortSignal | undefined,
+  send: (requestSignal: AbortSignal) => Promise<Response>): Promise<Response> {
+  if (expected.phase !== 'ready' || !isCurrentAuthSession(expected)) throw new DOMException('Voice account session changed', 'AbortError');
+  signal?.throwIfAborted();
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort(signal?.reason);
+  signal?.addEventListener('abort', forwardAbort, { once: true });
+  let unsubscribe = () => {};
+  let cleaned = false;
+  const cleanup = () => { if (!cleaned) { cleaned = true; unsubscribe(); signal?.removeEventListener('abort', forwardAbort); } };
+  unsubscribe = subscribeToAuthSession(() => {
+    if (!isCurrentAuthSession(expected)) { controller.abort(new DOMException('Voice account session changed', 'AbortError')); cleanup(); }
+  });
+  const verify = () => { controller.signal.throwIfAborted(); if (!isCurrentAuthSession(expected)) throw new DOMException('Voice account session changed', 'AbortError'); };
+  try {
+    const admission = await dispatchWithAuthSession(expected, () => { verify(); return send(controller.signal); });
+    const response = await admission.operation;
+    verify();
+    // Body parsing is another async boundary. The subscription stays live until its bounded body is consumed or explicitly cancelled.
+    if (response.body) {
+      const reader = response.body.getReader();
+      const body = new ReadableStream<Uint8Array>({
+        async pull(stream) {
+          try { verify(); const next = await reader.read(); verify(); if (next.done) { cleanup(); stream.close(); } else stream.enqueue(next.value); }
+          catch (error) { cleanup(); await reader.cancel(error).catch(() => {}); stream.error(error); }
+        },
+        async cancel(reason) { cleanup(); await reader.cancel(reason); },
+      });
+      return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+    }
+    cleanup();
+    return response;
+  } catch (error) { cleanup(); throw error; }
 }
 
 /**
  * Transcribes recorded audio, posting directly to the user's configured OpenAI-compatible
  * endpoint when one is set and otherwise going through the CloudCLI voice proxy.
  */
-export function transcribeVoice(blob: Blob, filename: string): Promise<Response> {
-  const config = readVoiceConfig();
+export function transcribeVoice(blob: Blob, filename: string, signal?: AbortSignal, expected = getAuthSessionSnapshot()): Promise<Response> {
+  const config = readVoiceConfig(expected);
   const body = new FormData();
 
   if (config.baseUrl.trim()) {
     body.append('file', blob, filename);
     body.append('model', config.sttModel || 'whisper-1');
-    return fetch(voiceDirectUrl(config.baseUrl.trim(), '/audio/transcriptions'), {
+    return voiceRequest(expected, signal, requestSignal => fetch(voiceDirectUrl(config.baseUrl.trim(), '/audio/transcriptions'), {
       method: 'POST',
       headers: config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {},
       body,
-    });
+      signal: requestSignal,
+      redirect: 'error',
+      credentials: 'omit',
+    }));
   }
 
   body.append('audio', blob, filename);
-  return api.voice.transcribe(body, voiceConfigHeaders());
+  return voiceRequest(expected, signal, requestSignal => api.voice.transcribe(body, voiceConfigHeaders(expected), { signal: requestSignal, expectedSession: expected }));
 }
 
 /**
  * Synthesizes speech for the given text, using the user's configured OpenAI-compatible
  * endpoint when one is set and otherwise the CloudCLI voice proxy.
  */
-export function synthesizeVoice(text: string, signal: AbortSignal): Promise<Response> {
-  const config = readVoiceConfig();
+export function synthesizeVoice(text: string, signal: AbortSignal, expected = getAuthSessionSnapshot()): Promise<Response> {
+  const config = readVoiceConfig(expected);
 
   if (config.baseUrl.trim()) {
-    return fetch(voiceDirectUrl(config.baseUrl.trim(), '/audio/speech'), {
+    return voiceRequest(expected, signal, requestSignal => fetch(voiceDirectUrl(config.baseUrl.trim(), '/audio/speech'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -905,9 +1081,11 @@ export function synthesizeVoice(text: string, signal: AbortSignal): Promise<Resp
         input: text,
         ...(config.ttsFormat.trim() ? { response_format: config.ttsFormat.trim() } : {}),
       }),
-      signal,
-    });
+      signal: requestSignal,
+      redirect: 'error',
+      credentials: 'omit',
+    }));
   }
 
-  return api.voice.tts(text, { headers: voiceConfigHeaders(), signal });
+  return voiceRequest(expected, signal, requestSignal => api.voice.tts(text, { headers: voiceConfigHeaders(expected), signal: requestSignal, expectedSession: expected }));
 }

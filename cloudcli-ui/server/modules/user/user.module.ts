@@ -46,12 +46,16 @@ const userService = createUserService({
     hasCompletedOnboarding: (userId) => userDb.hasCompletedOnboarding(userId),
   },
   preferences: {
-    getPreferences: (userId) => userPreferencesDb.getPreferences(userId),
+    getPreferenceSnapshot: (userId) => userPreferencesDb.getPreferenceSnapshot(userId),
     savePreferences: (userId, updates) => userPreferencesDb.savePreferences(userId, updates),
+    savePreferenceTransaction: (userId, transaction) => userPreferencesDb.savePreferenceTransaction(userId, transaction),
   },
   drafts: {
     getDrafts: (userId) => sessionDraftsDb.getDrafts(userId),
     saveDraft: (userId, scope, draft) => sessionDraftsDb.saveDraft(userId, scope, draft),
+    saveDraftText: (userId, scope, text) => sessionDraftsDb.saveDraftText(userId, scope, text),
+    appendQueuedMessage: (userId, scope, message) => sessionDraftsDb.appendQueuedMessage(userId, scope, message),
+    clearQueuedMessage: (userId, scope) => sessionDraftsDb.clearQueuedMessage(userId, scope),
     deleteDraft: (userId, scope) => sessionDraftsDb.deleteDraft(userId, scope),
   },
   readSystemGitConfig,

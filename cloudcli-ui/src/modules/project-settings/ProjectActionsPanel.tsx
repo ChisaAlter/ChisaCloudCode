@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { api } from '@/shared/api';
 import { Button, Input } from '@/shared/ui';
 import { useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
+import { useSshJobOutputStream } from '@/shared/hooks/useSshJobOutputStream';
 import type { ProjectAction, ProjectActionKind, ProjectActionRunResult } from '@/shared/types';
 
 const KINDS: Array<{ value: ProjectActionKind; label: string }> = [
@@ -29,6 +30,11 @@ export default function ProjectActionsPanel({ projectId }: { projectId: string }
   const [error, setError] = useState<string | null>(null);
   const [runningId, setRunningId] = useState<string | null>(null);
   const [runResult, setRunResult] = useState<ProjectActionRunResult | null>(null);
+  const liveOutput = useSshJobOutputStream({
+    enabled: Boolean(runningId && workspace?.sourceMode === 'ssh'),
+    projectId,
+    generation: workspace?.generation,
+  });
 
   const load = useCallback(async () => {
     setIsLoading(true);
@@ -184,6 +190,16 @@ export default function ProjectActionsPanel({ projectId }: { projectId: string }
               <code className="mt-2 block overflow-x-auto rounded bg-muted/40 px-2 py-1 text-xs text-foreground/80">{action.cwd ? `[${action.cwd}] ` : ''}{action.command}</code>
             </div>
           ))}
+        </div>
+      )}
+
+      {runningId && !runResult && (liveOutput.stdout || liveOutput.stderr) && (
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <span className="font-medium text-foreground">正在实时输出…</span>
+            {liveOutput.truncated && <span className="text-xs text-muted-foreground">输出已截断</span>}
+          </div>
+          <pre aria-label="项目操作实时输出" className="max-h-60 overflow-auto whitespace-pre-wrap rounded-lg border border-border/70 bg-muted/20 p-3 text-xs text-foreground/85">{liveOutput.stdout || '(无 stdout)'}{liveOutput.stderr ? `\n[stderr]\n${liveOutput.stderr}` : ''}</pre>
         </div>
       )}
 

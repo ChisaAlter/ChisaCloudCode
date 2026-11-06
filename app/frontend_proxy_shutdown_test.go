@@ -50,7 +50,7 @@ func TestFrontendProxyWindowCloseCancelsHTTPAndUpgradedSocketKeepsNativeCleanup(
 	if err := StartAPIProxy(); err != nil {
 		t.Fatal(err)
 	}
-	base := fmt.Sprintf("http://127.0.0.1:%d/channel/%s", apiProxyPort, apiProxyKey)
+	base := fmt.Sprintf("http://127.0.0.1:%d/channel/%s", apiProxyPort, connection.proxyCapability)
 	httpDone := make(chan struct{})
 	go func() {
 		defer close(httpDone)
@@ -60,13 +60,13 @@ func TestFrontendProxyWindowCloseCancelsHTTPAndUpgradedSocketKeepsNativeCleanup(
 			response.Body.Close()
 		}
 	}()
-	<-httpStarted
+	awaitNativeSignal(t, httpStarted, "proxy request did not reach upstream before window closure")
 	client, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", apiProxyPort), time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	fmt.Fprintf(client, "GET /channel/%s/ws HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n", apiProxyKey)
+	fmt.Fprintf(client, "GET /channel/%s/ws HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n", connection.proxyCapability)
 	reader := bufio.NewReader(client)
 	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
 	upgrade, err := http.ReadResponse(reader, nil)

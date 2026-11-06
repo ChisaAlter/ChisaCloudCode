@@ -6,6 +6,7 @@ import type { AppTab, Project, ProjectSession } from '@/shared/types';
 import { cn } from '@/shared/utils';
 import { isDesktop } from '@/shared/chisa';
 import MobileMenuButton from '@/modules/project-workspace/MobileMenuButton';
+import WorkspaceConnectionStatus from '@/modules/project-workspace/WorkspaceConnectionStatus';
 import WorkspaceTabs from '@/modules/project-workspace/WorkspaceTabs';
 import WorkspaceTitle from '@/modules/project-workspace/WorkspaceTitle';
 import { ProjectSettingsDialog } from '@/modules/project-settings';
@@ -20,9 +21,11 @@ type WorkspaceHeaderProps = {
   isMobile: boolean;
   onMenuClick: () => void;
   statusControl?: ReactNode;
+  /** Persists a new title for a session; resolves false when the backend refuses it. */
+  onRenameSession: (sessionId: string, summary: string) => Promise<boolean>;
 };
 
-/** Rendered by WorkspaceMain to show the workspace title alongside the scrollable tab bar. */
+/** Rendered by WorkspaceMain to show the workspace title and chat connection status alongside the scrollable tab bar. */
 export default function WorkspaceHeader({
   activeTab,
   setActiveTab,
@@ -33,6 +36,7 @@ export default function WorkspaceHeader({
   isMobile,
   onMenuClick,
   statusControl,
+  onRenameSession,
 }: WorkspaceHeaderProps) {
   const { t } = useTranslation();
   const compact = isDesktop() && !isMobile;
@@ -107,6 +111,7 @@ export default function WorkspaceHeader({
             selectedProject={selectedProject}
             selectedSession={selectedSession}
             shouldShowTasksTab={shouldShowTasksTab}
+            onRenameSession={onRenameSession}
           />
           {statusControl}
           <button
@@ -118,6 +123,7 @@ export default function WorkspaceHeader({
           >
             <Settings2 className="h-4 w-4" />
           </button>
+          <WorkspaceConnectionStatus />
         </div>
 
         {compact ? (

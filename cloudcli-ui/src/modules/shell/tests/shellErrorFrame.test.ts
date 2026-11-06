@@ -9,6 +9,7 @@ import { useShellConnection } from '@/modules/shell/hooks/useShellConnection';
 import type { Project, ProjectSession, WorkspaceDescriptor } from '@/shared/types';
 import { WorkspaceScopeContext } from '@/shared/context/WorkspaceScopeContext';
 import { TERMINAL_INIT_DELAY_MS } from '@/shared/constants';
+import { acknowledgeAuthSession, getAuthSessionSnapshot, initializeAuthSession, startAuthSession } from '@/shared/authToken';
 
 // Only the URL builder is stubbed: it reads a stored auth token and would bail
 // before a socket is ever constructed. `parseShellMessage` stays real, because
@@ -44,7 +45,7 @@ class FakeSocket {
 
 const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value });
 
-function renderConnection(workspace?: WorkspaceDescriptor | null) {
+async function renderConnection(workspace?: WorkspaceDescriptor | null) {
   const write = vi.fn();
   const clearTerminalScreen = vi.fn();
   const closeSocket = vi.fn();
@@ -64,6 +65,7 @@ function renderConnection(workspace?: WorkspaceDescriptor | null) {
       initialCommandRef: ref<string | null | undefined>(null),
       isPlainShellRef: ref(false),
       bypassPermissionsRef: ref(false),
+      isDarkModeRef: ref(true),
       onProcessCompleteRef: ref<((exitCode: number) => void) | null | undefined>(null),
       isInitialized: true,
       autoConnect: false,
@@ -73,7 +75,7 @@ function renderConnection(workspace?: WorkspaceDescriptor | null) {
     { wrapper: ({ children }: PropsWithChildren) => createElement(WorkspaceScopeContext.Provider, { value: workspace }, children) },
   );
 
-  act(() => {
+  await act(async () => {
     view.result.current.connectToShell();
   });
   act(() => {
@@ -83,8 +85,11 @@ function renderConnection(workspace?: WorkspaceDescriptor | null) {
   return { view, write, clearTerminalScreen, closeSocket, socket: FakeSocket.last! };
 }
 
-describe('shell socket error frames', () => {
-  beforeEach(() => {
+describe('shell socket error frames', async () => {
+  beforeEach(async () => {
+    await initializeAuthSession();
+    await startAuthSession('shell.fixture.signature');
+    acknowledgeAuthSession(getAuthSessionSnapshot());
     vi.useFakeTimers();
     FakeSocket.last = null;
     vi.stubGlobal('WebSocket', FakeSocket);
@@ -104,8 +109,8 @@ describe('shell socket error frames', () => {
     capabilities: { read: true, write: true, git: true, shell: true, preview: true, integrate: true, cloudExecutionIndependentOfDesktop: true },
   };
 
-  it('sends an exact workspace selector and waits for matching server readiness', () => {
-    const { view, write, socket } = renderConnection(workspace);
+  it('sends an exact workspace selector and waits for matching server readiness', async () => {
+    const { view, write, socket } = await renderConnection(workspace);
     expect(view.result.current.isConnected).toBe(false);
     act(() => vi.advanceTimersByTime(TERMINAL_INIT_DELAY_MS));
     expect(JSON.parse(socket.sent[0])).toMatchObject({ type: 'init', projectId: 'project', workspaceId: 'session:one', generation: 'generation', sessionId: 'one', projectPath: '/isolated/one' });
@@ -115,8 +120,8 @@ describe('shell socket error frames', () => {
     expect(write.mock.calls[0][0]).toContain('Ctrl+C 将结束此终端');
   });
 
-  it('describes Windows SSH commands without claiming Ctrl+C closes the terminal', () => {
-    const { view, write, socket } = renderConnection({ ...workspace, sourceMode: 'ssh' });
+  it('describes Windows SSH commands without claiming Ctrl+C closes the terminal', async () => {
+    const { view, write, socket } = await renderConnection({ ...workspace, sourceMode: 'ssh' });
     act(() => socket.onmessage?.({ data: JSON.stringify({ type: 'ready', projectId: 'project', workspaceId: 'session:one', generation: 'generation', sessionId: 'one', transport: 'pipe' }) }));
     expect(view.result.current.isConnected).toBe(true);
     expect(write.mock.calls[0][0]).toContain('Windows 命令');
@@ -125,26 +130,26 @@ describe('shell socket error frames', () => {
     expect(write.mock.calls[0][0]).not.toContain('结束此终端');
   });
 
-  it('rejects readiness for another session and does not connect an unavailable workspace', () => {
-    const { view, socket } = renderConnection(workspace);
+  it('rejects readiness for another session and does not connect an unavailable workspace', async () => {
+    const { view, socket } = await renderConnection(workspace);
     act(() => socket.onmessage?.({ data: JSON.stringify({ type: 'ready', projectId: 'project', workspaceId: 'session:one', generation: 'generation', sessionId: 'wrong-session' }) }));
     expect(view.result.current.isConnected).toBe(false);
     expect(socket.readyState).toBe(3);
     view.unmount();
     FakeSocket.last = null;
-    const unavailable = renderConnection(null);
+    const unavailable = await renderConnection(null);
     expect(unavailable.view.result.current.isConnected).toBe(false);
     expect(FakeSocket.last).toBeNull();
   });
 
-  it('a cloud replica init omits the selected chat session', () => {
-    const { socket } = renderConnection({ ...workspace, workspaceId: 'replica', kind: 'cloudReplica', sessionId: undefined });
+  it('a cloud replica init omits the selected chat session', async () => {
+    const { socket } = await renderConnection({ ...workspace, workspaceId: 'replica', kind: 'cloudReplica', sessionId: undefined });
     act(() => vi.advanceTimersByTime(TERMINAL_INIT_DELAY_MS));
     expect(JSON.parse(socket.sent[0])).not.toHaveProperty('sessionId');
   });
 
-  it('writes the server error into the terminal instead of dropping it', () => {
-    const { write, socket } = renderConnection();
+  it('writes the server error into the terminal instead of dropping it', async () => {
+    const { write, socket } = await renderConnection();
 
     act(() => {
       socket.onmessage?.({
@@ -156,8 +161,8 @@ describe('shell socket error frames', () => {
     expect(write.mock.calls[0][0]).toContain('Invalid project path');
   });
 
-  it('keeps the socket open so the message it just wrote is not cleared', () => {
-    const { clearTerminalScreen, closeSocket, socket } = renderConnection();
+  it('keeps the socket open so the message it just wrote is not cleared', async () => {
+    const { clearTerminalScreen, closeSocket, socket } = await renderConnection();
 
     act(() => {
       socket.onmessage?.({
@@ -170,8 +175,8 @@ describe('shell socket error frames', () => {
     expect(socket.readyState).toBe(1);
   });
 
-  it('falls back to a generic label when the frame carries no message', () => {
-    const { write, socket } = renderConnection();
+  it('falls back to a generic label when the frame carries no message', async () => {
+    const { write, socket } = await renderConnection();
 
     act(() => {
       socket.onmessage?.({ data: JSON.stringify({ type: 'error' }) });
@@ -180,8 +185,8 @@ describe('shell socket error frames', () => {
     expect(write.mock.calls[0][0]).toContain('Shell error');
   });
 
-  it('still writes plain output frames unchanged', () => {
-    const { write, socket } = renderConnection();
+  it('still writes plain output frames unchanged', async () => {
+    const { write, socket } = await renderConnection();
 
     act(() => {
       socket.onmessage?.({ data: JSON.stringify({ type: 'output', data: 'hello' }) });

@@ -1,149 +1,126 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { getAuthSessionSnapshot, isCurrentAuthSession, subscribeToAuthSession } from '@/modules/auth-session';
 import { transcribeVoice } from '@/shared/api';
-import type { VoiceInputState } from '@/shared/types';
+import type { AuthSessionSnapshot, VoiceInputState } from '@/shared/types';
 
-// Mobile-safe recording: iOS Safari 18.4+ supports webm/opus; older iOS needs mp4.
-const MIME_CANDIDATES = [
-  'audio/webm;codecs=opus',
-  'audio/webm',
-  'audio/mp4',
-  'audio/ogg;codecs=opus',
-  'audio/ogg',
-];
-
+const MIME_CANDIDATES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/ogg'];
 function pickMime(): string {
-  for (const t of MIME_CANDIDATES) {
-    try {
-      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t)) return t;
-    } catch {
-      /* isTypeSupported can throw on some iOS versions */
-    }
+  for (const type of MIME_CANDIDATES) {
+    try { if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(type)) return type; }
+    catch { /* Some mobile browsers reject unsupported MIME probes. */ }
   }
   return '';
 }
 
+type Recording = { session: AuthSessionSnapshot; controller: AbortController; stream: MediaStream | null;
+  recorder: MediaRecorder | null; chunks: Blob[]; send: boolean };
 
-/**
- * Push-to-talk dictation. Records the mic, uploads to /api/voice/transcribe
- * (an OpenAI-compatible speech-to-text backend via the Express proxy), and
- * returns the transcript through onTranscript.
- */
-export function useVoiceInput(
-  onTranscript: (text: string, send?: boolean) => void,
-  onError?: (msg: string) => void,
-) {
+/** Chat dictation keeps the recording, upload and transcript bound to the account that started the microphone. */
+export function useVoiceInput(onTranscript: (text: string, send?: boolean) => void, onError?: (msg: string) => void) {
+  // Only the active recording may update status or deliver a transcript.
   const [state, setState] = useState<VoiceInputState>('idle');
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const streamRef = useRef<MediaStream | null>(null);
-  const cancelledRef = useRef(false);
-  const startingRef = useRef(false);
-  // Whether the in-progress stop should auto-send the transcript (vs just fill the box).
-  const sendRef = useRef(false);
+  // Pending microphone permission, recorder events and response parsing share one cancellable owner.
+  const active = useRef<Recording | null>(null);
+  // Async browser callbacks may outlive the composer that requested the microphone.
+  const mounted = useRef(true);
+  const isActive = (recording: Recording) => mounted.current && active.current === recording
+    && !recording.controller.signal.aborted && isCurrentAuthSession(recording.session)
+    && getAuthSessionSnapshot().phase === 'ready';
+  const releaseTracks = (recording: Recording) => { recording.stream?.getTracks().forEach(track => track.stop()); recording.stream = null; };
 
-  const stopTracks = () => {
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
-  };
-
-  // Stop the mic if the component unmounts mid-recording.
   useEffect(() => {
-    cancelledRef.current = false;
-    return () => {
-      cancelledRef.current = true;
-      startingRef.current = false;
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-      recorderRef.current = null;
+    mounted.current = true;
+    const cancel = () => {
+      const recording = active.current;
+      active.current = null;
+      if (recording) {
+        recording.controller.abort();
+        recording.send = false;
+        recording.chunks = [];
+        if (recording.recorder) {
+          recording.recorder.onstop = null;
+          recording.recorder.ondataavailable = null;
+          try { if (recording.recorder.state !== 'inactive') recording.recorder.stop(); }
+          catch { /* A recorder failure must not prevent account revocation from releasing its tracks. */ }
+        }
+        releaseTracks(recording);
+      }
+      if (mounted.current) setState('idle');
     };
+    const unsubscribe = subscribeToAuthSession(() => {
+      if (active.current && (!isCurrentAuthSession(active.current.session) || getAuthSessionSnapshot().phase !== 'ready')) cancel();
+    });
+    return () => { mounted.current = false; unsubscribe(); cancel(); };
   }, []);
 
   const start = useCallback(async () => {
-    if (startingRef.current || (recorderRef.current && recorderRef.current.state !== 'inactive')) return;
-    startingRef.current = true;
+    if (active.current) return;
+    const session = getAuthSessionSnapshot();
+    if (session.phase !== 'ready') return;
+    const recording: Recording = { session, controller: new AbortController(), stream: null, recorder: null, chunks: [], send: false };
+    active.current = recording;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true },
-      });
-      if (cancelledRef.current) {
-        stream.getTracks().forEach((t) => t.stop());
-        return;
-      }
-      streamRef.current = stream;
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      if (!isActive(recording)) { stream.getTracks().forEach(track => track.stop()); return; }
+      recording.stream = stream;
       const mimeType = pickMime();
-      const rec = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-      recorderRef.current = rec;
-      chunksRef.current = [];
-
-      rec.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
-      };
-
-      rec.onstop = async () => {
-        stopTracks();
-        if (cancelledRef.current) return;
-        // Capture and clear the send intent for this stop before any async work.
-        const shouldSend = sendRef.current;
-        sendRef.current = false;
-        const type = rec.mimeType || 'audio/webm';
-        const blob = new Blob(chunksRef.current, { type });
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      recording.recorder = recorder;
+      recorder.ondataavailable = event => { if (isActive(recording) && event.data.size > 0) recording.chunks.push(event.data); };
+      recorder.onstop = async () => {
+        releaseTracks(recording);
+        if (!isActive(recording)) return;
+        const shouldSend = recording.send;
+        recording.send = false;
+        const type = recorder.mimeType || 'audio/webm';
+        const blob = new Blob(recording.chunks, { type });
+        recording.chunks = [];
         if (blob.size < 800) {
+          active.current = null;
           setState('idle');
           onError?.('Recording too short');
           return;
         }
         setState('transcribing');
         try {
-          const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
-          const res = await transcribeVoice(blob, `recording.${ext}`);
-          if (!res.ok) throw new Error(`transcribe ${res.status}`);
-          const data = await res.json();
-          if (cancelledRef.current) return;
+          const extension = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
+          const response = await transcribeVoice(blob, `recording.${extension}`, recording.controller.signal, recording.session);
+          if (!isActive(recording)) return;
+          if (!response.ok) throw new Error(`transcribe ${response.status}`);
+          const data = await response.json();
+          if (!isActive(recording)) return;
           const text = String(data?.text || '').trim();
           if (text) onTranscript(text, shouldSend);
           else onError?.('No speech detected');
-        } catch (e) {
-          if (!cancelledRef.current) {
-            onError?.(`Transcription failed: ${e instanceof Error ? e.message : String(e)}`);
-          }
+        } catch (error) {
+          if (isActive(recording)) onError?.(`Transcription failed: ${error instanceof Error ? error.message : String(error)}`);
         } finally {
-          if (!cancelledRef.current) setState('idle');
+          if (isActive(recording)) { active.current = null; setState('idle'); }
         }
       };
-
-      rec.start();
+      recorder.start();
       setState('recording');
-    } catch (e) {
-      recorderRef.current = null;
-      stopTracks();
-      if (cancelledRef.current) return;
-      const err = e as { name?: string; message?: string };
-      let msg = `Mic error: ${err?.message || e}`;
-      if (err?.name === 'NotAllowedError') msg = 'Microphone access denied.';
-      else if (err?.name === 'NotFoundError') msg = 'No microphone found.';
-      onError?.(msg);
+    } catch (error) {
+      releaseTracks(recording);
+      if (!isActive(recording)) return;
+      active.current = null;
+      const failure = error as { name?: string; message?: string };
+      onError?.(failure.name === 'NotAllowedError' ? 'Microphone access denied.'
+        : failure.name === 'NotFoundError' ? 'No microphone found.' : `Mic error: ${failure.message || error}`);
       setState('idle');
-    } finally {
-      startingRef.current = false;
     }
   }, [onTranscript, onError]);
 
-  // Stop recording. Pass { send: true } to auto-send the transcript once it's ready.
-  // Guard on the recorder's own state (not React state) so a double tap, or the mic
-  // and Send buttons both firing, can't call stop() on an already-inactive recorder.
-  const stop = useCallback((opts?: { send?: boolean }) => {
-    const rec = recorderRef.current;
-    if (rec && rec.state !== 'inactive') {
-      sendRef.current = opts?.send ?? false;
-      rec.stop();
+  const stop = useCallback((options?: { send?: boolean }) => {
+    const recording = active.current;
+    if (recording?.recorder && recording.recorder.state !== 'inactive' && isActive(recording)) {
+      recording.send = options?.send ?? false;
+      // A browser may queue onstop; release the microphone at the user's stop action.
+      try { recording.recorder.stop(); }
+      finally { releaseTracks(recording); }
     }
   }, []);
-
-  const toggle = useCallback(() => {
-    if (state === 'recording') stop();
-    else if (state === 'idle') start();
-  }, [state, start, stop]);
-
+  const toggle = useCallback(() => { if (state === 'recording') stop(); else if (state === 'idle') void start(); }, [state, start, stop]);
   return { state, toggle, stop };
 }

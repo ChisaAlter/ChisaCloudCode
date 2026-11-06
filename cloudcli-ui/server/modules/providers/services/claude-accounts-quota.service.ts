@@ -20,6 +20,15 @@ function empty(now: number, error: string, failureKind: string, status: 'error' 
   return { status, windows: [], updatedAt: null, checkedAt: now, error, failureKind, stale: false };
 }
 
+function credentialUsage(credentials: ClaudeAccountCredentialRead, now: number): ClaudeAccountUsage | null {
+  if (credentials.unavailable) return empty(now, '无法读取此账号的凭据。', 'credentials-unavailable');
+  if (!credentials.accessToken) return credentials.refreshable
+    ? empty(now, '登录仍可自动续期，正在等待后台重试后更新额度。', 'stale-token')
+    : empty(now, '请登录此 Claude 订阅账号。', 'missing-credentials', 'unavailable');
+  if (credentials.expiresAt !== null && credentials.expiresAt <= now) return empty(now, credentials.refreshable ? '登录仍可自动续期，正在等待后台重试后更新额度。' : 'Claude 登录已过期，请重新登录。', credentials.refreshable ? 'stale-token' : 'missing-credentials');
+  return null;
+}
+
 function currentWindows(usage: ClaudeAccountUsage, now: number): ClaudeAccountUsage {
   const windows = usage.windows.filter(window => window.resetsAt === null || window.resetsAt > now);
   if (windows.length === usage.windows.length) return usage;
@@ -46,6 +55,14 @@ export class ClaudeAccountQuotaService {
     this.generations.set(key, (this.generations.get(key) ?? 0) + 1);
     this.cache.delete(key);
     this.inFlight.delete(key);
+  }
+
+  /** The account coordinator uses this local snapshot without starting or joining an in-flight remote refresh. */
+  peek(key: string, credentials: ClaudeAccountCredentialRead): ClaudeAccountUsage {
+    const now = (this.options.now ?? Date.now)();
+    const cached = this.cache.get(key);
+    if (cached?.fingerprint === fingerprint(credentials)) return currentWindows(cached.usage, now);
+    return credentialUsage(credentials, now) ?? empty(now, '尚未读取额度，请刷新。', 'not-read', 'unavailable');
   }
 
   async read(key: string, readCredentials: () => ClaudeAccountCredentialRead, force = false): Promise<ClaudeAccountUsage> {
@@ -84,11 +101,8 @@ export class ClaudeAccountQuotaService {
   }
 
   private async fetch(credentials: ClaudeAccountCredentialRead, now: number): Promise<ClaudeAccountUsage> {
-    if (credentials.unavailable) return empty(now, '无法读取此账号的凭据。', 'credentials-unavailable');
-    if (!credentials.accessToken) return credentials.refreshable
-      ? empty(now, '登录仍可自动续期，正在等待后台重试后更新额度。', 'stale-token')
-      : empty(now, '请登录此 Claude 订阅账号。', 'missing-credentials', 'unavailable');
-    if (credentials.expiresAt !== null && credentials.expiresAt <= now) return empty(now, credentials.refreshable ? '登录仍可自动续期，正在等待后台重试后更新额度。' : 'Claude 登录已过期，请重新登录。', credentials.refreshable ? 'stale-token' : 'missing-credentials');
+    const unavailable = credentialUsage(credentials, now);
+    if (unavailable) return unavailable;
     try {
       const response = await (this.options.fetch ?? globalThis.fetch)(USAGE_URL, {
         headers: { Authorization: `Bearer ${credentials.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20', 'User-Agent': 'claude-code/2.1.0', Accept: 'application/json' },

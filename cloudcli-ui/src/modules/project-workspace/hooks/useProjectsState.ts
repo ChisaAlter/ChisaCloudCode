@@ -10,7 +10,7 @@ import type { ServerEvent,
   ProjectSession,IsSessionProcessing } from '@/shared/types';
 import { mergeProjectSelectionMetadata } from '@/modules/project-workspace/utils/projectSelectionMetadata';
 import { readSelectedProvider } from '@/shared/selectedProvider';
-import { getAuthSessionVersion } from '@/shared/authToken';
+import { getAuthSessionSnapshot, getAuthSessionVersion } from '@/shared/authToken';
 import { getServerConnectionVersion } from '@/shared/chisa';
 
 type UseProjectsStateArgs = {
@@ -356,6 +356,21 @@ const removeSessionFromProject = (project: Project, sessionIdToDelete: string): 
   return updatedProject;
 };
 
+// Writes a confirmed rename onto the matching sidebar row. Returns the same
+// project when it holds no such row, or the row already carries that title, so
+// the sidebar list does not re-render for projects the rename did not touch.
+const renameSessionInProject = (project: Project, sessionIdToRename: string, summary: string): Project => {
+  const sessions = project.sessions ?? [];
+  const existingIndex = sessions.findIndex((session) => session.id === sessionIdToRename);
+  if (existingIndex < 0 || sessions[existingIndex].summary === summary) {
+    return project;
+  }
+
+  const nextSessions = [...sessions];
+  nextSessions[existingIndex] = { ...sessions[existingIndex], summary };
+  return { ...project, sessions: nextSessions };
+};
+
 const VALID_TABS: Set<string> = new Set(['chat', 'files', 'shell', 'git', 'tasks', 'browser']);
 
 const isValidTab = (tab: string): tab is AppTab => {
@@ -364,12 +379,9 @@ const isValidTab = (tab: string): tab is AppTab => {
 
 function tabStorageKey(): string | null {
   try {
-    const token = localStorage.getItem('auth-token');
-    if (!token) return 'activeTab'; // Anonymous/platform installations retain their local tab preference.
-    const payload = token.split('.')[1]?.replace(/-/g, '+').replace(/_/g, '/');
-    const claims = JSON.parse(atob(payload)) as { userId?: unknown; username?: unknown };
-    if (typeof claims.userId !== 'string' && typeof claims.userId !== 'number') return null;
-    return `activeTab:${JSON.stringify([window.location.origin, getServerConnectionVersion(), claims.userId, claims.username])}`;
+    const identity = getAuthSessionSnapshot();
+    if (!identity.token) return 'activeTab';
+    return `activeTab:${JSON.stringify([identity.serverKey, identity.userId ?? identity.sessionInstanceId])}`;
   } catch { return null; }
 }
 
@@ -781,6 +793,8 @@ export function useProjectsState({
         && event.kind !== 'chat_subscribed'
         && event.kind !== 'loading_progress'
         && event.kind !== 'session_upserted'
+        // A change to the session's scheduled messages is not new activity in it.
+        && event.kind !== 'scheduled_messages_changed'
         && event.kind !== 'status'
         && event.kind !== 'stream_end'
         && event.kind !== 'permission_resolved'
@@ -1155,6 +1169,59 @@ export function useProjectsState({
     }
   }, [accountCurrent, projects, selectedProject, selectedSession]);
 
+  /**
+   * Persists a new title for one session and writes it onto both local copies
+   * — the sidebar row in `projects` and the workspace header's `selectedSession`
+   * — the moment the backend confirms. The rename route only updates the DB; it
+   * does not broadcast a `session_upserted`, so nothing else would refresh the
+   * header. Patching in place rather than refetching also keeps every session
+   * page the sidebar has loaded past the first. The sidebar's Conversations
+   * list folds the new title in from `projects` itself.
+   *
+   * Resolves `false` when the backend refused the rename; transport errors
+   * propagate so the caller can tell the two apart, as the sidebar does.
+   */
+  const renameSession = useCallback(async (sessionIdToRename: string, summary: string): Promise<boolean> => {
+    if (!accountCurrent()) return false;
+    const trimmed = summary.trim();
+    if (!trimmed) {
+      return false;
+    }
+
+    const response = await api.renameSession(sessionIdToRename, trimmed);
+    if (!accountCurrent()) return false;
+    if (!response.ok) {
+      console.error('[Workspace] Failed to rename session:', response.status);
+      return false;
+    }
+
+    setProjects((previousProjects) => {
+      let changed = false;
+      const nextProjects = previousProjects.map((project) => {
+        const renamedProject = renameSessionInProject(project, sessionIdToRename, trimmed);
+        if (renamedProject !== project) {
+          changed = true;
+        }
+        return renamedProject;
+      });
+      return changed ? nextProjects : previousProjects;
+    });
+
+    setSelectedSession((previousSession) => {
+      if (previousSession?.id !== sessionIdToRename || previousSession.summary === trimmed) {
+        return previousSession;
+      }
+      // A session opened from a Conversations search hit carries the one-shot
+      // jump target the chat reads off every new `selectedSession` identity.
+      // Leave it behind, or the rename would scroll the transcript back to the
+      // matched message and flash the search highlight again.
+      const { __searchTargetSnippet: _snippet, __searchTargetTimestamp: _timestamp, ...session } = previousSession;
+      return { ...session, summary: trimmed };
+    });
+
+    return true;
+  }, [accountCurrent]);
+
   const loadMoreProjectSessions = useCallback(async (projectId: string) => {
     if (!accountCurrent()) return;
     const project = projects.find((candidate) => candidate.projectId === projectId);
@@ -1283,5 +1350,6 @@ export function useProjectsState({
     loadMoreProjectSessions,
     handleProjectDelete,
     handleSidebarRefresh,
+    renameSession,
   };
 }

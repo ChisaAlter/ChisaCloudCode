@@ -1,11 +1,15 @@
 import express from 'express';
 
+import cloneJobsRouter from '@/modules/projects/project-clone-jobs.routes.js';
+
 import { userDb } from '@/modules/database/index.js';
 import { assertCloudWorkspaceOwner } from '@/modules/workspace-runtime/index.js';
 import { createProject, updateProjectDisplayName } from '@/modules/projects/services/project-management.service.js';
 import { createSshProject } from '@/modules/projects/services/ssh-project-management.service.js';
 import { assertProjectSshAccess } from '@/modules/projects/services/project-ssh-access.service.js';
 import { registerExistingProjectPaths } from '@/modules/projects/services/legacy-project-registration.service.js';
+import { createProjectCloneRouter } from '@/modules/projects/project-clone.routes.js';
+import { createPendingCloneRequests } from '@/modules/projects/services/project-clone-request.service.js';
 import { startCloneProject } from '@/modules/projects/services/project-clone.service.js';
 import { getProjectTaskMaster } from '@/modules/projects/services/projects-has-taskmaster.service.js';
 import { projectSettingsService } from '@/modules/projects/services/project-settings.service.js';
@@ -17,7 +21,16 @@ import { getArchivedProjectsWithSessions, getProjectSessionsPage, getProjectsWit
 import { deleteOrArchiveProject, restoreArchivedProject } from '@/modules/projects/services/project-delete.service.js';
 import { applyLegacyStarredProjectIds, toggleProjectStar } from '@/modules/projects/services/project-star.service.js';
 
+/**
+ * How long a posted clone request waits for its progress stream to be opened.
+ * The client opens the stream as soon as the POST resolves, so this only has
+ * to outlast a slow round trip.
+ */
+const PENDING_CLONE_REQUEST_TTL_MS = 60_000;
+
 const router = express.Router();
+// Starting and observing imports are separate transports with one task identity.
+router.use(cloneJobsRouter);
 
 type AuthenticatedUser = {
   id?: number | string;
@@ -67,18 +80,6 @@ function parseNonNegativeIntQuery(value: unknown, name: string, fallback: number
   }
 
   return parsedValue;
-}
-
-function resolveRouteErrorMessage(error: unknown): string {
-  if (error instanceof AppError) {
-    return error.message;
-  }
-
-  if (error instanceof Error && error.message) {
-    return error.message;
-  }
-
-  return 'Failed to clone repository';
 }
 
 router.get(
@@ -136,7 +137,7 @@ router.post(
       throw new AppError('Repository cloning is not supported on create-project', {
         code: 'CLONE_NOT_SUPPORTED_ON_CREATE_PROJECT',
         statusCode: 400,
-        details: 'Use /api/projects/clone-progress for cloning workflows',
+        details: 'Use /api/projects/clone for cloning workflows',
       });
     }
 
@@ -176,7 +177,9 @@ router.post(
   '/register-existing',
   asyncHandler(async (req, res) => {
     const requestBody = req.body as Record<string, unknown>;
-    const { results } = await registerExistingProjectPaths(requestBody?.paths);
+    const ownerId = authenticatedOwner(req);
+    const { results } = await registerExistingProjectPaths(requestBody?.paths, undefined,
+      candidate => assertCloudWorkspaceOwner(candidate, ownerId, userDb.getActiveUserIds()));
     res.json({ success: true, results });
   }),
 );
@@ -195,70 +198,13 @@ router.post(
   }),
 );
 
-router.get('/clone-progress', async (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-
-  const sendEvent = (type: string, data: Record<string, unknown>) => {
-    if (res.writableEnded) {
-      return;
-    }
-
-    res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
-  };
-
-  let cloneOperation: Awaited<ReturnType<typeof startCloneProject>> | null = null;
-  const closeListener = () => {
-    cloneOperation?.cancel();
-  };
-  req.on('close', closeListener);
-
-  try {
-    const queryParams = req.query as Record<string, unknown>;
-    const workspacePath = readQueryStringValue(queryParams.path);
-    const githubUrl = readQueryStringValue(queryParams.githubUrl);
-    const githubTokenId = readOptionalNumericQueryValue(queryParams.githubTokenId);
-    const newGithubToken = readQueryStringValue(queryParams.newGithubToken) || null;
-
-    const authenticatedUser = (req as typeof req & { user?: AuthenticatedUser }).user;
-    const userId = authenticatedUser?.id;
-    if (userId === undefined || userId === null) {
-      throw new AppError('Authenticated user is required', {
-        code: 'AUTHENTICATION_REQUIRED',
-        statusCode: 401,
-      });
-    }
-
-    cloneOperation = await startCloneProject(
-      {
-        workspacePath,
-        githubUrl,
-        githubTokenId,
-        newGithubToken,
-        userId,
-      },
-      {
-        onProgress: (message) => {
-          sendEvent('progress', { message });
-        },
-        onComplete: ({ project, message }) => {
-          sendEvent('complete', { project, message });
-        },
-      },
-    );
-
-    await cloneOperation.waitForCompletion;
-  } catch (error) {
-    sendEvent('error', { message: resolveRouteErrorMessage(error) });
-  } finally {
-    req.off('close', closeListener);
-    if (!res.writableEnded) {
-      res.end();
-    }
-  }
-});
+router.use(
+  createProjectCloneRouter({
+    startCloneProject,
+    pendingCloneRequests: createPendingCloneRequests(PENDING_CLONE_REQUEST_TTL_MS),
+    assertOwner: (workspacePath, userId) => assertCloudWorkspaceOwner(workspacePath, userId, userDb.getActiveUserIds()),
+  }),
+);
 
 router.get(
   '/:projectId/taskmaster',

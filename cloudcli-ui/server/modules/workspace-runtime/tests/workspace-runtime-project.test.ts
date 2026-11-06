@@ -67,7 +67,7 @@ function seedRepository(): void {
 mock.module('@/shared/index.js', { namedExports: { AppError } });
 mock.module('node:path', { defaultExport: realPath.posix, namedExports: { ...realPath.posix } });
 mock.module('node:fs', { namedExports: {
-  ...realFiles,
+  ...Object.fromEntries(Object.entries(realFiles).filter(([key]) => key !== 'default')),
   constants: safeFlags,
   existsSync: (filename: string) => { try { lookup(filename); return true; } catch { return false; } },
   lstatSync: (filename: string) => stats(lookup(filename, false).entry),

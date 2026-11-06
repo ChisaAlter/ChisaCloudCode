@@ -66,10 +66,13 @@ function fixture(owner = 'owner-1') {
   const aborts: string[] = [];
   const approvals: string[] = [];
   const pending = new Map<string, unknown[]>([['ssh-session', [{ requestId: 'ssh-request', input: { secretSource: 'private' } }]], ['cloud-session', [{ requestId: 'cloud-request' }]]]);
-  const dependencies: Parameters<typeof handleChatConnection>[2] = { runtime: {
+  const dependencies: Parameters<typeof handleChatConnection>[2] = { isSessionActive: () => true, runtime: {
     hasRuntime: () => true,
     run: async () => assert.fail('unexpected provider run'),
     abort: async (_provider, sessionId) => { aborts.push(sessionId); return true; },
+    hasBackgroundWork: () => false,
+    hasBackgroundTask: () => false,
+    stopBackgroundTask: async () => false,
     getPendingApprovalsForSession: sessionId => pending.get(sessionId) ?? [],
     resolveToolApproval: requestId => { approvals.push(requestId); },
   } };

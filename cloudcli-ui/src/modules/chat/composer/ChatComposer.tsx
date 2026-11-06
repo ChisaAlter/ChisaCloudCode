@@ -14,7 +14,7 @@ import { PaperclipIcon, SlashIcon, XIcon, Loader2, ArrowUpIcon, PencilIcon, Plus
 
 import { useVoiceInput } from '@/modules/chat/hooks/useVoiceInput';
 import { useVoiceAvailable } from '@/modules/chat/hooks/useVoiceAvailable';
-import type { QueuedDraft, ScheduledMessage, SlashCommand,SessionActivity,PendingPermissionRequest,PermissionMode,ProviderModelOption } from '@/shared/types';
+import type { BackgroundSendChoice, BackgroundSendPrompt, QueuedDraft, ScheduledMessage, SlashCommand,SessionActivity,PendingPermissionRequest,PermissionMode,ProviderModelOption } from '@/shared/types';
 import {
   ActionMenu,
   PromptInput,
@@ -31,6 +31,7 @@ import ComposerAttachment from '@/modules/chat/composer/ComposerAttachment';
 import VoiceInputButton from '@/modules/chat/composer/VoiceInputButton';
 import PermissionRequestsBanner from '@/modules/chat/composer/PermissionRequestsBanner';
 import QueuedMessageCard from '@/modules/chat/composer/QueuedMessageCard';
+import BackgroundSendDialog from '@/modules/chat/composer/BackgroundSendDialog';
 import { ScheduleMessagePopover } from '@/modules/chat/composer/ScheduleMessagePopover';
 import { ScheduledMessageList } from '@/modules/chat/composer/ScheduledMessageList';
 import ComposerModelMenu from '@/modules/chat/composer/ComposerModelMenu';
@@ -52,6 +53,10 @@ type ChatComposerProps = {
   isLoading: boolean;
   /** Uploading attachments or allocating a session before socket dispatch. */
   isPreparingSend?: boolean;
+  preparationStage?: string | null;
+  canCancelPreparation?: boolean;
+  sendError?: string | null;
+  onCancelPreparingSend?: () => void;
   onAbortSession: () => void;
   permissionMode: PermissionMode;
   availablePermissionModes: PermissionMode[];
@@ -67,12 +72,16 @@ type ChatComposerProps = {
   modelsLoading: boolean;
   /** New conversations supply the full cross-provider picker in the existing model slot. */
   modelControl?: ReactNode;
+  /** Cumulative statistics stay separate from model selection and the context-window counter. */
+  usageControl?: ReactNode;
   onToggleCommandMenu: () => void;
   hasInput: boolean;
   onClearInput: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement> | MouseEvent<HTMLButtonElement> | TouchEvent<HTMLButtonElement>) => void;
   isDragActive: boolean;
   queuedDraft: QueuedDraft | null;
+  backgroundSendPrompt: BackgroundSendPrompt | null;
+  onResolveBackgroundSendPrompt: (choice: BackgroundSendChoice) => void;
   /** Set while the composer is replacing an already-sent message. */
   isEditingSentMessage: boolean;
   onCancelEditMessage: () => void;
@@ -128,6 +137,10 @@ export default function ChatComposer({
   activity,
   isLoading,
   isPreparingSend = false,
+  preparationStage,
+  canCancelPreparation = true,
+  sendError,
+  onCancelPreparingSend,
   onAbortSession,
   permissionMode,
   availablePermissionModes,
@@ -142,12 +155,15 @@ export default function ChatComposer({
   onSelectModel,
   modelsLoading,
   modelControl,
+  usageControl,
   onToggleCommandMenu,
   hasInput,
   onClearInput,
   onSubmit,
   isDragActive,
   queuedDraft,
+  backgroundSendPrompt,
+  onResolveBackgroundSendPrompt,
   isEditingSentMessage,
   onCancelEditMessage,
   scheduledMessages,
@@ -257,7 +273,7 @@ export default function ChatComposer({
     ? t('input.preparing', { defaultValue: '正在准备发送…' })
     : canQueueDraft
     ? hasQueuedDraft
-      ? t('input.queue.update', { defaultValue: 'Update queued message' })
+      ? t('input.queue.append', { defaultValue: 'Add to queued message' })
       : t('input.queue.sendNext', { defaultValue: 'Queue next message' })
     : isLoading
       ? t('input.stop')
@@ -304,6 +320,11 @@ export default function ChatComposer({
         </div>
       )}
 
+      <BackgroundSendDialog
+        prompt={backgroundSendPrompt}
+        onResolve={onResolveBackgroundSendPrompt}
+      />
+
       {queuedDraft && (
         <QueuedMessageCard
           content={queuedDraft.content}
@@ -316,6 +337,20 @@ export default function ChatComposer({
       )}
 
       {!hasQuestionPanel && <div className="relative mx-auto max-w-[54.25rem]">
+        {sendError && (
+          <div role="alert" aria-live="assertive" className="mb-2 break-words rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-foreground">
+            {sendError}
+          </div>
+        )}
+        {isPreparingSend && (
+          <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
+            <Loader2 aria-hidden="true" className="h-3.5 w-3.5 shrink-0 animate-spin" />
+            <span role="status" aria-live="polite" className="min-w-0 flex-1">{preparationStage || submitAriaLabel}</span>
+            {canCancelPreparation && <button type="button" onClick={onCancelPreparingSend} className="shrink-0 rounded-md px-2 py-1 font-medium hover:bg-muted hover:text-foreground">
+              {t('input.cancelPreparation', { defaultValue: '取消准备' })}
+            </button>}
+          </div>
+        )}
         {showFileDropdown && filteredFiles.length > 0 && (
           <div
             ref={fileDropdownRef}
@@ -450,12 +485,12 @@ export default function ChatComposer({
           </PromptInputTools>
 
           <div className="ml-auto flex min-w-0 items-center gap-1">
-            {isPreparingSend && <span role="status" className="text-xs text-muted-foreground">{submitAriaLabel}</span>}
             {hasInput && <ScheduleMessagePopover
               disabled={!input.trim()}
               onSchedule={onScheduleMessage}
             />}
 
+            {usageControl}
             {modelControl ?? <ComposerModelMenu
               effort={effort}
               effortOptions={availableEffortOptions}

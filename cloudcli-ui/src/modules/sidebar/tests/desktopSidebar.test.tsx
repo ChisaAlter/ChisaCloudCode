@@ -140,7 +140,7 @@ test('desktop recents overflow preserves disabled refresh and Escape focus retur
 function renderEmptyRecents({ hasError = false, isMobile = false } = {}) {
   const retry = vi.fn();
   const actions: SessionRowActions = {
-    activeRename: null, activeSessions: new Set(), attentionSessionIds: new Set(),
+    activeRename: null, activeSessions: new Set<string>(), backgroundSessionIds: new Set<string>(), attentionSessionIds: new Set(),
     onRenameDraftChange: noop, onStartEditingSession: noop, onCancelEditingSession: noop,
     onSaveEditingSession: noop, onDeleteSession: noop,
   };
@@ -175,7 +175,7 @@ test('desktop hover options open the existing menu and archive the selected conv
   const archive = vi.fn();
   const select = vi.fn();
   const actions: SessionRowActions = {
-    activeRename: null, activeSessions: new Set(), attentionSessionIds: new Set(),
+    activeRename: null, activeSessions: new Set<string>(), backgroundSessionIds: new Set<string>(), attentionSessionIds: new Set(),
     onRenameDraftChange: noop, onStartEditingSession: noop, onCancelEditingSession: noop,
     onSaveEditingSession: noop, onDeleteSession: noop, onArchiveSession: archive,
   };

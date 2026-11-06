@@ -44,9 +44,15 @@
 <br>
 <em>Main interface showing project overview and chat</em>
 </td>
+<td align="center">
+<h3>Mobile Experience</h3>
+<img src="https://raw.githubusercontent.com/siteboon/claudecodeui/main/public/screenshots/mobile-chat.png" alt="Mobile Interface" width="250">
+<br>
+<em>Responsive mobile design with touch navigation</em>
+</td>
 </tr>
 <tr>
-<td align="center">
+<td align="center" colspan="2">
 <h3>CLI Selection</h3>
 <img src="https://raw.githubusercontent.com/siteboon/claudecodeui/main/public/screenshots/cli-selection.png" alt="CLI Selection" width="400">
 <br>

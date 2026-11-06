@@ -34,7 +34,7 @@ beforeEach(() => localStorage.clear());
 test('a pinned conversation outside the loaded page remains visible', () => {
   const actions: SessionRowActions = {
     activeRename: null,
-    activeSessions: new Set(),
+    activeSessions: new Set<string>(), backgroundSessionIds: new Set<string>(),
     attentionSessionIds: new Set(),
     onRenameDraftChange: noop,
     onStartEditingSession: noop,

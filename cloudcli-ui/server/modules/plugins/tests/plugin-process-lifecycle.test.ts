@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import type { realpathSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -30,6 +31,14 @@ mock.module('cross-spawn', {
     return child;
   },
 });
+const fixtureResources = new Map<string, string>();
+const allowed = new Set(['claude-usage', 'other-plugin', 'stop-exit', 'timeout-reserved', 'replace-identity', 'cancel-startup', 'os-child']);
+mock.module('../plugin-registry.service.js', { namedExports: {
+  scanPlugins: () => [...allowed].map(name => ({ name, bundled: name === 'claude-usage', enabled: true,
+    server: name === 'os-child' ? 'os-child.cjs' : 'server.js', security: { digest: 'sha256:fixture', trusted: true, permitted: true, permissions: ['backend:process'] } })),
+  getPluginDir: (name: string) => name === 'claude-usage' ? '/fixture' : fixtureResources.get(name) ?? '/fixture',
+} });
+mock.method((await import('node:fs')).default, 'realpathSync', ((filename: string) => path.resolve(filename)) as typeof realpathSync);
 const { getPluginPort, isPluginRunning, startPluginServer, stopPluginServer } = await import('../plugin-process.service.js');
 const settle = async () => { for (let count = 0; count < 8; count++) await Promise.resolve(); };
 
@@ -46,7 +55,6 @@ test('credential store paths reach only the shipped usage reader, never host tok
     for (const [name, directory, expected] of [
       ['claude-usage', shippedDirectory, true],
       ['other-plugin', '/fixture', false],
-      ['claude-usage', '/untrusted/usage', false],
     ] as const) {
       const startup = startPluginServer(name, directory, 'server.js');
       const child = children.at(-1)!;
@@ -60,6 +68,7 @@ test('credential store paths reach only the shipped usage reader, never host tok
       child.emit('exit', 0);
       await stopping;
     }
+    await assert.rejects(startPluginServer('claude-usage', '/untrusted/usage', 'server.js'), /explicitly trusted/);
   } finally {
     keys.forEach((key, index) => {
       if (before[index] === undefined) delete process.env[key];
@@ -144,6 +153,7 @@ test('disable during startup cancels readiness and cannot report success until c
 
 test('real OS child readiness and stop confirm process exit before returning', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'chisa-plugin-exit-'));
+  fixtureResources.set('os-child', directory);
   const fixture = path.join(directory, 'os-child.cjs');
   await writeFile(fixture, 'console.log(JSON.stringify({ready:true,port:4105}));setInterval(()=>{},1000);');
   try {

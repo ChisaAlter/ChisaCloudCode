@@ -40,7 +40,7 @@ function deferred<T>() {
 }
 function Harness({ onDeleted = deleted }: { onDeleted?: (id: string) => void }) {
   const state = useSidebarController({ projects, selectedProject, selectedSession: { id: 'selected-session' },
-    activeSessions: new Set(), isLoading: false, isMobile: false, t, onRefresh: noop, onProjectSelect: noop, onSessionSelect: noop,
+    activeSessions: new Set<string>(), backgroundSessionIds: new Set<string>(), isLoading: false, isMobile: false, t, onRefresh: noop, onProjectSelect: noop, onSessionSelect: noop,
     onSessionDelete: onDeleted, setCurrentProject: noop, setSidebarVisible: noop, sidebarVisible: true });
   useEffect(() => { controller = state; }, [state]);
   return <>
@@ -52,7 +52,7 @@ function Harness({ onDeleted = deleted }: { onDeleted?: (id: string) => void }) 
     <SidebarModals projects={[selectedProject, targetProject]} showSettings={false} settingsInitialTab="general" onCloseSettings={noop}
       showNewProject={false} onCloseNewProject={noop} onProjectCreated={noop} pendingDeletion={state.pendingDeletion}
       isDeleting={state.isDeleting} deletionError={state.deletionError} onCancelDeletion={state.cancelDeletion}
-      onConfirmDeleteProject={state.confirmDeleteProject} onConfirmDeleteSession={state.confirmDeleteSession} t={t} />
+      onConfirmDeleteProject={state.confirmDeleteProject} onConfirmDeleteSession={state.confirmDeleteSession} onConfirmDeleteSessions={state.confirmDeleteSessions} t={t} />
     <SidebarContent isPWA={false} isMobile={false} isLoading={false} projects={[selectedProject, targetProject]} runningSessionsCount={0}
       archivedProjects={[]} archivedSessions={[]} archivedSessionsCount={0} isArchivedSessionsLoading={false}
       recentConversations={[]} pinnedConversations={[]} recentConversationsTotal={0} recentConversationsHasMore={false}
@@ -137,6 +137,32 @@ test('direct archive errors appear above sidebar items without opening a confirm
   expect(screen.queryByRole('alert')).toBeNull();
   expect(deleted).not.toHaveBeenCalled();
   expect(window.alert).not.toHaveBeenCalled();
+});
+
+test('successful archive removes only the requested conversation and refreshes the archive without force', async () => {
+  const request = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(Response.json({ success: true, data: { sessionId: 'row-session', action: 'archived', deletedFromDisk: false } }));
+  render(<Harness />);
+  await waitFor(() => expect(screen.getByTestId('recent-total').textContent).toBe('3'));
+  fireEvent.click(screen.getByRole('button', { name: 'archive-row' }));
+  await waitFor(() => expect(deleted).toHaveBeenCalledExactlyOnceWith('row-session'));
+  expect(String(request.mock.calls[0][0])).toBe('/api/providers/sessions/row-session');
+  expect(request.mock.calls[0][1]?.method).toBe('DELETE');
+  expect(screen.getByTestId('recent-ids').textContent).toBe('');
+  expect(screen.getByTestId('pinned-ids').textContent).toBe('');
+  expect(screen.getByTestId('recent-total').textContent).toBe('2');
+  expect(screen.queryByRole('dialog')).toBeNull();
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect(api.getArchivedSessions).toHaveBeenCalled();
+});
+
+test('archive transport errors use archive wording and retain the conversation for retry', async () => {
+  vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(new TypeError('Failed to fetch'));
+  render(<Harness />);
+  await waitFor(() => expect(screen.getByTestId('recent-total').textContent).toBe('3'));
+  fireEvent.click(screen.getByRole('button', { name: 'archive-row' }));
+  expect((await screen.findByRole('alert')).textContent).toContain(t('messages.archiveSessionFailed'));
+  expect(screen.getByTestId('recent-ids').textContent).toContain('row-session');
+  expect(deleted).not.toHaveBeenCalled();
 });
 
 test('late response bodies from another account cannot delete rows, close confirmation or publish errors', async () => {

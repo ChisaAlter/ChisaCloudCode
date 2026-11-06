@@ -1,4 +1,5 @@
 import path from 'node:path';
+import fs from 'node:fs';
 import type { ChildProcess } from 'node:child_process';
 
 // cross-spawn: drop-in spawn with Windows .cmd/PATHEXT resolution.
@@ -8,6 +9,7 @@ import { scanPlugins, getPluginDir } from './plugin-registry.service.js';
 
 type PluginProcessEntry = {
   process: ChildProcess;
+  digest: string;
   port: number | null;
   ended: boolean;
   stopping: boolean;
@@ -71,7 +73,20 @@ function buildPluginEnv(name: string, pluginDir: string): NodeJS.ProcessEnv {
  * to stdout within 10 seconds.
  */
 export function startPluginServer(name: string, pluginDir: string, serverEntry: unknown): Promise<number> {
+  const resource = scanPlugins().find(plugin => plugin.name === name);
+  if (!resource?.security.trusted || !resource.security.permitted || !resource.enabled
+    || !resource.security.permissions.includes('backend:process') || resource.server !== serverEntry
+    || !getPluginDir(name) || path.resolve(getPluginDir(name)!) !== path.resolve(pluginDir)) {
+    return Promise.reject(new Error('Plugin process requires an enabled, explicitly trusted resource and process permission'));
+  }
+  const resolvedServer = path.resolve(pluginDir, String(serverEntry));
+  try {
+    if (!fs.realpathSync(resolvedServer).startsWith(fs.realpathSync(pluginDir) + path.sep)) throw new Error('Invalid plugin server path');
+  } catch { return Promise.reject(new Error('Plugin server resource is unavailable')); }
   const previous = pluginProcesses.get(name);
+  if (previous && !previous.ended && previous.digest !== resource.security.digest) {
+    return Promise.reject(new Error('Plugin version changed; stop the previous process before starting the approved version'));
+  }
   if (previous && !previous.ended && previous.stopping) {
     return Promise.reject(new Error('Plugin server shutdown is not confirmed; stop it again before restarting'));
   }
@@ -97,7 +112,7 @@ export function startPluginServer(name: string, pluginDir: string, serverEntry: 
     let stdout = '';
     let confirmExit!: () => void;
     const entry: PluginProcessEntry = {
-      process: pluginProcess, port: null, ended: false, stopping: false,
+      process: pluginProcess, digest: resource.security.digest, port: null, ended: false, stopping: false,
       exited: new Promise<void>((done) => { confirmExit = done; }),
       stopPromise: null, cancelStartup: () => {},
     };
@@ -223,7 +238,9 @@ export async function stopPluginServer(name: string): Promise<void> {
  */
 export function getPluginPort(name: string): number | undefined {
   const entry = pluginProcesses.get(name);
-  return entry && !entry.ended && !entry.stopping ? entry.port ?? undefined : undefined;
+  const resource = scanPlugins().find(plugin => plugin.name === name);
+  return entry && !entry.ended && !entry.stopping && resource?.enabled && resource.security.trusted && resource.security.permitted
+    && entry.digest === resource.security.digest ? entry.port ?? undefined : undefined;
 }
 
 /**
@@ -243,25 +260,4 @@ export function stopAllPlugins(): Promise<void[]> {
     stops.push(stopPluginServer(name));
   }
   return Promise.all(stops);
-}
-
-/**
- * Server boot starts enabled plugins that declare a server entry.
- */
-export async function startEnabledPluginServers() {
-  const plugins = scanPlugins();
-
-  for (const plugin of plugins) {
-    if (!plugin.server) continue;
-    if (!plugin.enabled) continue;
-
-    const pluginDir = getPluginDir(plugin.name);
-    if (!pluginDir) continue;
-
-    try {
-      await startPluginServer(plugin.name, pluginDir, plugin.server);
-    } catch (error) {
-      console.error(`[Plugins] Failed to start server for "${plugin.name}":`, error instanceof Error ? error.message : String(error));
-    }
-  }
 }

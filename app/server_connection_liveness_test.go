@@ -205,7 +205,8 @@ func TestServerConnectionHTTP2LivenessDropsSilentConnectionWithoutReplayingPost(
 	bodyResult := make(chan error, 1)
 	go func() { _, err := io.ReadAll(response.Body); bodyResult <- err }()
 	bridge := FrontendBridge{}
-	postID := bridge.BeginServerRequest()
+	connection.authenticated, connection.accessToken = true, "liveness-fixture-token"
+	postID := reserveTestRequest(t, "api")
 	t.Cleanup(func() { bridge.CancelServerRequest(postID) })
 	postResult := make(chan BridgeResponse, 1)
 	go func() {
@@ -241,7 +242,7 @@ func TestServerConnectionHTTP2LivenessDropsSilentConnectionWithoutReplayingPost(
 	if elapsed < 25*time.Second || old.drops.Load() == 0 {
 		t.Fatalf("failure did not exercise the actual PING budget: elapsed=%s dropped_writes=%d", elapsed, old.drops.Load())
 	}
-	result := bridge.ServerRequest(bridge.BeginServerRequest(), http.MethodGet, "/api/liveness/recovered", nil, "")
+	result := bridge.ServerRequest(reserveTestRequest(t, "api"), http.MethodGet, "/api/liveness/recovered", nil, "")
 	body, _ := base64.StdEncoding.DecodeString(result.BodyB64)
 	if result.Status != http.StatusOK || string(body) != "read-only recovery succeeded" || <-recoveryConnection == old {
 		t.Fatal("the next read-only request did not succeed on a fresh connection")

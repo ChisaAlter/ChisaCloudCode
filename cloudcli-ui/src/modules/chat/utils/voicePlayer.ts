@@ -1,5 +1,6 @@
+import { getAuthSessionSnapshot, isCurrentAuthSession, subscribeToAuthSession } from '@/modules/auth-session';
 import { synthesizeVoice, voiceConfigSignature } from '@/shared/api';
-import type { VoicePlayState, VoiceSnapshot } from '@/shared/types';
+import type { AuthSessionSnapshot, VoicePlayState, VoiceSnapshot } from '@/shared/types';
 
 // A single app-level audio player for read-aloud. It owns one <audio> element, lives
 // outside the React tree, and caches generated audio by content. Because playback is not
@@ -32,6 +33,22 @@ class VoicePlayer {
   private activeController: AbortController | null = null; // aborts the in-flight TTS fetch
   private errorTimer: ReturnType<typeof setTimeout> | null = null;
   private listeners = new Set<() => void>();
+
+  constructor() {
+    const revoke = () => {
+      if (!this.currentSession || isCurrentAuthSession(this.currentSession) && getAuthSessionSnapshot().phase === 'ready') return;
+      this.haltPlayback();
+      for (const url of this.cache.values()) URL.revokeObjectURL(url);
+      this.cache.clear();
+      this.currentSession = null;
+      this.errorId = null;
+      this.errorMsg = null;
+      if (this.errorTimer) { clearTimeout(this.errorTimer); this.errorTimer = null; }
+      this.emit();
+    };
+    subscribeToAuthSession(revoke);
+  }
+  private currentSession: AuthSessionSnapshot | null = null;
 
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
@@ -79,6 +96,9 @@ class VoicePlayer {
   }
 
   toggle(content: string) {
+    const session = getAuthSessionSnapshot();
+    if (session.phase !== 'ready') return;
+    this.currentSession = session;
     const id = voiceId(content);
     if (this.currentId === id && (this.state === 'playing' || this.state === 'loading')) {
       this.stop();
@@ -88,12 +108,16 @@ class VoicePlayer {
   }
 
   stop() {
+    this.haltPlayback();
+    this.emit();
+  }
+
+  private haltPlayback() {
     this.token++; // ignore any stale in-flight result
     this.abortActive(); // and actually cancel the network request
-    if (this.audio) this.audio.pause();
+    if (this.audio) { this.audio.pause(); this.audio.removeAttribute('src'); this.audio.load(); }
     this.state = 'idle';
     this.currentId = null;
-    this.emit();
   }
 
   private abortActive() {
@@ -128,8 +152,12 @@ class VoicePlayer {
   }
 
   private async play(id: string, content: string) {
+    const expected = this.currentSession;
+    if (!expected || expected.phase !== 'ready' || !isCurrentAuthSession(expected)) return;
     const audio = this.ensureAudio();
     audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
     this.currentId = id;
     this.errorId = null;
     this.errorMsg = null;
@@ -138,44 +166,56 @@ class VoicePlayer {
 
     const myToken = ++this.token;
     this.abortActive(); // cancel any request this play supersedes
+    const controller = new AbortController();
+    this.activeController = controller;
+    const timer = setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
+    const current = () => myToken === this.token && isCurrentAuthSession(expected)
+      && getAuthSessionSnapshot().phase === 'ready';
+    const verify = () => { controller.signal.throwIfAborted(); return current(); };
 
     try {
       let url = this.cache.get(id);
-      if (!url) {
-        const controller = new AbortController();
-        this.activeController = controller;
-        const timer = setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
-        const res = await synthesizeVoice(content, controller.signal).finally(() => {
-          clearTimeout(timer);
-          if (this.activeController === controller) this.activeController = null;
-        });
-        if (myToken !== this.token) return; // superseded by another play/stop
+      if (url) {
+        this.cache.delete(id);
+        this.cache.set(id, url);
+      } else {
+        const res = await synthesizeVoice(content, controller.signal, expected);
+        if (!verify()) return;
         if (!res.ok) {
           let msg = `Read-aloud failed (${res.status})`;
           try {
             const j = await res.json();
+            if (!verify()) return;
             if (j?.error) msg = String(j.error);
           } catch {
-            /* non-JSON error body */
+            controller.signal.throwIfAborted();
+            if (!current()) return;
+            // An unreadable JSON body still uses the response's status message.
           }
           throw new Error(msg);
         }
         const blob = await res.blob();
-        if (myToken !== this.token) return;
+        if (!verify()) return;
         url = URL.createObjectURL(blob);
         this.cacheSet(id, url);
       }
-      if (myToken !== this.token) return;
+      if (!verify()) return;
       audio.src = url;
       audio.load();
       await audio.play();
-      if (myToken !== this.token) return;
+      if (!verify()) return;
       this.state = 'playing';
       this.emit();
     } catch (e) {
-      if (myToken !== this.token) return;
-      const aborted = e instanceof Error && e.name === 'AbortError';
+      if (!current()) return;
+      const aborted = controller.signal.aborted || e instanceof Error && e.name === 'AbortError';
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
       this.setError(id, aborted ? 'Read-aloud timed out.' : e instanceof Error ? e.message : 'Read-aloud failed');
+    } finally {
+      clearTimeout(timer);
+      if (this.activeController === controller) this.activeController = null;
     }
   }
 
@@ -186,7 +226,7 @@ class VoicePlayer {
       if (oldest === undefined) break;
       const oldUrl = this.cache.get(oldest);
       this.cache.delete(oldest);
-      if (oldUrl && oldUrl !== this.audio?.src) URL.revokeObjectURL(oldUrl);
+      if (oldUrl) URL.revokeObjectURL(oldUrl);
     }
   }
 }

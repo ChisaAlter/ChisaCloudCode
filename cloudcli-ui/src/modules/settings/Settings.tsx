@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
@@ -20,6 +20,7 @@ import ChisaSettingsTab from '@/modules/settings/tabs/chisa-settings/ChisaSettin
 import { useSettingsController } from '@/modules/settings/hooks/useSettingsController';
 import { useWebPush } from '@/modules/settings/hooks/useWebPush';
 import type { AgentSettingsProject } from '@/shared/types';
+import { getPreferenceSyncStatus, hydrateUserPreferences, retryUserPreferences, subscribeToPreferenceSyncStatus } from '@/shared/userSettings';
 
 type SettingsProps = {
   isOpen: boolean;
@@ -39,6 +40,8 @@ type DesktopNotificationsState = {
 /** Exported as the settings module's public entry point and rendered by the sidebar module as its settings dialog. */
 function Settings({ isOpen, onClose, projects = [], initialTab = 'agents' }: SettingsProps) {
   const { t } = useTranslation('settings');
+  // Only an acknowledged preference outbox may display a server-saved success state.
+  const preferenceSync = useSyncExternalStore(subscribeToPreferenceSyncStatus, getPreferenceSyncStatus, getPreferenceSyncStatus);
   const dialogRef = useRef<HTMLDivElement>(null);
   const desktopNotificationsBridge = useMemo(() => (
     typeof window === 'undefined'
@@ -50,6 +53,7 @@ function Settings({ isOpen, onClose, projects = [], initialTab = 'agents' }: Set
     activeTab,
     setActiveTab,
     saveStatus,
+    retrySettings,
     projectSortOrder,
     setProjectSortOrder,
     codeEditorSettings,
@@ -72,6 +76,16 @@ function Settings({ isOpen, onClose, projects = [], initialTab = 'agents' }: Set
     isOpen,
     initialTab
   });
+
+  const preferenceMessage = saveStatus === 'error' ? '通知设置未保存，请重试'
+    : preferenceSync.persistenceError ? '设置尚未安全保存到本机'
+    : preferenceSync.hydrationError ? '设置恢复失败，本机编辑已保留'
+    : (preferenceSync.status === 'saving' || saveStatus === 'saving') ? '正在保存设置'
+    : preferenceSync.status === 'unsaved' ? '设置尚未保存'
+    : preferenceSync.status === 'retrying' ? '保存失败，等待重试'
+    : preferenceSync.status === 'paused' ? '登录恢复后继续保存'
+    : preferenceSync.status === 'failed' ? '设置未保存，请重试'
+    : preferenceSync.status === 'local' && saveStatus !== 'success' ? '设置仅保存在此设备' : null;
 
   const {
     permission: pushPermission,
@@ -140,21 +154,52 @@ function Settings({ isOpen, onClose, projects = [], initialTab = 'agents' }: Set
 
   useEffect(() => {
     if (!isOpen) return;
-    // The menu trigger hands keyboard focus to this standalone settings panel.
+    // Restore focus to the menu trigger when this standalone settings panel closes.
     const previousFocus = document.activeElement as HTMLElement | null;
     const focusFrame = requestAnimationFrame(() => dialogRef.current?.querySelector<HTMLElement>('button, input, select, textarea, [tabindex="0"]')?.focus());
     return () => { cancelAnimationFrame(focusFrame); previousFocus?.focus(); };
   }, [isOpen]);
 
+  // Escape closes Settings, matching the other modals in the app. Layers that open
+  // on top of it — nested modals, dropdown menus — mark themselves with
+  // `data-escape-layer` and get the Escape first, so dismissing a menu never also
+  // pulls Settings out from under the user.
   useEffect(() => {
-    if (!isOpen) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      // Keep an open provider login dialog in place instead of closing its settings parent.
-      if (event.key === 'Escape' && !showLoginModal) onClose();
+    if (!isOpen) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || showLoginModal || document.querySelector('[data-escape-layer], [role="menu"]')) {
+        return;
+      }
+      onClose();
     };
-    document.addEventListener('keydown', closeOnEscape);
-    return () => document.removeEventListener('keydown', closeOnEscape);
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
   }, [isOpen, onClose, showLoginModal]);
+
+  // A click only counts as "outside" when it both started and ended on the backdrop:
+  // releasing on the backdrop after selecting text inside the panel must not close it.
+  const backdropMouseDownRef = useRef(false);
+
+  const handleBackdropMouseDown = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    backdropMouseDownRef.current = event.target === event.currentTarget;
+  }, []);
+
+  const handleBackdropClick = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      const startedOnBackdrop = backdropMouseDownRef.current;
+      backdropMouseDownRef.current = false;
+      if (startedOnBackdrop && event.target === event.currentTarget) {
+        onClose();
+      }
+    },
+    [onClose]
+  );
 
   if (!isOpen) {
     return null;
@@ -163,7 +208,7 @@ function Settings({ isOpen, onClose, projects = [], initialTab = 'agents' }: Set
   const isAuthenticated = Boolean(loginProvider && providerAuthStatus[loginProvider].authenticated);
 
   return (
-    <div className="modal-backdrop fixed inset-0 z-[9999] flex items-center justify-center bg-background/80 backdrop-blur-sm md:p-4" onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <div className="modal-backdrop fixed inset-0 z-[9999] flex items-center justify-center bg-background/80 backdrop-blur-sm md:p-4" onMouseDown={handleBackdropMouseDown} onClick={handleBackdropClick}>
       <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={t('title')} className="flex h-full w-full flex-col overflow-hidden border border-border bg-background shadow-2xl md:h-[90vh] md:max-w-4xl md:rounded-xl" onKeyDown={(event) => {
         if (event.key !== 'Tab' || showLoginModal) return;
         const controls = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex="0"]') ?? []);
@@ -176,9 +221,20 @@ function Settings({ isOpen, onClose, projects = [], initialTab = 'agents' }: Set
         <div className="flex flex-shrink-0 items-center justify-between border-b border-border px-4 py-3 md:px-5">
           <h2 className="text-base font-semibold text-foreground">{t('title')}</h2>
           <div className="flex items-center gap-2">
-            {saveStatus === 'success' && (
-              <span className="animate-in fade-in text-xs text-muted-foreground">{t('saveStatus.success')}</span>
-            )}
+            {preferenceMessage ? (
+              <div className="flex items-center gap-2 text-xs text-muted-foreground" role="status">
+                <span>{preferenceMessage}</span>
+                {(saveStatus === 'error' || preferenceSync.status === 'failed' || preferenceSync.status === 'retrying' || preferenceSync.hydrationError) && (
+                  <Button variant="outline" size="sm" onClick={() => {
+                    if (saveStatus === 'error') void retrySettings();
+                    if (preferenceSync.hydrationError) void hydrateUserPreferences();
+                    void retryUserPreferences();
+                  }}>重试</Button>
+                )}
+              </div>
+            ) : preferenceSync.status === 'saved' || saveStatus === 'success' ? (
+              <span className="animate-in fade-in text-xs text-muted-foreground" role="status">{t('saveStatus.success')}</span>
+            ) : null}
             <Button
               variant="ghost"
               size="sm"

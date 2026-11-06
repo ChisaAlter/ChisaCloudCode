@@ -1,0 +1,27 @@
+[Unit]
+Description=Chisa explicitly fenced encrypted offsite recovery point
+Requires=opt-chisacloudcode-workspaces.mount
+After=opt-chisacloudcode-workspaces.mount docker.service
+BindsTo=opt-chisacloudcode-workspaces.mount
+# Candidate only. Enabling the timer does not close admission or stop writers.
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStartPre=/usr/bin/python3 -B /opt/chisa-recovery/recovery.py preflight --config /etc/chisa-recovery/config.json
+ExecStart=/usr/bin/python3 -B /opt/chisa-recovery/recovery.py backup --config /etc/chisa-recovery/config.json --execute
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+# /proc must remain the host view for PID birth/open-file inspection.
+ReadWritePaths=/var/lib/chisa-recovery /etc/chisa-recovery/public-keyring
+ReadOnlyPaths=/opt/chisacloudcode /etc/systemd/system /root/.ssh
+TimeoutStartSec=14400
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+StandardOutput=journal
+StandardError=journal
+# Attach the independently reviewed monitoring/notification route before enablement.

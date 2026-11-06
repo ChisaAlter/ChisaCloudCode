@@ -59,7 +59,7 @@ test('real SQLite writer fence survives response loss and reopen until exact nat
     db.closeConnection();
     await db.initializeDatabase();
     assert.deepEqual(db.sshProjectTargetsDb.getByProjectId('project'), fenced, 'unknown mutation fence must survive backend DB reopen');
-    await assert.rejects(mutate(), { code: 'WORKSPACE_BUSY' });
+    await assert.rejects(mutate(), { code: 'SSH_WORKSPACE_RECOVERY_REQUIRED' });
     assert.equal(requests.filter(item => item.request.op === 'write').length, 1);
     assert.deepEqual(await bridge.recoverSshWorkspace(target), { status: 'running', jobId: fenced.pendingJobId });
     assert.deepEqual(db.sshProjectTargetsDb.getByProjectId('project'), fenced);
@@ -75,6 +75,24 @@ test('real SQLite writer fence survives response loss and reopen until exact nat
     assert.equal(recovered.pendingJobId, null);
     assert.equal(recovered.activeRunId, null);
     assert.equal(requests.filter(item => item.request.op === 'write').length, 1, 'status/cancel recovery must never replay the original write');
+
+    const beforeConfirmedWrite = requests.length;
+    await assert.rejects(mutate(), error => {
+      assert.ok(error instanceof Error);
+      const failure = error as Error & { code: string; statusCode: number; details: Record<string, unknown> };
+      assert.equal(failure.code, 'SSH_WORKSPACE_UNAVAILABLE');
+      assert.equal(failure.statusCode, 503);
+      assert.equal(failure.message, 'The desktop workspace agent is unavailable');
+      assert.equal(failure.details.cleanupConfirmed, true);
+      assert.equal(failure.details.jobId, `operation:${failure.details.operationId}`);
+      assert.equal(failure.details.operationId, requests[beforeConfirmedWrite]!.operationId);
+      return true;
+    });
+    assert.deepEqual(requests.slice(beforeConfirmedWrite).map(item => item.request.op), ['write', 'operation_status']);
+    const confirmed = db.sshProjectTargetsDb.getByProjectId('project')!;
+    assert.equal(confirmed.phase, 'idle', 'a matching terminal receipt must release the writer despite the lost write response');
+    assert.equal(confirmed.pendingJobId, null);
+    assert.equal(confirmed.activeRunId, null);
 
     refusal = true;
     await assert.rejects(mutate(), { code: 'AGENT_UNAUTHORIZED', statusCode: 401 });

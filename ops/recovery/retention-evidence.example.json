@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "destination": null,
+  "directory": null,
+  "verified_at": null,
+  "writer_cannot_delete_history": false,
+  "independent_admin_verified": false,
+  "hourly": 48,
+  "daily": 30,
+  "monthly": 12,
+  "evidence_reference": null,
+  "operator_note": "Destination administrator must independently verify append-only/immutable history, separate retention administrator, restore read access and actual retention. This file is pinned by SHA256 in config; self-asserting true is not a successful control test."
+}

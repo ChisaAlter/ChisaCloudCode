@@ -1,64 +1,63 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 
+import { getAuthSessionSnapshot, isCurrentAuthSession, subscribeToAuthSession } from '@/modules/auth-session';
+import { getVoiceConfigRevision, readVoiceConfig, subscribeToVoiceConfig } from '@/modules/voice';
 import { api } from '@/shared/api';
 import { useUiPreferences } from '@/shared/context/UiPreferencesContext';
-import { readVoiceConfig, VOICE_CONFIG_SYNC_EVENT } from '@/shared/voiceConfig';
+import type { AuthSessionSnapshot } from '@/shared/types';
 
-// Voice UI is gated on the `voiceEnabled` UI preference (toggled in Quick Settings /
-// the Settings modal) and a configured voice backend.
-let healthRequest: Promise<boolean> | null = null;
-
-function checkVoiceHealth(): Promise<boolean> {
-  if (healthRequest) return healthRequest;
-  const request = api.voice.health()
-    .then(async (response) => {
+// A shared health check may be reused only by the same account incarnation and voice configuration.
+const healthRequests = new Map<string, Promise<boolean>>();
+function healthKey(session: AuthSessionSnapshot, revision: number): string {
+  return JSON.stringify([session.serverKey, session.userId, session.sessionInstanceId, revision]);
+}
+function checkVoiceHealth(expected: AuthSessionSnapshot, revision: number): Promise<boolean> {
+  const key = healthKey(expected, revision);
+  const pending = healthRequests.get(key);
+  if (pending) return pending;
+  const controller = new AbortController();
+  const valid = () => !controller.signal.aborted && isCurrentAuthSession(expected)
+    && getAuthSessionSnapshot().phase === 'ready' && getVoiceConfigRevision() === revision;
+  const abortStale = () => { if (!valid()) controller.abort(); };
+  const unsubscribeAuth = subscribeToAuthSession(abortStale);
+  const unsubscribeConfig = subscribeToVoiceConfig(abortStale);
+  const request = api.voice.health({ expectedSession: expected, signal: controller.signal })
+    .then(async response => {
+      if (!valid()) return false;
       if (!response.ok) throw new Error(`Voice health check failed (${response.status})`);
       const data = await response.json();
-      return data?.configured === true;
+      return valid() && data?.configured === true;
     })
     .finally(() => {
-      healthRequest = null;
+      unsubscribeAuth();
+      unsubscribeConfig();
+      if (healthRequests.get(key) === request) healthRequests.delete(key);
     });
-  healthRequest = request;
+  healthRequests.set(key, request);
   return request;
 }
 
+/** Chat controls display voice availability for the verified current account only. */
 export function useVoiceAvailable(): boolean {
-  // Read through the shared preferences owner. This used to re-parse the
-  // preferences blob and register its own storage + sync listeners, once per
-  // assistant message row.
   const { voiceEnabled: enabled } = useUiPreferences();
-  const [available, setAvailable] = useState(false);
-
+  const session = useSyncExternalStore(subscribeToAuthSession, getAuthSessionSnapshot, getAuthSessionSnapshot);
+  const revision = useSyncExternalStore(subscribeToVoiceConfig, getVoiceConfigRevision, getVoiceConfigRevision);
+  // Availability carries its origin so a replacement login cannot briefly display the old account's health.
+  const [result, setResult] = useState<{ key: string; available: boolean } | null>(null);
+  const key = healthKey(session, revision);
   useEffect(() => {
     let active = true;
-    let requestId = 0;
-
-    const check = async () => {
-      if (!enabled) {
-        setAvailable(false);
-        return;
-      }
-      if (readVoiceConfig().baseUrl.trim()) {
-        setAvailable(true);
-        return;
-      }
-      const id = ++requestId;
-      try {
-        const result = await checkVoiceHealth();
-        if (active && id === requestId) setAvailable(result);
-      } catch {
-        if (active && id === requestId) setAvailable(false);
-      }
+    // Capture only when the account/configuration key changes; token refresh preserves this work.
+    const expected = getAuthSessionSnapshot();
+    const capturedRevision = getVoiceConfigRevision();
+    if (!enabled || expected.phase !== 'ready' || healthKey(expected, capturedRevision) !== key) return;
+    const apply = (available: boolean) => {
+      if (active && isCurrentAuthSession(expected) && getVoiceConfigRevision() === capturedRevision)
+        setResult({ key, available });
     };
-
-    void check();
-    window.addEventListener(VOICE_CONFIG_SYNC_EVENT, check);
-    return () => {
-      active = false;
-      window.removeEventListener(VOICE_CONFIG_SYNC_EVENT, check);
-    };
-  }, [enabled]);
-
-  return enabled && available;
+    if (readVoiceConfig(expected).baseUrl.trim()) apply(true);
+    else void checkVoiceHealth(expected, capturedRevision).then(apply, () => apply(false));
+    return () => { active = false; };
+  }, [enabled, key, session.phase]);
+  return enabled && session.phase === 'ready' && result?.key === key && result.available;
 }

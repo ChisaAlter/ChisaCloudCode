@@ -1,27 +1,86 @@
 import assert from 'node:assert/strict';
-import childProcess from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { EventEmitter } from 'node:events';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import fsPromises, { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import type { IncomingMessage } from 'node:http';
-import { syncBuiltinESMExports } from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
 import test, { mock } from 'node:test';
 import type { TestContext } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { createFileTreeService } from '@/modules/file-tree/file-tree.service.js';
-// File-tree integration uses a controlled cloud sandbox without restoring accounts.
-mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
+import { AppError, WORKSPACES_ROOT, registerWorkspaceRuntimeNetwork, resolveReadOnlyRootPath, validateWorkspacePath } from '@/shared/index.js';
+import type { FileTreeFileSystem } from '@/shared/index.js';
+
+// The real bridge process adapter consumes semantic broker replies. The fixture
+// implements only that public boundary; it never intercepts Docker spawning.
+const fixtureUser = 'file-tree-account';
+type ControlFixture = { handle(request: unknown, incoming: Pick<IncomingMessage, 'headers'>): Response | Promise<Response> };
+const controls = new Map<string, ControlFixture>();
+const leaseMappings = new Map<string, { legacy: string; broker: string; session: string; epoch: string }>();
+const leaseOperations = new Map<string, Map<string, { output: PassThrough; input: Buffer[]; sequence: number; complete: boolean; profileId: string }>>();
+let ownership: Pick<typeof import('@/modules/workspace-runtime/index.js'), 'readCloudWorkspaceOwner' | 'assertCloudWorkspaceOwner'>;
+const readCloudWorkspaceOwner: typeof ownership.readCloudWorkspaceOwner = (...args) => ownership.readCloudWorkspaceOwner(...args);
+const assertCloudWorkspaceOwner: typeof ownership.assertCloudWorkspaceOwner = (...args) => ownership.assertCloudWorkspaceOwner(...args);
+const runtimeMock = mock.module('@/modules/workspace-runtime/index.js', { namedExports: {
   ensureCloudWorkspaceBinding() {}, excludeCloudWorkspaceMetadata() {}, getWorkspaceRuntimeIdentity() { return undefined; },
+  async getWorkspaceBrokerAdmission(input: { userId: string; root: string; leaseId?: string; brokerLeaseId?: string; bindingEpoch: string; sessionId?: string }) {
+    assert.equal(input.userId, fixtureUser);assert.equal(input.bindingEpoch, 'test-epoch');
+    const control = controls.get(input.root);assert.ok(control, 'broker root must be in this fixture enrollment');
+    const key = input.root + '\0' + (input.leaseId ?? 'readonly');
+    let mapped = leaseMappings.get(key);
+    if (!mapped) { mapped = { legacy: input.leaseId ?? 'readonly', broker: 'broker-' + createHash('sha256').update(key).digest('hex'), session: 'file-tree-session', epoch: input.bindingEpoch };leaseMappings.set(key, mapped); }
+    if (input.brokerLeaseId) assert.equal(input.brokerLeaseId, mapped.broker);
+    if (input.sessionId) assert.equal(input.sessionId, mapped.session);
+    let operations = leaseOperations.get(key);
+    if (!operations) { operations = new Map();leaseOperations.set(key, operations); }
+    const proof = (permission: string, profileId: string) => { assert.ok(['worker-ro','worker-rw'].includes(profileId));return permission + ':' + profileId; };
+    const receipt = (id: string) => { const operation = operations.get(id);assert.ok(operation);return { operationId: id, workspaceId: 'file-tree-workspace', generation: 'file-tree-generation', leaseId: mapped.broker, profileId: operation.profileId, kind: 'run' as const, state: operation.complete ? 'complete' as const : 'running' as const, cleanupConfirmed: operation.complete, writerLeaseHeld: !operation.complete, resourceId: createHash('sha256').update(id).digest('hex'), exitCode: 0 }; };
+    const client = {
+      async run(grant: string, request: { operationId: string; workspaceId: string; generation: string; leaseId: string; profileId: string; command: string[]; cwd: string }) {
+        assert.equal(grant, proof('run', request.profileId));assert.equal(request.workspaceId, 'file-tree-workspace');assert.equal(request.generation, 'file-tree-generation');assert.equal(request.leaseId, mapped.broker);
+        assert.deepEqual(request.command, ['python3','/opt/chisa/workspace.py']);assert.equal(request.cwd, '');
+        assert.equal(operations.has(request.operationId), false);operations.set(request.operationId, { output: new PassThrough(), input: [], sequence: 0, complete: false, profileId: request.profileId });return receipt(request.operationId);
+      },
+      async writeStdin(grant: string, id: string, chunk: { sequence: number; data: Buffer; end?: boolean }) {
+        const operation = operations.get(id);assert.ok(operation);assert.equal(grant, proof('stdin', operation.profileId));assert.equal(chunk.sequence, ++operation.sequence);operation.input.push(chunk.data);
+        if (chunk.end) {
+          try { const reply = await control.handle(JSON.parse(Buffer.concat(operation.input).toString()), { headers: { 'x-cwd': Buffer.from(input.root).toString('latin1') } });const payload = await reply.json() as Record<string, unknown>;operation.output.end(JSON.stringify({ ok: !payload.error,...payload })); }
+          catch (error) { operation.output.destroy(error as Error);throw error; }
+        }
+        return { sequence: chunk.sequence, replay: false };
+      },
+      async stream(grant: string, id: string) { const operation = operations.get(id);assert.ok(operation);assert.equal(grant, proof('stream', operation.profileId));const iterator = (async function* () { for await (const bytes of operation.output) yield { channel: 'stdout' as const, data: Buffer.from(bytes) };return receipt(id); })();return { next: () => iterator.next(),return: () => iterator.return(receipt(id)) }; },
+      async status(grant: string, id: string) { const operation = operations.get(id);assert.ok(operation);assert.equal(grant, proof('status', operation.profileId));return receipt(id); },
+      async cancel(grant: string, id: string) { const operation = operations.get(id);assert.ok(operation);assert.equal(grant, proof('cancel', operation.profileId));operation.complete = true;return receipt(id); },
+      async reconcile(grant: string, id: string) { const operation = operations.get(id);assert.ok(operation);assert.equal(grant, proof('reconcile', operation.profileId));operation.complete = true;return receipt(id); },
+    };
+    return { client, userId: fixtureUser, root: input.root, bindingEpoch: mapped.epoch, sessionId: mapped.session, leaseId: mapped.broker, legacyReservationId: mapped.legacy, workspaceId: 'file-tree-workspace', generation: 'file-tree-generation', profileId: 'worker-rw', proof };
+  },
+  async closeWorkspaceBrokerLease(input: { root: string; leaseId: string; brokerLeaseId?: string; bindingEpoch: string }) {
+    const key=input.root+'\0'+input.leaseId; const mapped=leaseMappings.get(key);assert.ok(mapped);
+    assert.equal(input.brokerLeaseId,mapped.broker);assert.equal(input.bindingEpoch,mapped.epoch);
+    const operations=leaseOperations.get(key);assert.ok(operations);
+    for (const operation of operations.values()) assert.equal(operation.complete,true,'whole lease may close only after every tracked operation is cleaned');
+    return { version: 1, state: 'closed', legacyReservationId: input.leaseId, leaseId: mapped.broker, root: input.root, bindingEpoch: input.bindingEpoch, quiescent: true, cleanupConfirmed: true, resourceInventoryComplete: true,
+      resources: [...operations.keys()].map(operationId => ({ operationId, resourceId: createHash('sha256').update(operationId).digest('hex'), kind: 'run', cleanupConfirmed: true })) };
+  },
+  readCloudWorkspaceOwner, assertCloudWorkspaceOwner,
   executeWorkspaceRuntimePreview() { assert.fail('unexpected preview'); },
 } });
 const { bridgeFileSystem } = await import('@/modules/workspace-bridge/index.js');
-import type { FileTreeFileSystem } from '@/shared/index.js';
+// Bridge has captured the mock public boundary; now restore only future imports
+// so ownership validation comes from the real public runtime barrel.
+runtimeMock.restore();
+ownership = await import('@/modules/workspace-runtime/index.js');
 type FileTreeDirectoryEntry = ReturnType<FileTreeFileSystem['openDirectory']> extends AsyncIterable<infer Entry> ? Entry : never;
 type FileTreeServiceDependencies = Parameters<typeof createFileTreeService>[0];
 type FileTreeStats = Awaited<ReturnType<FileTreeFileSystem['stat']>>;
-import { AppError, WORKSPACES_ROOT, registerWorkspaceRuntimeNetwork } from '@/shared/index.js';
+type FileTreeServices = ReturnType<typeof createFileTreeService>;
+
+const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 
 function createDirectoryEntry(name: string, directory: boolean): FileTreeDirectoryEntry {
   return {
@@ -85,26 +144,26 @@ async function startWorkspaceControl<T>(
   _legacyReadBatch: boolean,
   handle: (request: T, incoming: Pick<IncomingMessage, 'headers'>) => Response | Promise<Response>,
 ) {
-  let fixtureError: unknown;
-  registerWorkspaceRuntimeNetwork(path.resolve(WORKSPACES_ROOT), 'chisa-workspace-network-' + 'f'.repeat(24), 'file-tree-cloud-fixture');
-  const spawning = mock.method(childProcess, 'spawn', (_command: string, args: string[]) => {
-    const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill() {} });
-    if (args[0] !== 'run') { queueMicrotask(() => child.emit('close', 0)); return child as never; }
-    const mount = args[args.indexOf('--volume') + 1]!;
-    const cwd = mount.slice(0, mount.lastIndexOf(':/workspace:'));
-    assert.ok(roots.includes(cwd));
-    let input = '';
-    child.stdin.on('data', chunk => { input += String(chunk); });
-    child.stdin.once('finish', () => { void (async () => {
-      const request = JSON.parse(input) as T;
-      const reply = await handle(request, { headers: { 'x-cwd': Buffer.from(cwd).toString('latin1') } });
-      child.stdout.write(JSON.stringify(await reply.json())); child.emit('close', 0);
-    })().catch(error => { fixtureError = error; child.emit('error', error); child.emit('close', 1); }); });
-    return child as never;
+  const accountRoot = path.resolve(WORKSPACES_ROOT);
+  const privateHome = await mkdtemp(path.join(accountRoot, '.chisa-file-tree-private-'));
+  const previousRoot = process.env.WORKSPACES_ROOT;const previousProfiles = process.env.CHISA_WORKSPACE_BROKER_PROFILE_CONFIG;
+  process.env.WORKSPACES_ROOT = accountRoot;
+  const homeMock = mock.method(os, 'homedir', () => privateHome);
+  const owner = createHash('sha256').update(accountRoot + '\0' + fixtureUser).digest('hex').slice(0, 24);
+  const stateDirectory = path.join(privateHome, '.chisa-workspace-runtime');await fsPromises.mkdir(stateDirectory, { recursive: true });
+  await writeFile(path.join(stateDirectory, createHash('sha256').update(accountRoot).digest('hex').slice(0, 24) + '.json'), JSON.stringify({ version: 1, root: accountRoot, userId: fixtureUser, owner }), { mode: 0o600 });
+  const profileFile = path.join(privateHome, 'worker-profiles.json');
+  await writeFile(profileFile, JSON.stringify({ version: 1, profiles: roots.flatMap(root => [true, false].map(readOnly => ({ workspaceId: 'file-tree-workspace', generation: 'file-tree-generation', root, profileId: readOnly ? 'worker-ro' : 'worker-rw', purpose: 'worker', readOnly, runtimeMounts: [], gitMounts: [] }))) }), { mode: 0o600 });
+  process.env.CHISA_WORKSPACE_BROKER_PROFILE_CONFIG = profileFile;
+  registerWorkspaceRuntimeNetwork(accountRoot, 'chisa-workspace-network-' + owner, owner);
+  for (const root of roots) { controls.set(root, { handle: (request, incoming) => handle(request as T, incoming) });await writeFile(path.join(root, '.chisa-bridge.json'), JSON.stringify({ protocol: 3, root, owner, bindingEpoch: 'test-epoch' }));assert.equal(readCloudWorkspaceOwner(root), fixtureUser); }
+  context.after(async () => {
+    homeMock.mock.restore();
+    if (previousRoot === undefined) delete process.env.WORKSPACES_ROOT;else process.env.WORKSPACES_ROOT = previousRoot;
+    if (previousProfiles === undefined) delete process.env.CHISA_WORKSPACE_BROKER_PROFILE_CONFIG;else process.env.CHISA_WORKSPACE_BROKER_PROFILE_CONFIG = previousProfiles;
+    for (const root of roots) { controls.delete(root);for (const key of leaseMappings.keys()) if (key.startsWith(root + '\0')) { leaseMappings.delete(key);leaseOperations.delete(key); } }
+    assert.equal(path.dirname(privateHome), accountRoot);await rm(privateHome, { recursive: true, force: true });
   });
-  syncBuiltinESMExports();
-  context.after(() => { spawning.mock.restore(); syncBuiltinESMExports(); if (fixtureError) throw fixtureError; });
-  await Promise.all(roots.map(root => writeFile(path.join(root, '.chisa-bridge.json'), JSON.stringify({ protocol: 3, root, owner: 'cloud-file-tree-fixture', bindingEpoch: 'test-epoch' }))));
 }
 
 test('workspace editor saves use the hash of the loaded snapshot', async () => {
@@ -217,12 +276,139 @@ function createDependencies(
     workspace: {
       rootPath: projectRoot,
       validatePath: async (candidatePath) => ({ valid: true, resolvedPath: candidatePath }),
+      resolveReadOnlyRootPath: async () => null,
     },
     resolveMimeType: () => 'text/plain',
     fileSystemConcurrency: 4,
     logger: { error: () => undefined },
   };
 }
+
+test('cloud folder browsing skips SSH metadata before bridge dispatch and only lists the current directory', async () => {
+  const workspaceRoot = path.resolve(WORKSPACES_ROOT);
+  const opened: string[] = [];
+  const metadata: string[] = [];
+  const host = createFakeFileSystem({
+    access: async candidate => { assert.equal(candidate, workspaceRoot); },
+    stat: async candidate => { assert.equal(candidate, workspaceRoot); return createStats(true, 0o755); },
+    realpath: async candidate => candidate,
+    lstat: async candidate => { metadata.push(candidate); return createStats(true, 0o755); },
+    openDirectory: createDirectoryReader(candidate => {
+      opened.push(candidate);
+      assert.equal(candidate, workspaceRoot, 'the chooser must not open child directories');
+      return [
+        createDirectoryEntry('.chisa-ssh-projects', true),
+        createDirectoryEntry('zeta', true),
+        createDirectoryEntry('.config', true),
+        createDirectoryEntry('Projects', true),
+        createDirectoryEntry('.chisa-ssh-projects-other', true),
+        createDirectoryEntry('node_modules', true),
+        createDirectoryEntry('README.md', false),
+      ];
+    }),
+  });
+  // Production's bridge rejects the metadata container even when no binding is missing.
+  const service = createFileTreeService(createDependencies(bridgeFileSystem(host), workspaceRoot));
+  for (const input of ['~', null, workspaceRoot]) {
+    const result = await service.browseWorkspace(input);
+    assert.equal(result.path, workspaceRoot);
+    assert.deepEqual(result.suggestions, ['Projects', 'zeta', '.chisa-ssh-projects-other', '.config'].map(name => ({
+      name, path: path.join(workspaceRoot, name), type: 'directory',
+    })));
+  }
+  assert.deepEqual(opened, [workspaceRoot, workspaceRoot, workspaceRoot]);
+  assert.deepEqual(metadata, [], 'folder suggestions do not need per-entry metadata');
+});
+
+test('legacy root project trees never traverse or expose SSH metadata containers', async () => {
+  const workspaceRoot = path.resolve(WORKSPACES_ROOT);
+  const opened: string[] = [];
+  const host = createFakeFileSystem({
+    access: async () => undefined,
+    stat: async () => createStats(true, 0o755),
+    openDirectory: createDirectoryReader(candidate => {
+      opened.push(candidate);
+      assert.equal(candidate, workspaceRoot);
+      return [createDirectoryEntry('.chisa-ssh-projects', true), { ...createDirectoryEntry('README.md', false), stats: createStats(false, 0o644) }];
+    }),
+  });
+  const service = createFileTreeService(createDependencies(bridgeFileSystem(host), workspaceRoot));
+  for (const options of [undefined, { shallow: true, respectGitignore: false }]) {
+    assert.deepEqual((await service.listProjectFiles('legacy-project', options)).map(entry => entry.name), ['README.md']);
+  }
+  assert.deepEqual(opened, [workspaceRoot, workspaceRoot]);
+});
+
+test('cloud chooser rejects explicit SSH metadata roots and descendants before filesystem access', async () => {
+  const workspaceRoot = path.resolve('cloud-folder-test');
+  const canonicalRoot = path.resolve('canonical-cloud-folder-test');
+  const dependencies = createDependencies(createFakeFileSystem({ realpath: async () => canonicalRoot }), workspaceRoot);
+  dependencies.workspace.validatePath = async candidate => ({ valid: true, resolvedPath: candidate.replace(workspaceRoot, canonicalRoot) });
+  const service = createFileTreeService(dependencies);
+  for (const candidate of [
+    '~/.chisa-ssh-projects', '~/.chisa-ssh-projects/project/new',
+    path.join(workspaceRoot, '.chisa-ssh-projects'),
+    path.join(canonicalRoot, '.chisa-ssh-projects', 'project'),
+  ]) {
+    await assert.rejects(service.browseWorkspace(candidate), { code: 'SSH_ANCHOR_RESERVED', statusCode: 400 });
+    await assert.rejects(service.createWorkspaceFolder(candidate), { code: 'SSH_ANCHOR_RESERVED', statusCode: 400 });
+  }
+});
+
+test('cloud chooser hides canonical SSH metadata but preserves same-named ordinary nested directories', async () => {
+  const workspaceRoot = path.resolve('cloud-folder-test');
+  const canonicalRoot = path.resolve('canonical-cloud-folder-test');
+  const fileSystem = createFakeFileSystem({
+    access: async () => undefined,
+    stat: async () => createStats(true, 0o755),
+    realpath: async () => canonicalRoot,
+    openDirectory: createDirectoryReader(() => [createDirectoryEntry('.chisa-ssh-projects', true)]),
+  });
+  const dependencies = createDependencies(fileSystem, workspaceRoot);
+  dependencies.workspace.validatePath = async candidate => ({ valid: true, resolvedPath: candidate.replace(workspaceRoot, canonicalRoot) });
+  const service = createFileTreeService(dependencies);
+  assert.deepEqual((await service.browseWorkspace('~')).suggestions, []);
+  const nested = path.join(canonicalRoot, 'Projects');
+  assert.deepEqual((await service.browseWorkspace(path.join(workspaceRoot, 'Projects'))).suggestions, [{
+    name: '.chisa-ssh-projects', path: path.join(nested, '.chisa-ssh-projects'), type: 'directory',
+  }]);
+  dependencies.workspace.validatePath = async () => ({ valid: true, resolvedPath: path.join(canonicalRoot, '.chisa-ssh-projects', 'aliased') });
+  await assert.rejects(service.browseWorkspace(path.join(workspaceRoot, 'alias')), { code: 'SSH_ANCHOR_RESERVED' });
+  await assert.rejects(service.createWorkspaceFolder(path.join(workspaceRoot, 'alias', 'new')), { code: 'SSH_ANCHOR_RESERVED' });
+});
+
+test('cloud browsing reports an unreadable or disappeared directory instead of a successful empty listing', async () => {
+  const workspaceRoot = path.resolve('cloud-folder-test');
+  for (const [code, statusCode] of [['EACCES', 403], ['EPERM', 403], ['ENOENT', 404], ['EIO', undefined]] as const) {
+    const failure = Object.assign(new Error('cannot list directory'), { code });
+    const service = createFileTreeService(createDependencies(createFakeFileSystem({
+      realpath: async candidate => candidate,
+      access: async () => undefined,
+      stat: async () => createStats(true, 0o755),
+      openDirectory: () => ({ [Symbol.asyncIterator]: () => ({ next: async () => { throw failure; } }) }),
+    }), workspaceRoot));
+    if (statusCode) await assert.rejects(service.browseWorkspace('~'), { code, statusCode });
+    else await assert.rejects(service.browseWorkspace('~'), error => error === failure);
+  }
+});
+
+test('cloud folder creation still permits ordinary and similarly named sibling directories', async () => {
+  const workspaceRoot = path.resolve('cloud-folder-test');
+  const created: string[] = [];
+  const service = createFileTreeService(createDependencies(createFakeFileSystem({
+    realpath: async candidate => candidate,
+    access: async candidate => {
+      if (candidate === workspaceRoot) return;
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+    },
+    makeDirectory: async (candidate, recursive) => { assert.equal(recursive, false); created.push(candidate); },
+  }), workspaceRoot));
+  for (const name of ['new-project', '.chisa-ssh-projects-other']) {
+    const target = path.join(workspaceRoot, name);
+    assert.deepEqual(await service.createWorkspaceFolder(`~/${name}`), { success: true, path: target });
+  }
+  assert.deepEqual(created, [path.join(workspaceRoot, 'new-project'), path.join(workspaceRoot, '.chisa-ssh-projects-other')]);
+});
 
 test('listProjectFiles maps only missing roots and preserves workspace unavailable errors', async () => {
   const projectRoot = path.resolve('file-tree-test-project');
@@ -749,6 +935,26 @@ test('readTextFile rejects traversal before invoking the filesystem adapter', as
   assert.deepEqual(readPaths, []);
 });
 
+test('readTextFile reports a directory as a client error, not a 500', async () => {
+  const projectRoot = path.resolve('file-tree-test-project');
+  const fileSystem = createFakeFileSystem({
+    readTextFile: async () => {
+      const error = new Error('EISDIR: illegal operation on a directory, read');
+      (error as NodeJS.ErrnoException).code = 'EISDIR';
+      throw error;
+    },
+  });
+  const service = createFileTreeService(createDependencies(fileSystem, projectRoot));
+
+  await assert.rejects(
+    service.readTextFile('project-1', 'decisions'),
+    (error: unknown) => error instanceof AppError
+      && error.code === 'EISDIR'
+      && error.statusCode === 400
+      && error.message === 'Path is a directory, not a file',
+  );
+});
+
 test('createEntry performs filesystem mutation only through the injected adapter', async () => {
   const projectRoot = path.resolve('file-tree-test-project');
   const targetPath = path.join(projectRoot, 'notes.txt');
@@ -774,4 +980,188 @@ test('createEntry performs filesystem mutation only through the injected adapter
 
   assert.equal(result.path, targetPath);
   assert.deepEqual(writtenFiles, [{ filePath: targetPath, content: '' }]);
+});
+
+/**
+ * Builds the service against the real filesystem and the real workspace policy,
+ * which is the only way to exercise the read-only roots: the whole guarantee
+ * rests on `realpath` resolving symlinks before the comparison.
+ */
+function createRealFileSystemService(projectRoot: string, workspaceRoot = projectRoot): FileTreeServices {
+  return createFileTreeService({
+    fileSystem: {
+      access: (candidatePath) => fsPromises.access(candidatePath),
+      stat: (candidatePath) => fsPromises.stat(candidatePath),
+      lstat: (candidatePath) => fsPromises.lstat(candidatePath),
+      openDirectory: async function* (directoryPath) {
+        yield* await fsPromises.opendir(directoryPath);
+      },
+      realpath: (candidatePath) => fsPromises.realpath(candidatePath),
+      readTextFile: (filePath) => fsPromises.readFile(filePath, 'utf8'),
+      writeTextFile: (filePath, content) => fsPromises.writeFile(filePath, content, 'utf8'),
+      async makeDirectory(directoryPath, recursive) {
+        await fsPromises.mkdir(directoryPath, { recursive });
+      },
+      rename: (oldPath, newPath) => fsPromises.rename(oldPath, newPath),
+      async removeDirectory(directoryPath) {
+        await fsPromises.rm(directoryPath, { recursive: true, force: true });
+      },
+      unlink: (filePath) => fsPromises.unlink(filePath),
+      copyFile: (source, destination) => fsPromises.copyFile(source, destination),
+      createReadStream: (filePath) => createReadStream(filePath),
+    },
+    projects: { getProjectPathById: async () => projectRoot },
+    workspace: {
+      rootPath: workspaceRoot,
+      validatePath: async (candidatePath) => {
+        const relative = path.relative(workspaceRoot, candidatePath);
+        if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+          return { valid: false, error: 'Path is outside the workspace root' };
+        }
+        return { valid: true, resolvedPath: candidatePath };
+      },
+      resolveReadOnlyRootPath: (candidatePath) => resolveReadOnlyRootPath(candidatePath),
+    },
+    resolveMimeType: () => 'text/plain',
+    fileSystemConcurrency: 4,
+    logger: { error: () => undefined },
+  });
+}
+
+test('the temp directory can be browsed and read, but never written to', async () => {
+  const temporaryDirectory = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'file-tree-tmp-'));
+  const projectRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'file-tree-project-'));
+
+  try {
+    // The shape a task notification quotes: an agent's output file written to
+    // the system temp directory, outside every project.
+    await fsPromises.mkdir(path.join(temporaryDirectory, 'tasks'));
+    const outputPath = path.join(temporaryDirectory, 'tasks', 'agent.output');
+    await fsPromises.writeFile(outputPath, 'what the agent found', 'utf8');
+
+    const service = createRealFileSystemService(projectRoot);
+
+    const browsed = await service.browseWorkspace(temporaryDirectory);
+    assert.deepEqual(browsed.suggestions.map((entry) => entry.name), ['tasks']);
+
+    const opened = await service.readTextFile('project-1', outputPath);
+    assert.equal(opened.content, 'what the agent found');
+
+    const streamed = await service.openFile('project-1', outputPath);
+    streamed.stream.destroy();
+
+    // Read-only means read-only: nothing may be created or changed there.
+    await assert.rejects(
+      service.saveTextFile('project-1', outputPath, 'overwritten'),
+      (error: unknown) => (error as AppError).code === 'PATH_OUTSIDE_PROJECT',
+    );
+    await assert.rejects(
+      service.createWorkspaceFolder(path.join(temporaryDirectory, 'new-folder')),
+      (error: unknown) => (error as AppError).code === 'INVALID_WORKSPACE_PATH',
+    );
+    await assert.rejects(
+      service.createEntry({
+        projectId: 'project-1',
+        parentPath: path.join(temporaryDirectory, 'tasks'),
+        type: 'file',
+        name: 'planted.txt',
+      }),
+      (error: unknown) => (error as AppError).code === 'PATH_OUTSIDE_PROJECT',
+    );
+    await assert.rejects(
+      service.renameEntry({ projectId: 'project-1', oldPath: outputPath, newName: 'renamed.output' }),
+      (error: unknown) => (error as AppError).code === 'PATH_OUTSIDE_PROJECT',
+    );
+    const uploadedTemporaryPath = path.join(projectRoot, 'upload.tmp');
+    await fsPromises.writeFile(uploadedTemporaryPath, 'upload', 'utf8');
+    await assert.rejects(
+      service.storeUploadedFiles({
+        projectId: 'project-1',
+        targetPath: path.join(temporaryDirectory, 'tasks'),
+        relativePaths: [],
+        requestedFileCount: 1,
+        files: [{ originalName: 'upload.txt', temporaryPath: uploadedTemporaryPath, size: 6, mimeType: 'text/plain' }],
+      }),
+      (error: unknown) => (error as AppError).code === 'PATH_OUTSIDE_PROJECT',
+    );
+    await assert.rejects(
+      service.deleteEntry({ projectId: 'project-1', targetPath: outputPath }),
+      (error: unknown) => (error as AppError).code === 'PATH_OUTSIDE_PROJECT',
+    );
+    assert.deepEqual(await fsPromises.readdir(path.join(temporaryDirectory, 'tasks')), ['agent.output']);
+    assert.equal(await fsPromises.readFile(outputPath, 'utf8'), 'what the agent found');
+  } finally {
+    await fsPromises.rm(temporaryDirectory, { recursive: true, force: true });
+    await fsPromises.rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('reading through a symlink out of the temp directory is still refused', async () => {
+  const temporaryDirectory = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'file-tree-tmp-'));
+  const projectRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'file-tree-project-'));
+  // The link target has to sit under no read-only root. Beside this file is
+  // deterministic; a directory under `$HOME` lands under `/tmp` whenever a
+  // test run isolates its home there, and the Claude projects directory is a
+  // read-only root too.
+  const outsideDirectory = await fsPromises.mkdtemp(path.join(testDirectory, 'file-tree-outside-'));
+
+  try {
+    assert.equal(await resolveReadOnlyRootPath(outsideDirectory), null);
+    await fsPromises.writeFile(path.join(outsideDirectory, 'secret.txt'), 'secret', 'utf8');
+    await fsPromises.symlink(outsideDirectory, path.join(temporaryDirectory, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
+
+    const service = createRealFileSystemService(projectRoot);
+    await assert.rejects(
+      service.readTextFile('project-1', path.join(temporaryDirectory, 'escape', 'secret.txt')),
+      (error: unknown) => (error as AppError).code === 'PATH_OUTSIDE_PROJECT',
+    );
+  } finally {
+    await fsPromises.rm(temporaryDirectory, { recursive: true, force: true });
+    await fsPromises.rm(projectRoot, { recursive: true, force: true });
+    await fsPromises.rm(outsideDirectory, { recursive: true, force: true });
+  }
+});
+
+test('a file in another folder of the workspace can be read, but never written to', async () => {
+  // Both sit beside this file, outside every read-only root, for the reason
+  // given in the symlink test above.
+  const workspaceRoot = await fsPromises.mkdtemp(path.join(testDirectory, 'file-tree-workspace-'));
+  const projectRoot = path.join(workspaceRoot, 'project');
+  const siblingDirectory = path.join(workspaceRoot, '.runs', 'run-1');
+  const outsideDirectory = await fsPromises.mkdtemp(path.join(testDirectory, 'file-tree-outside-'));
+
+  try {
+    await fsPromises.mkdir(projectRoot);
+    await fsPromises.mkdir(siblingDirectory, { recursive: true });
+    const reportPath = path.join(siblingDirectory, 'report.md');
+    await fsPromises.writeFile(reportPath, 'what the run found', 'utf8');
+    await fsPromises.writeFile(path.join(outsideDirectory, 'secret.txt'), 'secret', 'utf8');
+    await fsPromises.symlink(outsideDirectory, path.join(workspaceRoot, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
+
+    const service = createRealFileSystemService(projectRoot, workspaceRoot);
+
+    const opened = await service.readTextFile('project-1', reportPath);
+    assert.equal(opened.content, 'what the run found');
+    const streamed = await service.openFile('project-1', reportPath);
+    streamed.stream.destroy();
+
+    await assert.rejects(
+      service.saveTextFile('project-1', reportPath, 'overwritten'),
+      (error: unknown) => (error as AppError).code === 'PATH_OUTSIDE_PROJECT',
+    );
+    await assert.rejects(
+      service.deleteEntry({ projectId: 'project-1', targetPath: reportPath }),
+      (error: unknown) => (error as AppError).code === 'PATH_OUTSIDE_PROJECT',
+    );
+    assert.equal(await fsPromises.readFile(reportPath, 'utf8'), 'what the run found');
+
+    // A link inside the workspace does not open what lies outside it.
+    await assert.rejects(
+      service.readTextFile('project-1', path.join(workspaceRoot, 'escape', 'secret.txt')),
+      (error: unknown) => (error as AppError).code === 'PATH_OUTSIDE_PROJECT',
+    );
+  } finally {
+    await fsPromises.rm(workspaceRoot, { recursive: true, force: true });
+    await fsPromises.rm(outsideDirectory, { recursive: true, force: true });
+  }
 });

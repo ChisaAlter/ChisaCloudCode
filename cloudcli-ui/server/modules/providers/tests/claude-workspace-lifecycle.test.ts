@@ -24,18 +24,36 @@ let sshTarget: SshProjectTarget = { projectId: 'ssh-project', ownerId: '42', con
   rootPath: 'D:\\Code\\App', rootIdentity: 'physical-root', generation: 'ssh-generation', workspaceId: 'ssh-workspace', anchorPath: sshAnchor,
   phase: 'idle', activeRunId: null, pendingJobId: null };
 let sshProbes = 0;
+let sshProbeRequests: Array<Parameters<typeof import('@/modules/ssh-workspaces/index.js').probeSshWorkspace>[0] & { phase: SshProjectTarget['phase'] }> = [];
 let sshOperations = 0;
 let sshPreflightRequests: Array<Record<string, unknown>> = [];
 mock.module('@/modules/ssh-workspaces/index.js', { namedExports: {
-  probeSshWorkspace: async () => { sshProbes++; return { rootIdentity: sshTarget.rootIdentity, rootPath: sshTarget.rootPath }; },
+  probeSshWorkspace: async (input: Parameters<typeof import('@/modules/ssh-workspaces/index.js').probeSshWorkspace>[0]) => {
+    sshProbes++;
+    sshProbeRequests.push({ ...input, phase: sshTarget.phase });
+    assert.equal(input.connectionId, sshTarget.connectionId);
+    assert.equal(input.rootPath, sshTarget.rootPath);
+    assert.equal(input.userId, sshTarget.ownerId);
+    if (input.signal) assert.equal(input.signal.aborted, false, 'the admission handshake must be live');
+    return { rootIdentity: sshTarget.rootIdentity, rootPath: sshTarget.rootPath };
+  },
   executeSshWorkspace: async (input: { request: Record<string, unknown>; userId: string; generation: string; expectedRootIdentity: string }) => {
     sshOperations++;
     assert.equal(input.userId, sshTarget.ownerId);
     assert.equal(input.generation, sshTarget.generation);
     assert.equal(input.expectedRootIdentity, sshTarget.rootIdentity);
-    assert.ok(['lstat', 'list', 'read'].includes(String(input.request.op)), 'only configuration inspection is permitted in this lifecycle fixture');
-    assert.ok(String(input.request.path).startsWith('/workspace/'));
-    sshPreflightRequests.push({ ...input.request });
+    if (input.request.op === 'project_snapshot') {
+      assert.deepEqual(input.request, { op: 'project_snapshot' });
+      // Model an older helper, then exercise the real batched inspection fallback.
+      throw Object.assign(new Error('Fixture helper does not support snapshots'), { code: 'SSH_WORKSPACE_REQUEST_INVALID' });
+    }
+    const inspections = input.request.op === 'batch' ? input.request.requests : [input.request];
+    assert.ok(Array.isArray(inspections) && inspections.length > 0);
+    for (const request of inspections) {
+      assert.ok(['lstat', 'list', 'read'].includes(String(request.op)), 'only configuration inspection is permitted in this lifecycle fixture');
+      assert.ok(String(request.path).startsWith('/workspace/'));
+      sshPreflightRequests.push({ ...request });
+    }
     throw Object.assign(new Error('Fixture has no remote project configuration'), { code: 'ENOENT' });
   },
 } });
@@ -114,6 +132,7 @@ async function fixture(run: (cwd: string, context: ProviderRuntimeContext, frame
 function sshFixture(sessionId = 'ssh-app-session') {
   sshTarget = { ...sshTarget, phase: 'idle', activeRunId: null, pendingJobId: null };
   sshProbes = 0;
+  sshProbeRequests = [];
   sshOperations = 0;
   sshPreflightRequests = [];
   const row = { session_id: sessionId, provider: 'claude', provider_session_id: 'ssh-provider-session', project_path: sshAnchor, workspace_mode: 'shared' } as NonNullable<ReturnType<typeof sessionsDb.getSessionById>>;
@@ -238,7 +257,13 @@ test('Claude allows an authenticated SSH owner with the exact pinned session and
     assert.equal(calls.model, 1);
     assert.equal(calls.catalog, 1);
     assert.equal(calls.credentials, 1);
-    assert.equal(sshProbes, 1);
+    const admissionProbes = sshProbeRequests.filter(request => request.signal !== undefined);
+    assert.equal(admissionProbes.length, 1, 'exactly one cancellable SSH handshake belongs to this admission');
+    assert.equal(admissionProbes[0]!.phase, 'running', 'the foreground handshake holds the authenticated writer reservation');
+    const reachabilityProbes = sshProbeRequests.filter(request => request.signal === undefined);
+    assert.equal(reachabilityProbes.length, 1, 'the first pinned descriptor also learns background connection reachability');
+    assert.equal(reachabilityProbes[0]!.phase, 'idle');
+    assert.equal(sshProbes, admissionProbes.length + reachabilityProbes.length);
     assert.ok(sshOperations > 0, 'authenticated admission reads optional project configuration before query');
     assert.ok(sshPreflightRequests.some(request => request.op === 'lstat' && request.path === '/workspace/CLAUDE.md'));
     assert.ok(sshPreflightRequests.every(request => ['lstat', 'list', 'read'].includes(String(request.op))));
@@ -285,6 +310,31 @@ test('Claude streams observed main-session versions without rewriting the pinned
   });
 });
 
+for (const inherited of [undefined, 'sdk-cli', 'sdk-ts', 'cli', 'other-client']) {
+  test(`Claude attributes SDK requests to ChisaCloudCode with inherited entrypoint ${String(inherited)}`, { timeout: 5000 }, async () => {
+    const original = process.env.CLAUDE_CODE_ENTRYPOINT;
+    if (inherited === undefined) delete process.env.CLAUDE_CODE_ENTRYPOINT;
+    else process.env.CLAUDE_CODE_ENTRYPOINT = inherited;
+    try {
+      await fixture(async (cwd, context) => {
+        scenario = input => {
+          assert.equal(input.options?.env?.CLAUDE_CODE_ENTRYPOINT, 'chisacloudcode');
+          const pathKey = Object.keys(process.env).find(key => key.toLowerCase() === 'path')!;
+          assert.equal(input.options?.env?.[pathKey], process.env[pathKey]);
+          assert.equal(input.options?.env?.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, '1800000');
+          assert.equal(process.env.CLAUDE_CODE_ENTRYPOINT, inherited, 'launch must not mutate the host environment');
+          return Object.assign((async function* () { yield { type: 'result', subtype: 'success' }; })(), { close() {} });
+        };
+        await queryClaudeSDK('fixture', { cwd }, { send() {} }, context);
+        assert.equal(queries, 1);
+      });
+    } finally {
+      if (original === undefined) delete process.env.CLAUDE_CODE_ENTRYPOINT;
+      else process.env.CLAUDE_CODE_ENTRYPOINT = original;
+    }
+  });
+}
+
 test('Claude carries the selected workspace through admission but strips it from SDK options', { timeout: 5000 }, async () => {
   await fixture(async (cwd, context) => {
     const descriptor = describeWorkspaceSelection({ projectId: 'project', sourceRoot: cwd }).cloudReplica;
@@ -313,7 +363,7 @@ test('Claude rechecks selected workspace at a delayed actual process launch', { 
       spawnChecked = true;
       yield { type: 'result', subtype: 'success' };
     })(), { close() {} });
-    await queryClaudeSDK('fixture', { cwd, sessionId: 'delayed-spawn-fixture', workspaceDescriptor: descriptor }, { send() {} }, context);
+    await assert.rejects(queryClaudeSDK('fixture', { cwd, sessionId: 'delayed-spawn-fixture', workspaceDescriptor: descriptor }, { send() {} }, context), { code: 'WORKSPACE_GENERATION_CHANGED' });
     assert.equal(spawnChecked, true);
   });
 });

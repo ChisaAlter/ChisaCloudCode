@@ -1,4 +1,4 @@
-import { assertWorkspaceDescriptor, resolveSshProjectTarget, runSshWorkspaceCommand } from '@/modules/workspace-bridge/index.js';
+import { assertWorkspaceDescriptor, readSshWorkspaceJobOutput, resolveSshProjectTarget, runSshWorkspaceCommand } from '@/modules/workspace-bridge/index.js';
 import { AppError } from '@/shared/index.js';
 import type { WorkspaceDescriptor } from '@/shared/index.js';
 
@@ -16,6 +16,7 @@ export function createSshCommandConsole(descriptor: WorkspaceDescriptor, initial
   let pending: Promise<void> | undefined;
   let controller: AbortController | undefined;
   const emit = (data: string) => outputListeners.forEach(listener => listener(data));
+  const normalizeNewlines = (text: string) => text.replace(/(?<!\r)\n/g, '\r\n');
   const finish = (error?: unknown) => {
     if (closed) return;
     closed = true;
@@ -28,16 +29,85 @@ export function createSshCommandConsole(descriptor: WorkspaceDescriptor, initial
     if (command.trim().toLowerCase() === 'exit') { finish(); return; }
     busy = true;
     controller = new AbortController();
+    const signal = controller.signal;
     pending = (async () => {
+      let stopPolling: (() => void) | undefined;
+      let pollLoop: Promise<void> | undefined;
+      let stdoutOffset = 0;
+      let stderrOffset = 0;
+      const stdoutDecoder = new TextDecoder('utf-8');
+      const stderrDecoder = new TextDecoder('utf-8');
       try {
         assertWorkspaceDescriptor(descriptor);
         const target = resolveSshProjectTarget(descriptor.rootPath);
         if (!target) throw new AppError('SSH 项目目标已失效。', { code: 'WORKSPACE_GENERATION_CHANGED', statusCode: 409 });
-        const result = await runSshWorkspaceCommand(descriptor, command, controller!.signal);
-        if (result.stdout) emit(result.stdout.replace(/(?<!\r)\n/g, '\r\n'));
-        if (result.stderr) emit(result.stderr.replace(/(?<!\r)\n/g, '\r\n'));
+        const startPolling = (jobId: string) => {
+          if (typeof readSshWorkspaceJobOutput !== 'function' || pollLoop) return;
+          let active = true;
+          let wake: (() => void) | undefined;
+          stopPolling = () => { active = false; wake?.(); };
+          const drainStream = async (stream: 'stdout' | 'stderr') => {
+            const offset = stream === 'stdout' ? stdoutOffset : stderrOffset;
+            const chunkResult = await readSshWorkspaceJobOutput(target, { jobId, stream, offset, maxBytes: 65536 }, signal);
+            if (typeof chunkResult?.chunk === 'string' && chunkResult.chunk.length > 0) {
+              const bytes = Buffer.from(chunkResult.chunk, 'base64');
+              if (bytes.length > 0) {
+                if (stream === 'stdout') {
+                  stdoutOffset += bytes.length;
+                  const decoded = stdoutDecoder.decode(bytes, { stream: true });
+                  if (decoded) emit(normalizeNewlines(decoded));
+                } else {
+                  stderrOffset += bytes.length;
+                  const decoded = stderrDecoder.decode(bytes, { stream: true });
+                  if (decoded) emit(normalizeNewlines(decoded));
+                }
+              }
+            }
+          };
+          pollLoop = (async () => {
+            while (active && !signal.aborted) {
+              try {
+                await drainStream('stdout');
+                if (!active || signal.aborted) break;
+                await drainStream('stderr');
+              } catch {
+                // Degrade silently to completion-time output if the helper does not support job_output or is transiently busy.
+                active = false;
+                break;
+              }
+              if (!active || signal.aborted) break;
+              await new Promise<void>(resolve => {
+                const timer = setTimeout(() => { wake = undefined; resolve(); }, 150);
+                wake = () => { clearTimeout(timer); wake = undefined; resolve(); };
+              });
+            }
+          })();
+        };
+        const result = await runSshWorkspaceCommand(descriptor, command, signal, { onJobCreated: startPolling });
+        stopPolling?.();
+        await pollLoop;
+        const flushedStdout = stdoutDecoder.decode();
+        if (flushedStdout) emit(normalizeNewlines(flushedStdout));
+        const flushedStderr = stderrDecoder.decode();
+        if (flushedStderr) emit(normalizeNewlines(flushedStderr));
+        if (result.stdout) {
+          if (stdoutOffset === 0) emit(normalizeNewlines(result.stdout));
+          else {
+            const fullBytes = Buffer.from(result.stdout, 'utf8');
+            if (fullBytes.length > stdoutOffset) emit(normalizeNewlines(fullBytes.subarray(stdoutOffset).toString('utf8')));
+          }
+        }
+        if (result.stderr) {
+          if (stderrOffset === 0) emit(normalizeNewlines(result.stderr));
+          else {
+            const fullBytes = Buffer.from(result.stderr, 'utf8');
+            if (fullBytes.length > stderrOffset) emit(normalizeNewlines(fullBytes.subarray(stderrOffset).toString('utf8')));
+          }
+        }
         emit(`\r\n[exit ${result.exitCode ?? 'unknown'}${result.truncated ? ', output truncated' : ''}]\r\n`);
       } catch (error) {
+        stopPolling?.();
+        await pollLoop;
         emit(`\r\n${error instanceof Error ? error.message : String(error)}\r\n`);
         if ((error as { workspaceCleanupError?: boolean; code?: string }).workspaceCleanupError
           || ['SSH_EXECUTION_UNCONFIRMED', 'SSH_WORKSPACE_RECOVERY_REQUIRED'].includes((error as { code?: string }).code ?? '')) { finish(error); return; }

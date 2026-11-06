@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import type { ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import { api, readApiJson, subscribeToProviderConnectionChanges } from '@/shared/api';
+import { api, ApiRequestError, readApiJson, subscribeToProviderConnectionChanges } from '@/shared/api';
 import type {
   ClaudeAccountActionResult,
   ClaudeAccountLogin,
@@ -121,8 +121,13 @@ export function ClaudeAccountsProvider({ children }: { children: ReactNode }) {
   const translate = useRef(t);
   useEffect(() => { translate.current = t; }, [t]);
 
-  const failure = useCallback((cause: unknown) => cause instanceof Error && cause.message
-    ? cause.message : translate.current('claudeAccounts.requestFailed'), []);
+  const failure = useCallback((cause: unknown) => {
+    if (cause instanceof ApiRequestError && [502, 503, 504].includes(cause.status)
+      && cause.message === `Request failed (${cause.status})`) {
+      return translate.current('claudeAccounts.serviceUnavailable', { status: cause.status });
+    }
+    return cause instanceof Error && cause.message ? cause.message : translate.current('claudeAccounts.requestFailed');
+  }, []);
 
   const accept = useCallback((next: ClaudeAccountsState) => {
     snapshotRef.current = next;
@@ -171,13 +176,15 @@ export function ClaudeAccountsProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     mounted.current = true;
-    void readState('state');
+    const initialRead = readState('state');
     const onFocus = () => {
       if (document.visibilityState === 'hidden') return;
       const state = snapshotRef.current;
       const account = state?.activeId === null ? state.defaultAccount : state?.accounts.find(item => item.id === state.activeId);
-      if (!account || Date.now() - account.usage.checkedAt >= FOCUS_STALE_MS) void readState('active', true);
+      if (account && (account.usage.failureKind === 'not-read' || Date.now() - account.usage.checkedAt >= FOCUS_STALE_MS)) void readState('active', true);
     };
+    // Metadata reads are local-only; fetch missing or stale quota after showing the saved selection.
+    void initialRead.then(() => { if (mounted.current && snapshotRef.current) onFocus(); });
     const timer = window.setInterval(() => { void readState('active', true); }, POLL_MS);
     window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onFocus);

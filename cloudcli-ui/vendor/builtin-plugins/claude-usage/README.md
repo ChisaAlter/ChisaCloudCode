@@ -15,6 +15,8 @@
 
 ---
 
+![Claude Usage plugin running in a CloudCLI tab: plan-limit gauges, 30-day token chart, and per-model/per-project cost breakdowns](banner.png)
+
 # Claude Usage — CloudCLI Plugin
 
 Shows the current usage of Claude Code in a CloudCLI tab:

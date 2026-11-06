@@ -6,6 +6,8 @@ import path from 'node:path';
 
 import { AppError } from '@/shared/index.js';
 
+import { workspaceBrokerRecoveryPython } from './workspace-broker-recovery.service.js';
+
 // These contracts stay private: the bridge passes its descriptor and lease structurally.
 type IntegrationIntent = {
   workspaceId: string; generation: string; baseRevision: string;
@@ -13,13 +15,14 @@ type IntegrationIntent = {
   operationId: string; previewId: string; expectedSourceRevision: string; expectedTargetRevision: string;
 };
 type IntegrationLease = {
-  owner: string; id: string; epoch: string; pid?: number; processStartTime?: string; bootId?: string;
+  owner: string; id: string; epoch: string; pid?: number; processStartTime?: string; bootId?: string; pidNamespace?: string;
+  brokerLeaseId?: string; brokerSessionId?: string; brokerPreviewProfileId?: string; integrationPeerChanged?: true;
   mayWrite?: boolean; cleanupPending?: string[]; previews?: string[]; integrationOperation?: string; writerGate?: boolean;
 };
-type LeaseIdentity = Pick<IntegrationLease, 'owner' | 'id' | 'epoch' | 'pid' | 'processStartTime' | 'bootId'>;
+type LeaseIdentity = Pick<IntegrationLease, 'owner' | 'id' | 'epoch' | 'pid' | 'processStartTime' | 'bootId' | 'pidNamespace' | 'brokerLeaseId' | 'brokerSessionId' | 'brokerPreviewProfileId' | 'integrationPeerChanged'>;
 type Marker = { version: 1; intent: IntegrationIntent; roots: Record<string, { stamp: string; leases: LeaseIdentity[] }> };
 const fields = ['workspaceId', 'generation', 'baseRevision', 'sourceRoot', 'executionRoot', 'sessionId', 'bindingEpoch', 'operationId', 'previewId', 'expectedSourceRevision', 'expectedTargetRevision'] as const;
-const identityFields = ['owner', 'id', 'epoch', 'pid', 'processStartTime', 'bootId'] as const;
+const identityFields = ['owner', 'id', 'epoch', 'pid', 'processStartTime', 'bootId', 'pidNamespace', 'brokerLeaseId', 'brokerSessionId', 'brokerPreviewProfileId', 'integrationPeerChanged'] as const;
 const suffix = '.chisa-integration.json';
 
 function fail(message: string, code = 'WORKSPACE_INTEGRATION_INVALID'): never {
@@ -45,6 +48,9 @@ function tuple(value: IntegrationLease): LeaseIdentity { return Object.fromEntri
 function sameLease(a: IntegrationLease, b: IntegrationLease): boolean { return identityFields.every(key => a[key] === b[key]); }
 function validLease(value: IntegrationLease, expected: IntegrationIntent): void {
   if (!value || value.owner !== 'claude' || !text(value.id) || value.epoch !== expected.bindingEpoch || !Number.isInteger(value.pid) || Number(value.pid) <= 0 || (value.integrationOperation !== undefined && value.integrationOperation !== expected.operationId)) fail('Integration reservation identity changed');
+  if (value.pidNamespace !== undefined && !/^pid:\[\d+\]$/.test(value.pidNamespace)) fail('Integration reservation namespace changed');
+  for (const key of ['brokerLeaseId', 'brokerSessionId', 'brokerPreviewProfileId'] as const) if (value[key] !== undefined && !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value[key]!)) fail('Integration broker selector changed');
+  if (value.integrationPeerChanged !== undefined && value.integrationPeerChanged !== true) fail('Integration recovery state is invalid');
   for (const key of ['cleanupPending', 'previews'] as const) if (value[key] !== undefined && (!Array.isArray(value[key]) || value[key]!.length !== 0)) fail('Integration reservation has unconfirmed writers or cleanup', 'WORKSPACE_RECOVERY_REQUIRED');
 }
 function readJson(file: string): Record<string, unknown> | null {
@@ -162,8 +168,9 @@ function windows(action: 'begin' | 'recover' | 'clear', expected: IntegrationInt
 
 const integrationScript = String.raw`
 import datetime, errno, fcntl, json, os, re, secrets, stat, sys
+${workspaceBrokerRecoveryPython}
 FIELDS = ('workspaceId','generation','baseRevision','sourceRoot','executionRoot','sessionId','bindingEpoch','operationId','previewId','expectedSourceRevision','expectedTargetRevision')
-IDENTITY = ('owner','id','epoch','pid','processStartTime','bootId')
+IDENTITY = ('owner','id','epoch','pid','processStartTime','bootId','pidNamespace','brokerLeaseId','brokerSessionId','brokerPreviewProfileId','integrationPeerChanged')
 SUFFIX = '.chisa-integration.json'
 class GuardError(Exception):
     def __init__(self, message, code='WORKSPACE_INTEGRATION_INVALID'):
@@ -220,11 +227,14 @@ def acquire(parent,name,create=False):
         if named is None or not same(named,os.fstat(fd)): fail('Integration guard changed')
         os.fsync(parent); return fd
     except BaseException: os.close(fd); raise
-def tuple_of(value): return {key:value[key] for key in IDENTITY}
+def tuple_of(value): return {key:value[key] for key in IDENTITY if key in value}
 def equal_lease(a,b): return all(a.get(key)==b.get(key) for key in IDENTITY)
 def lease_valid(value,intent):
     if not isinstance(value,dict) or value.get('owner')!='claude' or not text(value.get('id')) or value.get('epoch')!=intent['bindingEpoch'] or type(value.get('pid')) is not int or not 0<value['pid']<=2147483647 or not isinstance(value.get('processStartTime'),str) or not re.fullmatch(r'[0-9]+',value['processStartTime']) or not isinstance(value.get('bootId'),str) or not re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',value['bootId']): fail('Integration lease lacks exact Linux process birth identity')
     if value.get('integrationOperation') not in (None,intent['operationId']): fail('Lease belongs to another integration','WORKSPACE_BUSY')
+    if 'pidNamespace' in value and (not isinstance(value['pidNamespace'],str) or not re.fullmatch(r'pid:\[[0-9]+\]',value['pidNamespace'])): fail('Integration namespace is invalid')
+    if any(key in value and not recovery_identity(value[key]) for key in ('brokerLeaseId','brokerSessionId','brokerPreviewProfileId')): fail('Integration broker selector is invalid')
+    if 'integrationPeerChanged' in value and value['integrationPeerChanged'] is not True: fail('Integration recovery state is invalid')
     for key in ('cleanupPending','previews'):
         if key in value and value[key]!=[]: fail('Integration has unconfirmed writers or cleanup','WORKSPACE_RECOVERY_REQUIRED')
 def birth(pid):
@@ -233,21 +243,15 @@ def birth(pid):
     with open('/proc/sys/kernel/random/boot_id') as handle: boot=handle.read().strip()
     return fields[0],fields[19],boot
 def caller_identity():
-    pid=os.getppid(); state,start,boot=birth(pid)
-    if state=='Z': fail('Admitting process has exited')
-    return {'owner':'claude','pid':pid,'processStartTime':start,'bootId':boot}
-def owned(value,caller): return all(value.get(key)==caller[key] for key in ('owner','pid','processStartTime','bootId'))
-def stopped(value,caller,inactive):
+    return {'owner':'claude',**native_parent()}
+def owned(value,caller): return all(value.get(key)==caller[key] for key in ('owner','pid','processStartTime','bootId')) and ('pidNamespace' not in value or value['pidNamespace']==caller['pidNamespace'])
+def stopped(root,value,caller,inactive):
     if owned(value,caller):
         if inactive!=value['id']: fail('Exact in-process integration lease is still active','WORKSPACE_BUSY')
-        return
-    try: state,start,boot=birth(value['pid'])
-    except FileNotFoundError:
-        try: os.kill(value['pid'],0)
-        except ProcessLookupError: return
-        fail('Integration owner exit could not be proved','WORKSPACE_BUSY')
-    if state=='Z' or start!=value['processStartTime'] or boot!=value['bootId']: return
-    fail('Integration lease owner is still alive','WORKSPACE_BUSY')
+        return trusted_workspace_cleanup(root,value,'integration-writer-release' if value.get('integrationPeerChanged') is True else 'live-writer-release')
+    # A second crash must attest the current native writer stopped again, while
+    # the independent authority retains its original broker-peer stop witness.
+    return trusted_workspace_cleanup(root,value,'legacy-writer-release')
 def operate(q):
     intent=q.get('intent'); action=q.get('action')
     if not isinstance(intent,dict) or set(intent)!=set(FIELDS) or any(not text(intent.get(key)) or (key not in ('sourceRoot','executionRoot') and len(intent[key])>256) for key in FIELDS) or action not in ('begin','recover','clear'): fail('Invalid integration operation identity')
@@ -318,7 +322,7 @@ def operate(q):
             else:
                 guard=acquire(parent,base+'.chisa-writer.guard'); opened.append(guard); pinned.append((parent,base+'.chisa-writer.guard',guard))
                 cap=read(parent,base+'.chisa-writer-capability.json')
-                if type(cap.get('version')) is not int or cap['version']!=1 or cap.get('root')!=root or cap.get('bindingEpoch')!=intent['bindingEpoch'] or cap.get('protocol')!='chisa-writer-gate-v1' or cap.get('engineVersion')!='0.18.1-chisa.5': fail('Cloud writer capability changed')
+                if type(cap.get('version')) is not int or cap['version']!=1 or cap.get('root')!=root or cap.get('bindingEpoch')!=intent['bindingEpoch'] or not (cap.get('protocol')=='chisa-cloud-writer-v1' or (cap.get('protocol')=='chisa-writer-gate-v1' and cap.get('engineVersion')=='0.18.1-chisa.5')): fail('Cloud writer capability changed')
                 s['enrolled']=True
             guard=acquire(parent,base+'.chisa-lease.guard',True); opened.append(guard); pinned.append((parent,base+'.chisa-lease.guard',guard))
         check(); previous=pair(); caller=caller_identity()
@@ -344,14 +348,19 @@ def operate(q):
             lease,fd=get_lease(root)
             if lease is None: return {'ok':True,'lease':None}
             if not any(equal_lease(lease,w) for w in previous['roots'][root]['leases']): fail('Integration lease no longer matches the durable witness','WORKSPACE_BUSY')
-            verify_generation(root,lease); stopped(lease,caller,q.get('inactiveLeaseId'))
+            verify_generation(root,lease); receipt=stopped(root,lease,caller,q.get('inactiveLeaseId'))
             adopted={**lease,**caller,'integrationOperation':intent['operationId']}
+            if lease.get('integrationPeerChanged') is True or not owned(lease,caller):
+                # Only the verified root receipt can fill selectors lost before
+                # admission acknowledged; known selectors remain exact above.
+                if not isinstance(receipt,dict) or not recovery_identity(receipt.get('leaseId')) or not recovery_identity(receipt.get('sessionId')): fail('Integration recovery lacks the exact closed broker mapping')
+                adopted.update(integrationPeerChanged=True,brokerLeaseId=receipt['leaseId'],brokerSessionId=receipt['sessionId'])
             witnesses=[tuple_of(lease)]
             if not equal_lease(lease,adopted): witnesses.append(tuple_of(adopted))
             previous['roots'][root]['leases']=witnesses; persist(previous)
             current,_=get_lease(root)
             if current!=lease: fail('Integration lease changed during adoption','WORKSPACE_BUSY')
-            stopped(current,caller,q.get('inactiveLeaseId')); check(); atomic(fd,'state.json',adopted,stores[root]['parent']); check()
+            stopped(root,current,caller,q.get('inactiveLeaseId')); check(); atomic(fd,'state.json',adopted,stores[root]['parent']); check()
             return {'ok':True,'lease':adopted}
         for root in stores:
             lease,_=get_lease(root)
@@ -369,7 +378,7 @@ try:
     if not isinstance(request,dict): fail('Invalid integration guard request')
     response=operate(request)
 except GuardError as error: response={'ok':False,'code':error.code,'error':error.message}
-except (OSError,ValueError,TypeError,KeyError,AttributeError) as error: response={'ok':False,'code':'WORKSPACE_INTEGRATION_INVALID','error':'Integration state could not be safely verified; preserve the barrier ('+type(error).__name__+')'}
+except (OSError,ValueError,TypeError,KeyError,AttributeError,RuntimeError,http.client.HTTPException) as error: response={'ok':False,'code':'WORKSPACE_INTEGRATION_INVALID','error':'Integration state could not be safely verified; preserve the barrier ('+type(error).__name__+')'}
 print(json.dumps(response,separators=(',',':')))
 `;
 
@@ -378,7 +387,7 @@ function run(action: 'begin' | 'recover' | 'clear', expected: IntegrationIntent,
   if (os.platform() === 'win32') return windows(action, normalized, leasesByRoot, root, inactiveLeaseId);
   if (os.platform() !== 'linux') fail('Integration mutations require Linux or a same-process Windows reservation');
   let result;
-  try { result = spawnSync('python3', ['-I', '-c', integrationScript], { input: JSON.stringify({ action, intent: normalized, leasesByRoot, root, inactiveLeaseId }), encoding: 'utf8', timeout: 2500, killSignal: 'SIGKILL', maxBuffer: 65_536, windowsHide: true }); }
+  try { result = spawnSync('python3', ['-I', '-c', integrationScript], { input: JSON.stringify({ action, intent: normalized, leasesByRoot, root, inactiveLeaseId }), encoding: 'utf8', timeout: action === 'recover' ? 20_000 : 2500, killSignal: 'SIGKILL', maxBuffer: 65_536, windowsHide: true }); }
   catch { fail('Integration helper could not start; preserve the barrier'); }
   if (result.error || result.status !== 0 || result.signal) fail('Integration helper did not confirm completion; preserve the barrier');
   let value: { ok?: boolean; error?: string; code?: string; lease?: IntegrationLease | null };

@@ -285,6 +285,10 @@ export function buildLaunchArgv(
       note = (note ? note + '. ' : '')
         + 'queued manual-then-auto — this leg is gated, everything it spawns runs auto';
     }
+    // sudo and the external launcher's credential loading can both discard env.
+    // Keep its exact authorization contract and make the remaining deployment step visible.
+    note = (note ? note + '. ' : '')
+      + 'Claude attribution is not verified for this external launcher; set CLAUDE_CODE_ENTRYPOINT=chisacloudcode immediately before its final Claude exec';
     return { argv, note };
   }
 

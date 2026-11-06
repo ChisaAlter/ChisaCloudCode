@@ -95,9 +95,10 @@ test('foreign history/delete/fork/model/session creation are rejected before pro
 
 test('foreign chat send/replay and direct Claude stop before provider/model/credentials', async () => {
   const ws = socket('2'); let providerRuns = 0;
-  handleChatConnection(ws as never, { user: { id: '2' } } as never, { runtime: {
+  handleChatConnection(ws as never, { user: { id: '2' } } as never, { isSessionActive: () => true, runtime: {
     hasRuntime: () => true, run: async () => { providerRuns++; }, abort: async () => { providerRuns++; return true; },
     getPendingApprovalsForSession: () => [], resolveToolApproval() { providerRuns++; },
+    hasBackgroundWork: () => false, hasBackgroundTask: () => false, stopBackgroundTask: async () => false,
   } });
   for (const payload of [{ type: 'chat.send', sessionId: 'private-session', content: 'run' }, { type: 'chat.subscribe', sessions: [{ sessionId: 'private-session' }] }]) {
     for (const listener of ws.listeners('message')) await listener(JSON.stringify(payload));

@@ -248,5 +248,5 @@ The plugin now auto-normalizes the legacy Codex preset on reload.
 
 ## Related Docs
 
-- [quickstart.md](specs/001-workspace-scheduled-prompts/quickstart.md)
-- [plan.md](specs/001-workspace-scheduled-prompts/plan.md)
+- [quickstart.md](/home/sorg/CloudCLI/cloudcli-cron/specs/001-workspace-scheduled-prompts/quickstart.md)
+- [plan.md](/home/sorg/CloudCLI/cloudcli-cron/specs/001-workspace-scheduled-prompts/plan.md)

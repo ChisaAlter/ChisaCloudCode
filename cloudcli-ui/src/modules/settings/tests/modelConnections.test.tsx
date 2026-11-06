@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 import { i18n } from '@/modules/i18n';
 import { ModelConnectionsSection } from '@/modules/settings/tabs/models-settings/ModelConnectionsSection';
+import { acknowledgeAuthSession, clearAuthToken, getAuthSessionSnapshot, initializeAuthSession, startAuthSession, synchronizeAuthSession } from '@/shared/authToken';
 
 const CONNECTION = { id: 'conn-1', name: 'My DeepSeek', baseUrl: 'https://api.deepseek.com/anthropic', model: 'deepseek-chat', hasApiKey: true };
 const fetchMock = vi.fn<typeof fetch>();
@@ -29,14 +30,21 @@ function body(index: number) {
   return JSON.parse(fetchMock.mock.calls[index][1]?.body as string);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   fetchMock.mockReset();
   vi.stubGlobal('fetch', fetchMock);
   localStorage.clear();
-  localStorage.setItem('auth-token', 'test-account-token');
+  sessionStorage.clear();
+  await initializeAuthSession();
+  await synchronizeAuthSession();
+  const payload = btoa(JSON.stringify({ userId: 'model-connections-owner', exp: Math.floor(Date.now() / 1000) + 600 })).replace(/=/g, '');
+  const session = await startAuthSession(`header.${payload}.signature`, getAuthSessionSnapshot());
+  expect(session).toMatchObject({ phase: 'ready', userId: 'model-connections-owner', storageMode: 'window' });
+  acknowledgeAuthSession(session!);
+  expect(localStorage.getItem('auth-token')).toBeNull();
 });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(async () => { vi.restoreAllMocks(); vi.unstubAllGlobals(); await clearAuthToken(); });
 
 test('locks operations until authenticated loading succeeds and aborts reads on unmount', async () => {
   let resolve!: (value: Response) => void;
@@ -44,8 +52,9 @@ test('locks operations until authenticated loading succeeds and aborts reads on 
   const view = mount();
   expect(screen.getByRole('status').textContent).toContain('Loading model connections');
   expect(screen.queryByRole('button', { name: 'Save connection' })).toBeNull();
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
   expect(fetchMock.mock.calls[0][0]).toBe('/api/providers/claude/connections');
-  expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({ Authorization: 'Bearer test-account-token' });
+  expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get('Authorization')).toBe(`Bearer ${getAuthSessionSnapshot().token}`);
   const signal = fetchMock.mock.calls[0][1]?.signal;
   await act(async () => { resolve(response()); });
   expect(screen.getByText('Configured — not tested')).toBeTruthy();
@@ -167,6 +176,7 @@ test('activates a connection, locks all actions while busy, and returns to defau
   fetchMock.mockReturnValueOnce(new Promise<Response>(done => { resolve = done; }));
   fireEvent.click(within(savedRow()).getByRole('button', { name: 'Activate' }));
   expect(screen.getByRole('button', { name: 'Saving…' }).closest('fieldset')?.disabled).toBe(true);
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
   expect(fetchMock.mock.calls[1][0]).toBe('/api/providers/claude/connections/active');
   expect(fetchMock.mock.calls[1][1]?.method).toBe('PUT');
   expect(body(1)).toEqual({ id: CONNECTION.id });

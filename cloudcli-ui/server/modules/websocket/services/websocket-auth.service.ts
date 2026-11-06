@@ -1,59 +1,66 @@
+import type { IncomingMessage } from 'node:http';
+
 import type { VerifyClientCallbackSync } from 'ws';
 
-import type { AuthenticatedWebSocketRequest } from '@/shared/types.js';
+import { createHttpIngressPolicy } from '@/modules/http-ingress/index.js';
+import type { AuthenticatedWebSocketRequest } from '@/shared/index.js';
 
 type WebSocketAuthDependencies = {
   isPlatform: boolean;
-  authenticateWebSocket: (token: string | null) => {
-    id?: string | number;
-    userId?: string | number;
-    username?: string;
-    [key: string]: unknown;
-  } | null;
+  authenticateWebSocket: (token: string | null) => AuthenticatedWebSocketRequest['user'] | null;
+  consumeWebSocketTicket: (ticket: unknown, path: string) => AuthenticatedWebSocketRequest['user'] | null;
+  isAuthSessionActive: (sessionId: string, userId: number, version: number) => boolean;
+  authorizeUpgrade?: (request: IncomingMessage, nativeHeader?: boolean) => boolean;
 };
 
-/**
- * Authenticates websocket upgrade requests before the `connection` handler runs.
- */
+/** Gateway and its lifetime guard use the same persistent login proof; a platform/user-only identity is insufficient. */
+export function isWebSocketSessionActive(
+  request: AuthenticatedWebSocketRequest,
+  check: WebSocketAuthDependencies['isAuthSessionActive'],
+): boolean {
+  const user = request.user;
+  const userId = Number(user?.id ?? user?.userId);
+  if (!user || !Number.isSafeInteger(userId) || userId <= 0 || typeof user.sessionId !== 'string'
+    || typeof user.sessionVersion !== 'number' || !Number.isSafeInteger(user.sessionVersion) || user.sessionVersion < 0
+    || typeof user.sessionExpiresAt !== 'number' || !Number.isSafeInteger(user.sessionExpiresAt)
+    || user.sessionExpiresAt <= Math.floor(Date.now() / 1000)) return false;
+  try { return check(user.sessionId, userId, user.sessionVersion) === true; } catch { return false; }
+}
+
+/** The websocket gateway authenticates each exact path with a one-use ticket or a native Authorization header. */
 export function verifyWebSocketClient(
   info: Parameters<VerifyClientCallbackSync<AuthenticatedWebSocketRequest>>[0],
-  dependencies: WebSocketAuthDependencies
+  dependencies: WebSocketAuthDependencies,
 ): boolean {
   const request = info.req as AuthenticatedWebSocketRequest;
-  const upgradeUrl = new URL(request.url ?? '/', 'http://localhost');
-  const loggedUrl = new URL(upgradeUrl);
-  if (loggedUrl.searchParams.has('token')) {
-    loggedUrl.searchParams.set('token', 'REDACTED');
-  }
-
-  console.log('WebSocket connection attempt to:', `${loggedUrl.pathname}${loggedUrl.search}`);
-
-  // Platform mode: use the first DB user and skip token checks.
-  if (dependencies.isPlatform) {
-    const user = dependencies.authenticateWebSocket(null);
-    if (!user) {
-      console.log('[WARN] Platform mode: No user found in database');
-      return false;
-    }
-
-    request.user = user;
-    console.log('[OK] Platform mode WebSocket authenticated for user:', user.username);
+  delete request.user;
+  try {
+    const raw = request.url ?? '';
+    if (!raw.startsWith('/') || raw.startsWith('//') || raw.length > 1024 || /[\\\r\n\0#]/.test(raw)) return false;
+    const url = new URL(raw, 'http://websocket.invalid');
+    if (raw.split('?')[0] !== url.pathname) return false;
+    if (!['/ws', '/shell', '/desktop-notifications'].includes(url.pathname)
+      && !/^\/plugin-ws\/[A-Za-z0-9_-]+$/.test(url.pathname)) return false;
+    // A query JWT is never a fallback credential. Reject ambiguous tickets/headers and unexpected URL parameters.
+    if ([...url.searchParams.keys()].some(key => key !== 'ticket') || url.searchParams.getAll('ticket').length > 1) return false;
+    if (request.rawHeaders?.filter((value, index) => index % 2 === 0 && value.toLowerCase() === 'authorization').length > 1) return false;
+    const authorization = request.headers.authorization;
+    const bearer = typeof authorization === 'string' ? /^Bearer ([^\s]+)$/i.exec(authorization)?.[1] : undefined;
+    const ticket = url.searchParams.get('ticket');
+    if ((ticket !== null && authorization !== undefined) || (authorization !== undefined && !bearer)) return false;
+    const authorize = dependencies.authorizeUpgrade ?? createHttpIngressPolicy().authorizeUpgrade;
+    if (!authorize(request, Boolean(bearer))) return false;
+    const user = ticket !== null
+      ? dependencies.consumeWebSocketTicket(ticket, url.pathname)
+      : bearer ? dependencies.authenticateWebSocket(bearer) : null;
+    if (!user) return false;
+    request.user = Object.freeze({ ...user });
+    if (!isWebSocketSessionActive(request, dependencies.isAuthSessionActive)) { delete request.user; return false; }
+    // No capability survives into application logging, downstream URLs, or route handlers.
+    request.url = url.pathname;
     return true;
-  }
-
-  // OSS mode: read JWT from query string first, then Authorization header.
-  const token =
-    upgradeUrl.searchParams.get('token') ??
-    request.headers.authorization?.split(' ')[1] ??
-    null;
-
-  const user = dependencies.authenticateWebSocket(token);
-  if (!user) {
-    console.log('[WARN] WebSocket authentication failed');
+  } catch {
+    delete request.user;
     return false;
   }
-
-  request.user = user;
-  console.log('[OK] WebSocket authenticated for user:', user.username);
-  return true;
 }

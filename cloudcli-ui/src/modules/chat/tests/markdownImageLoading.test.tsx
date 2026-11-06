@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+
 import type { ReactNode } from 'react';
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { createInstance } from 'i18next';
@@ -10,6 +11,7 @@ import StreamingMarkdown from '@/modules/chat/transcript/StreamingMarkdown';
 import { ToolRenderer } from '@/modules/chat/tools/ToolRenderer';
 import enCommon from '@/modules/i18n/locales/en/common.json';
 import enChat from '@/modules/i18n/locales/en/chat.json';
+import { acknowledgeAuthSession, clearAuthToken, getAuthSessionSnapshot, initializeAuthSession, startAuthSession } from '@/shared/authToken';
 
 const translations = createInstance();
 const nativeUrl = URL;
@@ -19,6 +21,8 @@ const revokeObjectUrl = vi.fn<(url: string) => void>();
 const imageBytes = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS24AAAAASUVORK5CYII='), (byte) => byte.charCodeAt(0));
 
 const imageResponse = () => new Response(imageBytes, { headers: { 'Content-Type': 'image/png' } });
+const encode = (value: unknown) => btoa(JSON.stringify(value)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+const imageToken = `${encode({ alg: 'HS256' })}.${encode({ userId: 'image-owner', iat: 1_700_000_000, exp: 4_102_444_800 })}.signature`;
 
 function Translations({ children }: { children: ReactNode }) {
   return <I18nextProvider i18n={translations}>{children}</I18nextProvider>;
@@ -47,11 +51,16 @@ beforeAll(async () => {
   });
 });
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.resetAllMocks();
-  localStorage.clear();
-  localStorage.setItem('auth-token', 'test.payload.signature');
+  vi.stubEnv('VITE_IS_PLATFORM', 'false');
   vi.stubGlobal('mygo', undefined);
+  await initializeAuthSession();
+  await clearAuthToken(getAuthSessionSnapshot());
+  localStorage.clear();
+  const session = await startAuthSession(imageToken, getAuthSessionSnapshot());
+  assert.ok(session, 'image transport fixtures must explicitly commit an authenticated account');
+  acknowledgeAuthSession(session);
   fetchMock.mockImplementation(async () => imageResponse());
   vi.stubGlobal('fetch', fetchMock);
   let nextObjectUrl = 0;
@@ -62,9 +71,11 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  await clearAuthToken(getAuthSessionSnapshot());
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   localStorage.clear();
 });
 
@@ -77,7 +88,7 @@ test('a project-relative image loads with authentication and inaccessible replac
   const request = requestAt(0);
   assert.equal(request.url.pathname, '/api/file-tree/projects/project-a/files/content');
   assert.equal(request.url.searchParams.get('path'), 'images/chart.png');
-  assert.equal(new Headers(request.options.headers).get('Authorization'), 'Bearer test.payload.signature');
+  assert.equal(new Headers(request.options.headers).get('Authorization'), `Bearer ${imageToken}`);
   const loadedBytes = await new Promise<ArrayBuffer>((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result as ArrayBuffer);
@@ -128,7 +139,7 @@ test('an explicit API image is fetched with the current account instead of becom
   const view = renderMarkdown('![Uploaded](/api/assets/images/upload.png)');
   await waitFor(() => assert.ok(view.queryByRole('img', { name: 'Uploaded' })));
   assert.equal(String(fetchMock.mock.calls[0][0]), '/api/assets/images/upload.png');
-  assert.equal(new Headers(requestAt(0).options.headers).get('Authorization'), 'Bearer test.payload.signature');
+  assert.equal(new Headers(requestAt(0).options.headers).get('Authorization'), `Bearer ${imageToken}`);
   assert.ok(view.getByRole('img', { name: 'Uploaded' }).getAttribute('src')?.startsWith('blob:'));
 });
 
@@ -172,10 +183,10 @@ test('changing source and project cancels a pending image request and ignores it
   const newRequest = pendingResponse();
   fetchMock.mockImplementationOnce(() => oldRequest.promise).mockImplementationOnce(() => newRequest.promise);
   const view = renderMarkdown('![Old](old.png)', 'project-a');
-  assert.equal(fetchMock.mock.calls.length, 1);
+  await waitFor(() => assert.equal(fetchMock.mock.calls.length, 1));
   const oldSignal = requestAt(0).options.signal;
   view.rerender(<Markdown projectId="project-b">{'![Current](current.png)'}</Markdown>);
-  assert.equal(fetchMock.mock.calls.length, 2);
+  await waitFor(() => assert.equal(fetchMock.mock.calls.length, 2));
   assert.equal(oldSignal?.aborted, true);
   assert.equal(requestAt(1).url.pathname, '/api/file-tree/projects/project-b/files/content');
   assert.equal(requestAt(1).url.searchParams.get('path'), 'current.png');

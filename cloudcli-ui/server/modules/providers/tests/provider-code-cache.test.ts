@@ -1,39 +1,31 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp,mkdir,readFile,rm,symlink,writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import test, { mock } from 'node:test';
+import test from 'node:test';
 import { promisify } from 'node:util';
 
-import { stageProviderCli } from '@/modules/providers/services/provider-code-cache.service.js';
+import type { ProviderTrustedSlot } from '@/shared/index.js';
 
-const runFile = promisify(execFile);
-test('CLI cache retains self-contained node_modules dependencies used by a fixed local executable', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'chisa-cli-cache-'));
-  const home = mock.method(os, 'homedir', () => path.join(root, 'home'));
+import { prepareProviderCodeCache,stageProviderCli } from '../services/provider-code-cache.service.js';
+
+const runFile=promisify(execFile);
+test('readonly operator CLI slot retains self-contained dependencies without creating API caches',async()=>{
+  const root=await mkdtemp(path.join(os.tmpdir(),'chisa-slot-cli-'));
   try {
-    const install = path.join(root, 'install');
-    await mkdir(path.join(install, 'node_modules', 'fixture-dependency'), { recursive: true });
-    await writeFile(path.join(install, 'main.cjs'), "process.stdout.write(require('fixture-dependency'));\n");
-    await writeFile(path.join(install, 'node_modules', 'fixture-dependency', 'index.js'), "module.exports='bounded-cli-dependency';\n");
-    const staged = stageProviderCli(path.join(install, 'main.cjs'));
-    assert.equal(await readFile(path.join(staged.mount.source, 'node_modules', 'fixture-dependency', 'index.js'), 'utf8'), "module.exports='bounded-cli-dependency';\n");
-    const output = await runFile(process.execPath, [path.join(staged.mount.source, 'main.cjs')], { env: { ...process.env, NODE_OPTIONS: '' } });
-    assert.equal(output.stdout, 'bounded-cli-dependency');
-  } finally { home.mock.restore(); await rm(root, { recursive: true, force: true }); }
+    await mkdir(path.join(root,'node_modules','fixture-dependency'),{recursive:true});await writeFile(path.join(root,'main.cjs'),"process.stdout.write(require('fixture-dependency'));\n");await writeFile(path.join(root,'node_modules','fixture-dependency','index.js'),"module.exports='bounded-cli-dependency';\n");
+    const slot={cli:'/runtime/provider-code/main.cjs',executableSource:path.join(root,'main.cjs'),mounts:[{source:root,target:'/runtime/provider-code',writable:false}]} as ProviderTrustedSlot;
+    const staged=stageProviderCli(slot.executableSource,slot);assert.equal(staged.mount.source,root);assert.equal(staged.executable,'/runtime/provider-code/main.cjs');assert.deepEqual(prepareProviderCodeCache(slot),slot.mounts[0]);assert.equal(await readFile(path.join(root,'node_modules','fixture-dependency','index.js'),'utf8'),"module.exports='bounded-cli-dependency';\n");
+    const output=await runFile(process.execPath,[path.join(root,'main.cjs')],{env:{...process.env,NODE_OPTIONS:''}});assert.equal(output.stdout,'bounded-cli-dependency');
+    assert.throws(()=>stageProviderCli('/unregistered/cli',slot),{code:'WORKSPACE_PROVIDER_RUNTIME_UNAVAILABLE'});assert.throws(()=>stageProviderCli(slot.executableSource),{code:'WORKSPACE_PROVIDER_RUNTIME_UNAVAILABLE'});assert.throws(()=>prepareProviderCodeCache(),{code:'WORKSPACE_PROVIDER_RUNTIME_UNAVAILABLE'});
+  }finally{assert.equal(path.dirname(root),os.tmpdir());await rm(root,{recursive:true,force:true});}
 });
-
-test('CLI cache rejects dependency symlinks instead of following arbitrary host content', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'chisa-cli-cache-link-'));
-  const home = mock.method(os, 'homedir', () => path.join(root, 'home'));
-  try {
-    const install = path.join(root, 'install');
-    const outside = path.join(root, 'outside');
-    await mkdir(path.join(install, 'node_modules'), { recursive: true }); await mkdir(outside);
-    await writeFile(path.join(install, 'main.cjs'), 'process.exit(0);');
-    await writeFile(path.join(outside, 'index.js'), 'secret fixture');
-    await symlink(outside, path.join(install, 'node_modules', 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
-    assert.throws(() => stageProviderCli(path.join(install, 'main.cjs')), { code: 'WORKSPACE_PROVIDER_RUNTIME_UNAVAILABLE' });
-  } finally { home.mock.restore(); await rm(root, { recursive: true, force: true }); }
+test('operator CLI selector rejects replaced symlinks and writable code mounts',async()=>{
+  const root=await mkdtemp(path.join(os.tmpdir(),'chisa-slot-cli-link-'));
+  try{
+    await mkdir(path.join(root,'outside'));await writeFile(path.join(root,'outside','main.cjs'),'secret fixture');await symlink(path.join(root,'outside'),path.join(root,'code'),process.platform==='win32'?'junction':'dir');
+    const slot={cli:'/runtime/provider-code/main.cjs',mounts:[{source:path.join(root,'code'),target:'/runtime/provider-code',writable:false}]} as ProviderTrustedSlot;
+    assert.throws(()=>stageProviderCli(undefined,slot),{code:'WORKSPACE_PROVIDER_RUNTIME_UNAVAILABLE'});slot.mounts[0].writable=true;assert.throws(()=>prepareProviderCodeCache(slot),{code:'WORKSPACE_PROVIDER_RUNTIME_UNAVAILABLE'});
+  }finally{assert.equal(path.dirname(root),os.tmpdir());await rm(root,{recursive:true,force:true});}
 });

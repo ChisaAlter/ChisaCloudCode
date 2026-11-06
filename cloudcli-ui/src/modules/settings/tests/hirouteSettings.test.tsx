@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { i18n } from '@/modules/i18n';
 import { ClaudeAccountsProvider } from '@/modules/claude-accounts';
 import { api } from '@/shared/api';
+import { acknowledgeAuthSession, clearAuthToken, getAuthSessionSnapshot, initializeAuthSession, startAuthSession, synchronizeAuthSession } from '@/shared/authToken';
 import type { ClaudeAccountsState } from '@/shared/types';
 import AccountContent from '@/modules/settings/tabs/agents-settings/sections/content/AccountContent';
 import { HiRouteSettingsSection } from '@/modules/settings/tabs/agents-settings/sections/content/HiRouteSettingsSection';
@@ -31,14 +32,21 @@ function tokenInput() {
   return screen.getByLabelText<HTMLInputElement>('HiRoute auth token', { exact: false });
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   fetchMock.mockReset();
   vi.stubGlobal('fetch', fetchMock);
   localStorage.clear();
-  localStorage.setItem('auth-token', 'test-account-token');
+  sessionStorage.clear();
+  await initializeAuthSession();
+  await synchronizeAuthSession();
+  const payload = btoa(JSON.stringify({ userId: 'hiroute-owner', exp: Math.floor(Date.now() / 1000) + 600 })).replace(/=/g, '');
+  const session = await startAuthSession(`header.${payload}.signature`, getAuthSessionSnapshot());
+  expect(session).toMatchObject({ phase: 'ready', userId: 'hiroute-owner', storageMode: 'window' });
+  acknowledgeAuthSession(session!);
+  expect(localStorage.getItem('auth-token')).toBeNull();
 });
 
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(async () => { vi.restoreAllMocks(); vi.unstubAllGlobals(); await clearAuthToken(); });
 
 test('loads only token presence through the authenticated helper and retains it on an empty-token save', async () => {
   let resolve!: (response: Response) => void;
@@ -51,7 +59,7 @@ test('loads only token presence through the authenticated helper and retains it 
   expect(tokenInput().type).toBe('password');
   expect(screen.getByText('A token is saved. Its value is never returned to this form.')).toBeTruthy();
   expect(fetchMock.mock.calls[0][0]).toBe('/api/providers/claude/hiroute');
-  expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({ Authorization: 'Bearer test-account-token' });
+  expect(new Headers(fetchMock.mock.calls[0][1]?.headers).get('Authorization')).toBe(`Bearer ${getAuthSessionSnapshot().token}`);
   fetchMock.mockResolvedValueOnce(settingsResponse({ routeModel: 'route-next' }));
   fireEvent.change(screen.getByLabelText('HiRoute route model'), { target: { value: ' route-next ' } });
   fireEvent.click(saveButton());
@@ -82,7 +90,9 @@ test('saves a replacement secret without a token in the response, clears the fie
   expect(JSON.parse(fetchMock.mock.calls[1][1]?.body as string).authToken).toBe('new-private-token');
   expect(tokenInput().value).toBe('');
   expect(persist).not.toHaveBeenCalled();
-  expect(localStorage.getItem('auth-token')).toBe('test-account-token');
+  expect(localStorage.getItem('auth-token')).toBeNull();
+  expect(getAuthSessionSnapshot()).toMatchObject({ phase: 'ready', userId: 'hiroute-owner' });
+  expect(JSON.stringify({ local: { ...localStorage }, session: { ...sessionStorage } })).not.toContain('new-private-token');
   expect(document.body.textContent).not.toContain('new-private-token');
 });
 
@@ -113,7 +123,7 @@ test('requires complete enabled settings and rejects non-HTTP or message-endpoin
     fireEvent.click(saveButton());
     expect(screen.getByRole('alert').textContent).toContain('Enter a valid HTTP or HTTPS base URL');
   }
-  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(fetchMock.mock.calls.filter(call => String(call[0]).includes('/hiroute'))).toHaveLength(1);
 });
 
 test('failed initial loading prevents saves and supports an explicit retry', async () => {
@@ -148,14 +158,15 @@ test('the account section loads HiRoute only for Claude', async () => {
   const authStatus = { authenticated: true, loading: false, email: null, method: null, error: null };
   const { rerender } = render(<AccountContent agent="codex" authStatus={authStatus} onLogin={vi.fn()} />);
   expect(screen.queryByRole('region', { name: 'HiRoute for Claude' })).toBeNull();
-  expect(fetchMock).not.toHaveBeenCalled();
+  expect(fetchMock.mock.calls.map(call => String(call[0])).every(url => url.includes('/cli'))).toBe(true);
+  fetchMock.mockClear();
   // App owns this provider; keep its real account panel mounted beside HiRoute with separate endpoint fixtures.
   const accounts: ClaudeAccountsState = { runtime: { id: 'test', label: 'Test runtime' }, activeId: null, defaultAccount: null, accounts: [], route: { kind: 'default', label: 'Default Claude', accountId: null } };
   vi.spyOn(api.providers.claudeAccounts, 'state').mockImplementation(async () => Response.json({ success: true, data: accounts }));
   vi.spyOn(api.providers.claudeAccounts, 'refresh').mockImplementation(async () => Response.json({ success: true, data: accounts }));
-  fetchMock.mockResolvedValueOnce(settingsResponse());
+  fetchMock.mockImplementation(async url => String(url).includes('/hiroute') ? settingsResponse() : Response.json({ success: true, data: { installed: false } }));
   rerender(<ClaudeAccountsProvider><AccountContent agent="claude" authStatus={authStatus} onLogin={vi.fn()} /></ClaudeAccountsProvider>);
   await screen.findByText(/A token is saved/);
   expect(screen.getByRole('region', { name: 'Claude accounts and quota' })).toBeTruthy();
-  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(fetchMock.mock.calls.filter(call => String(call[0]).includes('/hiroute'))).toHaveLength(1);
 });

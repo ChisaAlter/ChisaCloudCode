@@ -1,4 +1,4 @@
-# Chisa SSH workspace helper. Protocol 1 / helper 1.0.2. Windows PowerShell 5.1+.
+# Chisa SSH workspace helper. Protocol 1 / helper 1.0.3. Windows PowerShell 5.1+.
 # One bounded JSON request on stdin and exactly one JSON result on stdout.
 # This is an on-demand SSH process, not an agent/service or a command sandbox.
 $ErrorActionPreference = 'Stop'
@@ -90,15 +90,30 @@ public sealed class ChisaWorkspaceJob : IDisposable {
     public int Pid { get; private set; }
     public string StartTime { get; private set; }
     public sealed class Capture { public string Text; public bool Truncated; }
-    static Capture Drain(IntPtr handle) {
+    // The persisted tail shares the durable job directory so sibling helpers
+    // can serve job_output while this command is still running.
+    static Capture Drain(IntPtr handle, string spillPath) {
         using (var stream = new FileStream(new SafeFileHandle(handle, true), FileAccess.Read))
         using (var bytes = new MemoryStream()) {
+            FileStream spill = null; long spilled = 0; const long SpillLimit = 8L*1024*1024;
             var buffer = new byte[16384]; bool cut = false; int n;
-            while ((n = stream.Read(buffer, 0, buffer.Length)) > 0) { int keep = Math.Min(n, 1024*1024-(int)bytes.Length); if (keep > 0) bytes.Write(buffer,0,keep); if (keep < n) cut = true; }
+            try {
+                while ((n = stream.Read(buffer, 0, buffer.Length)) > 0) {
+                    if (spillPath != null && spilled < SpillLimit) {
+                        try {
+                            if (spill == null) spill = new FileStream(spillPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+                            int share = (int)Math.Min(n, SpillLimit - spilled);
+                            spill.Write(buffer, 0, share); spill.Flush(); spilled += share;
+                            if (share < n) { try { File.WriteAllText(spillPath + ".truncated", "1"); } catch {} }
+                        } catch {}
+                    }
+                    int keep = Math.Min(n, 1024*1024-(int)bytes.Length); if (keep > 0) bytes.Write(buffer,0,keep); if (keep < n) cut = true;
+                }
+            } finally { if (spill != null) spill.Dispose(); }
             return new Capture { Text = Encoding.UTF8.GetString(bytes.ToArray()), Truncated = cut };
         }
     }
-    public ChisaWorkspaceJob(string name, string executable, string commandLine, string cwd, string environment) {
+    public ChisaWorkspaceJob(string name, string executable, string commandLine, string cwd, string environment, string spillDirectory) {
         job = CreateJobObject(IntPtr.Zero, name);
         int creationError = Marshal.GetLastWin32Error();
         if (job == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(creationError);
@@ -124,7 +139,8 @@ public sealed class ChisaWorkspaceJob : IDisposable {
             if (ResumeThread(pi.thread)==0xffffffff) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
             CloseHandle(outWrite); outWrite=IntPtr.Zero; CloseHandle(errWrite); errWrite=IntPtr.Zero; CloseHandle(inRead); inRead=IntPtr.Zero; CloseHandle(inWrite); inWrite=IntPtr.Zero;
             var r1=outRead; var r2=errRead; outRead=IntPtr.Zero; errRead=IntPtr.Zero;
-            output=Task.Run(()=>Drain(r1)); error=Task.Run(()=>Drain(r2));
+            output=Task.Run(()=>Drain(r1, spillDirectory==null?null:Path.Combine(spillDirectory,"stdout.out")));
+            error=Task.Run(()=>Drain(r2, spillDirectory==null?null:Path.Combine(spillDirectory,"stderr.out")));
         } catch { if (assigned) TerminateJobObject(job,1); else if (pi.process!=IntPtr.Zero) TerminateProcess(pi.process,1); Dispose(); throw; }
         finally {
             if (pi.thread!=IntPtr.Zero) CloseHandle(pi.thread); if (pi.process!=IntPtr.Zero) CloseHandle(pi.process);
@@ -337,6 +353,33 @@ public sealed class ChisaWorkspaceJob : IDisposable {
         } while($true)
         return @{jobId=$Id;state='running';cleanupConfirmed=$false}
     }
+    # Incremental output reads are byte offsets into the persisted spill files;
+    # a job that never wrote one simply reports an empty stream at offset zero.
+    function Job-Output($Request) {
+        $Id=[string]$Request.jobId
+        $stream=[string]$Request.stream
+        if($stream -ne 'stdout' -and $stream -ne 'stderr') { Fail 'SSH_WORKSPACE_REQUEST_INVALID' 'Stream must be stdout or stderr.' }
+        $offset=[int64]0
+        if(Has-Field $Request 'offset') {$offset=[int64]$Request.offset;if($offset -lt 0 -or $offset -gt 1099511627776){Fail 'SSH_WORKSPACE_REQUEST_INVALID' 'Job output offset is out of range.'}}
+        $maxBytes=262144
+        if(Has-Field $Request 'maxBytes') {$maxBytes=[int]$Request.maxBytes;if($maxBytes -lt 1 -or $maxBytes -gt 262144){Fail 'SSH_WORKSPACE_REQUEST_INVALID' 'Job output chunk must be 1 to 256 KiB.'}}
+        $directory=Job-Directory $Id
+        $state=Read-Job $directory
+        $file=[IO.Path]::Combine($directory,($stream+'.out'))
+        $total=[int64]0;$next=$offset;$chunk=''
+        if([IO.File]::Exists($file)) {
+            $fs=$null
+            try {$fs=[IO.File]::Open($file,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))} catch {}
+            if($fs) {
+                try {
+                    $total=$fs.Length;$next=[Math]::Min($offset,$total)
+                    if($next -lt $total) {$fs.Position=$next;$buffer=New-Object byte[] ([int][Math]::Min($maxBytes,$total-$next));$read=$fs.Read($buffer,0,$buffer.Length);$chunk=[Convert]::ToBase64String($buffer,0,$read);$next+=$read}
+                } finally {$fs.Dispose()}
+            }
+        }
+        $terminal=$state -and ($state.cleanupConfirmed -eq $true)
+        return @{jobId=$Id;stream=$stream;offset=$next;total=$total;chunk=$chunk;eof=($terminal -eq $true -and $next -ge $total);state=$(if($state){[string]$state.state}else{'not_found'});truncated=[IO.File]::Exists($file+'.truncated')}
+    }
     function Run-Command($Request) {
         if($Request.readOnly -eq $true) {Fail 'SSH_READ_ONLY_COMMAND_UNSUPPORTED' 'Windows SSH cannot enforce read-only commands.'}
         $directory=Job-Directory ([string]$Request.jobId)
@@ -378,7 +421,7 @@ public sealed class ChisaWorkspaceJob : IDisposable {
             Save-Job $directory $record
             $cancelFile=[IO.Path]::Combine($directory,'cancel')
             if([IO.File]::Exists($cancelFile)) {$record.state='cancelled';$record.cleanupConfirmed=$true;$record.exitCode=130;Save-Job $directory $record;return @{jobId=$record.jobId;state='cancelled';cleanupConfirmed=$true;cancelled=$true;stdout='';stderr='';exitCode=130}}
-            $job=New-Object ChisaWorkspaceJob((Job-Name $record.jobId),$executable,$commandLine,$cwd,$environment)
+            $job=New-Object ChisaWorkspaceJob((Job-Name $record.jobId),$executable,$commandLine,$cwd,$environment,$directory)
             $record.state='running';$record.childPid=$job.Pid;$record.childStartedAt=$job.StartTime;Save-Job $directory $record
             $deadline=[DateTime]::UtcNow.AddSeconds($seconds)
             while(!$job.Exited) {
@@ -407,10 +450,71 @@ public sealed class ChisaWorkspaceJob : IDisposable {
             throw
         } finally {if($job){$job.Dispose()};$claimStream.Dispose()}
     }
+    # Capture startup configuration in one helper lifetime. Directory handles stay
+    # leased until the response is complete; file handles enforce the existing
+    # reparse/hardlink rules and the smaller configuration limit before reading.
+    function Project-Snapshot {
+        $files=New-Object 'System.Collections.Generic.List[object]'
+        $directories=New-Object 'System.Collections.Generic.List[object]'
+        $state=@{bytes=0;entries=0}
+        function Snapshot-Path([string]$Relative) {
+            $cursor=$script:Root
+            $parts=$Relative.Split('/')
+            for($index=0;$index -lt $parts.Length;$index++){
+                Assert-Segment $parts[$index]
+                $cursor=[IO.Path]::Combine($cursor,$parts[$index])
+                if(![IO.File]::Exists($cursor) -and ![IO.Directory]::Exists($cursor)){return $null}
+                if($index -lt $parts.Length-1){$null=Lock-Directory $cursor}
+            }
+            return $cursor
+        }
+        function Snapshot-File([string]$Relative) {
+            $p=Snapshot-Path $Relative
+            if(!$p){$files.Add(@{path=$Relative;missing=$true});return}
+            $before=File-Stats $p
+            if($before.dir){Fail 'PROJECT_RUNTIME_CONFIG_INVALID' 'Project configuration must be an ordinary file.'}
+            if($before.size -gt 256*1024){Fail 'PROJECT_RUNTIME_LIMIT' 'Project configuration exceeds 256 KiB.'}
+            $stream=[ChisaWorkspaceNative]::ReadFile($p)
+            try {
+                if($stream.Length -gt 256*1024 -or $state.bytes+$stream.Length -gt 256*1024){Fail 'PROJECT_RUNTIME_LIMIT' 'Combined project configuration exceeds 256 KiB.'}
+                $hash=Hash-Stream $stream
+                $memory=New-Object IO.MemoryStream
+                try {$stream.CopyTo($memory);$bytes=$memory.ToArray();$state.bytes+=$bytes.Length;$files.Add(@{path=$Relative;stats=$before;b64=[Convert]::ToBase64String($bytes);hash=$hash})}
+                finally {$memory.Dispose()}
+            } finally {$stream.Dispose()}
+            if($files.Count -gt 256){Fail 'PROJECT_RUNTIME_LIMIT' 'Project configuration exceeds 256 files.'}
+        }
+        function Snapshot-Directory([string]$Relative,[bool]$Skills,[int]$Depth) {
+            if($Depth -gt 8 -or $directories.Count -ge 128){Fail 'PROJECT_RUNTIME_LIMIT' 'Project configuration discovery exceeds its directory limit.'}
+            $p=Snapshot-Path $Relative
+            if(!$p){$directories.Add(@{path=$Relative;entries=@()});return}
+            $null=Lock-Directory $p
+            $entries=New-Object 'System.Collections.Generic.List[object]'
+            foreach($entry in [IO.Directory]::EnumerateFileSystemEntries($p)) {
+                if(++$state.entries -gt 512){Fail 'PROJECT_RUNTIME_LIMIT' 'Project configuration discovery exceeds 512 entries.'}
+                $stats=File-Stats $entry
+                $entries.Add(@{name=[IO.Path]::GetFileName($entry);dir=$stats.dir;stats=$stats})
+            }
+            $rows=@($entries.ToArray())
+            $directories.Add(@{path=$Relative;entries=$rows})
+            if($Skills -and @($rows|Where-Object{!$_.dir -and $_.name -ceq 'SKILL.md'}).Count -gt 0){Snapshot-File ($Relative+'/SKILL.md');return}
+            foreach($entry in $rows){
+                $child=$Relative+'/'+$entry.name
+                if($entry.dir){Snapshot-Directory $child $Skills ($Depth+1)}
+                elseif(!$Skills -and $entry.name.EndsWith('.md',[StringComparison]::OrdinalIgnoreCase)){Snapshot-File $child}
+            }
+        }
+        foreach($relative in @('CLAUDE.md','.claude/CLAUDE.md','CLAUDE.local.md','.claude/settings.json','.claude/settings.local.json','.mcp.json')){Snapshot-File $relative}
+        Snapshot-Directory '.claude/rules' $false 0
+        Snapshot-Directory '.claude/skills' $true 0
+        return @{snapshotVersion=1;files=@($files.ToArray());directories=@($directories.ToArray())}
+    }
     function Invoke-Operation($Request) {
         $op=[string]$Request.op
+        if($op -eq 'project_snapshot'){return Project-Snapshot}
         if($op -eq 'probe') { return @{rootPath=$script:Root;rootIdentity=$script:RootIdentity;username=[Security.Principal.WindowsIdentity]::GetCurrent().Name;capabilities=@{files=$true;exec=$true;terminal=$false}} }
         if($op -eq 'job_status' -or $op -eq 'job_cancel') {return Job-Status ([string]$Request.jobId) ($op -eq 'job_cancel')}
+        if($op -eq 'job_output') {return Job-Output $Request}
         if($op -eq 'exec') {return Run-Command $Request}
         if($op -eq 'batch') {
             $rows=@($Request.requests)
@@ -497,7 +601,7 @@ public sealed class ChisaWorkspaceJob : IDisposable {
     if($script:JobBase.StartsWith($script:Root+'\',[StringComparison]::OrdinalIgnoreCase)){Fail 'SSH_HELPER_UNSAFE' 'Workspace task state must be outside the project.'}
     $null=[IO.Directory]::CreateDirectory($script:JobBase)
     $result=Invoke-Operation $envelope.request
-    $result.ok=$true;$result.protocol=1;$result.platform='win32';$result.helperVersion='1.0.2';$result.rootIdentity=$script:RootIdentity
+    $result.ok=$true;$result.protocol=1;$result.platform='win32';$result.helperVersion='1.0.3';$result.rootIdentity=$script:RootIdentity
     [Console]::Out.Write(($result|ConvertTo-Json -Depth 32 -Compress))
 } catch {
     $code='SSH_WORKSPACE_OPERATION_FAILED';$message='Windows workspace operation failed.'

@@ -23,11 +23,14 @@ export function createPluginsRouter(service: ReturnType<typeof createPluginsServ
       try { res.json(await operation(req)); } catch (error) { next(error); }
     };
 
-  router.get('/', respond(() => service.list()));
-  router.get('/:name/manifest', respond((req) => service.getManifest(routeParameter(req.params.name))));
+  const principal = (req: express.Request) => (req as express.Request & { user?: { id?: unknown; userId?: unknown } }).user?.id
+    ?? (req as express.Request & { user?: { userId?: unknown } }).user?.userId;
+  router.get('/', respond((req) => service.list(principal(req))));
+  router.get('/:name/manifest', respond((req) => service.getManifest(routeParameter(req.params.name), principal(req))));
+  router.get('/:name/review', respond((req) => service.review(routeParameter(req.params.name), principal(req))));
   router.get('/:name/assets/*', async (req, res, next) => {
     try {
-      const asset = service.resolveAsset(routeParameter(req.params.name), wildcardPath(req));
+      const asset = service.resolveAsset(routeParameter(req.params.name), wildcardPath(req), principal(req));
       res.setHeader('Content-Type', asset.contentType);
       res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
       const stream = fs.createReadStream(asset.path);
@@ -35,9 +38,9 @@ export function createPluginsRouter(service: ReturnType<typeof createPluginsServ
       stream.pipe(res);
     } catch (error) { next(error); }
   });
-  router.put('/:name/enable', respond((req) => service.setEnabled(routeParameter(req.params.name), req.body?.enabled)));
-  router.post('/install', respond((req) => service.install(req.body?.url)));
-  router.post('/:name/update', respond((req) => service.update(routeParameter(req.params.name))));
+  router.put('/:name/enable', respond((req) => service.setEnabled(routeParameter(req.params.name), req.body?.enabled, principal(req), req.body)));
+  router.post('/install', respond((req) => service.install(req.body, principal(req))));
+  router.post('/:name/update', respond((req) => service.update(routeParameter(req.params.name), principal(req), req.body)));
   router.all('/:name/rpc/*', async (req, res, next) => {
     let scope: Awaited<ReturnType<typeof resolveUsageScope>> | null = null;
     let proxyRequest: http.ClientRequest | null = null;
@@ -57,7 +60,7 @@ export function createPluginsRouter(service: ReturnType<typeof createPluginsServ
     req.once('aborted', disconnect);
     try {
       const name = routeParameter(req.params.name);
-      const { port, secrets } = await service.prepareRpc(name);
+      const { port, secrets } = await service.prepareRpc(name, principal(req));
       if (disconnected || res.destroyed) return;
       scope = name === 'claude-usage' ? await resolveUsageScope((req as express.Request & { user?: { id?: string | number; userId?: string | number } }).user?.id
         ?? (req as express.Request & { user?: { userId?: string | number } }).user?.userId) : null;
@@ -95,6 +98,6 @@ export function createPluginsRouter(service: ReturnType<typeof createPluginsServ
       proxyRequest.end();
     } catch (error) { releaseScope(); if (!disconnected && !res.destroyed) next(error); }
   });
-  router.delete('/:name', respond((req) => service.uninstall(routeParameter(req.params.name))));
+  router.delete('/:name', respond((req) => service.uninstall(routeParameter(req.params.name), principal(req))));
   return router;
 }

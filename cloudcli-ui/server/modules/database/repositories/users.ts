@@ -17,6 +17,8 @@ type UserRow = {
   created_at: string;
   last_login: string | null;
   is_active: number;
+  /** Incremented by the credential/activation trigger so authentication cannot outlive account changes. */
+  auth_version: number;
   git_name: string | null;
   git_email: string | null;
   has_completed_onboarding: number;

@@ -114,7 +114,7 @@ test('default Claude markdown keeps file references connected to the project edi
 
   assert.equal(onOpen.mock.calls.length, 0);
   fireEvent.click(view.getByRole('link', { name: 'source' }));
-  assert.deepEqual(onOpen.mock.calls, [['src/main.ts']]);
+  assert.deepEqual(onOpen.mock.calls, [['src/main.ts', 12]]);
 });
 
 test('private Pi markdown renders file references as text while keeping external links usable', () => {

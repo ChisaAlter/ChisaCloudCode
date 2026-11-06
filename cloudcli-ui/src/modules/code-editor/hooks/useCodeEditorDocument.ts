@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { SetStateAction } from 'react';
 
 import { readApiJson } from '@/shared/api';
@@ -12,31 +12,30 @@ type UseCodeEditorDocumentParams = {
   projectPath?: string;
 };
 
-const getErrorMessage = (error: unknown) => {
-  if (error instanceof Error) {
-    return error.message;
-  }
+const getErrorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 
-  return String(error);
-};
+// CodeMirror normalizes to LF, so loading a CRLF file must not itself mark it dirty.
+const normalizeLineEndings = (text: string) => text.replace(/\r\n?/g, '\n');
 
-/** CodeEditor keeps its document and explicit save requests independent of presentation changes. */
+/** CodeEditor keeps document reads, dirty tracking and explicit saves independent of layout changes. */
 export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocumentParams) => {
   const api = useEditorWorkspaceApi(file);
   const saveFile = useEditorWorkspaceSaveFile(file);
   // The current editor buffer remains editable while its earlier snapshot is saving.
   const [content, setContentState] = useState('');
+  // Compare with the exact snapshot last loaded or saved to guard discarding edits.
+  const [savedContent, setSavedContent] = useState('');
+  // Loading hides the previous document until the current scoped read finishes.
   const [loading, setLoading] = useState(true);
+  // The active explicit save controls the toolbar spinner.
   const [saving, setSaving] = useState(false);
+  // A short-lived tick confirms that the current buffer reached disk.
   const [saveSuccess, setSaveSuccess] = useState(false);
+  // Failed writes leave the editable buffer intact and explain the failure.
   const [saveError, setSaveError] = useState<string | null>(null);
+  // Non-previewable binary files must never be saved as text.
   const [isBinary, setIsBinary] = useState(false);
-  // Some binaries (images, PDFs, audio, video) can be rendered natively, so the
-  // editor shows an inline preview instead of the generic binary placeholder.
   const previewKind = getPreviewKind(file.name);
-  // `fileProjectId` is the DB primary key passed down from the editor sidebar;
-  // the fallback to `projectPath` preserves older callers that didn't yet
-  // propagate the identifier.
   const fileProjectId = file.projectId ?? projectPath;
   const filePath = file.path;
   const fileName = file.name;
@@ -65,56 +64,45 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
     const controller = new AbortController();
     const revision = ++revisionRef.current;
     const current = () => !controller.signal.aborted && revisionRef.current === revision && scopeRef.current === scope;
+    // Every load path resets the buffer and baseline together, including errors.
+    const applyLoadedContent = (text: string) => {
+      setContent(text);
+      setSavedContent(text);
+    };
     readyRef.current = null;
     requestedSave.current = false;
     hashRef.current = undefined;
-    setContent('');
+    applyLoadedContent('');
     setSaving(false);
     setSaveError(null);
     setSaveSuccess(false);
+
     const loadFileContent = async () => {
       try {
         setLoading(true);
         setIsBinary(false);
-
-        // Natively previewable media (image/pdf/audio/video) is rendered by
-        // CodeEditorMediaPreview, so there is nothing to read as text here.
-        // Clear any buffer left over from a previously opened text file so a
-        // stray save can't write stale content over the binary file.
-        if (getPreviewKind(file.name)) {
-          setContent('');
-          setLoading(false);
-          return;
-        }
-
-        // Check if file is binary by extension
-        if (isBinaryFile(file.name)) {
-          setContent('');
+        // Preview media and binaries have no editable text buffer.
+        if (getPreviewKind(fileName)) return;
+        if (isBinaryFile(fileName)) {
           setIsBinary(true);
-          setLoading(false);
           return;
         }
+        if (!fileProjectId) throw new Error('Missing project identifier');
 
-        // Diff payload may already include full old/new snapshots, so avoid disk read.
-
-        if (!fileProjectId) {
-          throw new Error('Missing project identifier');
-        }
-
+        // Even a supplied diff snapshot needs the disk hash for compare-and-save.
         const response = await api.readFile(fileProjectId, filePath, { signal: controller.signal });
         const data = await readApiJson<{ content: string; hash?: string }>(response);
         if (!current()) return;
         const hasDiffSnapshot = fileDiffNewString !== undefined && fileDiffOldString !== undefined;
-        setContent(hasDiffSnapshot ? fileDiffNewString : data.content);
+        applyLoadedContent(hasDiffSnapshot ? fileDiffNewString : data.content);
         if (!hasDiffSnapshot || data.content === fileDiffOldString || data.content === fileDiffNewString) {
           hashRef.current = data.hash;
         }
         readyRef.current = scope;
       } catch (error) {
         if (!current()) return;
-        const message = getErrorMessage(error);
         console.error('Error loading file:', error);
-        setContent(`// Error loading file: ${message}\n// File: ${fileName}\n// Path: ${filePath}`);
+        applyLoadedContent(`// Error loading file: ${getErrorMessage(error)}\n// File: ${fileName}\n// Path: ${filePath}`);
       } finally {
         if (current()) setLoading(false);
       }
@@ -132,41 +120,31 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
   }, [api, fileName, filePath, fileProjectId, fileDiffNewString, fileDiffOldString, scope, setContent]);
 
   const handleSave = useCallback(async () => {
-    // Preview-only and binary files have no editable text buffer; never write
-    // them back (e.g. via Cmd/Ctrl+S) or we'd corrupt the file on disk.
-    if (previewKind || isBinaryFile(fileName) || loading || readyRef.current !== scope || scopeRef.current !== scope) {
-      return;
-    }
+    if (previewKind || isBinaryFile(fileName) || loading || readyRef.current !== scope || scopeRef.current !== scope) return;
     if (saveControllerRef.current) {
-      // A second explicit save requests the newer buffer, not a duplicate of the in-flight write.
+      // A second explicit save requests the newer buffer, not a duplicate write.
       if (contentRef.current !== activeSaveContent.current) requestedSave.current = true;
       return;
     }
-
     const controller = new AbortController();
     saveControllerRef.current = controller;
     const revision = revisionRef.current;
     const current = () => !controller.signal.aborted && revisionRef.current === revision && scopeRef.current === scope;
-
     setSaving(true);
     setSaveError(null);
     setSaveSuccess(false);
-
     try {
-      if (!fileProjectId) {
-        throw new Error('Missing project identifier');
-      }
-
+      if (!fileProjectId) throw new Error('Missing project identifier');
       do {
         requestedSave.current = false;
         const submittedContent = contentRef.current;
         activeSaveContent.current = submittedContent;
         const response = await saveFile(fileProjectId, filePath, submittedContent, hashRef.current, { signal: controller.signal });
-
         const saved = await readApiJson<{ hash?: string }>(response);
         if (!current()) return;
         hashRef.current = saved.hash;
-
+        // Edits made during the write remain dirty against the submitted snapshot.
+        setSavedContent(submittedContent);
         const latestSaved = contentRef.current === submittedContent;
         setSaveSuccess(latestSaved);
         if (successTimerRef.current) clearTimeout(successTimerRef.current);
@@ -176,9 +154,8 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
       } while (requestedSave.current && current() && contentRef.current !== activeSaveContent.current);
     } catch (error) {
       if (!current()) return;
-      const message = getErrorMessage(error);
       console.error('Error saving file:', error);
-      setSaveError(message);
+      setSaveError(getErrorMessage(error));
     } finally {
       if (current()) setSaving(false);
       if (saveControllerRef.current === controller) {
@@ -193,28 +170,23 @@ export const useCodeEditorDocument = ({ file, projectPath }: UseCodeEditorDocume
     const blob = new Blob([content], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
-
     anchor.href = url;
     anchor.download = file.name;
-
     document.body.appendChild(anchor);
     anchor.click();
     document.body.removeChild(anchor);
-
     URL.revokeObjectURL(url);
   }, [content, file.name]);
 
+  const normalizedSavedContent = useMemo(() => normalizeLineEndings(savedContent), [savedContent]);
+  const hasUnsavedChanges = useMemo(
+    () => !loading && !previewKind && !isBinary && content !== savedContent
+      && normalizeLineEndings(content) !== normalizedSavedContent,
+    [content, isBinary, loading, normalizedSavedContent, previewKind, savedContent],
+  );
+
   return {
-    content,
-    setContent,
-    loading,
-    saving,
-    saveSuccess,
-    saveError,
-    isBinary,
-    previewKind,
-    fileProjectId,
-    handleSave,
-    handleDownload,
+    content, setContent, loading, saving, saveSuccess, saveError, isBinary,
+    previewKind, fileProjectId, hasUnsavedChanges, handleSave, handleDownload,
   };
 };

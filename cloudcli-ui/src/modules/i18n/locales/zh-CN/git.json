@@ -7,13 +7,15 @@
     "history": "提交",
     "branches": "分支",
     "worktrees": "工作树",
-    "ariaLabel": "版本控制视图"
+    "ariaLabel": "版本控制视图",
+    "compare": "比较"
   },
   "status": {
     "modified": "已修改",
     "added": "已添加",
     "deleted": "已删除",
-    "untracked": "未跟踪"
+    "untracked": "未跟踪",
+    "renamed": "已重命名"
   },
   "confirm": {
     "cancel": "取消",
@@ -226,5 +228,22 @@
     "explainerTitle": "并行处理多个分支",
     "explainerDescription": "工作树将分支检出到独立文件夹，你可以同时开展不同对话，准备好后再合并结果。",
     "createFirst": "创建第一个工作树"
+  },
+  "compare": {
+    "baseLabel": "比较基准",
+    "localGroup": "本地分支",
+    "remoteGroup": "远程分支",
+    "noBranches": "没有可用的分支",
+    "summary_one": "与 <ref>{{base}}</ref> 相比，{{count}} 个文件发生变更",
+    "summary_other": "与 <ref>{{base}}</ref> 相比，{{count}} 个文件发生变更",
+    "mergeBase": "合并基准 {{sha}}",
+    "mergeBaseTitle": "{{base}} 与 HEAD 的合并基准：{{sha}}",
+    "refresh": "刷新比较结果",
+    "noChanges": "与 {{base}} 没有差异",
+    "noCommonHistory": "「{{base}}」与当前分支没有共同历史，因此无可比较的内容。",
+    "loadError": "无法与「{{base}}」进行比较",
+    "renamedFrom": "重命名自 {{path}}",
+    "renameOnly": "仅重命名，内容未变",
+    "fileLoadError": "无法加载此差异。"
   }
 }

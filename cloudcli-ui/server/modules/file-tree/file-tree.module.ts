@@ -5,8 +5,10 @@ import os from 'node:os';
 import mime from 'mime-types';
 import multer from 'multer';
 
-import { resolveSelectedProjectPath, workspaceSelectionScope } from '@/modules/workspaces/index.js';
+import { currentWorkspaceUserId, resolveSelectedProjectPath, workspaceSelectionScope } from '@/modules/workspaces/index.js';
 import { bridgeFileSystem } from '@/modules/workspace-bridge/index.js';
+import { userDb } from '@/modules/database/index.js';
+import { assertCloudWorkspaceOwner } from '@/modules/workspace-runtime/index.js';
 import { createFileTreeRouter } from '@/modules/file-tree/file-tree.routes.js';
 import { createFileTreeService } from '@/modules/file-tree/file-tree.service.js';
 import type {
@@ -15,7 +17,7 @@ import type {
   FileTreeProjectGateway,
   FileTreeWorkspaceGateway,
 } from '@/shared/types.js';
-import { WORKSPACES_ROOT, validateWorkspacePath } from '@/shared/utils.js';
+import { WORKSPACES_ROOT, resolveReadOnlyRootPath, validateWorkspacePath } from '@/shared/utils.js';
 
 const MAXIMUM_UPLOAD_SIZE_MEGABYTES = 200;
 const MAXIMUM_UPLOAD_SIZE_BYTES = MAXIMUM_UPLOAD_SIZE_MEGABYTES * 1024 * 1024;
@@ -73,7 +75,27 @@ const fileTreeProjects: FileTreeProjectGateway = {
  */
 const fileTreeWorkspace: FileTreeWorkspaceGateway = {
   rootPath: WORKSPACES_ROOT,
-  validatePath: (candidatePath) => validateWorkspacePath(candidatePath),
+  validatePath: async (candidatePath) => {
+    const userId = currentWorkspaceUserId();
+    assertCloudWorkspaceOwner(candidatePath, userId, userId === null ? undefined : userDb.getActiveUserIds());
+    const validation = await validateWorkspacePath(candidatePath);
+    if (validation.valid && validation.resolvedPath) {
+      assertCloudWorkspaceOwner(validation.resolvedPath, userId, userId === null ? undefined : userDb.getActiveUserIds());
+    }
+    return validation;
+  },
+  resolveReadOnlyRootPath: async (candidatePath) => {
+    const userId = currentWorkspaceUserId();
+    const accounts = userId === null ? undefined : userDb.getActiveUserIds();
+    // Global temp/history roots are usable only when account ownership is
+    // established; a second account must never gain the server user's files.
+    const resolvedPath = await resolveReadOnlyRootPath(candidatePath);
+    if (resolvedPath) {
+      assertCloudWorkspaceOwner(candidatePath, userId, accounts);
+      assertCloudWorkspaceOwner(resolvedPath, userId, accounts);
+    }
+    return resolvedPath;
+  },
 };
 
 const fileTreeLogger: FileTreeLogger = {

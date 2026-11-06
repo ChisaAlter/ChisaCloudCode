@@ -1,9 +1,10 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { ReactNode } from 'react';
 
-import { api } from '@/shared/api';
+import { api, readApiErrorMessage } from '@/shared/api';
 import type { Plugin } from '@/shared/types';
 import { useAuth } from '@/modules/auth';
+import { getAuthSessionSnapshot, isCurrentAuthSession, subscribeToAuthSession } from '@/modules/auth-session';
 
 
 type PluginsContextValue = {
@@ -11,24 +12,10 @@ type PluginsContextValue = {
   loading: boolean;
   pluginsError: string | null;
   refreshPlugins: () => Promise<void>;
-  togglePlugin: (name: string, enabled: boolean) => Promise<{ success: boolean; error: string | null }>;
+  togglePlugin: (name: string, enabled: boolean, approval?: Parameters<typeof api.plugins.toggle>[2]) => Promise<{ success: boolean; error: string | null }>;
 };
 
 const PluginsContext = createContext<PluginsContextValue | null>(null);
-
-// The server returns both legacy text errors and { error: { message, code } }.
-// Only text may enter plugin error state, which is rendered directly by React.
-function pluginErrorMessage(data: unknown, fallback: string): string {
-  if (!data || typeof data !== 'object') return fallback;
-  const payload = data as Record<string, unknown>;
-  if (typeof payload.details === 'string' && payload.details) return payload.details;
-  if (typeof payload.error === 'string' && payload.error) return payload.error;
-  if (payload.error && typeof payload.error === 'object') {
-    const error = payload.error as Record<string, unknown>;
-    if (typeof error.message === 'string' && error.message) return error.message;
-  }
-  return fallback;
-}
 
 export function usePlugins() {
   const context = useContext(PluginsContext);
@@ -41,6 +28,7 @@ export function usePlugins() {
 /** App root supplies plugin switches to settings, workspace tabs and the account popup. */
 export function PluginsProvider({ children }: { children: ReactNode }) {
   const { user, isLoading: authLoading } = useAuth();
+  const session = useSyncExternalStore(subscribeToAuthSession, getAuthSessionSnapshot, getAuthSessionSnapshot);
   // Keep the authenticated server's plugin catalog available to workspace consumers.
   const [plugins, setPlugins] = useState<Plugin[]>([]);
   // The catalog waits for login before the first protected request.
@@ -48,15 +36,19 @@ export function PluginsProvider({ children }: { children: ReactNode }) {
   // API diagnostics remain renderable text so a failed refresh preserves settings.
   const [pluginsError, setPluginsError] = useState<string | null>(null);
   const catalogGenerationRef = useRef(0);
+  // Rendering exposes catalog data only to the exact identity that requested it, including same-user relogin.
+  const [catalogOwner, setCatalogOwner] = useState('');
+  const catalogOwnerKey = JSON.stringify([session.serverKey, session.sessionInstanceId, user?.id, user?.username]);
   const catalogRequestRef = useRef(0);
 
   const refreshPlugins = useCallback(async () => {
+    const captured = getAuthSessionSnapshot();
     const generation = catalogGenerationRef.current;
     const request = ++catalogRequestRef.current;
-    const current = () => generation === catalogGenerationRef.current && request === catalogRequestRef.current;
+    const current = () => isCurrentAuthSession(captured) && generation === catalogGenerationRef.current && request === catalogRequestRef.current;
     setLoading(true);
     try {
-      const res = await api.plugins.list();
+      const res = await api.plugins.list({ expectedSession: captured });
       if (!current()) return;
       if (res.ok) {
         const data = await res.json();
@@ -67,7 +59,7 @@ export function PluginsProvider({ children }: { children: ReactNode }) {
         let errorMessage = `Failed to fetch plugins (${res.status})`;
         try {
           const data = await res.json();
-          errorMessage = pluginErrorMessage(data, errorMessage);
+          errorMessage = readApiErrorMessage(data) ?? errorMessage;
         } catch {
           errorMessage = res.statusText || errorMessage;
         }
@@ -83,31 +75,33 @@ export function PluginsProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const hasUser = Boolean(user);
   useEffect(() => {
-    catalogGenerationRef.current++;
+    const generation = ++catalogGenerationRef.current;
+    const capturedSession = getAuthSessionSnapshot();
+    setCatalogOwner(catalogOwnerKey);
     // A different account must never inherit another account's catalog or quota view.
     setPlugins([]);
     setPluginsError(null);
-    if (authLoading) return;
-    if (!user) {
-      setPlugins([]);
-      setPluginsError(null);
-      setLoading(false);
-      return;
+    if (!authLoading) {
+      if (!hasUser || capturedSession.phase !== 'ready') setLoading(false);
+      else { setLoading(true); void refreshPlugins(); }
     }
-    setLoading(true);
-    void refreshPlugins();
-    return () => { catalogGenerationRef.current++; };
-  }, [user?.id, user?.username, authLoading, refreshPlugins]);
+    const invalidate = () => { if (catalogGenerationRef.current === generation) catalogGenerationRef.current = generation + 1; };
+    return invalidate;
+  }, [user?.id, user?.username, hasUser, authLoading, refreshPlugins, session.sessionInstanceId, session.serverKey, session.phase, catalogOwnerKey]);
 
-  const togglePlugin = useCallback(async (name: string, enabled: boolean): Promise<{ success: boolean; error: string | null }> => {
+  const togglePlugin = useCallback(async (name: string, enabled: boolean, approval?: Parameters<typeof api.plugins.toggle>[2]): Promise<{ success: boolean; error: string | null }> => {
+    const captured = session;
     try {
-      const res = await api.plugins.toggle(name, enabled);
+      if (!isCurrentAuthSession(captured) || captured.phase !== 'ready') throw new DOMException('Plugin account session changed', 'AbortError');
+      const res = await api.plugins.toggle(name, enabled, approval, { expectedSession: captured });
+      if (!isCurrentAuthSession(captured)) throw new DOMException('Plugin account session changed', 'AbortError');
       if (!res.ok) {
         let errorMessage = `Toggle failed (${res.status})`;
         try {
           const data = await res.json();
-          errorMessage = pluginErrorMessage(data, errorMessage);
+          errorMessage = readApiErrorMessage(data) ?? errorMessage;
         } catch {
           // response body wasn't JSON, use status text
           errorMessage = res.statusText || errorMessage;
@@ -119,13 +113,14 @@ export function PluginsProvider({ children }: { children: ReactNode }) {
     } catch (err) {
       return { success: false, error: err instanceof Error ? err.message : 'Toggle failed' };
     }
-  }, [refreshPlugins]);
+  }, [refreshPlugins, session]);
 
   // Built once per change: an inline object would re-render every consumer on
   // any render of this provider.
   const value = useMemo(
-    () => ({ plugins, loading, pluginsError, refreshPlugins, togglePlugin }),
-    [loading, plugins, pluginsError, refreshPlugins, togglePlugin],
+    () => ({ plugins: session.phase === 'ready' && catalogOwner === catalogOwnerKey ? plugins : [], loading,
+      pluginsError: catalogOwner === catalogOwnerKey ? pluginsError : null, refreshPlugins, togglePlugin }),
+    [loading, plugins, catalogOwner, catalogOwnerKey, session.phase, pluginsError, refreshPlugins, togglePlugin],
   );
 
   return (

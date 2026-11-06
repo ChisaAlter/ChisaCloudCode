@@ -80,8 +80,21 @@ func TestCloudOnlyLegacyRPCsNeverReadOrMutateLocalState(t *testing.T) {
 
 func TestCloudOnlyAuthRestoreAndServerSwitchIgnoreLegacyMappings(t *testing.T) {
 	requests := []string{}
+	expectedToken := ""
 	connection := accountWorkspaceFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		requests = append(requests, r.URL.Path)
+		wantMethod, wantAuthorization := http.MethodGet, ""
+		if r.URL.Path == "/api/auth/login" {
+			wantMethod = http.MethodPost
+		}
+		if r.URL.Path == "/instances/cloud/api/auth/user" {
+			wantAuthorization = "Bearer " + expectedToken
+		}
+		if r.Method != wantMethod || r.Header.Get("Authorization") != wantAuthorization || r.URL.RawQuery != "" {
+			t.Error("cloud authentication changed the captured method or bearer")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/auth/status":
@@ -96,6 +109,8 @@ func TestCloudOnlyAuthRestoreAndServerSwitchIgnoreLegacyMappings(t *testing.T) {
 			w.WriteHeader(500)
 		}
 	})
+	// Initial login must enter through an unauthenticated native incarnation.
+	connection.authenticated, connection.accountIdentity, connection.accessToken = false, "", ""
 	mapping := &Mapping{LocalPath: filepath.Join(t.TempDir(), "missing-project"), ServerPath: "/old/account/project", BindingEpoch: strings.Repeat("a", 32), ServerID: "foreign-account", SyncName: "old-session"}
 	store.Mappings = []*Mapping{mapping}
 	store.Cfg.ServerURL, store.Cfg.SSHHost, store.Cfg.KeyPath = "https://old.invalid", "old.invalid", "missing-key"
@@ -105,41 +120,64 @@ func TestCloudOnlyAuthRestoreAndServerSwitchIgnoreLegacyMappings(t *testing.T) {
 	}
 	before := *mapping
 	bridge := FrontendBridge{}
-	result := bridge.ServerRequest(bridge.BeginServerRequest(), "POST", "/api/auth/login", nil, "")
-	if result.Status != 200 || !apiConnection.authenticated || !strings.HasSuffix(apiConnection.baseURL, "/instances/cloud") {
-		t.Fatalf("legacy record blocked login: %+v", result)
+	result := bridge.ServerRequest(reserveTestRequest(t, "login"), "POST", "/api/auth/login", nil, "")
+	if result.Status != http.StatusOK || result.SessionTransition == nil || !apiConnection.authenticated || !strings.HasSuffix(apiConnection.baseURL, "/instances/cloud") {
+		t.Fatal("legacy record blocked native login")
 	}
 	if !reflect.DeepEqual(*store.Mappings[0], before) {
 		t.Fatal("login rewrote legacy mapping")
 	}
+	expectedToken = apiConnection.accessToken
 	version := apiConnection.version
-	result = bridge.ServerRequest(bridge.BeginServerRequest(), "GET", "/api/auth/user", map[string]string{"Authorization": "Bearer cloud-token"}, "")
-	if result.Status != 200 || apiConnection.version != version {
-		t.Fatal("restored same account lost its connection")
+	result = bridge.ServerRequest(reserveTestRequest(t, "api"), "GET", "/api/auth/user", map[string]string{"Authorization": "Bearer " + expectedToken}, "")
+	if result.Status != http.StatusOK || result.SessionTransition != nil || apiConnection.version != version {
+		t.Fatal("same-account profile read lost its native connection")
+	}
+	// A restart exposes only a bound restoration candidate until verified.
+	apiConnection.cancel()
+	apiConnection.client.CloseIdleConnections()
+	if err := initializeServerConnection(); err != nil {
+		t.Fatal(err)
+	}
+	if apiConnection.authenticated || apiConnection.restorationToken != expectedToken {
+		t.Fatal("restart lost the bound restoration candidate")
+	}
+	restorationHandle := apiConnection.sessionHandle
+	result = bridge.ServerRequest(reserveTestRequest(t, "restore"), "GET", "/api/auth/user", nil, "")
+	if result.Status != http.StatusOK || result.SessionTransition == nil || !apiConnection.authenticated || apiConnection.accessToken != expectedToken || apiConnection.sessionHandle == restorationHandle {
+		t.Fatal("legacy record blocked native restoration")
 	}
 	state := bridge.GetState()
 	if state["tunnel"] != false || state["workspaceConnecting"] != false || len(state["mappings"].([]*Mapping)) != 0 || len(state["inactiveMappings"].([]*Mapping)) != 1 {
 		t.Fatal(state)
 	}
-	if len(requests) != 2 {
+	if len(requests) != 3 {
 		t.Fatalf("authentication initiated local sync: %v", requests)
 	}
 	// A completely different service can be selected without handback or SSH.
-	replacement := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `{"isAuthenticated":false}`) }))
+	authenticated := apiConnection
+	replacement := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/auth/status" || r.Header.Get("Authorization") != "" || r.URL.RawQuery != "" {
+			t.Error("server switch forwarded account credentials or contacted a retired route")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fmt.Fprint(w, `{"isAuthenticated":false}`)
+	}))
 	defer replacement.Close()
 	if switched := bridge.ConnectServer(replacement.URL); switched["ok"] != true || switched["changed"] != true {
 		t.Fatal(switched)
 	}
-	if !reflect.DeepEqual(*store.Mappings[0], before) || connection.ctx.Err() == nil {
+	if !reflect.DeepEqual(*store.Mappings[0], before) || authenticated.ctx.Err() == nil || apiConnection.authenticated {
 		t.Fatal("server switch changed history or left the prior account alive")
 	}
 }
 
 func TestCloudOnlyBothAPIPathsRejectEnrollmentWithoutForwarding(t *testing.T) {
-	accountWorkspaceFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("retired enrollment reached upstream") })
+	connection := accountWorkspaceFixture(t, func(http.ResponseWriter, *http.Request) { t.Error("retired enrollment reached upstream") })
 	bridge := FrontendBridge{}
-	for _, endpoint := range []string{"/api/workspace-sync/enroll", "/api/workspace-sync/worker", "/api/a/../workspace-sync/enroll", "/api/workspace-sync"} {
-		response := bridge.ServerRequest(bridge.BeginServerRequest(), "POST", endpoint, nil, "")
+	for _, endpoint := range []string{"/api/workspace-sync/enroll", "/api/workspace-sync/worker", "/api/workspace-sync"} {
+		response := bridge.ServerRequest(reserveTestRequest(t, "api"), "POST", endpoint, nil, "")
 		if response.Status != http.StatusGone {
 			t.Fatalf("retired native API escaped: %s %+v", endpoint, response)
 		}
@@ -148,16 +186,27 @@ func TestCloudOnlyBothAPIPathsRejectEnrollmentWithoutForwarding(t *testing.T) {
 			t.Fatal(string(payload))
 		}
 	}
+	// Ambiguous paths are rejected before route classification or forwarding.
+	dotted := "/api/a/../workspace-sync/enroll"
+	if response := bridge.ServerRequest(reserveTestRequest(t, "api"), "POST", dotted, nil, ""); response.Status != http.StatusBadRequest {
+		t.Fatalf("dotted native API was not rejected before routing: %d", response.Status)
+	}
 	if err := StartAPIProxy(); err != nil {
 		t.Fatal(err)
 	}
-	for _, endpoint := range []string{"/api/workspace-sync/enroll", "/api/workspace-sync/worker"} {
-		response, err := http.Post(fmt.Sprintf("http://127.0.0.1:%d/channel/%s%s", apiProxyPort, apiProxyKey, endpoint), "application/json", nil)
+	for _, endpoint := range []string{"/api/workspace-sync/enroll", "/api/workspace-sync/worker", "/api/workspace-sync", dotted} {
+		response, err := http.Post(fmt.Sprintf("http://127.0.0.1:%d/channel/%s%s", apiProxyPort, connection.proxyCapability, endpoint), "application/json", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		raw, _ := io.ReadAll(response.Body)
 		response.Body.Close()
+		if endpoint == dotted {
+			if response.StatusCode != http.StatusForbidden || !strings.Contains(string(raw), "INVALID_REQUEST_PURPOSE") {
+				t.Fatal("dotted proxy API escaped its path gate", response.StatusCode)
+			}
+			continue
+		}
 		if response.StatusCode != http.StatusGone || !strings.Contains(string(raw), cloudOnlyCode) {
 			t.Fatal(response.StatusCode, string(raw))
 		}

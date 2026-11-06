@@ -7,7 +7,7 @@ import { executeSshWorkspace, probeSshWorkspace } from '@/modules/ssh-workspaces
 import { AppError, WORKSPACES_ROOT } from '@/shared/index.js';
 import type { SshProjectTarget, SshWorkspaceRpcResult, WorkspaceDescriptor, WorkspaceResolution } from '@/shared/index.js';
 
-type SshRunScope = { target: SshProjectTarget; runId: string; readOnly: boolean; uncertain: boolean; pendingJobId?: string; operations: Set<Promise<unknown>>; active: boolean; mutationActive?: boolean; gitInspection?: boolean };
+type SshRunScope = { target: SshProjectTarget; runId: string; readOnly: boolean; durable: boolean; uncertain: boolean; pendingJobId?: string; operations: Set<Promise<unknown>>; active: boolean; mutationActive?: boolean; gitInspection?: boolean };
 type SshAdmissionTicket = { start(): void; fail(error: unknown): void };
 type SshInspectionLane = { target: SshProjectTarget; inspecting: boolean; foregroundActive?: boolean; reads: SshAdmissionTicket[]; foreground?: SshAdmissionTicket };
 const runs = new AsyncLocalStorage<SshRunScope>();
@@ -15,7 +15,32 @@ const activeRuns = new Map<string, SshRunScope>();
 const inspectionLanes = new Map<string, SshInspectionLane>();
 const ADMISSION_WAIT_MS = 120_000;
 const MAX_QUEUED_INSPECTIONS = 32;
+const RECOVERY_TIMEOUT_MS = 10_000;
 const connectionStates = new Map<string, 'online' | 'offline'>();
+// Status polling, foreground admission and manual recovery may observe the same
+// lost response together. Share only the exact original receipt and action.
+const recoveries = new Map<string, Promise<{ status: 'idle' | 'running'; jobId?: string; inspectChanges?: boolean }>>();
+// Status reads, foreground admission and manual recovery may all observe the
+// same interrupted run; the throttle keeps server-side reconciliation cheap.
+const reconcileAt = new Map<string, number>();
+const probeAt = new Map<string, number>();
+const RECONCILE_INTERVAL_MS = 5_000;
+
+function scheduleRecovery(target: SshProjectTarget): void {
+  const now = Date.now();
+  if (now - (reconcileAt.get(target.projectId) ?? 0) < RECONCILE_INTERVAL_MS) return;
+  reconcileAt.set(target.projectId, now);
+  // Read-only reconciliation: never cancels, never throws into a status read.
+  void recoverSshWorkspace(target).catch(() => {});
+}
+
+/** Learn the real connection state after a restart instead of blocking on "unknown". */
+function scheduleProbe(target: SshProjectTarget): void {
+  const now = Date.now();
+  if (now - (probeAt.get(target.projectId) ?? 0) < RECONCILE_INTERVAL_MS) return;
+  probeAt.set(target.projectId, now);
+  void verifySshProject(target).catch(() => {});
+}
 
 function reservedPath(candidate: string): boolean {
   const boundary = path.resolve(WORKSPACES_ROOT, '.chisa-ssh-projects');
@@ -52,11 +77,22 @@ export function assertSshProjectOwner(target: SshProjectTarget, userId: string |
 export function describeSshWorkspace(target: SshProjectTarget, sessionId?: string): WorkspaceResolution {
   target = fresh(target);
   const phase = target.phase;
+  const needsRecovery = phase === 'recovery' || (phase === 'running' && !activeRuns.has(target.projectId));
+  // Reconcile from the server as well, so a fence clears even when no client is
+  // polling and without waiting for the user to click "stop original task".
+  // Throttled, deduped, and cancel-free: a genuinely running task stays fenced.
+  if (needsRecovery && !activeRuns.has(target.projectId)) scheduleRecovery(target);
+  const known = connectionStates.get(target.projectId);
+  // Reachability is learned, not assumed. A fresh process has no observation
+  // yet, and reporting "unknown" as offline used to block every send after a
+  // restart until a human clicked refresh. Probe in the background, stay
+  // optimistic, and let a real failure flip the state.
+  if (!needsRecovery && !known) scheduleProbe(target);
   const descriptor: WorkspaceDescriptor = {
     workspaceId: target.workspaceId, projectId: target.projectId, kind: 'cloudReplica', generation: target.generation,
     rootPath: target.anchorPath, sourceRoot: target.anchorPath, sourceMode: 'ssh', displayPath: target.rootPath,
-    connectionState: phase === 'recovery' || (phase === 'running' && !activeRuns.has(target.projectId)) ? 'recovery' : connectionStates.get(target.projectId) ?? 'offline',
-    requestedMode: 'shared', effectiveMode: 'shared', phase: phase === 'running' && !activeRuns.has(target.projectId) ? 'recovery' : phase, publicationState: 'integrated',
+    connectionState: needsRecovery ? 'recovery' : known ?? 'online',
+    requestedMode: 'shared', effectiveMode: 'shared', phase: needsRecovery ? 'recovery' : phase, publicationState: 'integrated',
     capabilities: { read: true, write: phase === 'idle', git: true, shell: true, preview: false, integrate: false, cloudExecutionIndependentOfDesktop: false },
   };
   if (!sessionId) return { cloudReplica: descriptor, session: null };
@@ -92,7 +128,7 @@ function uncertain(error: unknown): boolean {
 }
 
 function writeOperation(request: Record<string, unknown>): boolean {
-  return !['stat', 'lstat', 'list', 'batch', 'realpath', 'read', 'search', 'grep', 'job_status', 'operation_status'].includes(String(request.op));
+  return !['project_snapshot', 'stat', 'lstat', 'list', 'batch', 'realpath', 'read', 'search', 'grep', 'job_status', 'job_output', 'operation_status'].includes(String(request.op));
 }
 
 function busy(): AppError {
@@ -186,8 +222,14 @@ async function withWriter<T>(target: SshProjectTarget, operation: () => Promise<
     return operation();
   }
   const runId = randomUUID();
-  sshProjectTargetsDb.beginRun(target.projectId, runId);
-  const scope: SshRunScope = { target, runId, readOnly, gitInspection, uncertain: false, operations: new Set(), active: true };
+  // A read-only inspection cannot corrupt the Windows tree, so it must never
+  // own a durable writer row. Persisting one here made every background Git
+  // poll publish `phase='running'`, and any lost response from that poll left
+  // the whole workspace in an unnecessary recovery lock. Inspections stay
+  // serialized by the in-process lane instead.
+  const durable = !gitInspection;
+  if (durable) sshProjectTargetsDb.beginRun(target.projectId, runId);
+  const scope: SshRunScope = { target, runId, readOnly, durable, gitInspection, uncertain: false, operations: new Set(), active: true };
   activeRuns.set(target.projectId, scope);
   try { return await runs.run(scope, operation); }
   catch (error) { if (uncertain(error)) { scope.uncertain = true; scope.pendingJobId = failureJob(error); } throw error; }
@@ -195,7 +237,7 @@ async function withWriter<T>(target: SshProjectTarget, operation: () => Promise<
     scope.active = false;
     await Promise.allSettled([...scope.operations]);
     if (activeRuns.get(target.projectId) === scope) activeRuns.delete(target.projectId);
-    try { sshProjectTargetsDb.finishRun(target.projectId, runId, { uncertain: scope.uncertain, pendingJobId: scope.pendingJobId }); }
+    try { if (durable) sshProjectTargetsDb.finishRun(target.projectId, runId, { uncertain: scope.uncertain, pendingJobId: scope.pendingJobId }); }
     finally { if (!gitInspection) resumeInspections(target); }
   }
 }
@@ -204,6 +246,7 @@ async function withWriter<T>(target: SshProjectTarget, operation: () => Promise<
 export async function withSshWorkspaceWrite<T>(target: SshProjectTarget, operation: () => Promise<T>, readOnly = false, signal?: AbortSignal): Promise<T> {
   signal?.throwIfAborted();
   if (runs.getStore()?.target.projectId === target.projectId) return withWriter(target, operation, readOnly);
+  if (fresh(target).phase !== 'idle' && !activeRuns.has(target.projectId)) await confirmInterruptedRun(target);
   return afterInspection(target, () => withWriter(target, operation, readOnly), signal);
 }
 
@@ -211,6 +254,7 @@ export async function withSshWorkspaceWrite<T>(target: SshProjectTarget, operati
 export async function withSshWorkspaceGitRead<T>(target: SshProjectTarget, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
   signal?.throwIfAborted();
   target = fresh(target);
+  if (target.phase !== 'idle' && !activeRuns.has(target.projectId)) await confirmInterruptedRun(target);
   const run = async () => {
     signal?.throwIfAborted();
     const current = fresh(target);
@@ -264,7 +308,7 @@ function createAdmission(target: SshProjectTarget, readOnly: boolean) {
   target = fresh(target);
   const runId = randomUUID();
   sshProjectTargetsDb.beginRun(target.projectId, runId);
-  const scope: SshRunScope = { target, runId, readOnly, uncertain: false, operations: new Set(), active: true };
+  const scope: SshRunScope = { target, runId, readOnly, durable: true, uncertain: false, operations: new Set(), active: true };
   activeRuns.set(target.projectId, scope);
   let closePromise: Promise<void> | undefined;
   return {
@@ -290,15 +334,23 @@ function createAdmission(target: SshProjectTarget, readOnly: boolean) {
 
 /** Claude admission waits only for a classified inspection, then retains its writer through SDK/process teardown. */
 export async function admitSshWorkspace(target: SshProjectTarget, readOnly: boolean, signal?: AbortSignal) {
+  signal?.throwIfAborted();
+  if (fresh(target).phase !== 'idle' && !activeRuns.has(target.projectId)) await confirmInterruptedRun(target);
   return afterInspection(target, () => createAdmission(target, readOnly), signal);
 }
 
 /** All bridge RPC adapters use this transport; SSH failures are errors and can never select the host/cloud fallback. */
-export async function runSshWorkspaceOperation(target: SshProjectTarget, request: Record<string, unknown>, signal?: AbortSignal): Promise<SshWorkspaceRpcResult> {
+export async function runSshWorkspaceOperation(
+  target: SshProjectTarget,
+  request: Record<string, unknown>,
+  signal?: AbortSignal,
+  options?: { onJobCreated?: (jobId: string) => void },
+): Promise<SshWorkspaceRpcResult> {
   target = fresh(target);
   const scoped = runs.getStore();
   if (scoped) {
-    if (!scoped.active || scoped.target.projectId !== target.projectId || scoped.target.generation !== target.generation || target.activeRunId !== scoped.runId) {
+    if (!scoped.active || scoped.target.projectId !== target.projectId || scoped.target.generation !== target.generation
+      || (scoped.durable && target.activeRunId !== scoped.runId)) {
       throw new AppError('SSH 任务已结束或不再拥有项目。', { code: 'WORKSPACE_BUSY', statusCode: 409 });
     }
     if (scoped.uncertain) throw new AppError('远端任务尚未确认结束，不能开始新操作。', { code: 'SSH_WORKSPACE_RECOVERY_REQUIRED', statusCode: 409 });
@@ -307,20 +359,24 @@ export async function runSshWorkspaceOperation(target: SshProjectTarget, request
     throw new AppError('SSH 计划会话仅允许读取文件，不能执行命令或写入。', { code: 'WORKSPACE_READ_ONLY', statusCode: 409 });
   }
   if (writeOperation(request) && scoped?.target.projectId !== target.projectId) {
-    return withSshWorkspaceWrite(target, () => runSshWorkspaceOperation(target, request, signal), false, signal);
+    return withSshWorkspaceWrite(target, () => runSshWorkspaceOperation(target, request, signal, options), false, signal);
   }
-  if (target.phase === 'recovery' && !['job_status', 'job_cancel', 'operation_status', 'operation_cancel'].includes(String(request.op))) {
+  if (target.phase === 'recovery' && !['job_status', 'job_cancel', 'job_output', 'operation_status', 'operation_cancel'].includes(String(request.op))) {
     throw new AppError('SSH 项目有未确认的任务，请先恢复。', { code: 'SSH_WORKSPACE_RECOVERY_REQUIRED', statusCode: 409 });
   }
   const mutation = writeOperation(request);
   if (mutation && scoped?.mutationActive) throw new AppError('当前 SSH 写入命令仍在执行，请等待它结束。', { code: 'WORKSPACE_BUSY', statusCode: 409 });
   if (mutation && scoped) scoped.mutationActive = true;
+  // Non-durable inspections keep their receipts in memory only: there is no
+  // writer row to update, and a Git read must never create a recovery fence.
+  const persistJob = (jobId: string | null) => { if (scoped?.durable) sshProjectTargetsDb.setPendingJob(target.projectId, scoped.runId, jobId); };
   const operation = executeSshWorkspace({ connectionId: target.connectionId, rootPath: target.rootPath, userId: target.ownerId,
     generation: target.generation, expectedRootIdentity: target.rootIdentity, request, signal,
     onJobCreated: jobId => {
       if (!scoped || !scoped.active || scoped.target.projectId !== target.projectId) throw new AppError('操作缺少有效的 SSH 任务身份。', { code: 'WORKSPACE_BUSY', statusCode: 409 });
-      sshProjectTargetsDb.setPendingJob(target.projectId, scoped.runId, jobId);
+      persistJob(jobId);
       scoped.pendingJobId = jobId;
+      options?.onJobCreated?.(jobId);
     },
   });
   scoped?.operations.add(operation);
@@ -328,7 +384,7 @@ export async function runSshWorkspaceOperation(target: SshProjectTarget, request
     const result = await operation;
     if (scoped?.pendingJobId && (request.op === 'exec' ? result.cleanupConfirmed === true
       : ['write', 'mkdir', 'rename', 'copy', 'remove'].includes(String(request.op)) && scoped.pendingJobId.startsWith('operation:'))) {
-      sshProjectTargetsDb.setPendingJob(target.projectId, scoped.runId, null);
+      persistJob(null);
       scoped.pendingJobId = undefined;
     }
     connectionStates.set(target.projectId, 'online');
@@ -340,8 +396,9 @@ export async function runSshWorkspaceOperation(target: SshProjectTarget, request
     if (scoped && uncertain(error)) { scoped.uncertain = true; scoped.pendingJobId = failureJob(error) ?? scoped.pendingJobId; }
     else if (scoped?.pendingJobId && (request.op === 'exec'
       ? (error as { details?: { cleanupConfirmed?: boolean } }).details?.cleanupConfirmed === true
-      : scoped.pendingJobId.startsWith('operation:') && (confirmed || (error as { details?: { requestDispatched?: boolean } }).details?.requestDispatched === false))) {
-      sshProjectTargetsDb.setPendingJob(target.projectId, scoped.runId, null);
+      : scoped.pendingJobId.startsWith('operation:') && (confirmed || (error as { details?: { cleanupConfirmed?: boolean } }).details?.cleanupConfirmed === true
+          || (error as { details?: { requestDispatched?: boolean } }).details?.requestDispatched === false))) {
+      persistJob(null);
       scoped.pendingJobId = undefined;
     }
     if (error instanceof AppError) throw error;
@@ -356,34 +413,99 @@ export async function runSshWorkspaceOperation(target: SshProjectTarget, request
   }
 }
 
-/** The Windows command console uses the same target and writer lifecycle as CC, without launching a local coding-agent CLI. */
-export async function runSshWorkspaceCommand(descriptor: WorkspaceDescriptor, command: string, signal?: AbortSignal) {
-  const target = resolveSshProjectTarget(descriptor.sourceRoot);
-  if (!target || descriptor.sourceMode !== 'ssh' || descriptor.generation !== target.generation || descriptor.projectId !== target.projectId) throw new AppError('SSH 工作区身份不匹配。', { code: 'WORKSPACE_GENERATION_CHANGED', statusCode: 409 });
-  return runSshWorkspaceOperation(target, { op: 'exec', path: '/workspace', command, timeoutSeconds: 600 }, signal);
+/** Resolves the active command job ID for incremental output streaming when a frontend caller only knows the project target. */
+export function getActiveSshWorkspaceJobId(target: SshProjectTarget): string | null {
+  const current = fresh(target);
+  const candidate = activeRuns.get(current.projectId)?.pendingJobId ?? current.pendingJobId ?? null;
+  return candidate && !candidate.startsWith('operation:') ? candidate : null;
 }
 
-/** Explicit recovery checks/cancels only the persisted job; a disconnected SSH process is never proof that Windows stopped. */
+/** Bounded incremental reads of a running or finished command's persisted output; the control lane keeps polling alive under regular-work saturation. */
+export async function readSshWorkspaceJobOutput(target: SshProjectTarget, input: { jobId: string; stream?: 'stdout' | 'stderr'; offset?: number; maxBytes?: number }, signal?: AbortSignal) {
+  return runSshWorkspaceOperation(target, { op: 'job_output', jobId: input.jobId, stream: input.stream ?? 'stdout', offset: input.offset ?? 0, maxBytes: input.maxBytes ?? 256 * 1024 }, signal);
+}
+
+/** The Windows command console uses the same target and writer lifecycle as CC, without launching a local coding-agent CLI. */
+export async function runSshWorkspaceCommand(
+  descriptor: WorkspaceDescriptor,
+  command: string,
+  signal?: AbortSignal,
+  options?: { onJobCreated?: (jobId: string) => void },
+) {
+  const target = resolveSshProjectTarget(descriptor.sourceRoot);
+  if (!target || descriptor.sourceMode !== 'ssh' || descriptor.generation !== target.generation || descriptor.projectId !== target.projectId) throw new AppError('SSH 工作区身份不匹配。', { code: 'WORKSPACE_GENERATION_CHANGED', statusCode: 409 });
+  return runSshWorkspaceOperation(target, { op: 'exec', path: '/workspace', command, timeoutSeconds: 600 }, signal, options);
+}
+
+async function confirmInterruptedRun(target: SshProjectTarget): Promise<void> {
+  const result = await recoverSshWorkspace(target);
+  if (result.status !== 'idle') throw new AppError('原本地任务仍在运行，正在等待它结束；也可在本地工作区状态中停止原任务。', {
+    code: 'SSH_WORKSPACE_RECOVERY_REQUIRED', statusCode: 409,
+  });
+}
+
+/** UI polling, foreground admission and explicit recovery confirm only the persisted original receipt. A running task is never auto-cancelled; only a job the helper reports as never materialized is fenced by its idempotent cancel. */
 export async function recoverSshWorkspace(target: SshProjectTarget, cancel = false) {
   target = fresh(target);
   if (activeRuns.has(target.projectId)) throw new AppError('任务仍由当前服务管理，请先停止任务。', { code: 'WORKSPACE_BUSY', statusCode: 409 });
-  await verifySshProject(target);
-  if (!target.activeRunId) return { status: 'idle' as const };
+  const key = JSON.stringify([target.projectId, target.generation, target.activeRunId, target.pendingJobId, cancel]);
+  const pending = recoveries.get(key);
+  if (pending) return pending;
+  const recovery = recoverOriginalRun(target, cancel);
+  recoveries.set(key, recovery);
+  try { return await recovery; }
+  finally { if (recoveries.get(key) === recovery) recoveries.delete(key); }
+}
+
+async function recoverOriginalRun(target: SshProjectTarget, cancel: boolean) {
+  if (!target.activeRunId) {
+    await verifySshProject(target);
+    const current = fresh(target);
+    if (current.activeRunId) throw busy();
+    return { status: 'idle' as const };
+  }
   if (!target.pendingJobId) {
-    // Legacy file operations have no receipt. A fresh probe and HTTP abort do
-    // not prove that their helper stopped; automatic recovery must fail closed.
+    // `running` without a receipt means the process died before any remote call
+    // was transmitted: receipts are committed before dispatch, so nothing is in
+    // flight and clearing is safe — this is the crash case that used to demand a
+    // manual stop. A `recovery` row without a receipt is genuine pre-receipt
+    // uncertainty (old versions), which must still fail closed.
+    if (target.phase === 'running') {
+      const current = fresh(target);
+      if (current.activeRunId !== target.activeRunId || current.pendingJobId) throw busy();
+      if (current.activeRunId) sshProjectTargetsDb.recoverRun(current.projectId, current.activeRunId);
+      return { status: 'idle' as const };
+    }
     throw new AppError('旧文件操作没有可验证的完成记录；请先在本机确认原操作已停止并检查改动，不能自动解除恢复锁。', {
       code: 'SSH_OPERATION_RECOVERY_UNCONFIRMED', statusCode: 409,
     });
   }
   const operationId = target.pendingJobId.startsWith('operation:') ? target.pendingJobId.slice('operation:'.length) : undefined;
-  const result = await executeSshWorkspace({ connectionId: target.connectionId, rootPath: target.rootPath, userId: target.ownerId,
-    expectedRootIdentity: target.rootIdentity, generation: target.generation,
-    request: operationId ? { op: cancel ? 'operation_cancel' : 'operation_status', operationId }
-      : { op: cancel ? 'job_cancel' : 'job_status', jobId: target.pendingJobId } });
-  if (result.cleanupConfirmed !== true) return { status: 'running' as const, jobId: target.pendingJobId };
+  // Recovery RPCs already verify the root identity and use a reserved control
+  // lane. A normal probe here can queue behind the very helper being recovered.
+  const probe = (cancelIt: boolean) => executeSshWorkspace({ connectionId: target.connectionId, rootPath: target.rootPath, userId: target.ownerId,
+    expectedRootIdentity: target.rootIdentity, generation: target.generation, signal: AbortSignal.timeout(RECOVERY_TIMEOUT_MS),
+    request: operationId ? { op: cancelIt ? 'operation_cancel' : 'operation_status', operationId }
+      : { op: cancelIt ? 'job_cancel' : 'job_status', jobId: target.pendingJobId } });
+  let result: SshWorkspaceRpcResult;
+  try {
+    result = await probe(cancel);
+    // A job that provably never materialized can never be confirmed by a status
+    // query, yet it used to force a manual "stop original task" click every
+    // time. The helper's cancel claims the ID permanently without touching a
+    // running process, so escalating only for `not_found` is both safe and
+    // idempotent: a delayed duplicate start is refused instead of replaying.
+    if (!cancel && result.cleanupConfirmed !== true && result.state === 'not_found') result = await probe(true);
+  } catch (error) { connectionStates.set(target.projectId, 'offline'); throw error; }
   const current = fresh(target);
-  if (current.activeRunId !== target.activeRunId || current.pendingJobId !== target.pendingJobId) throw new AppError('恢复目标已改变，请重新检查。', { code: 'WORKSPACE_GENERATION_CHANGED', statusCode: 409 });
+  if (current.activeRunId !== target.activeRunId || current.pendingJobId !== target.pendingJobId) {
+    // An independently completed recovery is harmless; a replacement writer
+    // or receipt must never be cleared by this older status response.
+    if (current.phase === 'idle' && !current.activeRunId && !current.pendingJobId) return { status: 'idle' as const };
+    throw new AppError('恢复目标已改变，请重新检查。', { code: 'WORKSPACE_GENERATION_CHANGED', statusCode: 409 });
+  }
+  connectionStates.set(target.projectId, 'online');
+  if (result.cleanupConfirmed !== true) return { status: 'running' as const, jobId: target.pendingJobId };
   sshProjectTargetsDb.recoverRun(target.projectId, target.activeRunId);
   return operationId ? { status: 'idle' as const, inspectChanges: true } : { status: 'idle' as const };
 }

@@ -28,6 +28,8 @@ const options = [
 const session = { id: 'app-session', __provider: 'claude' } as ProjectSession;
 beforeEach(() => {
   localStorage.clear();
+  vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });
+  Element.prototype.scrollIntoView = vi.fn();
   mocks.read.mockImplementation(() => ok({ model: 'opus[1m]', resolvedModel: 'claude-opus-4-8', source: 'session' }));
   mocks.write.mockImplementation((_provider: string, _id: string, model: string) => ok({ model, source: 'session' }));
 });
@@ -39,7 +41,7 @@ test('the selector shows the observed version while fixed choices send their exa
     onSelectModel={onSelectModel} effort="default" effortOptions={[]} onSelectEffort={vi.fn()} modelsLoading={false} />);
   expect(screen.getByRole('button', { name: 'Select model and reasoning effort' }).textContent).toContain('Opus (auto, 1M context)');
   fireEvent.click(screen.getByRole('button'));
-  expect(screen.getByText('Last used: Opus 4.8')).toBeTruthy();
+  expect(screen.getByRole('button', { name: 'Select model and reasoning effort' }).title).toContain('Last used: Opus 4.8');
   fireEvent.click(screen.getByRole('menuitemradio', { name: /Opus 5/ }));
   expect(onSelectModel).toHaveBeenCalledWith('claude-opus-5');
 });

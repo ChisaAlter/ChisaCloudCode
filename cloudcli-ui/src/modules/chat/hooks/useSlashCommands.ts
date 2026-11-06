@@ -1,12 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Dispatch, KeyboardEvent, RefObject, SetStateAction } from 'react';
 
-import { api } from '@/shared/api';
-import { getAuthSessionVersion } from '@/shared/authToken';
-import { getServerConnectionVersion } from '@/shared/chisa';
-import { useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
 import { safeLocalStorage } from '@/modules/chat/utils/chatStorage';
+import { useProjectSlashCommands } from '@/shared/hooks/useProjectSlashCommands';
 import type { LLMProvider, Project, SlashCommand } from '@/shared/types';
+import { isSkillCommand } from '@/shared/utils';
 
 const COMMAND_QUERY_DEBOUNCE_MS = 150;
 
@@ -18,23 +16,6 @@ type UseSlashCommandsOptions = {
   setInput: Dispatch<SetStateAction<string>>;
   textareaRef: RefObject<HTMLTextAreaElement>;
   onExecuteCommand: (command: SlashCommand, rawInput?: string) => void | Promise<void>;
-};
-
-type ProviderSkill = {
-  name: string;
-  description?: string;
-  command: string;
-  scope: string;
-  sourcePath?: string;
-  pluginName?: string;
-  pluginId?: string;
-};
-
-type ProviderSkillsResponse = {
-  success?: boolean;
-  data?: {
-    skills?: ProviderSkill[];
-  };
 };
 
 const getCommandHistoryKey = (projectName: string) => `command_history_${projectName}`;
@@ -59,41 +40,6 @@ const saveCommandHistory = (projectName: string, history: Record<string, number>
 
 const isPromiseLike = (value: unknown): value is Promise<unknown> =>
   Boolean(value) && typeof (value as Promise<unknown>).then === 'function';
-
-const isSkillCommand = (command: SlashCommand) =>
-  command.type === 'skill' || command.metadata?.type === 'skill';
-
-const dedupeProviderSkills = (skills: ProviderSkill[]): ProviderSkill[] => {
-  const seenCommands = new Set<string>();
-
-  return skills.filter((skill) => {
-    // Multiple physical Claude plugin folders can expose the same invocation.
-    // The slash menu should show each executable command only once.
-    const key = skill.command;
-    if (seenCommands.has(key)) {
-      return false;
-    }
-
-    seenCommands.add(key);
-    return true;
-  });
-};
-
-const mapSkillToSlashCommand = (skill: ProviderSkill): SlashCommand => ({
-  name: skill.command,
-  description: skill.description,
-  namespace: 'skill',
-  path: skill.sourcePath,
-  type: 'skill',
-  metadata: {
-    type: skill.scope,
-    scope: skill.scope,
-    sourcePath: skill.sourcePath,
-    pluginName: skill.pluginName,
-    pluginId: skill.pluginId,
-    skillName: skill.name,
-  },
-});
 
 const filterSlashCommands = (
   commands: SlashCommand[],
@@ -137,20 +83,7 @@ export function useSlashCommands({
   textareaRef,
   onExecuteCommand,
 }: UseSlashCommandsOptions) {
-  const workspace = useWorkspaceScope();
-  const projectId = selectedProject?.projectId;
-  const workspaceProjectId = workspace?.projectId;
-  const workspaceId = workspace?.workspaceId;
-  const generation = workspace?.generation;
-  const sessionId = workspace?.kind === 'session' ? workspace.sessionId : undefined;
-  const workspacePath = workspace?.rootPath || selectedProject?.fullPath || selectedProject?.path || '';
-  const hasWorkspace = workspace !== undefined && workspace !== null;
-  const canDiscover = Boolean(selectedProject) && workspace !== null && workspace?.capabilities.read !== false;
-  const authVersion = getAuthSessionVersion();
-  const serverVersion = getServerConnectionVersion();
-  // Catalogue results belong to the stable workspace identity, never its polled status object or composer input.
-  const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
-  const [filteredCommands, setFilteredCommands] = useState<SlashCommand[]>([]);
+  const { commands: projectCommands } = useProjectSlashCommands(selectedProject, provider);
   const [showCommandMenu, setShowCommandMenu] = useState(false);
   const [commandQuery, setCommandQuery] = useState('');
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(-1);
@@ -173,43 +106,20 @@ export function useSlashCommands({
     clearCommandQueryTimer();
   }, [clearCommandQueryTimer]);
 
-  useEffect(() => {
-    const controller = new AbortController();
-    const current = () => !controller.signal.aborted && authVersion === getAuthSessionVersion() && serverVersion === getServerConnectionVersion();
-    setSlashCommands([]);
-    setFilteredCommands([]);
-    if (!canDiscover || !projectId) return () => controller.abort();
-    const selector = hasWorkspace && workspaceProjectId && workspaceId && generation ? {
-      projectId: workspaceProjectId, workspaceId, generation, ...(sessionId ? { sessionId } : {}),
-    } : undefined;
-    const fetchCommands = async () => {
-      try {
-        const response = await api.commands.list(workspacePath || undefined, selector, { signal: controller.signal });
-        if (!current()) return;
-        if (!response.ok) throw new Error('Failed to fetch commands');
-        const data = await response.json();
-        // A replaced workspace must not start the second helper lookup after a late commands body.
-        if (!current()) return;
-        const skillsResponse = await api.providers.skills(provider, selector ?? { workspacePath }, { signal: controller.signal });
-        const skillsData = skillsResponse.ok ? ((await skillsResponse.json()) as ProviderSkillsResponse) : null;
-        if (!current()) return;
-        const skillCommands = dedupeProviderSkills(skillsData?.data?.skills || []).map(mapSkillToSlashCommand);
-        const allCommands: SlashCommand[] = [
-          ...((data.builtIn || []) as SlashCommand[]).map(command => ({ ...command, type: 'built-in' })),
-          ...skillCommands,
-          ...((data.custom || []) as SlashCommand[]).map(command => ({ ...command, type: 'custom' })),
-        ];
-        const parsedHistory = readCommandHistory(projectId);
-        setSlashCommands([...allCommands].sort((left, right) => (parsedHistory[right.name] || 0) - (parsedHistory[left.name] || 0)));
-      } catch (error) {
-        if (!current()) return;
-        console.error('Error fetching slash commands:', error);
-        setSlashCommands([]);
-      }
-    };
-    void fetchCommands();
-    return () => controller.abort();
-  }, [authVersion, canDiscover, generation, hasWorkspace, projectId, provider, serverVersion, sessionId, workspaceId, workspacePath, workspaceProjectId]);
+  // The shared list ordered by this project's usage history, most-used first,
+  // so the menu surfaces what the user actually reaches for.
+  const slashCommands = useMemo<SlashCommand[]>(() => {
+    if (!selectedProject) {
+      return [];
+    }
+
+    const parsedHistory = readCommandHistory(selectedProject.projectId);
+    return [...projectCommands].sort((commandA, commandB) => {
+      const commandAUsage = parsedHistory[commandA.name] || 0;
+      const commandBUsage = parsedHistory[commandB.name] || 0;
+      return commandBUsage - commandAUsage;
+    });
+  }, [projectCommands, selectedProject]);
 
   useEffect(() => {
     if (!showCommandMenu) {
@@ -217,9 +127,8 @@ export function useSlashCommands({
     }
   }, [showCommandMenu]);
 
-  useEffect(() => {
-    setFilteredCommands(filterSlashCommands(slashCommands, commandQuery));
-  }, [commandQuery, slashCommands]);
+  // Derive the menu during render: a new project object must never create an effect/state feedback loop.
+  const filteredCommands = useMemo(() => filterSlashCommands(slashCommands, commandQuery), [commandQuery, slashCommands]);
 
   const frequentCommands = useMemo(() => {
     if (!selectedProject || slashCommands.length === 0) {
@@ -338,12 +247,8 @@ export function useSlashCommands({
     setCommandQuery('');
     setSelectedCommandIndex(-1);
 
-    if (isOpening) {
-      setFilteredCommands(slashCommands);
-    }
-
     textareaRef.current?.focus();
-  }, [showCommandMenu, slashCommands, textareaRef]);
+  }, [showCommandMenu, textareaRef]);
 
   const handleCommandInputChange = useCallback(
     (newValue: string, cursorPos: number) => {
@@ -419,10 +324,20 @@ export function useSlashCommands({
 
       if (event.key === 'Tab' || event.key === 'Enter') {
         event.preventDefault();
-        if (selectedCommandIndex >= 0) {
-          selectCommandFromKeyboard(filteredCommands[selectedCommandIndex]);
-        } else if (filteredCommands.length > 0) {
-          selectCommandFromKeyboard(filteredCommands[0]);
+        // Until the user arrows through the menu nothing is highlighted, so both
+        // keys act on the first match — the entry the menu renders at the top.
+        const targetCommand = filteredCommands[selectedCommandIndex >= 0 ? selectedCommandIndex : 0];
+        if (!targetCommand) {
+          return true;
+        }
+
+        // Tab is completion, not submission: it only writes "<name> " into the
+        // input and closes the menu, so an argument can still be typed before
+        // Enter runs the command. Enter keeps executing the highlighted entry.
+        if (event.key === 'Tab') {
+          insertCommandIntoInput(targetCommand);
+        } else {
+          selectCommandFromKeyboard(targetCommand);
         }
         return true;
       }
@@ -435,7 +350,14 @@ export function useSlashCommands({
 
       return false;
     },
-    [showCommandMenu, filteredCommands, resetCommandMenuState, selectCommandFromKeyboard, selectedCommandIndex],
+    [
+      showCommandMenu,
+      filteredCommands,
+      insertCommandIntoInput,
+      resetCommandMenuState,
+      selectCommandFromKeyboard,
+      selectedCommandIndex,
+    ],
   );
 
   useEffect(

@@ -1,10 +1,10 @@
 import { memo } from 'react';
 
-import { QuickSettingsPanel } from '@/modules/quick-settings-panel';
 import { isDesktop } from '@/shared/chisa';
 import ProjectEffects from '@/modules/project-workspace/controllers/ProjectEffects';
 import type { ProjectWorkspaceShellProps } from '@/shared/types';
 import ProjectMainRegion from '@/modules/project-workspace/ProjectMainRegion';
+import ProjectQuickSettingsRegion from '@/modules/project-workspace/ProjectQuickSettingsRegion';
 import ProjectSidebarRegion from '@/modules/project-workspace/ProjectSidebarRegion';
 
 /** Rendered by ProjectWorkspaceRoute to lay out the workspace sidebar, main region and global overlays. */
@@ -31,7 +31,8 @@ function ProjectWorkspaceShell({
         />
       </div>
 
-      {!isDesktop() && <QuickSettingsPanel />}
+      {/* The desktop shell owns its settings entry points; the web panel may dock here. */}
+      {!isDesktop() && <ProjectQuickSettingsRegion />}
     </div>
   );
 }

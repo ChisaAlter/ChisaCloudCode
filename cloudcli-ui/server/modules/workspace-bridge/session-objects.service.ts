@@ -40,7 +40,12 @@ export function sharedSessionGitRuntime(root: string, leaseDirectory: string, re
   if (!lstatSync(common).isDirectory() || lstatSync(common).isSymbolicLink() || realpathSync(common) !== common) throw invalid('Shared Git object quarantine requires a canonical Git directory');
   if (leaseDirectory !== root + '.chisa-lease' || realpathSync(leaseDirectory) !== leaseDirectory) throw invalid('Shared Git object quarantine requires the exact execution lease');
   const originalLease = JSON.parse(readFileSync(path.join(leaseDirectory, 'state.json'), 'utf8')) as { id?: unknown; epoch?: unknown; owner?: unknown };
-  const privateGit = path.join(leaseDirectory, 'git-runtime');
+  // Keep the operator-enrolled mount inode stable across leases. The permanent
+  // lease directory contains only its guarded state and may be removed only
+  // after phase-two publication; quarantine data is retained independently.
+  const stateDirectory = root + '.chisa-state';
+  canonicalDirectory(stateDirectory);
+  const privateGit = path.join(stateDirectory, 'git-runtime');
   canonicalDirectory(privateGit);
   if (process.platform !== 'win32' && process.getuid?.() === 0) chownSync(privateGit, 1000, 1000);
   const identity = [common, path.join(common, 'objects'), leaseDirectory, privateGit].map(filename => { const stats = lstatSync(filename); return { filename, dev: stats.dev, ino: stats.ino }; });

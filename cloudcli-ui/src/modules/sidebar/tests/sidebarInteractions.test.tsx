@@ -25,6 +25,7 @@ const sessions: SessionWithProvider[] = [
   { id: 'first', summary: '第一条对话', __provider: 'claude' },
   { id: 'second', summary: '第二条对话', __provider: 'codex' },
 ];
+const selectionProps = { selectedSessionIds: null, onSetSessionSelection: noop, onToggleSessionSelected: noop, onCancelSessionSelection: noop, onDeleteSelectedSessions: noop };
 const callbacks = { onRenameDraftChange: noop, onStartEditingSession: vi.fn(), onCancelEditingSession: noop,
   onSaveEditingSession: noop, onProjectSelect: noop, onSessionSelect: vi.fn(), onDeleteSession: vi.fn(), onArchiveSession: vi.fn() };
 
@@ -37,8 +38,8 @@ beforeEach(() => {
 test('directory menu owns rename/remove and only the header creates a conversation', () => {
   const create = vi.fn(); const rename = vi.fn(); const toggle = vi.fn();
   render(<I18nextProvider i18n={language}><SidebarProjectItem project={project} selectedProject={project} selectedSession={null}
-    isExpanded isDeleting={false} isStarred={false} isEditing={false} renameDraft="" sessions={[]}
-    initialSessionsLoaded isLoadingMoreSessions={false} activeSessions={new Set()} attentionSessionIds={new Set()}
+    {...selectionProps} isExpanded isDeleting={false} isStarred={false} isEditing={false} renameDraft="" sessions={[]}
+    initialSessionsLoaded isLoadingMoreSessions={false} backgroundSessionIds={new Set()} activeSessions={new Set()} attentionSessionIds={new Set()}
     currentTime={new Date()} sessionRenameId={null} sessionRenameDraft=""
     tasksEnabled={false} mcpServerStatus={{}} onToggleProject={toggle} onToggleStarProject={noop}
     onStartEditingProject={rename} onCancelEditingProject={noop} onSaveProjectName={noop} onDeleteProject={noop}
@@ -74,8 +75,8 @@ test('pin sorts loaded conversations, persists across remount and survives a UI 
     return <button onClick={() => set('showThinking', false)}>切换思考</button>;
   }
   const view = <I18nextProvider i18n={language}><UiPreferencesProvider><ToggleThinking /><SidebarProjectSessions project={project}
-    isExpanded sessions={sessions} selectedSession={null} initialSessionsLoaded hasMoreSessions={false} isLoadingMoreSessions={false}
-    activeSessions={new Set()} attentionSessionIds={new Set()} currentTime={new Date()} sessionRenameId={null} sessionRenameDraft=""
+    {...selectionProps} isExpanded sessions={sessions} selectedSession={null} initialSessionsLoaded hasMoreSessions={false} isLoadingMoreSessions={false}
+    activeSessions={new Set()} backgroundSessionIds={new Set()} attentionSessionIds={new Set()} currentTime={new Date()} sessionRenameId={null} sessionRenameDraft=""
     onLoadMoreSessions={noop} {...callbacks} t={t} /></UiPreferencesProvider></I18nextProvider>;
   const mounted = render(view);
   fireEvent.click(screen.getAllByRole('button', { name: '置顶对话' })[1]);

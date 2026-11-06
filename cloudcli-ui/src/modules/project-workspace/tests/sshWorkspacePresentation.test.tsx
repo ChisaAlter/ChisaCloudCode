@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, expect, test, vi } from 'vitest';
 
 import { WorkspaceScopeBar } from '@/modules/project-workspace/WorkspaceScopeBar';
@@ -94,4 +94,84 @@ test('recovered metadata without a confirmed receipt asks the user to inspect pr
   fireEvent.click(screen.getByRole('button', { name: '检查原任务' }));
   await screen.findByText('已恢复连接，请检查上次改动结果后继续。');
   expect(screen.queryByText('已确认本地任务结束，可以继续操作。')).toBeNull();
+});
+
+test('a manual recovery response from an old generation cannot update or refresh its replacement', async () => {
+  let finish!: (response: Response) => void;
+  const recover = vi.spyOn(api.sshWorkspaces, 'recover').mockImplementationOnce(() => new Promise<Response>(done => { finish = done; }));
+  const refresh = vi.fn();
+  const recovering = { ...local, phase: 'recovery' as const, connectionState: 'recovery' as const };
+  const view = render(<WorkspaceScopeBar {...props(recovering)} onRefresh={refresh} />);
+  openStatus();
+  fireEvent.click(screen.getByRole('button', { name: '检查原任务' }));
+  fireEvent.click(screen.getByRole('button', { name: '检查原任务' }));
+  expect(recover).toHaveBeenCalledOnce();
+  view.rerender(<WorkspaceScopeBar {...props({ ...recovering, generation: 'replacement' })} onRefresh={refresh} />);
+  await act(async () => finish(Response.json({ status: 'idle' })));
+  expect(refresh).not.toHaveBeenCalled();
+  expect(screen.queryByText('已确认本地任务结束，可以继续操作。')).toBeNull();
+  expect((screen.getByRole('button', { name: '检查原任务' }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+test('an unmounted manual recovery cannot deliver its result to a remounted status control', async () => {
+  let finish!: (response: Response) => void;
+  vi.spyOn(api.sshWorkspaces, 'recover').mockImplementationOnce(() => new Promise<Response>(done => { finish = done; }));
+  const refresh = vi.fn();
+  const recovering = { ...local, phase: 'recovery' as const, connectionState: 'recovery' as const };
+  const first = render(<WorkspaceScopeBar {...props(recovering)} onRefresh={refresh} />);
+  openStatus();
+  fireEvent.click(screen.getByRole('button', { name: '检查原任务' }));
+  first.unmount();
+  render(<WorkspaceScopeBar {...props(recovering)} onRefresh={refresh} />);
+  openStatus();
+  await act(async () => finish(Response.json({ status: 'idle' })));
+  expect(refresh).not.toHaveBeenCalled();
+  expect(screen.queryByText('已确认本地任务结束，可以继续操作。')).toBeNull();
+});
+
+test('local recovery streams incremental job output inside the status dialog while a task is still running', async () => {
+  vi.spyOn(api.sshWorkspaces, 'recover').mockResolvedValueOnce(Response.json({ status: 'running', jobId: 'job-live-1' }));
+  const jobOutput = vi.spyOn(api.sshWorkspaces, 'jobOutput').mockImplementation(async (body) => {
+    if (body.stream === 'stdout' && (body.offset ?? 0) === 0) {
+      return Response.json({
+        ok: true,
+        jobId: 'job-live-1',
+        stream: 'stdout',
+        offset: 0,
+        total: 15,
+        chunk: btoa('Compiling 42%\n'),
+        eof: false,
+        state: 'running',
+        truncated: false,
+      });
+    }
+    return Response.json({
+      ok: true,
+      jobId: 'job-live-1',
+      stream: body.stream ?? 'stdout',
+      offset: body.offset ?? 0,
+      total: body.offset ?? 0,
+      chunk: '',
+      eof: true,
+      state: 'completed',
+      truncated: false,
+    });
+  });
+
+  render(<WorkspaceScopeBar {...props({ ...local, phase: 'recovery', connectionState: 'recovery' })} />);
+  openStatus();
+  fireEvent.click(screen.getByRole('button', { name: '检查原任务' }));
+
+  const livePre = await screen.findByLabelText('本地任务实时输出');
+  expect(livePre.textContent).toContain('Compiling 42%');
+  expect(jobOutput).toHaveBeenCalledWith(
+    expect.objectContaining({
+      projectId: 'project',
+      generation: 'gen-one',
+      jobId: 'job-live-1',
+      stream: 'stdout',
+      offset: 0,
+    }),
+    expect.anything(),
+  );
 });

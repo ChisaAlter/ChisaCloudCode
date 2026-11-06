@@ -340,6 +340,10 @@ func TestSshRelayRegistrationCancelledOnAccountChangeAndNoCrossAccountDefaults(t
 	started, cancelled := make(chan struct{}), make(chan struct{})
 	release := make(chan struct{})
 	connection := accountWorkspaceFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/auth/logout" && r.Method == http.MethodPost {
+			fmt.Fprint(w, `{"success":true,"message":"Logged out successfully"}`)
+			return
+		}
 		_, _ = io.Copy(io.Discard, r.Body)
 		close(started)
 		select {
@@ -365,8 +369,12 @@ func TestSshRelayRegistrationCancelledOnAccountChangeAndNoCrossAccountDefaults(t
 	}
 	result := make(chan map[string]any, 1)
 	go func() { result <- (FrontendBridge{}).EnsureSshAgent("") }()
-	<-started
-	(FrontendBridge{}).EndServerSession(connection.version)
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("SSH registration did not start")
+	}
+	if result := (FrontendBridge{}).EndServerSessionV2(connection.sessionHandle, connection.tokenRevision); result["ok"] != true { t.Fatal(result) }
 	select {
 	case response := <-result:
 		if response["ok"] != false || response["code"] != "SSH_ACCOUNT_CHANGED" {
@@ -424,19 +432,20 @@ func TestSshRelayHandshakeRequiredAndRegistrationFailureRetryIsIdempotent(t *tes
 	m, _ := sshTestManager(t)
 	preserveDesktopSshManager(t, m)
 	agents := testAgentDependencies(t, m)
+	m.deps.after = func(time.Duration) <-chan time.Time { return time.After(time.Millisecond) }
 	first := (FrontendBridge{}).EnsureSshAgent("")
-	if first["ok"] != false || first["code"] != "SSH_AGENT_REGISTRATION_FAILED" {
-		t.Fatal(first)
+	if first["ok"] != true || registrations.Load() != 2 {
+		t.Fatal("one native ensure must recover handshake failure without a user retry", first, registrations.Load())
 	}
 	p := first["profile"].(SshTunnelProfile)
 	status := first["status"].(SshTunnelStatus)
-	if status.OuterConnected || status.RegistrationState != "error" {
+	if !status.OuterConnected || status.RegistrationState != "registered" || status.ReconnectAttempt != 0 {
 		t.Fatal(status)
 	}
 	a := <-agents
 	second := (FrontendBridge{}).EnsureSshAgent(p.ID)
-	if second["ok"] != true || second["status"].(SshTunnelStatus).Generation != status.Generation {
-		t.Fatal(second)
+	if second["ok"] != true || second["status"].(SshTunnelStatus).Generation != status.Generation || registrations.Load() != 2 {
+		t.Fatal("ready ensure restarted or registered the Agent again", second)
 	}
 	select {
 	case <-agents:

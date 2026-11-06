@@ -19,6 +19,8 @@ export function useComposerMenuAnchor(
   isOpen: boolean,
   onClose: () => void,
   preferredWidth = 320,
+  /** Return true when a child submenu handled Escape without closing the parent. */
+  onEscape?: () => boolean,
 ) {
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -58,6 +60,7 @@ export function useComposerMenuAnchor(
       }
       event.preventDefault();
       event.stopPropagation();
+      if (onEscape?.()) return;
       onClose();
       triggerRef.current?.focus();
     };
@@ -74,7 +77,7 @@ export function useComposerMenuAnchor(
       window.removeEventListener('scroll', updateAnchor, true);
       window.removeEventListener('keydown', handleKeyDown, { capture: true });
     };
-  }, [isOpen, onClose, updateAnchor]);
+  }, [isOpen, onClose, onEscape, updateAnchor]);
 
   return { triggerRef, menuRef, anchor, updateAnchor };
 }

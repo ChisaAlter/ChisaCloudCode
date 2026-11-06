@@ -7,7 +7,7 @@ import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import App from '@/App';
 import { useProjectsState } from '@/modules/project-workspace/hooks/useProjectsState';
 import { Sidebar } from '@/modules/sidebar';
-import { clearAuthToken, startAuthSession, storeAuthToken } from '@/shared/authToken';
+import { acknowledgeAuthSession, clearAuthToken, getAuthSessionSnapshot, initializeAuthSession, startAuthSession, storeAuthToken, synchronizeAuthSession } from '@/modules/auth-session';
 import type { Project } from '@/shared/types';
 
 const runtime = vi.hoisted(() => ({ user: { id: 1, username: 'a' } as { id: number; username: string } | null, projects: vi.fn(), recent: vi.fn(), details: vi.fn() }));
@@ -23,7 +23,7 @@ vi.mock('@/modules/desktop-chrome', () => ({ DesktopChrome: () => null }));
 vi.mock('@/shared/ui', () => ({ BlockingOperationDialog: () => null }));
 vi.mock('@/modules/command-palette', () => ({ usePaletteOps: () => ({}), usePaletteOpsRegister: () => {} }));
 vi.mock('@/shared/hooks/useDeviceSettings', () => ({ useDeviceSettings: () => ({ isMobile: false, isPWA: false }) }));
-vi.mock('@/shared/context/SessionProtectionContext', () => ({ useBusySessionIdSet: () => new Set() }));
+vi.mock('@/shared/context/SessionProtectionContext', () => ({ useBusySessionIdSet: () => new Set(), useBackgroundSessionIdSet: () => new Set() }));
 vi.mock('@/modules/sidebar/SidebarModals', () => ({ default: () => null }));
 vi.mock('@/modules/sidebar/SidebarContent', () => ({ default: (props: { recentConversations: Array<{ sessionTitle: string }>; onSearchModeChange: (mode: string) => void }) => <><button onClick={() => props.onSearchModeChange('conversations')}>show recents</button><p data-testid="recents">{props.recentConversations.map(row => row.sessionTitle).join(',')}</p></> }));
 vi.mock('@/modules/project-workspace', () => ({ ProjectWorkspaceRoute: () => <Probe /> }));
@@ -51,17 +51,23 @@ function Probe() {
   return <><p data-testid="selection">{projects.selectedProject?.displayName || 'no project'} / {projects.selectedSession?.summary || 'no session'} / {projects.activeTab}</p><Sidebar {...projects.sidebarSharedProps} /></>;
 }
 const a: Project = { projectId: 'a-project', fullPath: '/a', displayName: 'A private project', sessions: [{ id: 'a-session', summary: 'A private transcript' }] };
-const token = (id: number) => `header.${btoa(JSON.stringify({ userId: id, username: id === 1 ? 'a' : 'b' }))}.signature`;
+const token = (id: number) => `header.${Buffer.from(JSON.stringify({ userId: id, username: id === 1 ? 'a' : 'b', exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.signature`;
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; }
-beforeEach(() => {
-  mounts = 0; localStorage.clear(); vi.stubGlobal('mygo', undefined); runtime.user = { id: 1, username: 'a' };
+async function login(id: number) {
+  const session = await startAuthSession(token(id), getAuthSessionSnapshot());
+  expect(session).not.toBeNull();
+  acknowledgeAuthSession(session!);
+}
+beforeEach(async () => {
+  await initializeAuthSession(); await clearAuthToken();
+  mounts = 0; localStorage.clear(); sessionStorage.clear(); vi.stubGlobal('mygo', undefined); runtime.user = { id: 1, username: 'a' };
   window.history.replaceState(null, '', '/session/a-session');
-  startAuthSession(token(1));
+  await synchronizeAuthSession(); await login(1);
   runtime.projects.mockReset().mockImplementation(async () => Response.json([a]));
-  runtime.recent.mockReset().mockImplementation(async () => Response.json({ data: { conversations: [{ sessionId: 'a-session', sessionTitle: 'A recent title' }] } }));
+  runtime.recent.mockReset().mockImplementation(async () => Response.json({ data: { conversations: [{ sessionId: 'a-recent-session', sessionTitle: 'A recent title' }] } }));
   runtime.details.mockReset().mockImplementation(async () => Response.json({ data: { sessionId: 'a-session', summary: 'A private transcript', project: a } }));
 });
-afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(async () => { cleanup(); await clearAuthToken(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 test('logout and B login replace project, session, recents and tab; late A queries cannot restore metadata', async () => {
   const view = render(<App />);
@@ -76,12 +82,12 @@ test('logout and B login replace project, session, recents and tab; late A queri
   let refresh!: Promise<void>;
   act(() => { refresh = state.refreshProjectsSilently(); });
   await act(async () => { await Promise.resolve(); });
-  act(() => { clearAuthToken(); runtime.user = null; });
+  await act(async () => { await clearAuthToken(); runtime.user = null; });
   view.rerender(<App />);
   expect(screen.getByText('signed out')).toBeDefined();
   runtime.projects.mockImplementation(async () => Response.json([]));
   runtime.recent.mockImplementation(async () => Response.json({ data: { conversations: [] } }));
-  act(() => { startAuthSession(token(2)); runtime.user = { id: 2, username: 'b' }; });
+  await act(async () => { await login(2); runtime.user = { id: 2, username: 'b' }; });
   view.rerender(<App />);
   await waitFor(() => expect(state.isLoadingProjects).toBe(false));
   await act(async () => { pending.resolve([a]); await refresh; });
@@ -97,7 +103,7 @@ test('same-account token refresh retains mounted workspace and current selection
   const view = render(<App />);
   await screen.findByText(/A private project \/ A private transcript/);
   const previousMounts = mounts;
-  act(() => { state.setActiveTab('files'); storeAuthToken(token(1)); runtime.user = { id: 1, username: 'a' }; });
+  await act(async () => { state.setActiveTab('files'); expect(await storeAuthToken(token(1), getAuthSessionSnapshot())).toBe(true); runtime.user = { id: 1, username: 'a' }; });
   view.rerender(<App />);
   expect(mounts).toBe(previousMounts);
   expect(state.activeTab).toBe('files');

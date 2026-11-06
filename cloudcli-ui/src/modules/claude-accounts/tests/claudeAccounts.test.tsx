@@ -169,6 +169,35 @@ test('switch uses the chosen account and default selection without interrupting 
   await waitFor(() => expect(document.activeElement).toBe(refresh));
 });
 
+test('a gateway failure after a successful switch keeps the confirmed account and cached quota, then reload recovers', async () => {
+  vi.spyOn(accountApi, 'activate').mockImplementation(async id => {
+    current = { ...current, activeId: id, route: { kind: 'subscription', label: 'Claude', accountId: id } };
+    return envelope(current);
+  });
+  showPanel();
+  await screen.findByRole('listitem', { name: 'Personal' });
+  await waitFor(() => expect(screen.getByRole<HTMLButtonElement>('button', { name: '刷新所有账号额度' }).disabled).toBe(false));
+  vi.mocked(accountApi.refresh).mockResolvedValueOnce(new Response('error code: 502', { status: 502 }));
+  fireEvent.click(screen.getByRole('button', { name: '切换到 Personal' }));
+  const alert = await screen.findByRole('alert');
+  expect(alert.textContent).toBe('账号服务暂时不可用（HTTP 502），请稍后重新加载以确认当前账号和额度。');
+  const personal = within(screen.getByRole('listitem', { name: 'Personal' }));
+  expect(personal.getByRole<HTMLButtonElement>('button', { name: '切换到 Personal' }).disabled).toBe(true);
+  expect(personal.getByRole('progressbar', { name: '5 小时' }).getAttribute('aria-valuenow')).toBe('80');
+  fireEvent.click(screen.getByRole('button', { name: '重新加载' }));
+  await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+  expect(personal.getByText('已选择')).toBeTruthy();
+});
+
+test('a non-JSON gateway failure during switching preserves the previous confirmed selection', async () => {
+  vi.spyOn(accountApi, 'activate').mockResolvedValue(new Response('<html>Bad Gateway</html>', { status: 502 }));
+  showPanel();
+  fireEvent.click(await screen.findByRole('button', { name: '切换到 Personal' }));
+  expect((await screen.findByRole('alert')).textContent).toContain('HTTP 502');
+  expect(within(screen.getByRole('listitem', { name: 'Work' })).getByText('已选择')).toBeTruthy();
+  expect(screen.queryByText(/Unexpected token|not valid JSON/)).toBeNull();
+});
+
 test('an already selected profile can replace an active API route', async () => {
   current.route = { kind: 'api', label: 'Other API', accountId: null };
   const activate = vi.spyOn(accountApi, 'activate').mockImplementation(async id => {
@@ -441,6 +470,16 @@ test('changing the App provider key discards late reads from the previous Chisa 
   await waitFor(() => expect(screen.getByTestId('active').textContent).toBe('b'));
   await act(async () => { oldRead.resolve(envelope(initialState())); });
   expect(screen.getByTestId('active').textContent).toBe('b');
+});
+
+test('initial metadata appears before a pending first quota refresh and triggers an active read without opening the panel', async () => {
+  current.accounts[0].usage = { status: 'unavailable', windows: [], updatedAt: null, checkedAt: Date.now(), error: '尚未读取额度，请刷新。', failureKind: 'not-read', stale: false };
+  const quotaRead = deferred<Response>();
+  vi.mocked(accountApi.refresh).mockReturnValueOnce(quotaRead.promise);
+  render(<ClaudeAccountsProvider><Probe /></ClaudeAccountsProvider>);
+  await waitFor(() => expect(screen.getByTestId('active').textContent).toBe('a'));
+  await waitFor(() => expect(accountApi.refresh).toHaveBeenCalledWith({ id: 'a' }, expect.objectContaining({ signal: expect.any(AbortSignal) })));
+  await act(async () => { quotaRead.resolve(envelope(current)); });
 });
 
 test('opening during the initial request still fetches inactive quota', async () => {

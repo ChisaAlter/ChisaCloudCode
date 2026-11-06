@@ -2,10 +2,8 @@ import { randomUUID } from 'node:crypto';
 
 import { getConnection } from '@/modules/database/connection.js';
 
-/** Projects classifies explicit commands for run, test, build and custom actions. */
 export type ProjectActionKind = 'run' | 'test' | 'build' | 'custom';
 
-/** Projects consumes persisted commands scoped to one project and their display order. */
 export type ProjectActionRow = {
   id: string;
   projectId: string;
@@ -48,7 +46,6 @@ function toRow(row: DbRow | undefined): ProjectActionRow | null {
     : null;
 }
 
-/** Projects supplies validated command values; repository-owned ids and timestamps are generated separately. */
 export type ProjectActionInput = {
   name: string;
   command: string;
@@ -57,7 +54,7 @@ export type ProjectActionInput = {
   sortOrder: number;
 };
 
-/** Projects persists explicit project commands; the execution layer still owns admission and recovery. */
+/** Persists explicit project commands; the execution layer still owns admission and recovery. */
 export const projectActionsDb = {
   list(projectId: string): ProjectActionRow[] {
     const rows = getConnection()

@@ -96,6 +96,8 @@
           "src/shared/uiPreferences.ts",
           "src/shared/selectedProvider.ts",
           "src/shared/authToken.ts",
+          "src/shared/webSocketAdmission.ts",
+          "src/shared/authenticatedEventSource.ts",
           "src/shared/voiceConfig.ts",
           "src/shared/codeEditorSettings.ts",
           "src/shared/userSettings.ts",

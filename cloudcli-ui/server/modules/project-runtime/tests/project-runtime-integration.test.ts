@@ -48,11 +48,9 @@ async function createFixture(files: Record<string, string> = {}) {
   let current = true, checks = 0;
   let afterRpc: ((request: Record<string, unknown>) => void) | undefined;
   function assertCurrent() { checks++; if (!current) throw Object.assign(new Error('Fixture generation changed'), { code: 'WORKSPACE_GENERATION_CHANGED' }); }
-  const execute: Parameters<typeof prepareProjectRuntime>[0]['execute'] = async (request, signal) => {
-    assert.equal(signal, controller.signal, 'every RPC retains this admission cancellation signal');
-    signal?.throwIfAborted();
-    assertCurrent();
-    requests.push({ ...request });
+  const operations: Array<Record<string, unknown>> = [];
+  const inspect = (request: Record<string, unknown>) => {
+    operations.push({ ...request });
     const candidate = String(request.path);
     assert.ok(candidate.startsWith('/workspace/'), 'only admitted virtual project paths can be read');
     assert.equal(candidate.includes(hostDecoy), false);
@@ -60,10 +58,11 @@ async function createFixture(files: Record<string, string> = {}) {
     const content = remote.get(relative);
     const children = [...remote.keys()].filter(key => key.startsWith(relative + '/'));
     let result;
+    const stats = (dir: boolean, size = 0) => ({ dir, size, mode: dir ? 0o040700 : 0o100600, mtime: 1, symlink: links.has(relative) });
     if (request.op === 'lstat') {
-      if (links.has(relative)) result = { symlink: true, mode: 0o120777, dir: true };
-      else if (content !== undefined) result = { dir: false, size: Buffer.byteLength(content), mode: 0o100600 };
-      else if (children.length) result = { dir: true, mode: 0o040700 };
+      if (links.has(relative)) result = { ...stats(true), mode: 0o120777 };
+      else if (content !== undefined) result = stats(false, Buffer.byteLength(content));
+      else if (children.length) result = stats(true);
       else throw rpcMissing();
     } else if (request.op === 'read') {
       if (content === undefined) throw rpcMissing();
@@ -75,8 +74,68 @@ async function createFixture(files: Record<string, string> = {}) {
         const parts = key.slice(relative.length + 1).split('/');
         entries.set(parts[0], Boolean(entries.get(parts[0])) || parts.length > 1);
       }
-      result = { entries: [...entries].reverse().map(([name, dir]) => ({ name, dir, stats: { symlink: links.has(relative + '/' + name) } })) };
+      result = { entries: [...entries].reverse().map(([name, dir]) => ({ name, dir, stats: { ...stats(dir), symlink: links.has(relative + '/' + name) } })), truncated: false };
     } else assert.fail('Preparation must never dispatch a command or file mutation: ' + String(request.op));
+    return result;
+  };
+  // Match app/resources/ssh-workspace.ps1 Project-Snapshot: fixed startup files,
+  // recursive rules, skill-root stopping, missing rows and SHA256/base64 bytes.
+  const snapshot = () => {
+    const files: Array<Record<string, unknown>> = [], directories: Array<Record<string, unknown>> = [];
+    let bytes = 0, entries = 0;
+    const fail = (code: string) => { throw Object.assign(new Error('Fixture snapshot rejected unsafe configuration'), { code }); };
+    const inspectPath = (relative: string) => {
+      let cursor = '/workspace', stats: Record<string, unknown> = {};
+      for (const component of relative.split('/')) {
+        cursor += '/' + component;
+        try { stats = inspect({ op: 'lstat', path: cursor }); }
+        catch (error) { if ((error as { code?: string }).code === 'ENOENT') return null; throw error; }
+        if (stats.symlink) fail('SSH_WORKSPACE_PATH_UNSAFE');
+      }
+      return stats;
+    };
+    const captureFile = (relative: string) => {
+      const stats = inspectPath(relative);
+      if (!stats) { files.push({ path: relative, missing: true }); return; }
+      if (stats.dir) fail('PROJECT_RUNTIME_CONFIG_INVALID');
+      if (Number(stats.size) > 256 * 1024 || (bytes += Number(stats.size)) > 256 * 1024 || files.length >= 256) fail('PROJECT_RUNTIME_LIMIT');
+      files.push({ path: relative, stats, ...inspect({ op: 'read', path: '/workspace/' + relative }) });
+    };
+    const captureDirectory = (relative: string, skills: boolean, depth = 0) => {
+      if (depth > 8 || directories.length >= 128) fail('PROJECT_RUNTIME_LIMIT');
+      if (!inspectPath(relative)) { directories.push({ path: relative, entries: [] }); return; }
+      const listing = inspect({ op: 'list', path: '/workspace/' + relative, includeStats: true });
+      assert.ok('entries' in listing && Array.isArray(listing.entries), 'native snapshot directories retain entry metadata');
+      const rows = listing.entries as Array<{ name: string; dir: boolean; stats: { symlink: boolean } }>;
+      if ((entries += rows.length) > 512) fail('PROJECT_RUNTIME_LIMIT');
+      if (rows.some(row => row.stats.symlink)) fail('SSH_WORKSPACE_PATH_UNSAFE');
+      directories.push({ path: relative, entries: rows });
+      if (skills && rows.some(row => !row.dir && row.name === 'SKILL.md')) { captureFile(relative + '/SKILL.md'); return; }
+      for (const row of rows) {
+        const child = relative + '/' + row.name;
+        if (row.dir) captureDirectory(child, skills, depth + 1);
+        else if (!skills && row.name.toLowerCase().endsWith('.md')) captureFile(child);
+      }
+    };
+    for (const relative of ['CLAUDE.md', '.claude/CLAUDE.md', 'CLAUDE.local.md', '.claude/settings.json', '.claude/settings.local.json', '.mcp.json']) captureFile(relative);
+    captureDirectory('.claude/rules', false);
+    captureDirectory('.claude/skills', true);
+    return { snapshotVersion: 1, files, directories, ok: true as const, protocol: 1, platform: 'win32' as const };
+  };
+  const execute: Parameters<typeof prepareProjectRuntime>[0]['execute'] = async (request, signal) => {
+    assert.equal(signal, controller.signal, 'every RPC retains this admission cancellation signal');
+    signal?.throwIfAborted();
+    assertCurrent();
+    requests.push({ ...request });
+    let result;
+    if (request.op === 'project_snapshot') {
+      assert.deepEqual(request, { op: 'project_snapshot' }, 'snapshot scope comes only from the admitted workspace');
+      result = snapshot();
+    } else if (request.op === 'batch') {
+      assert.ok(Array.isArray(request.requests));
+      assert.ok(request.requests.length > 0 && request.requests.length <= 64);
+      result = { results: request.requests.map(row => inspect(row)), ok: true as const };
+    } else result = inspect(request);
     afterRpc?.(request);
     return result;
   };
@@ -88,7 +147,7 @@ async function createFixture(files: Record<string, string> = {}) {
     await rm(root, { recursive: true, force: true });
   }
   const options: Options = { cwd: hostDecoy, permissionMode: 'default', systemPrompt: { type: 'preset', preset: 'claude_code', append: 'Caller instruction' } };
-  return { root, account, hostDecoy, descriptor, launch, controller, options, requests, remote, links, execute, assertCurrent, dispose,
+  return { root, account, hostDecoy, descriptor, launch, controller, options, requests, operations, remote, links, execute, assertCurrent, dispose,
     setCurrent(value: boolean) { current = value; }, afterRpc(value: typeof afterRpc) { afterRpc = value; }, checks: () => checks };
 }
 
@@ -113,8 +172,7 @@ function prompt(options: Options) {
   if (typeof value === 'string') return value;
   if (Array.isArray(value)) return value.join('\n');
   if (!value) return '';
-  if (value.type === 'preset') return value.append ?? '';
-  return Array.isArray(value.prompt) ? value.prompt.join('\n') : value.prompt;
+  return value.type === 'custom' ? (Array.isArray(value.prompt) ? value.prompt.join('\n') : value.prompt) : value.append ?? '';
 }
 
 test('preparation loads remote instructions, selected account policy and cloud memory before query with retained public MCP provenance', async () => fixture({
@@ -158,32 +216,33 @@ test('preparation loads remote instructions, selected account policy and cloud m
   assert.equal(loaded.status, 'loaded');
   assert.match(loaded.configRevision, /^[a-f0-9]{64}$/);
   assert.ok(loaded.files.some(file => file.path === 'CLAUDE.md' && file.hash === hash(current.remote.get('CLAUDE.md')!)));
+  assert.equal(current.requests.filter(request => request.op === 'project_snapshot').length, 1, 'startup prefetch shares the exact run-local snapshot');
+  assert.deepEqual(current.requests.slice(1), [
+    { op: 'batch', requests: [{ op: 'lstat', path: '/workspace/docs' }, { op: 'lstat', path: '/workspace/docs/guide.md' }] },
+    { op: 'batch', requests: [{ op: 'read', path: '/workspace/docs/guide.md' }, { op: 'lstat', path: '/workspace/docs' }, { op: 'lstat', path: '/workspace/docs/guide.md' }] },
+  ], 'an instruction import outside the startup roots retains both ordered inspection batches');
   assert.ok(loaded.files.some(file => file.path === '.mcp.json' && file.kind === 'mcp'));
   assert.deepEqual(loaded.skills.map(skill => [skill.name, skill.status]), [['check', 'activated']]);
   assert.ok(loaded.mcp.some(server => server.name === 'docs' && server.status === 'selected'));
   assert.ok(loaded.mcp.some(server => server.name === 'windowsOnly' && server.status === 'unsupported' && server.location === 'local'));
   assert.equal(JSON.stringify(loaded).includes('remote-fixture-secret'), false);
   assert.equal(getProjectRuntimeManifest(current.launch.userId, current.descriptor.projectId, { accountKey: 'foreign-account' }), null);
+  assert.equal(getProjectRuntimeManifest('foreign-user', current.descriptor.projectId, { accountKey: current.launch.accountKey }), null);
+  assert.equal(getProjectRuntimeManifest(current.launch.userId, current.descriptor.projectId, { accountKey: current.launch.accountKey, workspaceId: 'foreign-workspace' }), null);
+  assert.equal(getProjectRuntimeManifest(current.launch.userId, current.descriptor.projectId, { accountKey: current.launch.accountKey, generation: 'foreign-generation' }), null);
   assert.equal(current.options.allowedTools?.includes('mcp__workspace__read_file'), false, 'ask Read cannot become automatic');
   assert.equal(current.options.allowedTools?.includes('mcp__workspace__*'), false, 'a wildcard cannot bypass the narrower ask/deny rules');
   assert.equal(current.options.allowedTools?.includes('mcp__docs__*'), false, 'external MCP wildcard cannot bypass a project/account deny');
   const permission = current.options.canUseTool!;
-  const context: Parameters<NonNullable<Options['canUseTool']>>[2] = { signal: current.controller.signal, toolUseID: 'tool-1', requestId: 'project-runtime-permission-request' };
-  const commandDecision = await permission('mcp__workspace__run_command', {}, context);
-  assert.ok(commandDecision, 'project deny returns an explicit permission decision');
-  assert.equal(commandDecision.behavior, 'deny');
-  const externalDecision = await permission('mcp__docs__danger', {}, context);
-  assert.ok(externalDecision, 'account deny returns an explicit permission decision');
-  assert.equal(externalDecision.behavior, 'deny');
+  const context = { signal: current.controller.signal, toolUseID: 'tool-1' } as Parameters<NonNullable<Options['canUseTool']>>[2];
+  assert.equal((await permission('mcp__workspace__run_command', {}, context))?.behavior, 'deny');
+  assert.equal((await permission('mcp__docs__danger', {}, context))?.behavior, 'deny');
   assert.equal(prompted, 0, 'project/account deny bypasses approval callback');
-  const readDecision = await permission('mcp__workspace__read_file', {}, context);
-  assert.ok(readDecision, 'project ask retains the explicit approval decision');
-  assert.equal(readDecision.behavior, 'deny');
+  assert.equal((await permission('mcp__workspace__read_file', {}, context))?.behavior, 'deny');
   assert.equal(prompted, 1, 'ask reaches the original explicit permission handler');
   assert.equal(permissionContexts[0]?.chisaForceAsk, true, 'project ask overrides the provider callback’s captured bypass options');
   assert.equal(permissionContexts[0]?.signal, context.signal);
   assert.equal(permissionContexts[0]?.toolUseID, context.toolUseID);
-  assert.equal(permissionContexts[0]?.requestId, context.requestId);
   assert.equal(Object.hasOwn(context, 'chisaForceAsk'), false, 'the original SDK context is not mutated');
   assert.match(await runtime.rulesForPath('/workspace/src/main.ts'), /TypeScript scoped rule/);
   assert.equal(await runtime.rulesForPath('/workspace/docs/guide.md'), '');
@@ -203,7 +262,7 @@ test('missing remote configuration never falls back to the host metadata anchor'
   const runtime = await prepareProjectRuntime(input(current));
   assert.doesNotMatch(prompt(current.options), /DECOY MUST NEVER LOAD/);
   assert.equal(manifest(current)?.files.length, 0);
-  assert.ok(current.requests.every(request => ['lstat', 'read', 'list'].includes(String(request.op))));
+  assert.deepEqual(current.requests, [{ op: 'project_snapshot' }]);
   runtime.close();
 }));
 
@@ -239,9 +298,47 @@ test('selected private account instructions and skill resources load without usi
   assert.equal(current.requests.length, requestsBeforeResource, 'account resources never fall through to the Windows project RPC');
   const unknown = await serverTool(runtime, 'read_skill_resource').invoke({ name: 'foreign', path: 'SKILL.md' });
   assert.equal(unknown.isError, true);
-  assert.ok(current.requests.every(request => ['lstat', 'read', 'list'].includes(String(request.op))));
+  assert.deepEqual(current.requests, [{ op: 'project_snapshot' }]);
   assert.equal(sdkCalls, 0);
   runtime.close();
+}));
+
+test('switching to an account with malformed optional skills keeps normal preparation available with account provenance', async () => fixture({
+  'CLAUDE.md': 'Required project instructions',
+}, async current => {
+  const foreignAccount = path.join(current.root, 'other-account');
+  await mkdir(foreignAccount);
+  current.launch.configDir = foreignAccount;
+  current.launch.accountKey = 'other-account';
+  const first = await prepareProjectRuntime(input(current));
+  assert.deepEqual(manifest(current)!.skills, []);
+  first.close();
+  const skillDirectory = path.join(current.account, 'skills', 'github-task');
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(path.join(skillDirectory, 'SKILL.md'), definition('name: github-task\ndescription: Order the board: "next"', 'INVALID ACCOUNT BODY MUST NOT LOAD'));
+  current.launch.configDir = current.account;
+  current.launch.accountKey = 'selected-account-1';
+  const runtime = await prepareProjectRuntime(input(current));
+  assert.equal(sdkCalls, 0);
+  assert.equal(manifest(current)!.status, 'loaded');
+  assert.match(prompt(current.options), /Required project instructions/);
+  assert.doesNotMatch(prompt(current.options), /INVALID ACCOUNT BODY MUST NOT LOAD/);
+  assert.ok(manifest(current)!.warnings.some(warning => warning.startsWith('account: .claude/skills/github-task/SKILL.md: invalid YAML frontmatter')));
+  assert.deepEqual(manifest(current)!.skills, [{ name: 'github-task', path: 'account/.claude/skills/github-task/SKILL.md', status: 'unsupported', reason: 'invalid YAML frontmatter' }]);
+  const activated = await serverTool(runtime, 'activate_skill').invoke({ name: 'github-task', arguments: '' });
+  assert.equal(activated.isError, true);
+  assert.match(activated.content[0]!.text, /invalid YAML frontmatter/);
+  const resource = await serverTool(runtime, 'read_skill_resource').invoke({ name: 'github-task', path: 'SKILL.md' });
+  assert.equal(resource.isError, true);
+  assert.match(resource.content[0]!.text, /invalid YAML frontmatter/);
+  assert.doesNotMatch(resource.content[0]!.text, /INVALID ACCOUNT BODY MUST NOT LOAD/);
+  runtime.close();
+  current.launch.configDir = foreignAccount;
+  current.launch.accountKey = 'other-account';
+  const restored = await prepareProjectRuntime(input(current));
+  assert.deepEqual(manifest(current)!.skills, []);
+  assert.equal(manifest(current)!.warnings.some(warning => warning.includes('github-task')), false);
+  restored.close();
 }));
 
 test('the admitted project skill wins a duplicate private account name for prompt and tool activation', async () => fixture({
@@ -317,9 +414,9 @@ test('present malformed configuration fails before query and persists sanitized 
 test('symbolic-link components and oversized remote content fail without host fallback or mutations', async () => {
   for (const scenario of ['link', 'oversize']) await fixture({ 'CLAUDE.md': scenario === 'oversize' ? 'x'.repeat(256 * 1024 + 1) : 'linked source' }, async current => {
     if (scenario === 'link') current.links.add('CLAUDE.md');
-    await assert.rejects(prepareProjectRuntime(input(current)), { code: scenario === 'link' ? 'PROJECT_RUNTIME_PATH_INVALID' : 'PROJECT_RUNTIME_LIMIT' });
+    await assert.rejects(prepareProjectRuntime(input(current)), { code: scenario === 'link' ? 'SSH_WORKSPACE_PATH_UNSAFE' : 'PROJECT_RUNTIME_LIMIT' });
     assert.equal(manifest(current)?.status, 'failed');
-    assert.equal(current.requests.some(request => request.op === 'read'), false);
+    assert.equal(current.operations.some(request => request.op === 'read'), false);
   });
 });
 
@@ -349,16 +446,12 @@ test('project dontAsk denies unlisted and ask-scoped tools before an original by
   assert.equal(current.options.allowedTools?.includes('mcp__workspace__read_file'), false);
   assert.equal(current.options.allowedTools?.includes('mcp__workspace__list_files'), true);
   const permission = current.options.canUseTool!;
-  const context: Parameters<NonNullable<Options['canUseTool']>>[2] = { signal: current.controller.signal, toolUseID: 'dont-ask-tool', requestId: 'project-runtime-dont-ask-request' };
+  const context = { signal: current.controller.signal, toolUseID: 'dont-ask-tool' } as Parameters<NonNullable<Options['canUseTool']>>[2];
   for (const name of ['mcp__workspace__run_command', 'mcp__workspace__read_file']) {
-    const decision = await permission(name, {}, context);
-    assert.ok(decision, 'dontAsk returns an explicit permission decision for ' + name);
-    assert.equal(decision.behavior, 'deny', name);
+    assert.equal((await permission(name, {}, context))?.behavior, 'deny', name);
     assert.equal(callbackCalls, 0, 'dontAsk rejects without consulting the captured bypass callback');
   }
-  const listDecision = await permission('mcp__workspace__list_files', {}, context);
-  assert.ok(listDecision, 'the explicitly allowed inspection returns a permission decision');
-  assert.equal(listDecision.behavior, 'allow');
+  assert.equal((await permission('mcp__workspace__list_files', {}, context))?.behavior, 'allow');
   assert.equal(callbackCalls, 1, 'an explicitly allowed non-ask inspection remains available');
   assert.equal((runtime.server as unknown as MockServer).tools.some(tool => tool.name === 'write_memory'), false);
   runtime.close();
@@ -402,7 +495,7 @@ test('discovered linked rules fail explicitly rather than silently disappearing'
   '.claude/rules/linked.md': 'Linked rule must not be silently ignored',
 }, async current => {
   current.links.add('.claude/rules/linked.md');
-  await assert.rejects(prepareProjectRuntime(input(current)), { code: 'PROJECT_RUNTIME_PATH_INVALID' });
+  await assert.rejects(prepareProjectRuntime(input(current)), { code: 'SSH_WORKSPACE_PATH_UNSAFE' });
   assert.equal(manifest(current)?.status, 'failed');
 }));
 

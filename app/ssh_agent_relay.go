@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,12 +16,18 @@ import (
 )
 
 type agentRelayJob struct {
-	RequestID string          `json:"requestId"`
-	Payload   json.RawMessage `json:"payload"`
+	RequestID  string          `json:"requestId"`
+	Payload    json.RawMessage `json:"payload"`
+	DeadlineAt int64           `json:"deadlineAt,omitempty"`
 }
 type agentRelayPoll struct {
-	Ready bool            `json:"ready"`
-	Jobs  []agentRelayJob `json:"jobs"`
+	Ready        bool            `json:"ready"`
+	Jobs         []agentRelayJob `json:"jobs"`
+	Protocol     int             `json:"protocol,omitempty"`
+	Epoch        string          `json:"epoch,omitempty"`
+	Capabilities *struct {
+		Events int `json:"events,omitempty"`
+	} `json:"capabilities,omitempty"`
 }
 type agentRelayResponse struct {
 	Status int    `json:"status"`
@@ -52,7 +59,7 @@ func relayControlPayload(payload []byte) bool {
 		return false
 	}
 	op := envelope.Request.Op
-	return op == "job_status" || op == "job_cancel" || op == "operation_status" || op == "operation_cancel"
+	return op == "job_status" || op == "job_cancel" || op == "job_output" || op == "operation_status" || op == "operation_cancel"
 }
 
 // All requests retain the captured account/client. Token refresh may update the
@@ -62,8 +69,9 @@ func sshAgentServiceRequest(ctx context.Context, scope sshAccountScope, agentTok
 	c := scope.connection
 	current := c != nil && apiConnection == c && c.authenticated && c.accountIdentity == scope.identity && c.version == scope.version && scope.ctx.Err() == nil && c.ctx.Err() == nil
 	accessToken := ""
+	var revision uint64
 	if current {
-		accessToken = c.accessToken
+		accessToken, revision = c.accessToken, c.tokenRevision
 	}
 	serverConnectionMu.RUnlock()
 	if !current || accessToken == "" {
@@ -92,13 +100,20 @@ func sshAgentServiceRequest(ctx context.Context, scope sshAccountScope, agentTok
 	if ctx.Err() != nil {
 		return nil, sshFailure("SSH_AGENT_RELAY_UNAVAILABLE", "Agent 中继请求超时或中断，正在重连。")
 	}
-	if response.StatusCode == 401 || response.StatusCode == 403 {
-		return nil, sshFailure("SSH_AGENT_RELAY_AUTH_FAILED", "Agent 中继认证失败，请重新登录或连接。")
+	// Accept refresh headers only after a complete bounded response; a
+	// recognized 401 can still revoke exactly its captured credential revision.
+	if response.StatusCode != http.StatusUnauthorized && (err != nil || len(raw) > int(limit)) {
+		return nil, sshFailure("SSH_AGENT_RELAY_UNAVAILABLE", "Agent 中继连接中断，正在重连。")
+	}
+	if saveErr := recordNativeRefreshedToken(c, response.Header, response.StatusCode, accessToken, revision); saveErr != nil {
+		return nil, sshFailure("SESSION_SAVE_FAILED", "账号凭据未保存，请重试。")
+	}
+	if failure := sshAgentHTTPFailure(response.StatusCode, response.Header, raw, accessToken, c.accessToken); failure != nil {
+		return nil, failure
 	}
 	if err != nil || len(raw) > int(limit) || response.StatusCode != http.StatusOK {
 		return nil, sshFailure("SSH_AGENT_RELAY_UNAVAILABLE", "Agent 中继连接中断，正在重连。")
 	}
-	recordNativeRefreshedToken(c, response.Header, response.StatusCode)
 	return raw, nil
 }
 
@@ -147,48 +162,76 @@ func (m *sshTunnelManager) runRelay(entry *sshTunnelEntry) (string, string) {
 	regularDeliveries, controlDeliveries := make(chan struct{}, 64), make(chan struct{}, 8)
 	resultBudget := &agentRelayResultBudget{}
 	registered := false
-	attempt := 0
+	session := newSshAgentSession(m, entry)
+	var protocol int
+	var runtime *sshRelayRuntime
+	var heartbeatCancel context.CancelFunc
+	var heartbeatDone chan struct{}
+	defer func() {
+		entry.cancel()
+		if heartbeatCancel != nil {
+			heartbeatCancel()
+			<-heartbeatDone
+		}
+		if runtime != nil {
+			runtime.close()
+		}
+	}()
+	handshake := func(handshakeCtx context.Context) error {
+		raw, failure := sshAgentServiceRequest(handshakeCtx, entry.scope, agent.token, http.MethodGet, "/api/ssh-workspaces/agent/relay/poll?connectionId="+url.QueryEscape(entry.profile.ID)+"&wait=0&protocol=2", nil, 64*1024)
+		if failure != nil {
+			return failure
+		}
+		var reply agentRelayPoll
+		if json.Unmarshal(raw, &reply) != nil || !reply.Ready || len(reply.Jobs) != 0 {
+			return sshFailure("SSH_AGENT_RELAY_HANDSHAKE_FAILED", "无法确认账号 Agent 中继已就绪，正在重新连接。")
+		}
+		if reply.Protocol == 2 {
+			if validateRelayEpoch(reply.Epoch) != nil {
+				return sshFailure("SSH_AGENT_RELAY_INVALID", "Agent 中继会话身份无效。")
+			}
+			if runtime == nil {
+				journal, failure := newRelayJournal(filepath.Join(filepath.Dir(m.path), "agent-relay-journal-v2", entry.scope.binding, entry.profile.ID))
+				if failure != nil {
+					return sshFailure("SSH_AGENT_RELAY_STORAGE_UNAVAILABLE", "无法安全保存 Agent 任务收据，正在等待本地存储恢复。")
+				}
+				runtime = newSshRelayRuntime(m, entry, localClient, journal)
+				heartbeatCtx, stop := context.WithCancel(ctx)
+				heartbeatCancel, heartbeatDone = stop, make(chan struct{})
+				go func() { defer close(heartbeatDone); runtime.heartbeat(heartbeatCtx) }()
+			}
+			runtime.setEpoch(reply.Epoch)
+			runtime.setEventsEnabled(reply.Capabilities != nil && reply.Capabilities.Events > 0)
+			runtime.resume(reply.Epoch)
+		} else if runtime != nil {
+			return sshFailure("SSH_AGENT_RELAY_INVALID", "Agent 服务协议已改变，正在重新协商。")
+		}
+		protocol = reply.Protocol
+		return nil
+	}
 	for {
 		if ctx.Err() != nil {
 			return "", "Agent 已停止。"
 		}
 		if !registered {
-			m.relayStatus(entry, "starting", "registering", "", "正在登记账号的本地 Agent。", attempt)
-			registerCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
-			err = m.deps.registerAgent(registerCtx, entry.scope, entry.profile, agent.token)
-			cancel()
-			if err != nil {
-				code, message := sshErrorFields(err)
-				m.relayStatus(entry, "starting", "error", code, message, attempt)
-				select {
-				case <-ctx.Done():
-					return "", "Agent 已停止。"
-				case <-entry.retryRegistration:
-					continue
-				}
+			if failure := session.connect(handshake); failure != nil {
+				return sshErrorFields(failure)
 			}
 			registered = true
-			// No success until the server's authenticated relay handshake confirms
-			// it can deliver this exact account connection.
-			handshakeCtx, handshakeCancel := context.WithTimeout(ctx, 12*time.Second)
-			raw, handshakeErr := sshAgentServiceRequest(handshakeCtx, entry.scope, agent.token, http.MethodGet, "/api/ssh-workspaces/agent/relay/poll?connectionId="+url.QueryEscape(entry.profile.ID)+"&wait=0", nil, 64*1024)
-			handshakeCancel()
-			var handshake agentRelayPoll
-			if handshakeErr != nil || json.Unmarshal(raw, &handshake) != nil || !handshake.Ready || len(handshake.Jobs) != 0 {
-				registered = false
-				m.relayStatus(entry, "starting", "error", "SSH_AGENT_RELAY_HANDSHAKE_FAILED", "无法确认账号 Agent 中继已就绪，请重试。", attempt)
-				select {
-				case <-ctx.Done():
-					return "", "Agent 已停止。"
-				case <-entry.retryRegistration:
-					continue
-				}
-			}
-			m.relayStatus(entry, "forwarding", "registered", "", "账号 Agent 中继已连接；项目目录仍需独立验证。", attempt)
 		}
-		pollCtx, cancel := context.WithTimeout(ctx, 32*time.Second)
-		raw, pollErr := sshAgentServiceRequest(pollCtx, entry.scope, agent.token, http.MethodGet, "/api/ssh-workspaces/agent/relay/poll?connectionId="+url.QueryEscape(entry.profile.ID), nil, 50*1024*1024)
-		cancel()
+		path := "/api/ssh-workspaces/agent/relay/poll?connectionId=" + url.QueryEscape(entry.profile.ID)
+		if protocol == 2 {
+			path += "&protocol=2"
+		}
+		var raw []byte
+		var pollErr error
+		if runtime != nil {
+			raw, pollErr = runtime.receive(ctx, path)
+		} else {
+			pollCtx, cancel := context.WithTimeout(ctx, 32*time.Second)
+			raw, pollErr = sshAgentServiceRequest(pollCtx, entry.scope, agent.token, http.MethodGet, path, nil, 50*1024*1024)
+			cancel()
+		}
 		var poll agentRelayPoll
 		if pollErr == nil && (json.Unmarshal(raw, &poll) != nil || !poll.Ready || len(poll.Jobs) > 4) {
 			pollErr = sshFailure("SSH_AGENT_RELAY_INVALID", "账号 Agent 中继响应无效。")
@@ -197,30 +240,44 @@ func (m *sshTunnelManager) runRelay(entry *sshTunnelEntry) (string, string) {
 			if ctx.Err() != nil {
 				return "", "Agent 已停止。"
 			}
-			code, message := sshErrorFields(pollErr)
-			if code == "SSH_ACCOUNT_CHANGED" || code == "SSH_AGENT_RELAY_AUTH_FAILED" || code == "SSH_AGENT_RELAY_INVALID" {
-				return code, message
-			}
-			attempt++
-			m.relayStatus(entry, "reconnecting", "registered", code, message, attempt)
-			select {
-			case <-ctx.Done():
-				return "", "Agent 已停止。"
-			case <-m.deps.after(time.Second << min(attempt-1, 5)):
+			if failure := session.wait(pollErr); failure != nil {
+				code, _ := sshErrorFields(failure)
+				if code == "SSH_AGENT_REGISTRATION_REQUIRED" {
+					registered = false
+					continue
+				}
+				return sshErrorFields(failure)
 			}
 			continue
 		}
-		m.relayStatus(entry, "forwarding", "registered", "", "账号 Agent 中继已连接；项目目录仍需独立验证。", attempt)
+		if protocol == 2 && (poll.Protocol != 2 || validateRelayEpoch(poll.Epoch) != nil) {
+			registered = false
+			if failure := session.wait(sshFailure("SSH_AGENT_RELAY_INVALID", "Agent 中继响应不完整，正在重新协商。")); failure != nil {
+				return sshErrorFields(failure)
+			}
+			continue
+		}
+		if protocol == 2 {
+			runtime.setEpoch(poll.Epoch)
+			runtime.setEventsEnabled(poll.Capabilities != nil && poll.Capabilities.Events > 0)
+		}
+		session.ready()
 		for _, job := range poll.Jobs {
 			if job.RequestID == "" || len(job.RequestID) > 128 || len(job.Payload) > 12*1024*1024 || !json.Valid(job.Payload) {
 				return "SSH_AGENT_RELAY_INVALID", "账号 Agent 中继任务无效。"
+			}
+			if protocol == 2 {
+				runtime.admit(poll.Epoch, job)
+				continue
 			}
 			if seen[job.RequestID] {
 				continue
 			}
 			seen[job.RequestID] = true
+			// Legacy servers never redeliver request IDs. Keep compatibility
+			// bounded without terminating a healthy long-running desktop session.
 			if len(seen) > 65536 {
-				return "SSH_AGENT_RELAY_LIMIT", "Agent 中继会话已达到任务上限，请重新连接。"
+				seen = map[string]bool{job.RequestID: true}
 			}
 			slots, deliveries := regularSlots, regularDeliveries
 			if relayControlPayload(job.Payload) {

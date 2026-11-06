@@ -62,6 +62,7 @@ for (const permissionMode of [undefined, 'default', 'plan', 'bypassPermissions',
     if (job?.kind !== 'cli') throw new Error('missing CLI job');
     assert.equal(job.cwd, '/execution');
     assert.deepEqual(job.args.slice(0, 5), ['run', '--format', 'json', '--dir', '/execution']);
+    assert.deepEqual(job.args.slice(5, 7), ['--model', 'provider/model']);
     assert.ok(job.args.at(-1)?.includes('<files_input>'));
     assert.ok(job.args.at(-1)?.includes('<images_input>'));
     const permissions = resolveOpenCodePermissionOptions(permissionMode);

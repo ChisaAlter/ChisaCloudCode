@@ -7,11 +7,15 @@ import { sessionsDb } from '@/modules/database/index.js';
 import { AppError } from '@/shared/index.js';
 import type { LLMProvider } from '@/shared/index.js';
 
+import { resolveProviderSlotHome } from './provider-slot.service.js';
+
 type ManagedProvider = Exclude<LLMProvider, 'claude'>;
 const listeners = new Set<(provider: ManagedProvider, home: string) => void>();
 
 /** Provider runners and session readers use a deterministic private HOME per app session; the native host profile is never mounted writable. */
 export function managedProviderHome(provider: ManagedProvider, sessionId: string) {
+  const slot = resolveProviderSlotHome(provider,sessionId);
+  if (slot) return slot;
   const identity = createHash('sha256').update(sessionId).digest('hex');
   return path.join(os.homedir(), '.cloudcli', 'provider-runtime', 'profiles', provider, identity, 'state-home');
 }

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "change_id": null,
+  "created_at": null,
+  "expires_at": null,
+  "machine": {"machine_id_sha256": null, "boot_id": null},
+  "admission_closed": false,
+  "all_writers_fenced": false,
+  "writer_classes": ["api", "worker", "agent", "shell", "preview", "legacy_sync", "scheduled", "host_manual"],
+  "inventory_reviewed_by": null,
+  "supervisors_and_schedulers_reviewed": false,
+  "operator_note": "Template is deliberately denied. A fresh root-owned 0600 evidence file is required only after separately authorized maintenance and review. Tool does not perform drain/mask/stop/update."
+}

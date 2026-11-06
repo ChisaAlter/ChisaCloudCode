@@ -14,7 +14,7 @@ export default function SidebarProjectList({
   selectedSession,
   isLoading,
   loadingProgress,
-  expandedProjects,
+  isProjectExpanded,
   activeRename,
   initialSessionsLoaded,
   currentTime,
@@ -26,8 +26,8 @@ export default function SidebarProjectList({
   onLoadMoreSessions,
   loadingMoreProjects,
   activeSessions,
+  backgroundSessionIds,
   attentionSessionIds,
-  forceExpanded = false,
   isProjectStarred,
   onRenameDraftChange,
   onToggleProject,
@@ -45,6 +45,11 @@ export default function SidebarProjectList({
   onStartEditingSession,
   onCancelEditingSession,
   onSaveEditingSession,
+  sessionSelection,
+  onSetSessionSelection,
+  onToggleSessionSelected,
+  onCancelSessionSelection,
+  onDeleteSelectedSessions,
   t,
 }: SidebarProjectListProps) {
   const pageTitle = getPageTitle(selectedProject, selectedSession);
@@ -80,6 +85,11 @@ export default function SidebarProjectList({
                 activeRename?.target === 'session' && activeRename.projectId === project.projectId
                   ? activeRename
                   : null;
+              // Resolved here for the same reason as the renames: only the
+              // project in selection mode sees a set, every other row keeps
+              // being handed the same `null` and its memo holds.
+              const selectedSessionIds =
+                sessionSelection?.projectId === project.projectId ? sessionSelection.sessionIds : null;
 
               // React key + per-project state lookups all use the DB `projectId`
               // so they remain stable across renames and session changes.
@@ -89,7 +99,7 @@ export default function SidebarProjectList({
                 project={project}
                 selectedProject={selectedProject}
                 selectedSession={selectedSession}
-                isExpanded={forceExpanded || expandedProjects.has(project.projectId)}
+                isExpanded={isProjectExpanded(project.projectId)}
                 isDeleting={deletingProjects.has(project.projectId)}
                 isStarred={isProjectStarred(project.projectId)}
                 isEditing={renamingProject !== null}
@@ -116,11 +126,17 @@ export default function SidebarProjectList({
                 onForkSession={onForkSession}
                 onLoadMoreSessions={onLoadMoreSessions}
                 activeSessions={activeSessions}
+                backgroundSessionIds={backgroundSessionIds}
                 attentionSessionIds={attentionSessionIds}
                 onNewSession={onNewSession}
                 onStartEditingSession={onStartEditingSession}
                 onCancelEditingSession={onCancelEditingSession}
                 onSaveEditingSession={onSaveEditingSession}
+                selectedSessionIds={selectedSessionIds}
+                onSetSessionSelection={onSetSessionSelection}
+                onToggleSessionSelected={onToggleSessionSelected}
+                onCancelSessionSelection={onCancelSessionSelection}
+                onDeleteSelectedSessions={onDeleteSelectedSessions}
                 t={t}
               />
             );

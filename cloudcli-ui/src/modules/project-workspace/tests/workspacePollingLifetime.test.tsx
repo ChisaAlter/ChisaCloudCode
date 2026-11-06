@@ -34,7 +34,7 @@ const workspace: WorkspaceDescriptor = {
 };
 const content = () => <WorkspaceMain projects={[]} selectedProject={{ projectId: 'project', displayName: 'Local', fullPath: '/meta/project', sourceMode: 'ssh' }} selectedSession={null} activeTab="files" setActiveTab={vi.fn()}
   ws={null} sendMessage={vi.fn()} isMobile={false} onMenuClick={vi.fn()} isLoading={false} onNavigateToSession={vi.fn()} onSessionEstablished={vi.fn()} onShowSettings={vi.fn()}
-  externalMessageUpdate={0} newSessionTrigger={0} onProjectSelect={vi.fn()} onProjectsRefresh={vi.fn()} />;
+  externalMessageUpdate={0} newSessionTrigger={0} onProjectSelect={vi.fn()} onProjectsRefresh={vi.fn()} onRenameSession={vi.fn(async () => true)} />;
 afterEach(() => { cleanup(); lifetime.headers.length = 0; lifetime.files.length = 0; });
 
 test('header and file requests remain mounted through phase polls but reset for a new generation', () => {

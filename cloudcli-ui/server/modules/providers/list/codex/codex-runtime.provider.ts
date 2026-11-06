@@ -14,6 +14,7 @@
 import type { ModelReasoningEffort, ThreadOptions } from '@openai/codex-sdk';
 
 import { runProviderProcess } from '@/modules/providers/services/provider-process.service.js';
+import { providerAttachmentsService } from '@/modules/providers/services/provider-attachments.service.js';
 import {
   appendFilesInputTag,
   buildCodexInputItems,
@@ -33,6 +34,10 @@ type ActiveCodexSession = {
 };
 
 const activeCodexSessions = new Map<string, ActiveCodexSession>();
+
+// Codex CLI requires non-whitespace stdin even when --image arguments are
+// present, so attachment-only turns need a small text instruction.
+const CODEX_IMAGE_ONLY_PROMPT = 'Please analyze the attached image(s).';
 
 /**
  * Item types whose in-flight updates are worth showing. These are the ones a
@@ -309,6 +314,8 @@ async function queryCodex(
   // Session-map key: the app session id when the caller supplied one, else
   // the provider-native thread id once captured (legacy/direct API callers).
   const sessionKey = () => sessionId || capturedSessionId || null;
+  let stagedAttachments: Awaited<ReturnType<typeof providerAttachmentsService.stage>> | undefined;
+  let retainAttachmentSnapshot = false;
 
   try {
     abortController.signal.throwIfAborted();
@@ -337,12 +344,28 @@ async function queryCodex(
       registerSession(sessionKey());
     }
 
-    // Execute with streaming. Turns with image attachments send structured
-    // input items so Codex reads the images from their local asset paths.
-    const promptWithFiles = appendFilesInputTag(command, files);
-    const turnInput = normalizeImageDescriptors(images).length > 0
-      ? buildCodexInputItems(promptWithFiles, images, workingDirectory)
+    let preparedImages = normalizeImageDescriptors(images);
+    let preparedFiles = files;
+    if (context.attachmentMode !== 'slot') {
+      const access = { userId: ws.userId, assertActive: () => ws.assertActive?.(),
+        signal: abortController.signal, readWorkspaceImage: context.readWorkspaceImage };
+      const verifiedImages = await providerAttachmentsService.readImages(images, access);
+      const verifiedFiles = await providerAttachmentsService.readFiles(files, access);
+      stagedAttachments = await providerAttachmentsService.stage([...verifiedImages, ...verifiedFiles]);
+      preparedImages = stagedAttachments.attachments.slice(0, verifiedImages.length);
+      preparedFiles = stagedAttachments.attachments.slice(verifiedImages.length);
+    }
+    // A slot launcher maps each original image to its sealed asset inode and
+    // rejects every unmapped path. Native SDKs receive private snapshots only.
+    const promptWithFiles = appendFilesInputTag(command, preparedFiles);
+    const promptWithImageFallback = !promptWithFiles.trim() && preparedImages.length > 0
+      ? CODEX_IMAGE_ONLY_PROMPT
       : promptWithFiles;
+    const turnInput = preparedImages.length > 0
+      ? buildCodexInputItems(promptWithImageFallback, preparedImages)
+      : promptWithFiles;
+    abortController.signal.throwIfAborted();
+    ws.assertActive?.();
     const result = await (context.runProcess ?? runProcess)({
       kind: 'codex', providerSessionId, threadOptions, input: turnInput,
     }, { event(event) {
@@ -419,6 +442,8 @@ async function queryCodex(
       }
     } }, abortController.signal);
     if (result.error) throw Object.assign(new Error(result.error.message), { name: result.error.name });
+    // runProcess resolves only after the SDK and its process tree are reaped.
+    await stagedAttachments?.dispose();
     if (result.code !== 0) throw new Error(`Codex worker exited with code ${result.code}`);
 
     // Send the terminal completion event — skipped for aborted runs, whose
@@ -449,6 +474,7 @@ async function queryCodex(
     // A failed teardown must retain workspace ownership and be visible to the
     // dispatcher. It is never an ordinary provider/model error or safe abort.
     if ((error as { processTeardownError?: boolean })?.processTeardownError) {
+      retainAttachmentSnapshot = true;
       if (session) session.cleanupError = error;
       throw error;
     }
@@ -486,15 +512,14 @@ async function queryCodex(
     }
 
   } finally {
-    externalSignal?.removeEventListener('abort', cancel);
-    resolveCompletion();
-    // Update session status
-    if (sessionKey()) {
-      const session = activeCodexSessions.get(sessionKey() || '');
-      if (session) {
-        session.status = session.status === 'aborted' ? 'aborted' : 'completed';
-        // Finished cancellations must not remain addressable as another active run.
-        if (!session.cleanupError) activeCodexSessions.delete(sessionKey()!);
+    try {
+      if (!retainAttachmentSnapshot) await stagedAttachments?.dispose();
+    } finally {
+      externalSignal?.removeEventListener('abort', cancel);
+      resolveCompletion();
+      if (sessionKey()) {
+        const session = activeCodexSessions.get(sessionKey() || '');
+        if (session) session.status = session.status === 'aborted' ? 'aborted' : 'completed';
       }
     }
   }
@@ -542,8 +567,8 @@ export const codexRuntime = createCodexRuntime();
  */
 function sendMessage(ws: ProviderRuntimeWriter, data: unknown) {
   try {
-    if (ws.isSSEStreamWriter || ws.isWebSocketWriter) {
-      // Writer handles stringification (SSEStreamWriter or WebSocketWriter)
+    if (ws.isWebSocketWriter) {
+      // The gateway writer handles stringification
       ws.send(data);
     } else if (typeof ws.send === 'function') {
       // Raw WebSocket - stringify here

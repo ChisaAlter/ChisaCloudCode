@@ -35,6 +35,7 @@ func TestAccountLiveGatewayNoSSH(t *testing.T) {
 	}
 	previousStore, previousConnection := store, apiConnection
 	t.Setenv("APPDATA", t.TempDir())
+	t.Setenv("CHISA_DATA_DIR", t.TempDir())
 	store = loadStore(dataDir())
 	store.Cfg.LoginURL = serviceURL
 	if err := initializeServerConnection(); err != nil {
@@ -48,7 +49,7 @@ func TestAccountLiveGatewayNoSSH(t *testing.T) {
 	}()
 	bridge := FrontendBridge{}
 	body, _ := json.Marshal(credentials)
-	login := bridge.ServerRequest(bridge.BeginServerRequest(), "POST", "/api/auth/login", map[string]string{"Content-Type": "application/json"}, base64.StdEncoding.EncodeToString(body))
+	login := bridge.ServerRequest(reserveTestRequest(t, "login"), "POST", "/api/auth/login", map[string]string{"Content-Type": "application/json"}, base64.StdEncoding.EncodeToString(body))
 	if login.Status != 200 {
 		t.Fatalf("real login returned HTTP %d", login.Status)
 	}
@@ -70,7 +71,7 @@ func TestAccountLiveGatewayNoSSH(t *testing.T) {
 		t.Fatal("account routing depended on SSH or selected the wrong instance")
 	}
 	for _, endpoint := range []string{"/api/auth/user", "/api/projects"} {
-		response := bridge.ServerRequest(bridge.BeginServerRequest(), "GET", endpoint, map[string]string{"Authorization": "Bearer " + session.Token}, "")
+		response := bridge.ServerRequest(reserveTestRequest(t, "api"), "GET", endpoint, nil, "")
 		if response.Status != 200 {
 			t.Fatalf("real protected endpoint %s returned %d", endpoint, response.Status)
 		}
@@ -98,11 +99,11 @@ func TestAccountLiveGatewayNoSSH(t *testing.T) {
 	}
 	defer client.Close()
 	client.SetDeadline(time.Now().Add(15 * time.Second))
-	fmt.Fprintf(client, "GET /channel/%s/ws?token=%s HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", apiProxyKey, session.Token)
+	fmt.Fprintf(client, "GET /channel/%s/ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", apiConnection.proxyCapability)
 	status, err := bufio.NewReader(client).ReadString('\n')
 	if err != nil || !strings.Contains(status, "101") {
 		t.Fatal("real authenticated chat websocket did not upgrade")
 	}
-	bridge.EndServerSession(apiConnection.version)
+	if result := bridge.EndServerSessionV2(apiConnection.sessionHandle, apiConnection.tokenRevision); result["ok"] != true { t.Fatal(result) }
 	t.Log("Real encrypted login, account routing, protected APIs, cross-instance rejection, chat connection and logout passed without SSH")
 }

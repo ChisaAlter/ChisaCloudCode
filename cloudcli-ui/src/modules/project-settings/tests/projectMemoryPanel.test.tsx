@@ -1,19 +1,38 @@
+import { Buffer } from 'node:buffer';
+import { createHmac } from 'node:crypto';
+
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 import ProjectMemoryPanel from '@/modules/project-settings/ProjectMemoryPanel';
 import ProjectSettingsDialog from '@/modules/project-settings/ProjectSettingsDialog';
 import { api } from '@/shared/api';
-import { clearAuthToken, startAuthSession } from '@/shared/authToken';
+import { acknowledgeAuthSession, clearAuthToken, initializeAuthSession, startAuthSession } from '@/shared/authToken';
+import type * as Chisa from '@/shared/chisa';
 
 const service = vi.hoisted(() => ({ version: 0 }));
-vi.mock('@/shared/chisa', () => ({ getServerConnectionVersion: () => service.version }));
+vi.mock('@/shared/chisa', async importOriginal => ({
+  ...await importOriginal<typeof Chisa>(),
+  getServerConnectionVersion: () => service.version,
+}));
 const initial = { content: 'Project conventions', hash: 'base-hash' };
 const response = (data = initial) => Response.json({ success: true, data });
 const editor = () => screen.getByRole<HTMLTextAreaElement>('textbox', { name: '项目记忆内容' });
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; }
-beforeEach(() => { service.version = 0; startAuthSession('account.payload.signature'); });
-afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); });
+async function authenticateMemoryAccount(userId = 'memory-account-a') {
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const unsigned = `${encode({ alg: 'HS256', typ: 'JWT' })}.${encode({ userId, iat: issuedAt, exp: issuedAt + 3600 })}`;
+  const token = `${unsigned}.${createHmac('sha256', 'project-memory-test-key').update(unsigned).digest('base64url')}`;
+  await clearAuthToken(await initializeAuthSession());
+  const session = await startAuthSession(token, await initializeAuthSession());
+  expect(session, 'memory fixture login must commit before rendering').not.toBeNull();
+  if (!session) throw new Error('Memory fixture login did not commit');
+  acknowledgeAuthSession(session);
+}
+
+beforeEach(async () => { service.version = 0; await authenticateMemoryAccount(); });
+afterEach(async () => { cleanup(); await clearAuthToken(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 async function loaded() {
   await screen.findByRole('textbox', { name: '项目记忆内容' });
@@ -105,7 +124,7 @@ test.each(['project', 'account', 'server'] as const)('a late parsed read cannot 
   const read = vi.spyOn(api, 'projectMemory').mockResolvedValueOnce({ ok: true, json } as unknown as Response).mockImplementation(async () => response({ content: 'Next owner memory', hash: 'next' }));
   const view = render(<ProjectMemoryPanel projectId="one" />);
   await waitFor(() => expect(json).toHaveBeenCalled());
-  if (transition === 'account') clearAuthToken();
+  if (transition === 'account') await act(async () => { await authenticateMemoryAccount('memory-account-b'); });
   if (transition === 'server') service.version += 1;
   view.rerender(<ProjectMemoryPanel projectId={transition === 'project' ? 'two' : 'one'} />);
   await loaded();
@@ -122,7 +141,7 @@ test('a pending save after an account change cannot replace the next account dra
   await loaded();
   fireEvent.change(editor(), { target: { value: 'A unsaved content' } });
   fireEvent.click(screen.getByRole('button', { name: '保存项目记忆' }));
-  clearAuthToken();
+  await act(async () => { await authenticateMemoryAccount('memory-account-b'); });
   view.rerender(<ProjectMemoryPanel projectId="one" />);
   await loaded();
   fireEvent.change(editor(), { target: { value: 'B draft' } });

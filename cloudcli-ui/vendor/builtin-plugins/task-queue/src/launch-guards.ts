@@ -158,7 +158,8 @@ export function preLaunchEnv(
     return { ok: true, env: parentEnv };
   }
 
-  const env = { ...parentEnv, ...loadAgentEnv(agent, opts.envRoot) };
+  // Stamp after agent overrides so headless Claude never inherits sdk-cli/sdk-ts attribution.
+  const env = { ...parentEnv, ...loadAgentEnv(agent, opts.envRoot), CLAUDE_CODE_ENTRYPOINT: 'chisacloudcode' };
 
   if (!env.SCOPED_MCP_BEARER_TOKEN) {
     return {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -23,7 +24,13 @@ func preserveDesktopSshManager(t *testing.T, manager *sshTunnelManager) {
 }
 
 func TestSshNativeAccountLogoutStopsOwnedTunnelAndPreservesCloudContract(t *testing.T) {
-	connection := accountWorkspaceFixture(t, func(http.ResponseWriter, *http.Request) {})
+	connection := accountWorkspaceFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		local, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+		if r.Method != http.MethodPost || r.URL.Path != "/api/auth/logout" || r.URL.RawQuery != "" || r.Header.Get("Authorization") != "Bearer header.payload.signature" || local == nil || r.Host != local.String() {
+			t.Error("logout changed the captured origin, route or bearer")
+		}
+		fmt.Fprint(w, `{"success":true,"message":"Logged out successfully"}`)
+	})
 	manager, runtime := sshTestManager(t)
 	preserveDesktopSshManager(t, manager)
 	scope, err := currentSshAccount()
@@ -38,8 +45,10 @@ func TestSshNativeAccountLogoutStopsOwnedTunnelAndPreservesCloudContract(t *test
 	if response := bridge.StartSshTunnel(profile.ID); response["ok"] != true {
 		t.Fatal(response)
 	}
-	started := <-runtime.starts
-	bridge.EndServerSession(connection.version + 1)
+	started := awaitSshStart(t, runtime.starts)
+	if result := bridge.EndServerSessionV2(connection.sessionHandle, connection.tokenRevision+1); result["ok"] != false {
+		t.Fatal("stale logout was accepted")
+	}
 	if connection.ctx.Err() != nil {
 		t.Fatal("stale logout canceled authenticated account")
 	}
@@ -48,7 +57,9 @@ func TestSshNativeAccountLogoutStopsOwnedTunnelAndPreservesCloudContract(t *test
 		t.Fatal("stale logout stopped current SSH tunnel")
 	default:
 	}
-	bridge.EndServerSession(connection.version)
+	if result := bridge.EndServerSessionV2(connection.sessionHandle, connection.tokenRevision); result["ok"] != true {
+		t.Fatal(result)
+	}
 	select {
 	case <-started.process.killed:
 	case <-time.After(time.Second):
@@ -66,7 +77,7 @@ func TestSshNativeAccountLogoutStopsOwnedTunnelAndPreservesCloudContract(t *test
 	}
 }
 
-func TestSshAccountIdentityRefreshWithoutReplacementRevokesTunnel(t *testing.T) {
+func TestSshAccountIdentityRefreshRotatesSessionAndRevokesTunnel(t *testing.T) {
 	connection := accountWorkspaceFixture(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// A self-hosted auth response may have no instancePath. Its verified user
@@ -83,11 +94,11 @@ func TestSshAccountIdentityRefreshWithoutReplacementRevokesTunnel(t *testing.T) 
 	if _, err := manager.start(scope, profile.ID); err != nil {
 		t.Fatal(err)
 	}
-	started := <-runtime.starts
+	started := awaitSshStart(t, runtime.starts)
 	bridge := FrontendBridge{}
-	response := bridge.ServerRequest(bridge.BeginServerRequest(), "GET", "/api/auth/user", map[string]string{"Authorization": "Bearer test-token"}, "")
-	if response.Status != 200 || apiConnection != connection {
-		t.Fatal("fixture did not exercise same-transport identity refresh", response)
+	response := bridge.ServerRequest(reserveTestRequest(t, "api"), "GET", "/api/auth/user", nil, "")
+	if response.Status != 200 || apiConnection == connection || apiConnection.baseURL != connection.baseURL || response.SessionTransition == nil {
+		t.Fatal("fixture did not rotate the identity at the same API target", response)
 	}
 	select {
 	case <-started.process.killed:
@@ -108,7 +119,13 @@ func TestSshAccountIdentityRefreshWithoutReplacementRevokesTunnel(t *testing.T) 
 }
 
 func TestSshWindowCloseDoesNotAcquireCloudAccountLockOrStartAfterClose(t *testing.T) {
-	connection := accountWorkspaceFixture(t, func(http.ResponseWriter, *http.Request) {})
+	connection := accountWorkspaceFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		local, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+		if r.Method != http.MethodPost || r.URL.Path != "/api/auth/logout" || r.URL.RawQuery != "" || r.Header.Get("Authorization") != "Bearer header.payload.signature" || local == nil || r.Host != local.String() {
+			t.Error("logout changed the captured origin, route or bearer")
+		}
+		fmt.Fprint(w, `{"success":true,"message":"Logged out successfully"}`)
+	})
 	manager, runtime := sshTestManager(t)
 	preserveDesktopSshManager(t, manager)
 	scope, err := currentSshAccount()
@@ -119,7 +136,7 @@ func TestSshWindowCloseDoesNotAcquireCloudAccountLockOrStartAfterClose(t *testin
 	if _, err := manager.start(scope, profile.ID); err != nil {
 		t.Fatal(err)
 	}
-	started := <-runtime.starts
+	started := awaitSshStart(t, runtime.starts)
 	serverConnectionMu.Lock()
 	closed := make(chan struct{})
 	go func() { stopDesktopSshTunnels(true); close(closed) }()
@@ -130,7 +147,11 @@ func TestSshWindowCloseDoesNotAcquireCloudAccountLockOrStartAfterClose(t *testin
 		t.Fatal("SSH window close waited for cloud account lock")
 	}
 	serverConnectionMu.Unlock()
-	<-started.process.killed
+	select {
+	case <-started.process.killed:
+	case <-time.After(time.Second):
+		t.Fatal("SSH window close did not terminate owned child")
+	}
 	waitSshState(t, manager, scope, profile.ID, "stopped")
 	if connection.ctx.Err() != nil {
 		t.Fatal("optional SSH close canceled native cloud account")

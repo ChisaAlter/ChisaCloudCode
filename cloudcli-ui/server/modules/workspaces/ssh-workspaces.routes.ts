@@ -1,8 +1,8 @@
 import express from 'express';
 
-import { agentConnectionService, agentRelayBroker, listSshConnections } from '@/modules/ssh-workspaces/index.js';
+import { agentConnectionService, agentRelayBroker, ensureAgentWorkspaceEventFanout, listSshConnections } from '@/modules/ssh-workspaces/index.js';
 import { probeSshProjectDirectory } from '@/modules/projects/index.js';
-import { assertSshProjectOwner, recoverSshWorkspace, resolveSshProjectTarget } from '@/modules/workspace-bridge/index.js';
+import { assertSshProjectOwner, getActiveSshWorkspaceJobId, recoverSshWorkspace, resolveSshProjectTarget, readSshWorkspaceJobOutput } from '@/modules/workspace-bridge/index.js';
 import { projectsDb } from '@/modules/database/index.js';
 import { AppError, asyncHandler } from '@/shared/index.js';
 
@@ -19,9 +19,12 @@ function text(value: unknown, field: string): string {
 
 /** Server entrypoint mounts this authenticated SSH catalog/probe/recovery API without exposing private connection credentials. */
 export function createSshWorkspacesRouter(): express.Router {
+  ensureAgentWorkspaceEventFanout();
   const router = express.Router();
   router.get('/connections', asyncHandler(async (request, response) => {
-    const connections = await listSshConnections(owner(request));
+    const account = owner(request);
+    const connections = (await listSshConnections(account)).map(connection => connection.delivery === 'relay'
+      ? { ...connection, relay: agentRelayBroker.status(account, connection.id) } : connection);
     response.json({ connections, configured: connections.length > 0 });
   }));
   router.post('/agent/connections', asyncHandler(async (request, response) => {
@@ -46,14 +49,34 @@ export function createSshWorkspacesRouter(): express.Router {
     response.once('close', cancel);
     try {
       const result = await agentRelayBroker.poll(owner(request), text(request.query.connectionId, 'connectionId'),
-        request.get('X-Chisa-Agent-Token') ?? '', controller.signal, request.query.wait === '0' ? 0 : 25_000);
+        request.get('X-Chisa-Agent-Token') ?? '', controller.signal, request.query.wait === '0' ? 0 : 25_000, request.query.protocol === '2' ? 2 : 1);
       if (!response.destroyed) response.set('Cache-Control', 'no-store').json(result);
     } finally { response.removeListener('close', cancel); }
+  }));
+  router.post('/agent/relay/ack', asyncHandler(async (request, response) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    response.set('Cache-Control', 'no-store').json(agentRelayBroker.acknowledge(owner(request), text(body.connectionId, 'connectionId'),
+      request.get('X-Chisa-Agent-Token') ?? '', body.requestId, body.epoch));
+  }));
+  router.post('/agent/relay/reject', asyncHandler(async (request, response) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    response.set('Cache-Control', 'no-store').json(agentRelayBroker.rejectReceipt(owner(request), text(body.connectionId, 'connectionId'),
+      request.get('X-Chisa-Agent-Token') ?? '', body.requestId, body.epoch));
+  }));
+  router.post('/agent/relay/heartbeat', asyncHandler(async (request, response) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    response.set('Cache-Control', 'no-store').json(agentRelayBroker.heartbeat(owner(request), text(body.connectionId, 'connectionId'),
+      request.get('X-Chisa-Agent-Token') ?? '', body.epoch, body.activeRequestIds));
   }));
   router.post('/agent/relay/result', asyncHandler(async (request, response) => {
     const body = (request.body ?? {}) as Record<string, unknown>;
     response.set('Cache-Control', 'no-store').json(agentRelayBroker.settle(owner(request), text(body.connectionId, 'connectionId'),
-      request.get('X-Chisa-Agent-Token') ?? '', body.requestId, body.response));
+      request.get('X-Chisa-Agent-Token') ?? '', body.requestId, body.response, body.epoch));
+  }));
+  router.post('/agent/relay/events', asyncHandler(async (request, response) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    response.set('Cache-Control', 'no-store').json(agentRelayBroker.events(owner(request), text(body.connectionId, 'connectionId'),
+      request.get('X-Chisa-Agent-Token') ?? '', body.epoch, body.events));
   }));
   router.post('/probe', asyncHandler(async (request, response) => {
     const body = (request.body ?? {}) as Record<string, unknown>;
@@ -68,6 +91,29 @@ export function createSshWorkspacesRouter(): express.Router {
     assertSshProjectOwner(target, owner(request));
     if (body.generation !== target.generation) throw new AppError('SSH workspace changed.', { code: 'WORKSPACE_GENERATION_CHANGED', statusCode: 409 });
     response.json(await recoverSshWorkspace(target, body.cancel === true));
+  }));
+  // Incremental command output: the persisted spill files let the UI follow a
+  // running job without waiting for the final exec response.
+  router.post('/job-output', asyncHandler(async (request, response) => {
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const root = projectsDb.getProjectPathById(text(body.projectId, 'projectId'));
+    const target = root ? resolveSshProjectTarget(root) : null;
+    if (!target) throw new AppError('SSH project was not found.', { code: 'SSH_WORKSPACE_NOT_FOUND', statusCode: 404 });
+    assertSshProjectOwner(target, owner(request));
+    if (body.generation !== undefined && body.generation !== target.generation) {
+      throw new AppError('SSH workspace changed.', { code: 'WORKSPACE_GENERATION_CHANGED', statusCode: 409 });
+    }
+    const stream = body.stream === 'stderr' ? 'stderr' : 'stdout';
+    const offset = typeof body.offset === 'number' && Number.isSafeInteger(body.offset) && body.offset >= 0 ? body.offset : 0;
+    const maxBytes = typeof body.maxBytes === 'number' && Number.isInteger(body.maxBytes) && body.maxBytes >= 1 && body.maxBytes <= 256 * 1024 ? body.maxBytes : 256 * 1024;
+    const jobId = body.jobId !== undefined && body.jobId !== null && body.jobId !== ''
+      ? text(body.jobId, 'jobId')
+      : getActiveSshWorkspaceJobId(target);
+    if (!jobId) {
+      response.json({ ok: true, jobId: null, stream, offset, total: offset, chunk: '', eof: false, state: 'idle', truncated: false });
+      return;
+    }
+    response.json(await readSshWorkspaceJobOutput(target, { jobId, stream, offset, maxBytes }));
   }));
   return router;
 }

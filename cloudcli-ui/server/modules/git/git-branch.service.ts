@@ -1,25 +1,14 @@
 import path from 'node:path';
 
 import { AppError } from '@/shared/index.js';
-import type { WorkspaceGitFileSystem } from '@/shared/index.js';
+import type { GitProcessRunner, WorkspaceGitFileSystem } from '@/shared/index.js';
 import { runWorkspaceGitBranchOperation, withWorkspaceWriteOperation } from '@/modules/workspace-bridge/index.js';
-
-type GitCommandResult = {
-  stdout: string;
-  stderr: string;
-};
-
-type GitCommandRunner = (
-  command: string,
-  args: string[],
-  options: { cwd: string },
-) => Promise<GitCommandResult>;
 
 type DeleteLocalBranchInput = {
   projectPath: string;
   branch: string;
   force: boolean;
-  runCommand: GitCommandRunner;
+  runCommand: GitProcessRunner;
 };
 
 /** Git routes use the owner's branch protocol or one local reservation through all checks and writes. */
@@ -28,7 +17,7 @@ export async function changeGitBranch(input: {
   action: 'checkout' | 'create' | 'delete';
   branch: string;
   force?: boolean;
-  runCommand: GitCommandRunner;
+  runCommand: GitProcessRunner;
   fileSystem: WorkspaceGitFileSystem;
   validateRepository(projectPath: string): Promise<void>;
 }): Promise<string> {

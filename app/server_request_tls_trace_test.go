@@ -77,6 +77,7 @@ func TestServerRequestTLSTraceObservesSilentHelloOnce(t *testing.T) {
 				t.Fatal(err)
 			}
 			previous := apiConnection
+			connection.authenticated, connection.accessToken = true, "TLS_PRIVATE_HEADER"
 			apiConnection = connection
 			t.Cleanup(func() { connection.cancel(); connection.client.CloseIdleConnections(); apiConnection = previous })
 			transport, ok := serverHTTPTransport(connection.client.Transport)
@@ -87,13 +88,13 @@ func TestServerRequestTLSTraceObservesSilentHelloOnce(t *testing.T) {
 				t.Fatal("TLS observation changed the existing transport or application time budget")
 			}
 			bridge := FrontendBridge{}
-			id := bridge.BeginServerRequest()
+			id := reserveTestRequest(t, "api")
 			t.Cleanup(func() { bridge.CancelServerRequest(id) })
 			result := make(chan BridgeResponse, 1)
 			started := time.Now()
 			var canceledAt time.Time
 			go func() {
-				result <- bridge.ServerRequest(id, http.MethodPost, "/api/tls-pending?token=TLS_PRIVATE_QUERY", map[string]string{"Authorization": "Bearer TLS_PRIVATE_HEADER"}, base64.StdEncoding.EncodeToString([]byte("TLS_PRIVATE_BODY")))
+				result <- bridge.ServerRequest(id, http.MethodPost, "/api/tls-pending?secret=TLS_PRIVATE_QUERY", map[string]string{"Authorization": "Bearer TLS_PRIVATE_HEADER"}, base64.StdEncoding.EncodeToString([]byte("TLS_PRIVATE_BODY")))
 			}()
 			select {
 			case err := <-ready:
@@ -193,10 +194,11 @@ func TestServerRequestTLSTraceFastTrustedHandshakeHasNoLatePending(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	apiConnection = connection
+	connection.authenticated, connection.accessToken = true, "TLS_PRIVATE_HEADER"
+			apiConnection = connection
 	t.Cleanup(func() { connection.cancel(); connection.client.CloseIdleConnections() })
 	bridge := FrontendBridge{}
-	response := bridge.ServerRequest(bridge.BeginServerRequest(), http.MethodGet, "/api/tls-fast", nil, "")
+	response := bridge.ServerRequest(reserveTestRequest(t, "api"), http.MethodGet, "/api/tls-fast", nil, "")
 	body, _ := base64.StdEncoding.DecodeString(response.BodyB64)
 	if response.Status != http.StatusOK || string(body) != "trusted local response" {
 		t.Fatal("a normally verified local TLS response did not complete")

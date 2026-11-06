@@ -1,6 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 
 import { api } from '@/shared/api';
+import { createAuthenticatedEventSource } from '@/shared/authenticatedEventSource';
+import { getAuthSessionSnapshot, isCurrentAuthSession, subscribeToAuthSession } from '@/shared/authToken';
+import { getServerTransportVersion, subscribeToServerConnection } from '@/shared/chisa';
 import type { LLMProvider } from '@/shared/types';
 
 export type SessionMessageMatch = {
@@ -24,42 +27,42 @@ type ProjectResult = {
 const MIN_QUERY = 2;
 const DEBOUNCE_MS = 250;
 
+/** CommandPalette reads streamed message matches for its focused project and current account. */
 export function useSessionMessageSearch(
   projectId: string | undefined,
   query: string,
   enabled: boolean,
 ) {
-  const [items, setItems] = useState<SessionMessageMatch[]>([]);
+  const session = useSyncExternalStore(subscribeToAuthSession, getAuthSessionSnapshot, getAuthSessionSnapshot);
+  const transport = useSyncExternalStore(subscribeToServerConnection, getServerTransportVersion, getServerTransportVersion);
+  // Associate rendered matches with the exact search owner so a render before effect cleanup cannot show old results.
+  const [result, setResult] = useState<{ owner: string; server: string; transport: number; projectId: string; query: string; items: SessionMessageMatch[] } | null>(null);
+  // Invalidate queued listeners synchronously whenever a search is replaced or canceled.
   const seqRef = useRef(0);
-  const esRef = useRef<EventSource | null>(null);
+  // Keep the current stream available for effect cleanup, including unmount during an async admission.
+  const esRef = useRef<ReturnType<typeof createAuthenticatedEventSource> | null>(null);
 
   useEffect(() => {
     const trimmed = query.trim();
-    if (!enabled || !projectId || trimmed.length < MIN_QUERY) {
-      setItems([]);
-      esRef.current?.close();
-      esRef.current = null;
-      return;
-    }
-
+    const expected = getAuthSessionSnapshot();
+    const seq = ++seqRef.current;
     esRef.current?.close();
     esRef.current = null;
-    seqRef.current++;
-
+    setResult(null);
+    if (!enabled || !projectId || trimmed.length < MIN_QUERY) return;
+    const controller = new AbortController();
+    const current = () => !controller.signal.aborted && seq === seqRef.current && isCurrentAuthSession(expected)
+      && transport === getServerTransportVersion();
     const handle = setTimeout(() => {
-      const seq = ++seqRef.current;
-      const url = api.searchConversationsUrl(trimmed);
-      const es = new EventSource(url);
+      if (!current()) return;
+      const es = createAuthenticatedEventSource(api.searchConversationsUrl(trimmed), { expectedSession: expected, signal: controller.signal });
       esRef.current = es;
       const accumulated: SessionMessageMatch[] = [];
 
       es.addEventListener('result', (evt) => {
-        if (seq !== seqRef.current) {
-          es.close();
-          return;
-        }
+        if (!current()) { es.close(); return; }
         try {
-          const data = JSON.parse((evt as MessageEvent).data) as { projectResult: ProjectResult };
+          const data = JSON.parse(evt.data) as { projectResult: ProjectResult };
           const pr = data.projectResult;
           if (pr.projectId !== projectId) return;
           for (const s of pr.sessions) {
@@ -70,32 +73,29 @@ export function useSessionMessageSearch(
               provider: s.provider,
             });
           }
-          setItems([...accumulated]);
+          setResult({ owner: expected.sessionInstanceId, server: expected.serverKey, transport, projectId, query: trimmed, items: [...accumulated] });
         } catch {
-          // ignore malformed
+          // Ignore malformed application payloads; the shared parser owns framing and resource budgets.
         }
       });
 
       const finish = () => {
-        if (seq !== seqRef.current) return;
         es.close();
-        esRef.current = null;
+        if (esRef.current === es) esRef.current = null;
       };
       es.addEventListener('done', finish);
       es.addEventListener('error', finish);
     }, DEBOUNCE_MS);
 
     return () => {
+      ++seqRef.current;
       clearTimeout(handle);
-    };
-  }, [projectId, query, enabled]);
-
-  useEffect(() => {
-    return () => {
+      controller.abort();
       esRef.current?.close();
       esRef.current = null;
     };
-  }, []);
+  }, [projectId, query, enabled, session.sessionInstanceId, session.serverKey, session.phase, transport]);
 
-  return items;
+  return enabled && isCurrentAuthSession(session) && result && result.owner === session.sessionInstanceId && result.server === session.serverKey
+    && result.transport === transport && result.projectId === projectId && result.query === query.trim() ? result.items : [];
 }

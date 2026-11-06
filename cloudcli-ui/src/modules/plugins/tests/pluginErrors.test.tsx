@@ -9,6 +9,10 @@ import { PluginsProvider, usePlugins } from '@/modules/plugins/context/PluginsCo
 import { api } from '@/shared/api';
 
 const auth = vi.hoisted(() => ({ user: { id: 1 } as { id: number; username?: string } | null, isLoading: false }));
+const identity = vi.hoisted(() => ({ snapshot: { sessionInstanceId: 'plugin-test-login', serverKey: 'https://fixture.test', userId: '1', phase: 'ready', token: 'fixture' } }));
+vi.mock('@/modules/auth-session', () => ({ getAuthSessionSnapshot: () => identity.snapshot,
+  isCurrentAuthSession: (captured: { sessionInstanceId: string }) => captured.sessionInstanceId === identity.snapshot.sessionInstanceId,
+  subscribeToAuthSession: () => () => {} }));
 vi.mock('@/modules/auth', () => ({ useAuth: () => auth }));
 vi.mock('@/modules/plugins/PluginTabContent', () => ({
   default: function MockPluginContent() {
@@ -20,6 +24,8 @@ const usagePlugin = {
   name: 'claude-usage', displayName: 'Claude Usage', description: '', version: '1.0.0',
   author: '', icon: 'Puzzle', type: 'module', slot: 'tab', entry: 'dist/index.js',
   server: 'dist/server.js', enabled: false, permissions: [], dirName: 'claude-usage', repoUrl: null,
+  security: { model: 'trusted-only', digest: `sha256:${'a'.repeat(64)}`, source: { kind: 'bundled', location: 'application:builtin/claude-usage', version: '1.0.0' },
+    trusted: true, permitted: true, reviewRequired: false, permissions: ['host:context', 'host:rpc', 'backend:process'] },
 };
 
 function deferred<T>() {
@@ -38,6 +44,7 @@ afterEach(() => { cleanup(); vi.restoreAllMocks(); auth.user = { id: 1 }; });
 test('bundled plugin settings only expose switches and keep failed switches usable', async () => {
   await i18n.changeLanguage('zh-CN');
   vi.spyOn(api.plugins, 'list').mockImplementation(async () => Response.json({ plugins: [usagePlugin] }));
+  vi.spyOn(api.plugins, 'review').mockResolvedValue(Response.json(usagePlugin));
   const toggle = vi.spyOn(api.plugins, 'toggle').mockImplementation(async () => Response.json({
     success: false, error: { code: 'PLUGIN_SERVER_UNAVAILABLE', message: 'Cannot load server dependency' },
   }, { status: 400 }));
@@ -47,9 +54,14 @@ test('bundled plugin settings only expose switches and keep failed switches usab
   expect(screen.queryByRole('textbox')).toBeNull();
   expect(screen.queryByRole('button', { name: /安装|卸载|更新/ })).toBeNull();
   fireEvent.click(control);
+  await screen.findByRole('region', { name: 'Plugin trust review' });
+  expect(toggle).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('checkbox', { name: /I trust this exact source/ }));
+  fireEvent.click(screen.getByRole('button', { name: 'Trust and enable this version' }));
   await screen.findByText('Cannot load server dependency');
   expect(toggle).toHaveBeenCalledOnce();
-  expect(toggle).toHaveBeenCalledWith('claude-usage', true);
+  expect(toggle).toHaveBeenCalledWith('claude-usage', true, { confirmed: true, expectedDigest: usagePlugin.security.digest,
+    grantedPermissions: usagePlugin.security.permissions }, { expectedSession: identity.snapshot });
   expect(screen.getByText('Claude 额度')).toBeTruthy();
   expect((control as HTMLInputElement).disabled).toBe(false);
   expect((control as HTMLInputElement).checked).toBe(false);

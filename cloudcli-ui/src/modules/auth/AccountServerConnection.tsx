@@ -3,7 +3,6 @@ import type { FormEvent } from 'react';
 import { Check, CircleAlert, Globe, Loader2 } from 'lucide-react';
 
 import { FrontendBridge } from '@/shared/chisa';
-import { useAuth } from '@/modules/auth/context/AuthContext';
 import { Button } from '@/shared/ui';
 
 // Keep simultaneously mounted desktop login/settings forms aligned after a switch.
@@ -15,7 +14,6 @@ type AccountServerConnectionProps = {
 
 /** Desktop login, AccountPopup and Settings share the cloud account-service connection form. */
 export function AccountServerConnection({ onConnectionChange }: AccountServerConnectionProps = {}) {
-  const { logout } = useAuth();
   const originalUrl = useRef('');
   const serverInputId = useId();
   // The user edits the native app's server URL before any protected APIs are available.
@@ -57,7 +55,6 @@ export function AccountServerConnection({ onConnectionChange }: AccountServerCon
       if (result.ok === false) throw new Error(String(result.error || '连接失败'));
       const connectedUrl = String(result.serverUrl || serverUrl.trim().replace(/\/$/, ''));
       if (originalUrl.current !== connectedUrl) {
-        logout();
         window.dispatchEvent(new CustomEvent(SERVER_CHANGED_EVENT, { detail: connectedUrl }));
       }
       originalUrl.current = connectedUrl;

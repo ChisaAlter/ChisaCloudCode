@@ -182,7 +182,7 @@ export default function SidebarContent({
 
   return (
     <div
-      className={`sidebar-surface flex h-full flex-col md:w-72 md:select-none${isDesktop() && !isMobile ? ' desktop-sidebar' : ''}`}
+      className={`sidebar-surface flex h-full flex-col md:w-full md:select-none${isDesktop() && !isMobile ? ' desktop-sidebar' : ''}`}
     >
       <SidebarHeader
         isPWA={isPWA}

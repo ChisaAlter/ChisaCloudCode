@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { FolderPlus, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
@@ -8,11 +8,11 @@ import StepReview from '@/modules/project-creation-wizard/StepReview';
 import WizardFooter from '@/modules/project-creation-wizard/WizardFooter';
 import WizardProgress from '@/modules/project-creation-wizard/WizardProgress';
 import { useGithubTokens } from '@/modules/project-creation-wizard/hooks/useGithubTokens';
-import { cloneWorkspaceWithProgress, createProjectRequest } from '@/modules/project-creation-wizard/utils/workspaceApi';
+import { cancelCloneWorkspace, CloneJobOperationError, cloneWorkspaceWithProgress, createCloneAttempt, createProjectRequest } from '@/modules/project-creation-wizard/utils/workspaceApi';
 import { isCloneWorkflow, shouldShowGithubAuthentication } from '@/modules/project-creation-wizard/utils/pathUtils';
 import type { SshWorkspaceProbe, TokenMode, WizardFormState, WizardStep } from '@/shared/types';
 import { SshProjectFields } from '@/modules/ssh-workspaces';
-import { beginBlockingOperation } from '@/shared/utils';
+import { beginBackgroundOperation, beginBlockingOperation } from '@/shared/utils';
 import { getAuthSessionVersion } from '@/shared/authToken';
 import { getServerConnectionVersion } from '@/shared/chisa';
 
@@ -43,8 +43,12 @@ export default function ProjectCreationWizard({
   const [isCreating, setIsCreating] = useState(false);
   // Validation and API errors remain visible without discarding entered values.
   const [error, setError] = useState<string | null>(null);
-  // Cloud Git clone progress retains its existing event-stream presentation.
+  // Show the latest server task message independently from observation/opening errors.
   const [cloneProgress, setCloneProgress] = useState('');
+  // A retained attempt makes the primary action explicitly resume observation or opening.
+  const [cloneRetry, setCloneRetry] = useState(false);
+  // Prevent duplicate cancel requests while the server cancellation is being observed.
+  const [isCancelling, setIsCancelling] = useState(false);
   // A successful probe is bound to the exact selected connection and entered root.
   const [sshVerification, setSshVerification] = useState<{ key: string; probe: SshWorkspaceProbe; connectionLabel: string } | null>(null);
   const sshMode = formState.sourceMode === 'ssh';
@@ -53,8 +57,49 @@ export default function ProjectCreationWizard({
   const existingProject = sshMode ? verifiedSsh?.probe.existingProject : undefined;
   const requestRef = useRef(0);
   const selectionRef = useRef(sshSelectionKey);
-  selectionRef.current = sshSelectionKey;
-  useEffect(() => () => { ++requestRef.current; }, []);
+  useLayoutEffect(() => { selectionRef.current = sshSelectionKey; }, [sshSelectionKey]);
+  // Refs retain task identity through unknown status and synchronously gate double submits.
+  const cloneAttemptRef = useRef<ReturnType<typeof createCloneAttempt> | null>(null);
+  const cloneOwnerRef = useRef<{ identity: number; server: number } | null>(null);
+  const creatingRef = useRef(false);
+  const cancellingRef = useRef(false);
+  const controllerRef = useRef<AbortController | null>(null);
+  const finishRef = useRef<(() => void) | null>(null);
+  const mountedRef = useRef(true);
+  const ownsClone = useCallback(() => {
+    const owner = cloneOwnerRef.current;
+    return !!owner && owner.identity === getAuthSessionVersion() && owner.server === getServerConnectionVersion();
+  }, []);
+  useEffect(() => {
+    mountedRef.current = true;
+    const release = () => {
+      ++requestRef.current;
+      controllerRef.current?.abort();
+      finishRef.current?.();
+      finishRef.current = null;
+      creatingRef.current = false;
+      cancellingRef.current = false;
+    };
+    // Auth logout and native server changes do not expose one common subscription.
+    const timer = setInterval(() => {
+      if (!cloneOwnerRef.current || ownsClone()) return;
+      release();
+      cloneAttemptRef.current = null;
+      cloneOwnerRef.current = null;
+      setIsCreating(false);
+      setIsCancelling(false);
+      setCloneRetry(false);
+      setCloneProgress('');
+      setError('Account or server changed. The previous import is no longer being observed.');
+    }, 250);
+    return () => {
+      mountedRef.current = false;
+      clearInterval(timer);
+      release();
+      // Never send the old task id with credentials from another account/server.
+      if (ownsClone() && cloneAttemptRef.current) void cancelCloneWorkspace(cloneAttemptRef.current).catch(() => {});
+    };
+  }, [ownsClone]);
 
   const shouldLoadTokens =
     !sshMode && step === 1 && shouldShowGithubAuthentication(formState.githubUrl);
@@ -106,69 +151,111 @@ export default function ProjectCreationWizard({
     setStep((previousStep) => (previousStep > 1 ? ((previousStep - 1) as WizardStep) : previousStep));
   }, []);
 
+  const handleCancelClone = useCallback(async () => {
+    if (cancellingRef.current) return;
+    const attempt = cloneAttemptRef.current;
+    if (!attempt || !ownsClone()) return;
+    cancellingRef.current = true;
+    setIsCancelling(true);
+    ++requestRef.current;
+    controllerRef.current?.abort();
+    finishRef.current?.();
+    finishRef.current = null;
+    creatingRef.current = false;
+    setIsCreating(false);
+    const owner = cloneOwnerRef.current;
+    try {
+      if (!attempt.snapshot || attempt.snapshot.status === 'running') await cancelCloneWorkspace(attempt);
+      if (!mountedRef.current || owner !== cloneOwnerRef.current || !ownsClone()) return;
+      if (attempt.snapshot?.status === 'complete') {
+        setCloneProgress(attempt.snapshot.message);
+        setCloneRetry(true);
+        setError('Import completed before cancellation. Retry to open the project.');
+      } else {
+        cloneAttemptRef.current = null;
+        setCloneRetry(false);
+        setCloneProgress('');
+        setError(attempt.snapshot?.status === 'error' ? attempt.snapshot.message || 'Import failed.' : 'Import cancelled.');
+      }
+    } catch (cancelError) {
+      if (mountedRef.current && owner === cloneOwnerRef.current && ownsClone()) {
+        setCloneRetry(true);
+        setError(cancelError instanceof Error ? cancelError.message : 'Cancellation status is unknown. Retry to check the same import task.');
+      }
+    } finally {
+      if (mountedRef.current && owner === cloneOwnerRef.current) {
+        cancellingRef.current = false;
+        setIsCancelling(false);
+      }
+    }
+  }, [ownsClone]);
+
   const handleCreate = useCallback(async () => {
-    if (isCreating) return;
+    if (creatingRef.current || cancellingRef.current) return;
+    if (cloneOwnerRef.current && !ownsClone()) {
+      cloneAttemptRef.current = null;
+      cloneOwnerRef.current = null;
+      setCloneRetry(false);
+      setCloneProgress('');
+      setError('Account or server changed. Review the target before starting another import.');
+      return;
+    }
     if (sshMode && !verifiedSsh) { setError('目录验证已失效，请返回并重新验证。'); return; }
+    creatingRef.current = true;
     const request = ++requestRef.current;
     const identity = getAuthSessionVersion();
     const server = getServerConnectionVersion();
     const selection = sshSelectionKey;
-    const current = () => request === requestRef.current && identity === getAuthSessionVersion() && server === getServerConnectionVersion() && selection === selectionRef.current;
-    const finish = beginBlockingOperation(existingProject ? (existingProject.isArchived ? '正在恢复并打开项目' : '正在打开已有项目') : '正在准备项目', existingProject ? '服务器正在重新验证目录并载入原项目。' : '正在创建工作目录并载入项目，完成后即可继续操作。');
+    const shouldClone = !sshMode && isCloneWorkflow(formState.githubUrl);
+    cloneOwnerRef.current = { identity, server };
+    const current = () => mountedRef.current && request === requestRef.current && identity === getAuthSessionVersion() && server === getServerConnectionVersion() && selection === selectionRef.current;
+    // Cloud import keeps its own cancel action accessible while the task runs.
+    const finish = (shouldClone ? beginBackgroundOperation : beginBlockingOperation)(existingProject ? (existingProject.isArchived ? '正在恢复并打开项目' : '正在打开已有项目') : '正在准备项目', existingProject ? '服务器正在重新验证目录并载入原项目。' : '正在创建工作目录并载入项目，完成后即可继续操作。');
+    finishRef.current = finish;
+    const controller = new AbortController();
+    controllerRef.current = controller;
     setIsCreating(true);
     setError(null);
     setCloneProgress('');
+    let cloneComplete = false;
 
     try {
+      let project: Record<string, unknown> | undefined;
       if (sshMode && verifiedSsh) {
-        const project = await createProjectRequest({ sourceMode: 'ssh', connectionId: formState.connectionId || '', rootPath: verifiedSsh.probe.rootPath });
-        if (!current()) return;
-        await onProjectCreated?.(project);
-        if (current()) onClose();
-        return;
-      }
-      const shouldCloneRepository = isCloneWorkflow(formState.githubUrl);
-
-      if (shouldCloneRepository) {
-        const project = await cloneWorkspaceWithProgress(
-          {
-            workspacePath: formState.workspacePath,
-            githubUrl: formState.githubUrl,
-            tokenMode: formState.tokenMode,
-            selectedGithubToken: formState.selectedGithubToken,
-            newGithubToken: formState.newGithubToken,
-          },
-          {
-            onProgress: value => { if (current()) setCloneProgress(value); },
-          },
+        project = await createProjectRequest({ sourceMode: 'ssh', connectionId: formState.connectionId || '', rootPath: verifiedSsh.probe.rootPath });
+      } else if (shouldClone) {
+        const attempt = cloneAttemptRef.current ?? createCloneAttempt();
+        cloneAttemptRef.current = attempt;
+        project = await cloneWorkspaceWithProgress(
+          { ...formState, attempt, signal: controller.signal },
+          { onProgress: value => { if (current()) setCloneProgress(value); } },
         );
-
-        if (!current()) return;
-        await onProjectCreated?.(project);
-        if (current()) onClose();
-        return;
+        cloneComplete = true;
+      } else {
+        project = await createProjectRequest({ path: formState.workspacePath.trim() });
       }
-
-      const project = await createProjectRequest({
-        path: formState.workspacePath.trim(),
-      });
-
       if (!current()) return;
       await onProjectCreated?.(project);
       if (current()) onClose();
     } catch (createError) {
       if (!current()) return;
-      const errorMessage =
-        createError instanceof Error
-          ? createError.message
-          : t('projectWizard.errors.failedToCreate');
-      setError(errorMessage);
+      const message = createError instanceof Error ? createError.message : t('projectWizard.errors.failedToCreate');
+      if (shouldClone && createError instanceof CloneJobOperationError) cloneAttemptRef.current = null;
+      setCloneRetry(shouldClone && !!cloneAttemptRef.current);
+      setError(cloneComplete ? `Import completed, but opening the project or refreshing the project list failed. Retry to open the same project. ${message}` : message);
     } finally {
       finish();
-      if (current()) setIsCreating(false);
+      if (finishRef.current === finish) finishRef.current = null;
+      if (current()) {
+        creatingRef.current = false;
+        setIsCreating(false);
+      }
+      // Some transports settle after abort; cancel a newly discovered id only for its owner.
+      if (!mountedRef.current && controller.signal.aborted && identity === getAuthSessionVersion() && server === getServerConnectionVersion() && cloneAttemptRef.current) {
+        void cancelCloneWorkspace(cloneAttemptRef.current).catch(() => {});
+      }
     }
-  }, [existingProject, formState, isCreating, sshMode, sshSelectionKey, verifiedSsh, onClose, onProjectCreated, t]);
-
+  }, [existingProject, formState, sshMode, sshSelectionKey, verifiedSsh, onClose, onProjectCreated, ownsClone, t]);
   const shouldCloneRepository = useMemo(
     () => !sshMode && isCloneWorkflow(formState.githubUrl),
     [formState.githubUrl, sshMode],
@@ -250,8 +337,11 @@ export default function ProjectCreationWizard({
         <WizardFooter
           step={step}
           isCreating={isCreating}
+          isCancelling={isCancelling}
           isCloneWorkflow={shouldCloneRepository}
+          cloneRetry={cloneRetry}
           existingProject={existingProject}
+          onCancelClone={handleCancelClone}
           onClose={onClose}
           onBack={handleBack}
           onNext={handleNext}

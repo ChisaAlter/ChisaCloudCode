@@ -4,7 +4,8 @@ import type { DragEvent } from 'react';
 import { IS_PLATFORM } from '@/shared/utils';
 import type { FileTreeUploadProgressState, Project } from '@/shared/types';
 import { useWorkspaceApi } from '@/shared/context/WorkspaceScopeContext';
-import { expireAuthSession, getAuthSessionVersion, getStoredAuthToken, storeAuthToken } from '@/shared/authToken';
+import { dispatchWithAuthSession, expireAuthSession, getAuthSessionSnapshot, isCurrentAuthSession, storeAuthToken } from '@/shared/authToken';
+import { isDesktop } from '@/shared/chisa';
 import { MAX_FILE_UPLOAD_SIZE_BYTES, MAX_FILE_UPLOAD_SIZE_LABEL } from '@/shared/constants';
 
 type UseFileTreeUploadOptions = {
@@ -105,11 +106,7 @@ const uploadFormDataWithProgress = (
 
     xhr.open('POST', uploadUrl);
 
-    const token = getStoredAuthToken();
-    const identity = getAuthSessionVersion();
-    if (!IS_PLATFORM && token) {
-      xhr.setRequestHeader('Authorization', `Bearer ${token}`);
-    }
+    const expected = getAuthSessionSnapshot();
 
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) {
@@ -122,31 +119,27 @@ const uploadFormDataWithProgress = (
     };
 
     xhr.onload = () => {
-      if (identity !== getAuthSessionVersion()) {
-        reject(new DOMException('Account session changed', 'AbortError'));
-        return;
-      }
-      const refreshedToken = xhr.getResponseHeader('X-Refreshed-Token');
-      if (refreshedToken) {
-        storeAuthToken(refreshedToken);
-      }
-      if (xhr.getResponseHeader('X-Auth-Error')) {
-        expireAuthSession();
-      }
-
-      const payload = parseUploadResponse(xhr);
-      if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(payload);
-        return;
-      }
-
-      reject(new Error(payload.error || payload.message || `Upload failed with status ${xhr.status}`));
+      void (async () => {
+        if (!isCurrentAuthSession(expected)) throw new DOMException('Account session changed', 'AbortError');
+        if (!isDesktop()) {
+          const refreshedToken = xhr.getResponseHeader('X-Refreshed-Token');
+          if (xhr.status >= 200 && xhr.status < 300 && refreshedToken) await storeAuthToken(refreshedToken, expected);
+          if (xhr.status === 401 && xhr.getResponseHeader('X-Auth-Error')) await expireAuthSession(expected);
+        }
+        const payload = parseUploadResponse(xhr);
+        if (xhr.status >= 200 && xhr.status < 300) resolve(payload);
+        else reject(new Error(payload.error || payload.message || `Upload failed with status ${xhr.status}`));
+      })().catch(reject);
     };
 
     xhr.onerror = () => reject(new Error('Upload failed. Check your connection and try again.'));
     xhr.onabort = () => reject(new Error('Upload canceled.'));
 
-    xhr.send(formData);
+    void dispatchWithAuthSession(expected, current => {
+      if (!IS_PLATFORM && current.token && !isDesktop()) xhr.setRequestHeader('Authorization', `Bearer ${current.token}`);
+      xhr.send(formData);
+      return Promise.resolve();
+    }).catch(reject);
   });
 
 // Helper function to read all files from a directory entry recursively

@@ -299,7 +299,7 @@ function preLaunchEnv(agent, runAsUser, parentEnv, opts) {
   if (runAsUser) {
     return { ok: true, env: parentEnv };
   }
-  const env = { ...parentEnv, ...loadAgentEnv(agent, opts.envRoot) };
+  const env = { ...parentEnv, ...loadAgentEnv(agent, opts.envRoot), CLAUDE_CODE_ENTRYPOINT: "chisacloudcode" };
   if (!env.SCOPED_MCP_BEARER_TOKEN) {
     return {
       ok: false,
@@ -2950,7 +2950,7 @@ function requireDumper() {
     return quotingType === QUOTING_TYPE_DOUBLE ? STYLE_DOUBLE : STYLE_SINGLE;
   }
   function writeScalar(state, string, level, iskey, inblock) {
-    state.dump = function() {
+    state.dump = (function() {
       if (string.length === 0) {
         return state.quotingType === QUOTING_TYPE_DOUBLE ? '""' : "''";
       }
@@ -2989,7 +2989,7 @@ function requireDumper() {
         default:
           throw new YAMLException2("impossible error: invalid scalar style");
       }
-    }();
+    })();
   }
   function blockHeader(string, indentPerLevel) {
     const indentIndicator = needIndentIndicator(string) ? String(indentPerLevel) : "";
@@ -3003,12 +3003,12 @@ function requireDumper() {
   }
   function foldString(string, width) {
     const lineRe = /(\n+)([^\n]*)/g;
-    let result = function() {
+    let result = (function() {
       let nextLF = string.indexOf("\n");
       nextLF = nextLF !== -1 ? nextLF : string.length;
       lineRe.lastIndex = nextLF;
       return foldLine(string.slice(0, nextLF), width);
-    }();
+    })();
     let prevMoreIndented = string[0] === "\n" || string[0] === " ";
     let moreIndented;
     let match;
@@ -3520,6 +3520,7 @@ function buildLaunchArgv(entry, mode, prompt, claudeBin, queuedMode) {
     if (mode === "review" && queuedMode === "manual-then-auto") {
       note = (note ? note + ". " : "") + "queued manual-then-auto \u2014 this leg is gated, everything it spawns runs auto";
     }
+    note = (note ? note + ". " : "") + "Claude attribution is not verified for this external launcher; set CLAUDE_CODE_ENTRYPOINT=chisacloudcode immediately before its final Claude exec";
     return { argv, note };
   }
   const permissionMode = mode === "review" ? "plan" : "default";

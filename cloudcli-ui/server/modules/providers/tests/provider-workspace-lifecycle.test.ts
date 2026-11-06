@@ -10,16 +10,20 @@ function deferred<T = void>() {
   return { promise, resolve };
 }
 
-function makeService(provider: LLMProvider, runtime: IProviderRuntime, admission: any) {
+function makeService(provider: LLMProvider, runtime: IProviderRuntime, admission: any, overrides: Parameters<typeof createProviderRuntimeService>[0] = {}) {
   const adapter = { id: provider, runtime, sessions: { normalizeMessage: () => [] }, auth: { getStatus: async () => ({ installed: true }) } } as unknown as IProvider;
   return createProviderRuntimeService({
     listProviders: () => [adapter], resolveProvider: () => adapter,
     resolveProviderSessionId: () => 'native-session', resolveResumeModel: async () => 'model',
     getProviderModels: async () => ({ OPTIONS: [], DEFAULT: 'model' }),
     getSessionSource: () => ({ project_path: '/source', workspace_mode: 'isolated', provider }),
+    // Synthetic lifecycle fixtures isolate lease behavior. Real default owner
+    // authorization remains covered by cloud-account-ownership and runtime tests.
     authorizeRun() {},
+    getWorkspaceAttachmentMode: () => 'host',
     admitWorkspaceExecution: admission,
     registerManagedProviderProfile: () => '/fixture/profile',
+    ...overrides,
   });
 }
 
@@ -49,13 +53,13 @@ for (const provider of ['codex', 'cursor', 'opencode'] as const) {
       assert.equal(input.directExecution, true);
       return lease(async () => { assert.deepEqual(marker, ['process-stopped']); closeStarted.resolve(); await handback.promise; marker.push('handback'); });
     });
-    const running = service.run(provider, 'fixture', { sessionId: 'app', cwd: '/stale', workspaceMode: 'shared' }, { send: (message) => messages.push(message) });
+    const running = service.run(provider, 'fixture', { sessionId: 'app', cwd: '/stale', workspaceMode: 'shared' }, { userId: 'owner', send: (message) => messages.push(message) });
     await Promise.resolve();
     assert.deepEqual(messages, []);
     processStopped.resolve();
     await closeStarted.promise;
     assert.deepEqual(messages, []);
-    await assert.rejects(service.run(provider, 'next', { sessionId: 'app' }, { send() {} }), { code: 'RUN_IN_PROGRESS' });
+    await assert.rejects(service.run(provider, 'next', { sessionId: 'app' }, { userId: 'owner', send() {} }), { code: 'RUN_IN_PROGRESS' });
     handback.resolve();
     await running;
     assert.deepEqual(marker, ['process-stopped', 'handback']);
@@ -76,7 +80,7 @@ test('abort during admission waits cleanup and never launches provider', async (
     assert.equal(input.signal.aborted, true);
     return lease(async () => { await handback.promise; closed = true; });
   });
-  const running = service.run('opencode', 'fixture', { sessionId: 'app' }, { send() { assert.fail('cancelled run emitted terminal'); } });
+  const running = service.run('opencode', 'fixture', { sessionId: 'app' }, { userId: 'owner', send() { assert.fail('cancelled run emitted terminal'); } });
   void running.catch(() => {});
   await entered.promise;
   let aborted = false;
@@ -91,12 +95,126 @@ test('abort during admission waits cleanup and never launches provider', async (
   assert.equal(closed, true);
 });
 
+for (const provider of ['codex', 'cursor', 'opencode'] as const) {
+  test(`${provider} revoked during admission closes its lease without launching`, async () => {
+    const entered = deferred();
+    const admitted = deferred();
+    let active = true;
+    let starts = 0;
+    let closes = 0;
+    let runners = 0;
+    const revoked = Object.assign(new Error('Authentication session has ended'), { code: 'UNAUTHORIZED' });
+    const service = makeService(provider, { async run() { starts++; }, abort: () => false }, async () => {
+      entered.resolve();
+      await admitted.promise;
+      return lease(async () => { closes++; });
+    }, { createContainerProviderRunner() { runners++; assert.fail('Revoked session must not create a runner'); } });
+    const running = service.run(provider, 'fixture', { sessionId: 'app' }, {
+      userId: 'owner', assertActive() { if (!active) throw revoked; },
+      send() { assert.fail('Revoked session must not publish success'); },
+    });
+    const rejected = assert.rejects(running, (error: unknown) => error === revoked);
+    try {
+      await entered.promise;
+      active = false;
+      admitted.resolve();
+      await rejected;
+      assert.equal(starts, 0);
+      assert.equal(runners, 0);
+      assert.equal(closes, 1);
+    } finally { admitted.resolve(); }
+  });
+
+  test(`${provider} forwards prototype identity and live guards only from the trusted writer`, async () => {
+    let active = true;
+    let loginActive = true;
+    let guardCalls = 0;
+    let runnerCalls = 0;
+    let closes = 0;
+    const revoked = new Error('revoked');
+    let runnerGuard: (() => void) | undefined;
+    let reservationLoginGuard: (() => void) | undefined;
+    class TrustedWriter {
+      get userId() { return 73; }
+      get isWebSocketWriter() { return true; }
+      getSessionId() { return 'app'; }
+      assertActive() { guardCalls++; if (!active) throw revoked; }
+      assertAuthSessionActive() { assert.equal(this.userId, 73); if (!loginActive) throw revoked; }
+      send() {}
+    }
+    const service = makeService(provider, {
+      async run(_command, _options, writer, context) {
+        assert.equal(writer.userId, 73);
+        assert.equal(writer.isWebSocketWriter, true);
+        assert.equal(writer.getSessionId?.(), 'app');
+        assert.equal(context.attachmentMode, 'slot');
+        assert.equal(context.readWorkspaceImage, undefined);
+        assert.equal(typeof context.runProcess, 'function');
+        assert.ok(reservationLoginGuard);
+        assert.ok(writer.assertAuthSessionActive);
+        active = false;
+        assert.throws(() => writer.assertActive?.(), error => error === revoked);
+        assert.throws(() => runnerGuard?.(), error => error === revoked);
+        assert.doesNotThrow(() => writer.assertAuthSessionActive?.(), 'persistent login is independent from transport/run liveness');
+        assert.doesNotThrow(reservationLoginGuard);
+        loginActive = false;
+        assert.throws(() => writer.assertAuthSessionActive?.(), error => error === revoked);
+        assert.throws(reservationLoginGuard, error => error === revoked);
+        active = true;
+      }, abort: () => false,
+    }, async (input: Record<string, unknown>) => {
+      assert.equal(typeof input.assertActive, 'function');
+      assert.equal(typeof input.assertAuthActive, 'function');
+      reservationLoginGuard = input.assertAuthActive as () => void;
+      return lease(async () => { closes++; });
+    }, {
+      createContainerProviderRunner(_lease, selected, _attachments, dependencies) {
+        runnerCalls++;
+        assert.equal(selected, provider);
+        assert.equal(dependencies?.sessionId, 'app');
+        assert.equal(dependencies?.userId, '73');
+        runnerGuard = dependencies?.assertActive;
+        return async () => {
+          assert.fail('Prototype delegation fixture must not start a provider process');
+          return { code: 0 };
+        };
+      },
+    });
+    await service.run(provider, 'fixture', {
+      sessionId: 'app', userId: 'forged', attachmentMode: 'host', assertAuthActive: () => {}, assertAuthSessionActive: () => {}, readWorkspaceImage() { assert.fail('Transport reader must not be installed'); },
+    }, new TrustedWriter());
+    assert.ok(guardCalls >= 6);
+    assert.equal(runnerCalls, 1);
+    assert.equal(closes, 1);
+  });
+}
+
+for (const userId of [undefined, null, '', Number.NaN, Number.POSITIVE_INFINITY, 'owner\nforged']) {
+  test(`container runtime rejects invalid trusted identity ${String(userId)}`, async () => {
+    let closes = 0;
+    let profiles = 0;
+    let runners = 0;
+    let starts = 0;
+    const service = makeService('codex', { async run() { starts++; }, abort: () => false }, async () => lease(async () => { closes++; }), {
+      registerManagedProviderProfile() { profiles++; return '/fixture/profile'; },
+      createContainerProviderRunner() { runners++; assert.fail('Invalid trusted identity must not create a runner'); },
+    });
+    await assert.rejects(service.run('codex', 'fixture', { sessionId: 'app', userId: 'forged' }, {
+      userId, send() { assert.fail('Invalid trusted identity must not emit success'); },
+    }), { code: 'UNAUTHORIZED' });
+    assert.equal(profiles, 0);
+    assert.equal(runners, 0);
+    assert.equal(starts, 0);
+    assert.equal(closes, 1);
+  });
+}
+
 test('abort during finalization remains pending until exact handback succeeds', async () => {
   const closing = deferred();
   const handback = deferred();
   const messages: unknown[] = [];
   const service = makeService('cursor', { async run(_command, _options, writer) { writer.send({ kind: 'complete' }); }, abort: () => false }, async () => lease(async () => { closing.resolve(); await handback.promise; }));
-  const running = service.run('cursor', 'fixture', { sessionId: 'app' }, { send: (message) => messages.push(message) });
+  const running = service.run('cursor', 'fixture', { sessionId: 'app' }, { userId: 'owner', send: (message) => messages.push(message) });
   await closing.promise;
   let settled = false;
   const aborting = service.abort('cursor', 'app').then((result) => { settled = true; return result; });
@@ -111,10 +229,10 @@ test('abort during finalization remains pending until exact handback succeeds', 
 test('unconfirmed process teardown keeps lease and blocks next run without complete', async () => {
   let closed = false;
   const service = makeService('codex', { async run() { throw Object.assign(new Error('child still alive'), { processTeardownError: true }); }, abort: () => false }, async () => lease(async () => { closed = true; }));
-  await assert.rejects(service.run('codex', 'fixture', { sessionId: 'app' }, { send() { assert.fail('unsafe terminal'); } }), { workspaceCleanupError: true });
+  await assert.rejects(service.run('codex', 'fixture', { sessionId: 'app' }, { userId: 'owner', send() { assert.fail('unsafe terminal'); } }), { workspaceCleanupError: true });
   assert.equal(closed, false);
   await assert.rejects(service.abort('codex', 'app'), { workspaceCleanupError: true });
-  await assert.rejects(service.run('codex', 'next', { sessionId: 'app' }, { send() {} }), { code: 'RUN_IN_PROGRESS' });
+  await assert.rejects(service.run('codex', 'next', { sessionId: 'app' }, { userId: 'owner', send() {} }), { code: 'RUN_IN_PROGRESS' });
 });
 
 for (const provider of ['codex', 'cursor', 'opencode'] as const) {
@@ -141,7 +259,7 @@ for (const provider of ['codex', 'cursor', 'opencode'] as const) {
         }
       });
     });
-    const writer = { send: (message: unknown) => messages.push(message) };
+    const writer = { userId: 'owner', send: (message: unknown) => messages.push(message) };
     await assert.rejects(service.run(provider, 'first', { sessionId: 'app' }, writer), { workspaceCleanupError: true });
     assert.equal(providerRuns, 1, 'initial process was already confirmed stopped');
     assert.equal(messages.length, 0, 'failed handback must not publish success');
@@ -162,7 +280,7 @@ test('a runtime error after early success complete becomes failure only after sa
   let closed = false;
   const messages: any[] = [];
   const service = makeService('cursor', { async run(_command, _options, writer) { writer.send({ kind: 'complete', exitCode: 0 }); throw new Error('late provider failure'); }, abort: () => false }, async () => lease(async () => { closed = true; }));
-  await assert.rejects(service.run('cursor', 'fixture', { sessionId: 'app' }, { send(message) { assert.equal(closed, true); messages.push(message); } }), /late provider failure/);
+  await assert.rejects(service.run('cursor', 'fixture', { sessionId: 'app' }, { userId: 'owner', send(message) { assert.equal(closed, true); messages.push(message); } }), /late provider failure/);
   assert.equal(messages[0]?.exitCode, 1);
 });
 
@@ -180,11 +298,11 @@ for (const provider of ['codex', 'cursor', 'opencode'] as const) {
       assert.equal(input.expectedWorkspace, descriptor);
       return { ...lease(async () => { closes++; }), assertCurrent() { if (!current) throw Object.assign(new Error('Selection changed while provider admission was pending'), { code: 'WORKSPACE_GENERATION_CHANGED' }); } };
     });
-    await assert.rejects(service.run(provider, 'stale', { sessionId: 'app', workspaceDescriptor: descriptor }, { send() { assert.fail('A rejected selection must not publish success'); } }), { code: 'WORKSPACE_GENERATION_CHANGED' });
+    await assert.rejects(service.run(provider, 'stale', { sessionId: 'app', workspaceDescriptor: descriptor }, { userId: 'owner', send() { assert.fail('A rejected selection must not publish success'); } }), { code: 'WORKSPACE_GENERATION_CHANGED' });
     assert.equal(starts, 0);
     assert.equal(closes, 1, 'a rejected final pin still tears down its exact admitted reservation');
     current = true;
-    await service.run(provider, 'current', { sessionId: 'app', workspaceDescriptor: descriptor }, { send() {} });
+    await service.run(provider, 'current', { sessionId: 'app', workspaceDescriptor: descriptor }, { userId: 'owner', send() {} });
     assert.equal(starts, 1);
     assert.equal(closes, 2);
   });
@@ -193,6 +311,6 @@ for (const provider of ['codex', 'cursor', 'opencode'] as const) {
 test('Claude keeps its workspaceQuery lifecycle without a second admission', async () => {
   let calls = 0;
   const service = makeService('claude', { async run() { calls += 1; }, abort: () => false }, async () => assert.fail('double lifecycle'));
-  await service.run('claude', 'fixture', { sessionId: 'app' }, { send() {} });
+  await service.run('claude', 'fixture', { sessionId: 'app' }, { userId: 'owner', send() {} });
   assert.equal(calls, 1);
 });

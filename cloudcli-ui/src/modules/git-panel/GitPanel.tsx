@@ -6,6 +6,7 @@ import { useRevertLocalCommit } from '@/modules/git-panel/hooks/useRevertLocalCo
 import type { ConfirmationRequest, FileOpenHandler, GitPanelView, Project } from '@/shared/types';
 import { getChangedFileCount } from '@/modules/git-panel/utils/gitPanelUtils';
 import ChangesView from '@/modules/git-panel/changes/ChangesView';
+import CompareView from '@/modules/git-panel/compare/CompareView';
 import HistoryView from '@/modules/git-panel/history/HistoryView';
 import BranchesView from '@/modules/git-panel/branches/BranchesView';
 import WorktreesView from '@/modules/git-panel/worktrees/WorktreesView';
@@ -67,6 +68,7 @@ export default function GitPanel({
     branches,
     localBranches,
     remoteBranches,
+    remoteRefs,
     recentCommits,
     commitDiffs,
     commitDiffErrors,
@@ -222,6 +224,21 @@ export default function GitPanel({
               onCommitChanges={commitChanges}
               onRequestConfirmation={setConfirmAction}
               onExpandedFilesChange={setHasExpandedFiles}
+            />
+          )}
+
+          {activeView === 'compare' && (
+            <CompareView
+              key={selectedProject.fullPath}
+              projectId={selectedProject.projectId}
+              currentBranch={currentBranch}
+              localBranches={localBranches}
+              remoteRefs={remoteRefs}
+              gitStatus={gitStatus}
+              isMobile={isMobile}
+              wrapText={wrapText}
+              onWrapTextChange={setWrapText}
+              onOpenFile={openFile}
             />
           )}
 

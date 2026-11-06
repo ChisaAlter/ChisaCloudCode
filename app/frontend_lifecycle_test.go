@@ -68,6 +68,7 @@ func TestFrontendWindowClosureCancelsHTTP2OnlyFrontendRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	connection.authenticated, connection.accessToken = true, "lifecycle-fixture-token"
 	apiConnection = connection
 	t.Cleanup(func() { connection.cancel(); connection.client.CloseIdleConnections() })
 	// Product traffic defaults to H1; explicitly enable H2 to keep exercising
@@ -83,10 +84,10 @@ func TestFrontendWindowClosureCancelsHTTP2OnlyFrontendRequests(t *testing.T) {
 	bridge := FrontendBridge{}
 	results := make(chan BridgeResponse, 2)
 	for _, path := range []string{"/api/wait-headers", "/api/wait-body"} {
-		id := bridge.BeginServerRequest()
+		id := reserveTestRequest(t, "api")
 		go func() { results <- bridge.ServerRequest(id, http.MethodGet, path, nil, "") }()
 	}
-	reservedID := bridge.BeginServerRequest()
+	reservedID := reserveTestRequest(t, "api")
 	reserved, _ := bridgeRequests.Load(reservedID)
 	nativeResult := make(chan error, 1)
 	go func() {
@@ -116,8 +117,8 @@ func TestFrontendWindowClosureCancelsHTTP2OnlyFrontendRequests(t *testing.T) {
 	if reserved.(*bridgeRequest).ctx.Err() != context.Canceled {
 		t.Fatal("unforwarded frontend reservation survived window closure")
 	}
-	if bridge.BeginServerRequest() != "" {
-		t.Fatal("queued bridge call reserved a request after window closure")
+	if result := bridge.BeginServerRequestV2(connection.sessionHandle, connection.accessToken, connection.tokenRevision, "api", connection.serverKey); result["code"] != "FRONTEND_CLOSED" {
+		t.Fatal("queued bridge call reserved a request after window closure", result)
 	}
 	for range 2 {
 		select {
@@ -151,8 +152,11 @@ func TestFrontendWindowClosureCancelsHTTP2OnlyFrontendRequests(t *testing.T) {
 func TestFrontendWindowClosureRejectsConcurrentReservations(t *testing.T) {
 	preserveFrontendRequestLifecycle(t)
 	previous := apiConnection
-	ctx, cancel := context.WithCancel(context.Background())
-	apiConnection = &serverConnection{ctx: ctx, cancel: cancel}
+	connection, err := newServerConnection("https://lifecycle.invalid", "https://lifecycle.invalid")
+	if err != nil { t.Fatal(err) }
+	connection.authenticated, connection.accessToken = true, "lifecycle-fixture-token"
+	ctx, cancel := connection.ctx, connection.cancel
+	apiConnection = connection
 	t.Cleanup(func() { cancel(); apiConnection = previous })
 	bridge := FrontendBridge{}
 	ready := make(chan struct{})
@@ -160,8 +164,10 @@ func TestFrontendWindowClosureRejectsConcurrentReservations(t *testing.T) {
 	for range 64 {
 		workers.Go(func() {
 			<-ready
-			id := bridge.BeginServerRequest()
+			result := bridge.BeginServerRequestV2(connection.sessionHandle, connection.accessToken, connection.tokenRevision, "api", connection.serverKey)
+			id, _ := result["requestId"].(string)
 			if id == "" {
+				if result["code"] != "FRONTEND_CLOSED" { t.Errorf("unexpected admission failure: %v", result["code"]) }
 				return
 			}
 			pending, exists := bridgeRequests.Load(id)
@@ -179,19 +185,22 @@ func TestFrontendWindowClosureRejectsConcurrentReservations(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("a racing Begin escaped the closed-window cancellation gate")
 	}
-	if bridge.BeginServerRequest() != "" || ctx.Err() != nil {
-		t.Fatal("closed-window gate was reopened or canceled native account lifetime")
+	if result := bridge.BeginServerRequestV2(connection.sessionHandle, connection.accessToken, connection.tokenRevision, "api", connection.serverKey); result["code"] != "FRONTEND_CLOSED" || ctx.Err() != nil {
+		t.Fatal("closed-window gate was reopened or canceled native account lifetime", result)
 	}
 }
 
 func TestFrontendWindowClosureDoesNotWaitForAccountConnectionLock(t *testing.T) {
 	preserveFrontendRequestLifecycle(t)
 	previous := apiConnection
-	ctx, cancel := context.WithCancel(context.Background())
-	apiConnection = &serverConnection{ctx: ctx, cancel: cancel}
+	connection, err := newServerConnection("https://lifecycle.invalid", "https://lifecycle.invalid")
+	if err != nil { t.Fatal(err) }
+	connection.authenticated, connection.accessToken = true, "lifecycle-fixture-token"
+	ctx, cancel := connection.ctx, connection.cancel
+	apiConnection = connection
 	t.Cleanup(func() { cancel(); apiConnection = previous })
 	bridge := FrontendBridge{}
-	id := bridge.BeginServerRequest()
+	id := reserveTestRequest(t, "api")
 	pending, _ := bridgeRequests.Load(id)
 	serverConnectionMu.Lock()
 	locked := true
@@ -201,8 +210,8 @@ func TestFrontendWindowClosureDoesNotWaitForAccountConnectionLock(t *testing.T) 
 		}
 	}()
 	beginEntered := make(chan struct{})
-	beginResult := make(chan string, 1)
-	go func() { close(beginEntered); beginResult <- bridge.BeginServerRequest() }()
+	beginResult := make(chan map[string]any, 1)
+	go func() { close(beginEntered); beginResult <- bridge.BeginServerRequestV2(connection.sessionHandle, connection.accessToken, connection.tokenRevision, "api", connection.serverKey) }()
 	<-beginEntered
 	// Wait for the actual blocked RLock, rather than relying on scheduling or
 	// timing to make Begin enter before the window's OnClosed callback.
@@ -212,7 +221,7 @@ func TestFrontendWindowClosureDoesNotWaitForAccountConnectionLock(t *testing.T) 
 		stack = stack[:runtime.Stack(stack, true)]
 		waiting := false
 		for _, goroutine := range strings.Split(string(stack), "\n\n") {
-			if strings.Contains(goroutine, "FrontendBridge.BeginServerRequest") && strings.Contains(goroutine, "(*RWMutex).RLock") {
+			if strings.Contains(goroutine, "FrontendBridge.BeginServerRequestV2") && strings.Contains(goroutine, "(*RWMutex).RLock") {
 				waiting = true
 				break
 			}
@@ -238,9 +247,9 @@ func TestFrontendWindowClosureDoesNotWaitForAccountConnectionLock(t *testing.T) 
 	serverConnectionMu.Unlock()
 	locked = false
 	select {
-	case id := <-beginResult:
-		if id != "" {
-			t.Fatal("queued Begin created a request when the account operation completed after closure")
+	case result := <-beginResult:
+		if result["ok"] != false || result["code"] != "FRONTEND_CLOSED" {
+			t.Fatal("queued Begin created a request when the account operation completed after closure", result)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("queued Begin did not settle after the account operation released its lock")

@@ -5,6 +5,15 @@ import { createUserService } from '../user.service.js';
 
 type UserDependencies = Parameters<typeof createUserService>[0];
 
+const noDrafts: UserDependencies['drafts'] = {
+  getDrafts: () => [],
+  saveDraft: () => undefined,
+  saveDraftText: () => undefined,
+  appendQueuedMessage: (_userId, _scope, message) => ({ queuedMessage: message, appended: false }),
+  clearQueuedMessage: () => undefined,
+  deleteDraft: () => undefined,
+};
+
 function createDependencies(overrides: Partial<UserDependencies> = {}): UserDependencies {
   return {
     users: {
@@ -14,14 +23,11 @@ function createDependencies(overrides: Partial<UserDependencies> = {}): UserDepe
       hasCompletedOnboarding: () => false,
     },
     preferences: {
-      getPreferences: () => ({}),
+      getPreferenceSnapshot: () => ({ preferences: {}, revisions: {} }),
       savePreferences: () => undefined,
+      savePreferenceTransaction: () => { throw new Error('Unexpected preference transaction'); },
     },
-    drafts: {
-      getDrafts: () => [],
-      saveDraft: () => undefined,
-      deleteDraft: () => undefined,
-    },
+    drafts: noDrafts,
     readSystemGitConfig: async () => ({ git_name: null, git_email: null }),
     applyGlobalGitConfig: async () => undefined,
     logInfo: () => undefined,
@@ -73,8 +79,9 @@ test('savePreferences forwards only the keys the client sent', () => {
   const saved: Array<Record<string, unknown>> = [];
   const service = createUserService(createDependencies({
     preferences: {
-      getPreferences: () => ({ theme: 'dark' }),
+      getPreferenceSnapshot: () => ({ preferences: { theme: 'dark' }, revisions: { theme: 3 } }),
       savePreferences: (_id, updates) => saved.push(updates),
+      savePreferenceTransaction: () => { throw new Error('Unexpected preference transaction'); },
     },
   }));
 
@@ -82,6 +89,36 @@ test('savePreferences forwards only the keys the client sent', () => {
 
   assert.deepEqual(saved, [{ theme: 'light' }]);
   assert.deepEqual(result.preferences, { theme: 'dark' });
+  assert.deepEqual(result.revisions, { theme: 3 });
+});
+
+test('getPreferences exposes values with their durable revisions in the same snapshot', () => {
+  const service = createUserService(createDependencies({
+    preferences: {
+      getPreferenceSnapshot: () => ({ preferences: { theme: 'dark' }, revisions: { theme: 4, deleted: 2 } }),
+      savePreferences: () => undefined,
+      savePreferenceTransaction: () => { throw new Error('Unexpected preference transaction'); },
+    },
+  }));
+  assert.deepEqual(service.getPreferences(3), { success: true, preferences: { theme: 'dark' }, revisions: { theme: 4, deleted: 2 } });
+});
+
+test('savePreferenceTransaction forwards authenticated identity and preserves repository conflict data synchronously', () => {
+  const calls: unknown[][] = [];
+  const input = { operationId: '019cfabc-def0-7000-8000-000000000001', updates: { theme: 'old' }, expectedRevisions: { theme: 0 } };
+  const result = {
+    success: false as const, operationId: input.operationId, replayed: false,
+    code: 'PREFERENCE_REVISION_CONFLICT' as const, preferences: { theme: 'new' }, revisions: { theme: 1 },
+  };
+  const service = createUserService(createDependencies({
+    preferences: {
+      getPreferenceSnapshot: () => ({ preferences: {}, revisions: {} }),
+      savePreferences: () => undefined,
+      savePreferenceTransaction: (...args) => { calls.push(args); return result; },
+    },
+  }));
+  assert.equal(service.savePreferenceTransaction(3, input), result);
+  assert.deepEqual(calls, [[3, input]]);
 });
 
 test('savePreferences rejects a non-object body', () => {
@@ -100,11 +137,7 @@ test('savePreferences rejects an over-long preference key', () => {
 test('saveDraft stores the text and queued message under the given scope', () => {
   const saved: unknown[][] = [];
   const service = createUserService(createDependencies({
-    drafts: {
-      getDrafts: () => [],
-      saveDraft: (...args) => saved.push(args),
-      deleteDraft: () => undefined,
-    },
+    drafts: { ...noDrafts, saveDraft: (...args) => saved.push(args) },
   }));
 
   service.saveDraft(5, 'session-1', {
@@ -119,20 +152,100 @@ test('saveDraft stores the text and queued message under the given scope', () =>
   }]]);
 });
 
-test('saveDraft preserves an omitted queue field and distinguishes explicit null', () => {
+test('saveDraft without a queued message writes only the text and leaves the queued one alone', () => {
+  // The composer's debounced text save carries no queued message: its copy may
+  // already have been sent by the dispatcher, or added to from another tab.
   const saved: unknown[][] = [];
+  const textOnly: unknown[][] = [];
   const service = createUserService(createDependencies({
     drafts: {
-      getDrafts: () => [],
+      ...noDrafts,
       saveDraft: (...args) => saved.push(args),
-      deleteDraft: () => undefined,
+      saveDraftText: (...args) => textOnly.push(args),
     },
   }));
 
   service.saveDraft(5, 'session-1', { scope: 'session-1', text: 'typing' });
 
-  service.saveDraft(5, 'session-1', { text: 'typing', queuedMessage: null });
-  assert.deepEqual(saved, [[5, 'session-1', { text: 'typing' }], [5, 'session-1', { text: 'typing', queuedMessage: null }]]);
+  assert.deepEqual(textOnly, [[5, 'session-1', 'typing']]);
+  assert.deepEqual(saved, [], 'the stored queued message is not overwritten');
+});
+
+test('saveDraft with an explicit null queued message still clears it', () => {
+  const saved: unknown[][] = [];
+  const service = createUserService(createDependencies({
+    drafts: { ...noDrafts, saveDraft: (...args) => saved.push(args) },
+  }));
+
+  service.saveDraft(5, 'session-1', { scope: 'session-1', text: 'typing', queuedMessage: null });
+
+  assert.deepEqual(saved, [[5, 'session-1', { text: 'typing', queuedMessage: null }]]);
+});
+
+test('appendQueuedMessage hands the repository the message and returns what is now queued', () => {
+  const appended: unknown[][] = [];
+  const service = createUserService(createDependencies({
+    drafts: {
+      ...noDrafts,
+      appendQueuedMessage: (...args) => {
+        appended.push(args);
+        return { queuedMessage: { content: 'A\n\nB', attachments: [] }, appended: true };
+      },
+    },
+  }));
+
+  const result = service.appendQueuedMessage(5, 'session-1', {
+    content: 'B',
+    options: { model: 'opus' },
+    attachments: [{ name: 'b.txt' }],
+    stray: 'dropped',
+  });
+
+  assert.deepEqual(appended, [[5, 'session-1', {
+    content: 'B',
+    options: { model: 'opus' },
+    attachments: [{ name: 'b.txt' }],
+  }]]);
+  assert.deepEqual(result, {
+    success: true,
+    queuedMessage: { content: 'A\n\nB', attachments: [] },
+    appended: true,
+  });
+});
+
+test('appendQueuedMessage refuses a message with nothing to send, or a bad scope', () => {
+  const service = createUserService(createDependencies());
+
+  assert.throws(() => service.appendQueuedMessage(5, 'session-1', { content: '  ', attachments: [] }), /text or attachments/);
+  assert.throws(() => service.appendQueuedMessage(5, 'session-1', 'not an object'), /text or attachments/);
+  assert.throws(() => service.appendQueuedMessage(5, '   ', { content: 'B' }), /scope/i);
+});
+
+test('appendQueuedMessage refuses, as a conflict, a slash command the repository cannot combine', () => {
+  const service = createUserService(createDependencies({
+    drafts: { ...noDrafts, appendQueuedMessage: () => null },
+  }));
+
+  assert.throws(
+    () => service.appendQueuedMessage(5, 'session-1', { content: '/compact', attachments: [] }),
+    (error: unknown) => {
+      const appError = error as { code?: string; statusCode?: number; message?: string };
+      assert.equal(appError.code, 'QUEUED_MESSAGE_NOT_COMBINABLE');
+      assert.equal(appError.statusCode, 409);
+      assert.match(appError.message ?? '', /slash command/);
+      return true;
+    },
+  );
+});
+
+test('clearQueuedMessage clears the named scope', () => {
+  const cleared: unknown[][] = [];
+  const service = createUserService(createDependencies({
+    drafts: { ...noDrafts, clearQueuedMessage: (...args) => cleared.push(args) },
+  }));
+
+  assert.deepEqual(service.clearQueuedMessage(5, 'session-1'), { success: true });
+  assert.deepEqual(cleared, [[5, 'session-1']]);
 });
 
 test('saveDraft rejects a blank or over-long scope', () => {

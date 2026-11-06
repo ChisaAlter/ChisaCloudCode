@@ -63,11 +63,15 @@ export function createCommandsRouter(services: ReturnType<typeof createCommandsS
       const commandName = string(body.commandName, 'commandName');
       if (!commandName) throw new AppError('Command name is required', { code: 'COMMAND_NAME_REQUIRED', statusCode: 400 });
       const commandPath = string(body.commandPath, 'commandPath');
-      const args: unknown = body.args ?? [];
+      if (body.rawArgs !== undefined && typeof body.rawArgs !== 'string') {
+        throw new AppError('rawArgs must be a string', { code: 'INVALID_COMMAND_ARGUMENTS', statusCode: 400 });
+      }
+      const rawArgs = typeof body.rawArgs === 'string' ? body.rawArgs : undefined;
+      const args: unknown = body.args ?? (rawArgs?.trim() ? rawArgs.trim().split(/\s+/) : []);
       if (!Array.isArray(args) || args.some(arg => typeof arg !== 'string')) {
         throw new AppError('args must be an array of strings', { code: 'INVALID_COMMAND_ARGUMENTS', statusCode: 400 });
       }
-      response.json(await services.execute({ commandName, commandPath, args, context: contextFields(object(body.context, 'context'), request.query) }));
+      response.json(await services.execute({ commandName, commandPath, args, rawArgs, context: contextFields(object(body.context, 'context'), request.query) }));
     } catch (error) { failure(response, error); }
   });
   return router;

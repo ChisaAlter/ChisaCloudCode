@@ -1,0 +1,20 @@
+[Unit]
+Description=Chisa recovery read-only gates (no service changes)
+Requires=opt-chisacloudcode-workspaces.mount
+After=opt-chisacloudcode-workspaces.mount docker.service
+BindsTo=opt-chisacloudcode-workspaces.mount
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/usr/bin/python3 -B /opt/chisa-recovery/recovery.py preflight --config /etc/chisa-recovery/config.json
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+# Do not add PrivateMounts/PrivatePIDs: writer scan must inspect host /proc.
+ReadOnlyPaths=/opt/chisacloudcode /etc/systemd/system /etc/chisa-recovery /root/.ssh
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal

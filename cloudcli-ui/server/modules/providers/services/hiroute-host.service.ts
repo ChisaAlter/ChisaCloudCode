@@ -73,6 +73,7 @@ export XDG_RUNTIME_DIR="$runtime"
 export XDG_CONFIG_HOME="$HOME/.config"
 export XDG_DATA_HOME="$HOME/.local/share"
 export PATH="$root/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+export CLAUDE_CODE_ENTRYPOINT=chisacloudcode
 cd "$HOME"
 `;
 
@@ -165,11 +166,21 @@ with os.fdopen(lockfd, 'w') as lock:
         os.replace(temporary, binary)
         checksum.write_text(hashlib.sha256(source).hexdigest())
     destination = home.parent / 'bin/claude'
+    # HiRoute clears its probe environment again. Stamp attribution at the final
+    # executable boundary, including when replacing an existing symlink install.
+    import shlex
+    wrapper = '#!/bin/sh\nexport CLAUDE_CODE_ENTRYPOINT=chisacloudcode\nexec ' + shlex.quote(str(binary)) + ' "$@"\n'
     fd, temporary = tempfile.mkstemp(dir=destination.parent)
-    os.close(fd)
-    os.unlink(temporary)
-    os.symlink(binary, temporary)
-    os.replace(temporary, destination)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(wrapper)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o700)
+        os.replace(temporary, destination)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
     localmarker = home / '.local/share/hiroute/standalone.json'
     localmarker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(dir=localmarker.parent)

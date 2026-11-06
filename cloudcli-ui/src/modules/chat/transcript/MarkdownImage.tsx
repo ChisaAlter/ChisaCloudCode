@@ -2,9 +2,11 @@ import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { useWorkspaceApi, useWorkspaceScope } from '@/shared/context/WorkspaceScopeContext';
+import { useMarkdownWorkspaceProjectId } from '@/modules/chat/context/MarkdownWorkspaceContext';
 import { ImageLightbox } from '@/modules/chat/transcript/ChatMessageImages';
 
 type MarkdownImageProps = {
+  node?: unknown;
   src?: string;
   alt?: string;
   title?: string;
@@ -42,7 +44,7 @@ function resolveImageSource(src: string, projectId?: string | null, disableFileL
       filePath = decodeURIComponent(src);
     }
     // Provider paths use /workspace as a virtual mount for this project's root.
-    filePath = filePath.replace(/^\/workspace\//, '');
+    filePath = filePath.replace(/^\/workspace\//, '').replace(/^(?:\.\/)+/, '');
     return filePath ? { kind: 'project', projectId, path: filePath } : null;
   } catch {
     return null;
@@ -50,8 +52,10 @@ function resolveImageSource(src: string, projectId?: string | null, disableFileL
 }
 
 /** Used by chat's Markdown renderer to show authenticated workspace images and expand their previews. */
-export default function MarkdownImage({ src = '', alt = '', title, projectId, disableFileLinks = false }: MarkdownImageProps) {
+export function MarkdownImage({ src = '', alt = '', title, projectId, disableFileLinks = false }: MarkdownImageProps) {
   const { t } = useTranslation();
+  const contextProjectId = useMarkdownWorkspaceProjectId();
+  projectId = projectId === undefined ? contextProjectId : projectId;
   const api = useWorkspaceApi();
   const workspace = useWorkspaceScope();
   const sourceKey = JSON.stringify([src, projectId ?? null, disableFileLinks, workspace?.workspaceId, workspace?.generation, workspace === null]);
@@ -119,6 +123,8 @@ export default function MarkdownImage({ src = '', alt = '', title, projectId, di
         <img
           src={displaySrc}
           alt={alt}
+          title={title}
+          loading="lazy"
           onError={() => setFailedSourceKey(sourceKey)}
           className="m-0 block h-auto max-h-[32rem] max-w-full cursor-zoom-in object-contain"
         />
@@ -127,3 +133,5 @@ export default function MarkdownImage({ src = '', alt = '', title, projectId, di
     </>
   );
 }
+
+export default MarkdownImage;

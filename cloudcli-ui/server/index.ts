@@ -7,8 +7,8 @@ import os from 'os';
 import http from 'http';
 
 import express, { type NextFunction, type Request, type Response } from 'express';
-import cors from 'cors';
 
+import { createHttpIngressPolicy } from '@/modules/http-ingress/index.js';
 import { AppError, findApplicationRoot, getModuleDirectory, IS_PLATFORM, terminalTextStyles } from '@/shared/utils.js';
 import {
     closeSessionsWatcher,
@@ -16,7 +16,7 @@ import {
     initializeSessionsWatcher,
     providerRuntimeService,
 } from '@/modules/providers/index.js';
-import { createWebSocketServer } from '@/modules/websocket/index.js';
+import { chatRunRegistry, createWebSocketServer } from '@/modules/websocket/index.js';
 
 import { getConnectableHost } from '../shared/networkHosts.js';
 
@@ -24,6 +24,8 @@ import { createGitModule } from './modules/git/index.js';
 import {
     authenticateToken,
     authenticateWebSocket,
+    consumeWebSocketTicket,
+    isAuthSessionActive,
     authRoutes,
     validateApiKey,
 } from './modules/auth/index.js';
@@ -37,6 +39,7 @@ import notificationRoutes from './modules/notifications/notifications.routes.js'
 import { userRoutes } from './modules/user/index.js';
 import {
     getPluginPort,
+    authorizePluginAccess,
     pluginsRoutes,
     startEnabledPluginServers,
     stopAllPlugins,
@@ -86,7 +89,13 @@ console.log('SERVER_PORT from env:', process.env.SERVER_PORT);
 
 const workspaceRuntimeService = createWorkspaceRuntimeService();
 const app = express();
+const ingress = createHttpIngressPolicy();
+// Validate bypass configuration before database initialization or any background startup work.
+ingress.assertStartup();
+ingress.install(app);
 const server = http.createServer(app);
+server.headersTimeout = 15_000;
+server.maxHeadersCount = 64;
 const queryClaude = providerRuntimeService.getRunner('claude');
 const queryCursor = providerRuntimeService.getRunner('cursor');
 const queryCodex = providerRuntimeService.getRunner('codex');
@@ -103,10 +112,17 @@ const agentRoutes = createAgentModule({
 });
 
 // Single WebSocket server that handles chat, shell, and plugin proxy paths.
+// A completed run stays subscribable while its session's background work
+// (agents, workflows, backgrounded commands) is still reporting through it.
+chatRunRegistry.setRetentionGuard((sessionId) => providerRuntimeService.hasBackgroundWork(sessionId));
+
 createWebSocketServer(server, {
     verifyClient: {
         isPlatform: IS_PLATFORM,
         authenticateWebSocket,
+        consumeWebSocketTicket,
+        isAuthSessionActive,
+        authorizeUpgrade: ingress.authorizeUpgrade,
     },
     chat: {
         runtime: providerRuntimeService,
@@ -122,13 +138,14 @@ createWebSocketServer(server, {
         },
     },
     getPluginPort: (name) => getPluginPort(name) ?? null,
+    authorizePluginAccess,
+    authorizePreviewUpgrade: ingress.authorizePreviewUpgrade,
 });
-
-app.use(cors({ exposedHeaders: ['X-Refreshed-Token', 'X-Auth-Error'] }));
 // Preview capabilities authorize only their running sandbox, and proxy bodies must remain streams.
 app.use('/api/workspace-runtime', createWorkspaceRuntimePreviewRouter());
 app.use(express.json({
-    limit: '50mb',
+    // Allows the existing 2 MiB avatar after base64/JSON encoding; multipart retains its route-specific budgets.
+    limit: '4mb',
     type: (req) => {
         // Skip multipart/form-data requests (for file uploads like images)
         const contentType = req.headers['content-type'] || '';
@@ -138,7 +155,7 @@ app.use(express.json({
         return contentType.includes('json');
     }
 }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.urlencoded({ limit: '64kb', extended: false, parameterLimit: 256 }));
 
 // Public health check endpoint (no authentication required)
 app.get('/health', (req, res) => {
@@ -236,6 +253,20 @@ app.use(express.static(path.join(APP_ROOT, 'dist'), {
 // Chat uploads live under /api/assets (server/modules/assets), which stores
 // images and general files in the global ~/.cloudcli/assets folder.
 
+// Unknown API paths must answer JSON, never the SPA shell: the catch-all below
+// serves index.html with a 200 for anything without a file extension, so a
+// client calling a route this build does not have can only report a JSON parse
+// failure. An explicit 404 keeps that case honest for every method.
+app.use('/api', (req: Request, res: Response) => {
+    res.status(404).json({
+        success: false,
+        error: {
+            code: 'NOT_FOUND',
+            message: `Unknown API route: ${req.method} ${req.originalUrl.split('?')[0]}`
+        }
+    });
+});
+
 // Serve React app for all other routes (excluding static files)
 app.get('*', (req, res) => {
     // Skip requests for static assets (files with extensions)
@@ -274,7 +305,15 @@ app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
     });
   }
 
-  console.error(err);
+  const transportError = err as { type?: unknown; status?: unknown } | null;
+  if (transportError?.type === 'entity.too.large' || transportError?.status === 413) {
+    return res.status(413).json({ success: false, error: { code: 'PAYLOAD_TOO_LARGE', message: 'Request body exceeds its limit' } });
+  }
+  if (transportError?.type === 'entity.parse.failed') {
+    return res.status(400).json({ success: false, error: { code: 'INVALID_JSON', message: 'Invalid JSON request body' } });
+  }
+  // Request/parser errors may retain input or credentials; log only an error class.
+  console.error('[ERROR] Request failed:', err instanceof Error ? err.name : 'UnknownError');
 
   return res.status(500).json({
     success: false,

@@ -93,6 +93,7 @@ func TestAccountTransportRetiresGatewayIdleConnectionWithoutReplay(t *testing.T)
 func TestAccountHTTPSLoginWithoutSSHAndRestore(t *testing.T) {
 	previousStore, previousConnection, previousDefaults := store, apiConnection, serviceConfiguration
 	t.Setenv("APPDATA", t.TempDir())
+	t.Setenv("CHISA_DATA_DIR", t.TempDir())
 	store = loadStore(dataDir())
 
 	paths := []string{}
@@ -108,6 +109,11 @@ func TestAccountHTTPSLoginWithoutSSHAndRestore(t *testing.T) {
 				return
 			}
 			fmt.Fprint(w, `{"token":"valid-test-token","user":{"id":2,"username":"second"},"instancePath":"/instances/second","workspaceServerUrl":"http://second.test:8792"}`)
+		case "/instances/second/api/auth/logout":
+			if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer valid-test-token" || r.URL.RawQuery != "" {
+				t.Error("logout did not retain captured instance and bearer")
+			}
+			fmt.Fprint(w, `{"success":true,"message":"Logged out successfully"}`)
 		case "/instances/second/api/auth/user":
 			if r.Header.Get("Authorization") != "Bearer valid-test-token" {
 				t.Error("account token was lost")
@@ -133,7 +139,7 @@ func TestAccountHTTPSLoginWithoutSSHAndRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	bridge := FrontendBridge{}
-	response := bridge.ServerRequest(bridge.BeginServerRequest(), "POST", "/api/auth/login", map[string]string{"Content-Type": "application/json"}, b64encode(`{"username":"second","password":"test password"}`))
+	response := bridge.ServerRequest(reserveTestRequest(t, "login"), "POST", "/api/auth/login", map[string]string{"Content-Type": "application/json"}, b64encode(`{"username":"second","password":"test password"}`))
 	if response.Status != 200 {
 		raw, _ := base64.StdEncoding.DecodeString(response.BodyB64)
 		t.Fatalf("login failed: %d %s", response.Status, raw)
@@ -142,22 +148,27 @@ func TestAccountHTTPSLoginWithoutSSHAndRestore(t *testing.T) {
 		t.Fatal("login used SSH or the wrong instance")
 	}
 
-	version := apiConnection.version
-	bridge.EndServerSession(version - 1)
-	if !apiConnection.authenticated {
+	if result := bridge.EndServerSessionV2(apiConnection.sessionHandle, apiConnection.tokenRevision+1); result["ok"] != false || !apiConnection.authenticated {
 		t.Fatal("late logout ended the new account")
 	}
-	bridge.EndServerSession(version)
-	if apiConnection.authenticated {
-		t.Fatal("logout left realtime access active")
-	}
+	// Restart before logout: only the native server-bound candidate may restore.
 	store = loadStore(filepath.Dir(store.path))
 	if err := initializeServerConnection(); err != nil {
 		t.Fatal(err)
 	}
-	response = bridge.ServerRequest(bridge.BeginServerRequest(), "GET", "/api/auth/user", map[string]string{"Authorization": "Bearer valid-test-token"}, "")
+	if apiConnection.authenticated || apiConnection.restorationToken != "valid-test-token" {
+		t.Fatal("restart did not retain a verification-only restoration candidate")
+	}
+	response = bridge.ServerRequest(reserveTestRequest(t, "restore"), "GET", "/api/auth/user", nil, "")
 	if response.Status != 200 || !apiConnection.authenticated || len(paths) != 2 {
 		t.Fatal("restored session did not remain on the selected instance")
+	}
+	if result := bridge.EndServerSessionV2(apiConnection.sessionHandle, apiConnection.tokenRevision); result["ok"] != true || apiConnection.authenticated {
+		t.Fatal("logout left realtime access active", result)
+	}
+	store = loadStore(filepath.Dir(store.path))
+	if err := initializeServerConnection(); err != nil || apiConnection.restorationToken != "" {
+		t.Fatal("logout credential returned after restart", err)
 	}
 }
 
@@ -207,8 +218,8 @@ func TestAccountWebSocketProxyUsesHTTPSWithoutTunnel(t *testing.T) {
 			}
 			return
 		}
-		if r.URL.Path != "/instances/second/ws" || r.URL.Query().Get("token") != "session" {
-			t.Errorf("wrong websocket route: %s", r.URL.Path)
+		if r.URL.Path != "/instances/second/ws" || r.URL.RawQuery != "cursor=ws-first" || r.Header.Get("Authorization") != "Bearer session" || r.Header.Get("Origin") != upstream.URL {
+			t.Errorf("websocket lost captured route, bearer, or target Origin: %s", r.URL.Path)
 		}
 		connection, buffer, err := w.(http.Hijacker).Hijack()
 		if err != nil {
@@ -228,7 +239,7 @@ func TestAccountWebSocketProxyUsesHTTPSWithoutTunnel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection.authenticated = true
+	connection.authenticated, connection.accessToken = true, "session"
 	apiConnection = connection
 	defer func() {
 		connection.cancel()
@@ -237,7 +248,7 @@ func TestAccountWebSocketProxyUsesHTTPSWithoutTunnel(t *testing.T) {
 	if err := StartAPIProxy(); err != nil {
 		t.Fatal(err)
 	}
-	streamRequest, err := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/channel/%s/api/chat/stream?cursor=first", apiProxyPort, apiProxyKey), nil)
+	streamRequest, err := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%d/channel/%s/api/chat/stream?cursor=first", apiProxyPort, connection.proxyCapability), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +277,7 @@ func TestAccountWebSocketProxyUsesHTTPSWithoutTunnel(t *testing.T) {
 	}
 	defer client.Close()
 	client.SetDeadline(time.Now().Add(3 * time.Second))
-	fmt.Fprintf(client, "GET /channel/%s/ws?token=session HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n", apiProxyKey)
+	fmt.Fprintf(client, "GET /channel/%s/ws?token=renderer-injected&access_token=renderer-other&cursor=ws-first HTTP/1.1\r\nHost: localhost\r\nOrigin: https://renderer.invalid\r\nAuthorization: Bearer renderer-injected\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n", connection.proxyCapability)
 	buffer := bufio.NewReader(client)
 	status, err := buffer.ReadString('\n')
 	if err != nil || !strings.Contains(status, "101") {

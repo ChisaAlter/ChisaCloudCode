@@ -6,7 +6,7 @@ import { afterEach, test } from 'vitest';
 import { useEditorSidebar } from '@/modules/code-editor/hooks/useEditorSidebar';
 import type { Project } from '@/shared/types';
 
-const active: Project = { projectId: 'demo-project', fullPath: '/srv/workspaces/demo-user/demo-project', displayName: 'demo-project' };
+const active: Project = { projectId: 'agentmux', fullPath: '/srv/workspaces/user2/agentmux', displayName: 'agentmux' };
 const temporary: Project = { projectId: 'tmp', fullPath: '/tmp', displayName: 'tmp' };
 
 afterEach(cleanup);
@@ -16,7 +16,7 @@ test('absolute chat image opens through its registered owning project without sw
   act(() => result.current.handleFileOpen('/tmp/frames/after-140x38.png'));
   assert.deepEqual(result.current.editingFile, { name: 'after-140x38.png', path: '/tmp/frames/after-140x38.png', projectId: 'tmp', diffInfo: null });
   act(() => result.current.handleFileOpen('src/main.ts'));
-  assert.equal(result.current.editingFile?.projectId, 'demo-project');
+  assert.equal(result.current.editingFile?.projectId, 'agentmux');
 });
 
 test('nested owner wins and similarly prefixed or unregistered paths do not gain access', () => {
@@ -26,6 +26,6 @@ test('nested owner wins and similarly prefixed or unregistered paths do not gain
   assert.equal(result.current.editingFile?.projectId, 'frames');
   for (const path of ['/tmp-other/a.png', '/etc/passwd']) {
     act(() => result.current.handleFileOpen(path));
-    assert.equal(result.current.editingFile?.projectId, 'demo-project');
+    assert.equal(result.current.editingFile?.projectId, 'agentmux');
   }
 });
