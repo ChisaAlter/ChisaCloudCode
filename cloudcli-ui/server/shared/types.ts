@@ -635,7 +635,8 @@ export type GatewayEventKind =
   | 'session_upserted'
   | 'loading_progress'
   | 'protocol_error'
-  | 'scheduled_messages_changed';
+  | 'scheduled_messages_changed'
+  | 'ssh_workspace_changed';
 
 /**
  * Complete set of `kind` values emitted to websocket clients.

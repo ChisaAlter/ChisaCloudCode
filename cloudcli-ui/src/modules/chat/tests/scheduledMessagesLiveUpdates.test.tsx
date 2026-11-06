@@ -228,6 +228,14 @@ test('the announcement never lands in the transcript', () => {
 
   act(() => {
     listener?.({ kind: 'scheduled_messages_changed', sessionId: SESSION_ID, timestamp: '2026-10-19T17:22:09.000Z' });
+    listener?.({
+      kind: 'ssh_workspace_changed',
+      connectionId: 'conn-1',
+      rootPath: '/repo',
+      projectId: 'proj-1',
+      paths: ['src/index.ts'],
+      at: Date.now(),
+    });
   });
 
   assert.deepEqual(appended, []);

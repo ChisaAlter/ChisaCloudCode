@@ -291,6 +291,8 @@ export function useChatRealtimeHandlers({
         // Owned by useScheduledMessages, which reads the composer banner's
         // list again. Not a transcript row.
         case 'scheduled_messages_changed':
+        // Owned by file tree and git panel listeners. Not a transcript row.
+        case 'ssh_workspace_changed':
           return;
 
         default:
@@ -332,13 +334,15 @@ export function useChatRealtimeHandlers({
         return;
       }
 
-      // --- All other messages: route to store ---
+      // --- Transcript message rows: route to store ---
       const shouldPersist =
-        msg.kind !== 'complete'
-        && msg.kind !== 'status'
-        && msg.kind !== 'permission_request'
-        && msg.kind !== 'permission_resolved'
-        && msg.kind !== 'permission_cancelled';
+        msg.kind === 'text'
+        || msg.kind === 'tool_use'
+        || msg.kind === 'tool_result'
+        || msg.kind === 'thinking'
+        || msg.kind === 'error'
+        || msg.kind === 'task_notification'
+        || msg.kind === 'task_status';
 
       if (sid && shouldPersist) {
         sessionStore.appendRealtime(sid, msg as unknown as NormalizedMessage);

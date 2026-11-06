@@ -101,7 +101,7 @@ export function findOptimisticUserEchoes(
   const echoes = new Map<string, string>();
 
   for (const message of realtimeMessages) {
-    if (!message.id.startsWith('local_')) {
+    if (typeof message.id !== 'string' || !message.id.startsWith('local_')) {
       continue;
     }
 

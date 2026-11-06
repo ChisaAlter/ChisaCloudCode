@@ -372,7 +372,7 @@ function pruneRealtimeSupersededByServer(
     // while pending rows remain so a repeated send cannot take the same echo.
     for (let index = 0; index < realtimeMessages.length; index++) {
       const message = realtimeMessages[index];
-      if (message.id.startsWith('local_') && message.kind === 'text' && message.role === 'user' && anchors.has(message.id)) {
+      if (typeof message.id === 'string' && message.id.startsWith('local_') && message.kind === 'text' && message.role === 'user' && anchors.has(message.id)) {
         retainedIndices.add(index);
       }
     }
@@ -762,10 +762,14 @@ export function useSessionStore() {
 
   const appendRealtime = useCallback((sessionId: string, msg: NormalizedMessage) => {
     const slot = getSlot(sessionId);
+    const resolvedId =
+      typeof msg.id === 'string' && msg.id
+        ? msg.id
+        : `rt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const normalizedMessage =
-      msg.sessionId === sessionId
+      msg.sessionId === sessionId && msg.id === resolvedId
         ? msg
-        : { ...msg, sessionId };
+        : { ...msg, id: resolvedId, sessionId };
     let updated = [...slot.realtimeMessages, normalizedMessage];
     if (updated.length > MAX_REALTIME_MESSAGES) {
       updated = updated.slice(-MAX_REALTIME_MESSAGES);
